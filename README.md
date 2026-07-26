@@ -28,7 +28,7 @@ them met two different models, and the shared parts drifted apart with every cha
 layout, reading and validating configuration, volume and bind lifecycle, and the lifecycle verbs.
 Products contribute a manifest describing themselves, and nothing more.
 
-## Everything lives in one directory
+## One place for everything you edit
 
 ```
 ~/.mythical/
@@ -39,14 +39,22 @@ Products contribute a manifest describing themselves, and nothing more.
   transcripts/ logs/   product data
 ```
 
-Two properties this buys you:
+Nothing is scattered across your home directory: every file you are expected to read or edit is
+in there.
 
-- **One thing to remove.** Uninstalling is bounded, because nothing was scattered across your home
-  directory.
-- **Your data is never collateral.** The installer creates what is missing and reads what already
-  exists. It does not overwrite a configuration file you have edited, and it does not delete
-  transcripts, logs, or any directory you bound — re-installing on a machine that has been in use
-  for a year is safe.
+**It is not the whole install, though.** Product state — and each product's own secrets store —
+lives in named container volumes, and the containers, images and shared network live in your
+container runtime. None of that is in this directory. So:
+
+- **Copying `~/.mythical/` is not a backup.** The data and the runtime secrets are not in it. Use
+  `mythical-ctl` to back up, so the volumes are included.
+- **Deleting `~/.mythical/` is not an uninstall.** The containers keep running. Use
+  `mythical-ctl uninstall`.
+
+**Your data is never collateral.** The installer creates what is missing and reads what already
+exists. It does not overwrite a configuration file you have edited, and it does not delete
+transcripts, logs, or any directory you bound — re-installing on a machine that has been in use
+for a year is safe.
 
 ## Siblings
 

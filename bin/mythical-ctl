@@ -3,8 +3,11 @@
 # Copyright 2026 mythicalOS. Licensed under the Apache License, Version 2.0.
 #
 # Shell, deliberately: this runs before any language runtime is guaranteed to
-# exist on the machine. Its only dependencies are a POSIX shell and a container
-# runtime.
+# exist on the machine. Its only dependencies are bash and a container runtime.
+#
+# Bash specifically, not POSIX sh — `set -o pipefail` below is a bash builtin.
+# Saying "POSIX shell" here while shipping a bash script would be a portability
+# claim the code does not honour.
 #
 # The lifecycle verbs are specified but NOT YET IMPLEMENTED — see README.md.
 # This entrypoint carries the version and the help surface so that packaging,
