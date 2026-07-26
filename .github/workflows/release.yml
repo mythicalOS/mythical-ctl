@@ -71,23 +71,36 @@ jobs:
         with:
           subject-path: dist/mythical-ctl
 
-      # Idempotent: re-running a release for an existing tag uploads over the
-      # same assets instead of failing, so a transient runner failure does not
-      # require burning a version number.
-      - name: Publish the release
+      # IMMUTABLE (design D20). An earlier version of this step used --clobber so
+      # that a transient runner failure would not burn a version number. That is
+      # the wrong trade: it lets the bytes behind a published version change after
+      # the fact, so pinning a version pins nothing and the attestation only ever
+      # describes whichever upload happened last — which silently guts the reason
+      # this workflow signs anything at all.
+      #
+      # A tag that is already published is therefore a hard failure. Recovery from
+      # a failed release is a new patch version, never a re-upload.
+      - name: Refuse to republish an existing release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" dist/mythical-ctl dist/SHA256SUMS --clobber
-          else
-            gh release create "$GITHUB_REF_NAME" dist/mythical-ctl dist/SHA256SUMS \
-              --title "$GITHUB_REF_NAME" \
-              --notes "mythical-ctl $GITHUB_REF_NAME
+            echo "::error::${GITHUB_REF_NAME} is already published. Release assets are immutable — cut a new patch version instead of replacing published bytes."
+            exit 1
+          fi
+          echo "${GITHUB_REF_NAME} is unpublished — proceeding"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" dist/mythical-ctl dist/SHA256SUMS \
+            --title "$GITHUB_REF_NAME" \
+            --notes "mythical-ctl $GITHUB_REF_NAME
 
           Verify the download before running it:
 
               sha256sum -c SHA256SUMS
               gh attestation verify mythical-ctl --repo mythicalOS/mythical-ctl"
-          fi

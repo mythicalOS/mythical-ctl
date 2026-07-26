@@ -56,8 +56,12 @@ small enough to read.
 
 ## Requirements
 
-A POSIX shell and a container runtime. Nothing else — no language runtime is required to install a
+**Bash** and a container runtime. Nothing else — no language runtime is required to install a
 product, which is why this is written in shell.
+
+(Bash specifically, not POSIX `sh`: the CLI uses `set -o pipefail` and other bash features. Bash
+is present by default on macOS and every mainstream Linux distribution; where it is not — Alpine,
+some minimal images — it is a one-package install.)
 
 ## Open core
 
