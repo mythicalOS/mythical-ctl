@@ -12,10 +12,12 @@ curl -fsSL https://get.mythicalos.ai | bash          # choose interactively
 curl -fsSL https://get.mythicalos.ai/brokkr | bash   # a specific product
 ```
 
-> **Status: pre-launch.** The product images are not published yet. The command surface below is
-> specified but not implemented — this repository currently carries the project scaffolding, its
-> licence and community files, and CI. Until the images are public, any install attempt reports
-> that the product has not launched yet rather than failing with a registry error.
+> **Status: scaffolding.** This repository currently carries the project structure, its licence
+> and community files, and CI. **The lifecycle commands are not implemented** — `mythical-ctl`
+> today answers `--version` and `--help` and nothing else, so the invocations above do not work
+> yet. The product images are not published either; when the commands land, an install attempt
+> before a product is public will report that it has not launched yet rather than failing with a
+> registry error.
 
 ## Why it exists
 
@@ -46,10 +48,10 @@ in there.
 lives in named container volumes, and the containers, images and shared network live in your
 container runtime. None of that is in this directory. So:
 
-- **Copying `~/.mythical/` is not a backup.** The data and the runtime secrets are not in it. Use
-  `mythical-ctl` to back up, so the volumes are included.
-- **Deleting `~/.mythical/` is not an uninstall.** The containers keep running. Use
-  `mythical-ctl uninstall`.
+- **Copying `~/.mythical/` is not a backup.** The data and the runtime secrets are not in it — a
+  complete backup has to include the named volumes as well. (There is no backup command; the
+  documented volume-aware procedure will ship with the lifecycle commands.)
+- **Deleting `~/.mythical/` is not an uninstall.** The containers keep running.
 
 **Your data is never collateral.** The installer creates what is missing and reads what already
 exists. It does not overwrite a configuration file you have edited, and it does not delete
