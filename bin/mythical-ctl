@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# mythical-ctl — installer and lifecycle CLI for the mythicalOS family.
+# Copyright 2026 mythicalOS. Licensed under the Apache License, Version 2.0.
+#
+# Shell, deliberately: this runs before any language runtime is guaranteed to
+# exist on the machine. Its only dependencies are a POSIX shell and a container
+# runtime.
+#
+# The lifecycle verbs are specified but NOT YET IMPLEMENTED — see README.md.
+# This entrypoint carries the version and the help surface so that packaging,
+# release and installation can be built and tested ahead of them.
+
+set -euo pipefail
+
+VERSION="0.1.0"
+
+usage() {
+  cat <<'EOF'
+mythical-ctl — install and manage mythicalOS products
+
+USAGE
+  mythical-ctl <command> [options]
+
+COMMANDS
+  (none yet — the lifecycle commands land with the implementation)
+
+OPTIONS
+  -v, --version   print the version and exit
+  -h, --help      print this help and exit
+
+Products are not published yet. See https://github.com/mythicalOS/mythical-ctl
+EOF
+}
+
+main() {
+  if [ "$#" -eq 0 ]; then
+    usage
+    exit 0
+  fi
+
+  case "$1" in
+    -v|--version)
+      printf 'mythical-ctl %s\n' "$VERSION"
+      ;;
+    -h|--help)
+      usage
+      ;;
+    *)
+      # Exit 2 for usage errors, distinct from 1 for operational failure, so a
+      # caller can tell "you typed it wrong" from "it tried and could not".
+      printf 'mythical-ctl: unknown command: %s\n\n' "$1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"

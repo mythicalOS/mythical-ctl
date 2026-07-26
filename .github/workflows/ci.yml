@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Public-safety gate. Internal-only names must never appear in this PUBLIC
+  # repository. Any hit is a release blocker, not a style nit.
+  #
+  # Every banned term below is split by a single-character bracket class so this
+  # file never spells one out contiguously in plaintext — a public workflow that
+  # listed the private names verbatim would itself be the leak the gate exists to
+  # catch. The --exclude-dir=.github below is defence in depth on top of that,
+  # not the primary fix.
+  #
+  # DELIBERATELY NOT BANNED: the sibling product names (brokkr, skuld, saga).
+  # They are open source too, and naming them is this repository's entire job —
+  # an installer that cannot say what it installs is not an installer. Copying a
+  # sister repo's pattern verbatim would fail this build on its own README.
+  hygiene:
+    name: hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Genericize gate (banned internal names)
+        run: |
+          set -euo pipefail
+          pattern='mythical-proj[e]ct|mythical-serv[e]r|mythical-asga[r]d|agent-remote-mc[p]|agent-local-mc[p]|agent-daemo[n]|agent-playbook[s]|agent-skill[s]|agent-we[b]|de-ne[t]|dene[t]|saas-dra[f]t|mythical-master-pl[a]n|hamed[d]k|esmile[y]|sattar[i]|/private/tmp|/opt/mythical'
+          if grep -rliIE "$pattern" . \
+              --exclude-dir=.git --exclude-dir=.github --exclude-dir=node_modules
+          then
+            echo "::error::banned internal name(s) found — see the file(s) listed above"
+            exit 1
+          fi
+          echo "genericize gate: clean"
+
+      # Separate, case-SENSITIVE check for the internal decision-maker moniker
+      # (an all-caps role term). It cannot join the pattern above: that gate greps
+      # case-insensitively, so folding an all-caps word in would also flag the
+      # same word used lowercase in ordinary prose and fail on false positives.
+      # Bracket-split for the same self-safety reason.
+      - name: Genericize gate (internal role moniker, case-sensitive)
+        run: |
+          set -euo pipefail
+          if grep -rlI --exclude-dir=.git --exclude-dir=.github --exclude-dir=node_modules -E '\bB[O]SS\b' .
+          then
+            echo "::error::internal role moniker found (case-sensitive) — see the file(s) listed above"
+            exit 1
+          fi
+          echo "genericize gate (role moniker): clean"
+
+      # The health files must be PHYSICALLY present in the tree. Organisation-level
+      # defaults do not travel in a clone, a tarball, or a container image, so a
+      # consumer who downloads this repository sees only what is committed here.
+      - name: Community-health files are physically present
+        run: |
+          set -euo pipefail
+          missing=0
+          for f in LICENSE NOTICE README.md SECURITY.md CONTRIBUTING.md \
+                   CODE_OF_CONDUCT.md SUPPORT.md TRADEMARK.md; do
+            if [ -f "$f" ]; then echo "  ✓ $f"; else echo "  ✗ $f MISSING"; missing=1; fi
+          done
+          [ "$missing" -eq 0 ] || { echo "::error::required health file(s) missing from the tree"; exit 1; }
+
+  lint:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Ensure shellcheck is available
+        run: command -v shellcheck >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck; }
+
+      # -x follows `source`d files, so the lint keeps working once bin/ grows
+      # beyond a single self-contained script.
+      - name: shellcheck
+        run: |
+          set -euo pipefail
+          shellcheck --version
+          shellcheck -x bin/* tests/*.sh
+          echo "shellcheck: clean"
+
+      # Shell that is not executable is shell that will not run when installed.
+      - name: Entrypoints are executable
+        run: |
+          set -euo pipefail
+          rc=0
+          for f in bin/* tests/*.sh; do
+            [ -x "$f" ] || { echo "::error file=$f::not executable"; rc=1; }
+          done
+          exit "$rc"
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Smoke tests
+        run: ./tests/smoke.sh

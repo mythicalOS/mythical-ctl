@@ -1,0 +1,6 @@
+# Release staging (built by .github/workflows/release.yml)
+dist/
+
+# Editor / OS noise
+.DS_Store
+*.swp

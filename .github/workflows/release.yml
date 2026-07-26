@@ -1,0 +1,93 @@
+name: Release
+
+# Publishes a versioned mythical-ctl to GitHub Releases, with checksums and a
+# signed build-provenance attestation, on a `v*` tag.
+#
+# Why a GitHub Release and not a package registry: mythical-ctl runs BEFORE any
+# language runtime is guaranteed to exist on the machine — that is the whole
+# reason it is shell — so a registry that presupposes one cannot be the primary
+# channel. get.mythicalos.ai serves a pinned release artifact from here.
+#
+# The provenance attestation is the counterpart to package provenance elsewhere
+# in the family, and it matters more here than anywhere: users are asked to pipe
+# this script into their shell, so "prove this is the artifact your workflow
+# built from this tag" is the security story, not a formality.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # create the release and upload assets
+  id-token: write # OIDC, for the provenance attestation
+  attestations: write
+
+jobs:
+  release:
+    name: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # A tag that disagrees with the version the script reports would ship an
+      # artifact that lies about itself — every later "which version do I have?"
+      # answer descends from this, so it is checked before anything is built.
+      - name: Tag must match the version the CLI reports
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          reported="$(./bin/mythical-ctl --version | awk '{print $2}')"
+          echo "tag=${tag} reported=${reported}"
+          if [ "$tag" != "$reported" ]; then
+            echo "::error::tag v${tag} does not match the version the CLI reports (${reported})"
+            exit 1
+          fi
+
+      # The release runs the same gates as CI. A tag can be pushed to a commit
+      # that never saw a pull request, so re-running them here is the difference
+      # between a gate and a suggestion.
+      - name: Ensure shellcheck is available
+        run: command -v shellcheck >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck; }
+
+      - name: shellcheck
+        run: shellcheck -x bin/* tests/*.sh
+
+      - name: Smoke tests
+        run: ./tests/smoke.sh
+
+      - name: Stage release artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp bin/mythical-ctl dist/mythical-ctl
+          chmod +x dist/mythical-ctl
+          ( cd dist && sha256sum mythical-ctl > SHA256SUMS )
+          cat dist/SHA256SUMS
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: dist/mythical-ctl
+
+      # Idempotent: re-running a release for an existing tag uploads over the
+      # same assets instead of failing, so a transient runner failure does not
+      # require burning a version number.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/mythical-ctl dist/SHA256SUMS --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/mythical-ctl dist/SHA256SUMS \
+              --title "$GITHUB_REF_NAME" \
+              --notes "mythical-ctl $GITHUB_REF_NAME
+
+          Verify the download before running it:
+
+              sha256sum -c SHA256SUMS
+              gh attestation verify mythical-ctl --repo mythicalOS/mythical-ctl"
+          fi
