@@ -71,22 +71,27 @@ jobs:
         with:
           subject-path: dist/mythical-ctl
 
-      # IMMUTABLE (design D20). An earlier version of this step used --clobber so
-      # that a transient runner failure would not burn a version number. That is
-      # the wrong trade: it lets the bytes behind a published version change after
-      # the fact, so pinning a version pins nothing and the attestation only ever
-      # describes whichever upload happened last — which silently guts the reason
-      # this workflow signs anything at all.
+      # ACCIDENT GUARD, not an immutability guarantee (design D20).
       #
-      # A tag that is already published is therefore a hard failure. Recovery from
-      # a failed release is a new patch version, never a re-upload.
+      # An earlier version used --clobber so a transient runner failure would not
+      # burn a version number. That is the wrong trade: it lets the bytes behind a
+      # published version change after the fact, so the attestation only ever
+      # describes whichever upload happened last.
+      #
+      # Removing it does NOT make releases immutable, and this step must not be
+      # read as claiming so: anyone with write access can delete this release and
+      # publish again, or replace an asset, without the tag moving. What this
+      # catches is the ordinary accident — a re-run, a re-pushed tag.
+      #
+      # The actual integrity guarantee is content-addressed and lives at the
+      # consumer: verify the recorded SHA-256 digest, never the version string.
       - name: Refuse to republish an existing release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            echo "::error::${GITHUB_REF_NAME} is already published. Release assets are immutable — cut a new patch version instead of replacing published bytes."
+            echo "::error::${GITHUB_REF_NAME} is already published — cut a new patch version instead of replacing published bytes."
             exit 1
           fi
           echo "${GITHUB_REF_NAME} is unpublished — proceeding"

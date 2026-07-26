@@ -66,8 +66,14 @@ small enough to read.
 
 ## Requirements
 
-**Bash** and a container runtime. Nothing else — no language runtime is required to install a
+**To run the CLI:** bash and a container runtime. No language runtime is required to install a
 product, which is why this is written in shell.
+
+**To install via the one-liner**, the bootstrap additionally needs a downloader (`curl` or
+`wget`) and a SHA-256 implementation — `sha256sum` on Linux, `shasum` on macOS — because it
+verifies the CLI it downloads before running it. If it cannot find a way to check the digest it
+**stops** rather than running an unverified script. Both are present by default on macOS and
+mainstream Linux; the requirement is stated because it is security-critical, not incidental.
 
 (Bash specifically, not POSIX `sh`: the CLI uses `set -o pipefail` and other bash features. Bash
 is present by default on macOS and every mainstream Linux distribution; where it is not — Alpine,
