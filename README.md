@@ -8,18 +8,21 @@ afterwards — `install`, `start`, `stop`, `recreate`, `status`, `uninstall`. It
 environment) arrives from a manifest that product ships, never from logic baked in here.
 
 ```sh
-# fetch, CHECK, run — deliberately not a one-liner (see below)
-tmp=$(mktemp) || exit 1
-trap 'rm -f "$tmp"' EXIT
+# fetch, CHECK, run — deliberately not a one-liner (see below).
+# The subshell matters: without it, a failed download would exit your shell.
+(
+  set -e
+  tmp=$(mktemp)
+  trap 'rm -f "$tmp"' EXIT
 
-# BOTH gates: curl must succeed AND the status must be exactly 200
-code=$(curl -fsS --proto '=https' --max-redirs 0 \
-            -o "$tmp" -w '%{http_code}' \
-            https://get.mythicalos.ai/brokkr) \
-  || { echo "download failed — refusing to run it"; exit 1; }
-[ "$code" = 200 ] || { echo "unexpected HTTP $code — refusing to run it"; exit 1; }
+  # BOTH gates: curl must succeed AND the status must be exactly 200
+  code=$(curl -fsS --proto '=https' --max-redirs 0 \
+              -o "$tmp" -w '%{http_code}' \
+              https://get.mythicalos.ai/brokkr)
+  [ "$code" = 200 ] || { echo "unexpected HTTP $code — refusing to run it"; exit 1; }
 
-bash "$tmp"
+  bash "$tmp"
+)
 ```
 
 > **Status: scaffolding.** This repository currently carries the project structure, its licence
@@ -80,7 +83,7 @@ small enough to read.
 product, which is why this is written in shell. (Installing it needs `curl` and a digest tool
 too — see below.)
 
-**To install**, you additionally need **`curl`** and a SHA-256 implementation — `sha256sum` on
+**To install**, you additionally need **`curl`**, **`mktemp`**, and a SHA-256 implementation — `sha256sum` on
 Linux, `shasum` on macOS — because the installer verifies the CLI it downloads before running
 it. If it cannot find a way to check the digest it **stops** rather than running an unverified
 script. Both are present by default on macOS and mainstream Linux; the requirement is stated
