@@ -146,3 +146,12 @@ setup_ledger() { load_mctl; mi_ensure_layout; hold_lock; }
   [ "$status" -ne 3 ]
   assert_contains "checksum"
 }
+
+@test "mi_ledger_read leaves no read-snapshot temp behind" {
+  setup_ledger
+  printf 'identity\tid=abc\n' | mi_ledger_write
+  run mi_ledger_read
+  assert_ok
+  # the read path snapshots to a private .state/.ledger.read.* temp and MUST remove it
+  [ -z "$(find "$MYTHICAL_HOME/.state" -name '.ledger.*' -print -quit)" ]
+}

@@ -23,45 +23,53 @@ mi_ledger_read() {
   local f; f="$(_mi_ledger_path)"
   [ -f "$f" ] || return 3
 
-  # The file MUST end in a newline. Truncating just the final byte leaves the header/body byte
-  # range identical, so `sed '$d'` would hash the same bytes and accept a truncated write. A
-  # trailing newline makes `tail -c1` yield empty; anything else is truncation → fail closed.
-  [ -z "$(tail -c1 "$f")" ] || mi_die "ledger is not newline-terminated (truncated?) — refusing (fail closed)"
+  # Snapshot the ledger to a PRIVATE inode, then validate AND parse the SAME bytes. Reopening $f for
+  # each step (tail/head/sed) is a TOCTOU: reads do not hold the lock, so a concurrent atomic replace
+  # (mi_ledger_write's `mv -f`) between the checksum validation and the final body read would let us
+  # validate one file yet return another — e.g. a checksum-valid but NEWER-schema file whose schema
+  # gate we never ran (silently defeating D35). Reading a copy we own closes the window: once cat has
+  # opened $f, a later rename cannot change these bytes. Named `.ledger.*` so the fs snapshot excludes it.
+  local snap; snap="$(mktemp "$(dirname "$f")/.ledger.read.XXXXXX")" || mi_die "ledger: cannot create read buffer — refusing (fail closed)"
+  if ! cat "$f" > "$snap" 2>/dev/null; then rm -f "$snap"; mi_die "ledger: cannot read — refusing (fail closed)"; fi
+
+  # The file MUST end in a newline. Truncating just the final byte leaves the header/body byte range
+  # identical, so `sed '$d'` would hash the same bytes and accept a truncated write. A trailing
+  # newline makes `tail -c1` yield empty; anything else is truncation → fail closed.
+  [ -z "$(tail -c1 "$snap")" ] || { rm -f "$snap"; mi_die "ledger is not newline-terminated (truncated?) — refusing (fail closed)"; }
 
   # Split: header (line 1), checksum (last line), body (the rest).
   local header checkline
-  header="$(head -n1 "$f")"
-  checkline="$(tail -n1 "$f")"
+  header="$(head -n1 "$snap")"
+  checkline="$(tail -n1 "$snap")"
   case "$checkline" in
     '#sha256='*) : ;;
-    *) mi_die "ledger checksum line missing or malformed — refusing (fail closed)" ;;
+    *) rm -f "$snap"; mi_die "ledger checksum line missing or malformed — refusing (fail closed)" ;;
   esac
 
   # Recompute the checksum over everything except the last line.
   local recomputed expected
   expected="${checkline#\#sha256=}"
-  recomputed="$(sed '$d' "$f" | mi_digest /dev/stdin)"
-  [ "$recomputed" = "$expected" ] || mi_die "ledger checksum mismatch — refusing (fail closed)"
+  recomputed="$(sed '$d' "$snap" | mi_digest /dev/stdin)"
+  [ "$recomputed" = "$expected" ] || { rm -f "$snap"; mi_die "ledger checksum mismatch — refusing (fail closed)"; }
 
   # Schema gate (after integrity, so a torn header is caught as corruption first).
   case "$header" in
     '#mythical-ctl-ledger schema='*) : ;;
-    *) mi_die "ledger header malformed — refusing (fail closed)" ;;
+    *) rm -f "$snap"; mi_die "ledger header malformed — refusing (fail closed)" ;;
   esac
   local schema="${header#\#mythical-ctl-ledger schema=}"
   # Must be plain decimal digits BEFORE any comparison — a non-numeric schema is corruption.
   case "$schema" in
-    ''|*[!0-9]*) mi_die "ledger schema '$schema' is not a number — refusing (fail closed)" ;;
+    ''|*[!0-9]*) rm -f "$snap"; mi_die "ledger schema '$schema' is not a number — refusing (fail closed)" ;;
   esac
-  # Compare as decimal STRINGS, never via `[ -gt ]`: a large all-digit schema overflows shell
-  # integers, `[ -gt ]` then errors, the `if` sees false, and the body would be parsed. Compare
-  # by digit-count (after stripping leading zeros), then lexically at equal length.
+  # Compare as decimal STRINGS, never via `[ -gt ]` (overflow → parse). Digit-count then lexical.
   if _mi_num_gt "$schema" "$MI_LEDGER_SCHEMA"; then
-    mi_die "ledger schema $schema is newer than this mythical-ctl understands ($MI_LEDGER_SCHEMA) — refusing"
+    rm -f "$snap"; mi_die "ledger schema $schema is newer than this mythical-ctl understands ($MI_LEDGER_SCHEMA) — refusing"
   fi
 
-  # Body = everything except line 1 and the last line.
-  sed -e '1d' -e '$d' "$f"
+  # Body = everything except line 1 and the last line — from the SAME snapshot we validated.
+  sed -e '1d' -e '$d' "$snap"
+  rm -f "$snap"
 }
 
 # Replace the ledger atomically from records on stdin. Requires the caller to actually HOLD the
