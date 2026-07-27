@@ -89,7 +89,7 @@ jobs:
         run: |
           set -euo pipefail
           shellcheck --version
-          shellcheck -x bin/* tests/*.sh
+          shellcheck -x bin/* lib/*.sh tests/*.sh tests/harness/*
           echo "shellcheck: clean"
 
       # Shell that is not executable is shell that will not run when installed.
