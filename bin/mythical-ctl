@@ -17,6 +17,10 @@ set -euo pipefail
 
 VERSION="0.1.0"
 
+# Resolve lib/ relative to this script (symlink-safe enough for install + repo layouts).
+_MCTL_BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_MCTL_LIB="${_MCTL_BIN}/../lib"
+
 usage() {
   cat <<'EOF'
 mythical-ctl — install and manage mythicalOS products
@@ -47,6 +51,14 @@ main() {
       ;;
     -h|--help)
       usage
+      ;;
+    __selftest)
+      # Hidden: prove every SHIPPED lib/ module sources cleanly. Guarded exactly like load_mctl so
+      # it works at any task stage — a module a later task adds is simply skipped until it exists,
+      # never a fatal missing-source under the entrypoint's `set -e`. Used by the tests, undocumented.
+      # shellcheck disable=SC1090
+      for _m in common layout lock ledger; do [ -f "${_MCTL_LIB}/${_m}.sh" ] && source "${_MCTL_LIB}/${_m}.sh"; done
+      printf 'ok\n'
       ;;
     *)
       # Exit 2 for usage errors, distinct from 1 for operational failure, so a
