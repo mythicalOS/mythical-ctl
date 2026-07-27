@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Fake container runtime for the hermetic acceptance harness (test-only; never shipped).
+# State under $FAKE_DOCKER_STATE. Extend per-plan; the foundation covers volumes + pull + info.
+set -euo pipefail
+
+STATE="${FAKE_DOCKER_STATE:-${MYTHICAL_HOME:-/tmp}/.fake-docker}"
+mkdir -p "$STATE/volumes"
+printf '%s\n' "$*" >> "$STATE/calls.log"
+
+die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+
+case "${1:-}" in
+  volume)
+    shift
+    case "${1:-}" in
+      create)
+        shift
+        labels=""; name=""
+        while [ "$#" -gt 0 ]; do
+          case "$1" in
+            --label) labels="${labels}${2};"; shift 2 ;;
+            --label=*) labels="${labels}${1#--label=};"; shift ;;
+            *) name="$1"; shift ;;
+          esac
+        done
+        [ -n "$name" ] || die "volume create: no name"
+        # Real semantics (verified): existing name succeeds WITHOUT applying new labels.
+        if [ ! -e "$STATE/volumes/$name" ]; then
+          printf '%s' "$labels" > "$STATE/volumes/$name"
+        fi
+        printf '%s\n' "$name"
+        ;;
+      inspect)
+        name="$2"
+        [ -e "$STATE/volumes/$name" ] || die "no such volume: $name"
+        printf '{ "Name": "%s", "Labels": "%s", "Driver": "local" }\n' "$name" "$(cat "$STATE/volumes/$name")"
+        ;;
+      ls) ls -1 "$STATE/volumes" 2>/dev/null || true ;;
+      rm)
+        name="$2"
+        [ -e "$STATE/volumes/$name" ] || die "no such volume: $name"
+        rm -f "$STATE/volumes/$name"
+        printf '%s\n' "$name"
+        ;;
+      *) die "fake docker: unsupported volume subcommand: ${1:-}" ;;
+    esac
+    ;;
+  image)
+    shift
+    case "${1:-}" in
+      pull)
+        case "${FAKE_DOCKER_PULL:-ok}" in
+          ok)       printf 'pulled %s\n' "${2:-}" ;;
+          notfound) die "manifest for ${2:-} not found: manifest unknown" ;;
+          auth)     die "denied: requested access to the resource is denied" ;;
+          neterr)   die "dial tcp: lookup registry: no such host" ;;
+          *)        die "unknown FAKE_DOCKER_PULL outcome" ;;
+        esac
+        ;;
+      *) die "fake docker: unsupported image subcommand: ${1:-}" ;;
+    esac
+    ;;
+  info)
+    printf '%s\n' "${FAKE_DOCKER_SERVER_VERSION:-28.0.0}"
+    ;;
+  *) die "fake docker: unsupported command: ${1:-}" ;;
+esac
