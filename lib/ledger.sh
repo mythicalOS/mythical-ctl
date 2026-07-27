@@ -49,7 +49,8 @@ mi_ledger_read() {
   # Recompute the checksum over everything except the last line.
   local recomputed expected
   expected="${checkline#\#sha256=}"
-  recomputed="$(sed '$d' "$snap" | mi_digest /dev/stdin)"
+  recomputed="$(sed '$d' "$snap" | mi_digest /dev/stdin)" || { rm -f "$snap"; mi_die "ledger: failed to compute checksum — refusing (fail closed)"; }
+  [ -n "$recomputed" ] || { rm -f "$snap"; mi_die "ledger: empty computed checksum — refusing (fail closed)"; }
   [ "$recomputed" = "$expected" ] || { rm -f "$snap"; mi_die "ledger checksum mismatch — refusing (fail closed)"; }
 
   # Schema gate (after integrity, so a torn header is caught as corruption first).
@@ -112,7 +113,9 @@ mi_ledger_write() {
     printf '#mythical-ctl-ledger schema=%s\n' "$MI_LEDGER_SCHEMA"
     if [ -n "$body" ]; then printf '%s\n' "$body"; fi
   } > "$tmp"
-  local sum; sum="$(mi_digest "$tmp")"
+  local sum
+  sum="$(mi_digest "$tmp")" || { rm -f "$tmp"; mi_die "ledger: failed to compute checksum — refusing (fail closed)"; }
+  [ -n "$sum" ] || { rm -f "$tmp"; mi_die "ledger: empty checksum — refusing (fail closed)"; }
   printf '#sha256=%s\n' "$sum" >> "$tmp"
   # Atomic replace: same directory, so rename() cannot cross filesystems.
   mv -f "$tmp" "$f"

@@ -62,6 +62,43 @@ jobs:
       - name: Bats unit tests
         run: vendor/bats-core/bin/bats tests/unit
 
+      # Public-safety gate — same intent as CI's hygiene job. A tag can be pushed
+      # to a commit that never saw a PR, so the release must re-run it or a banned
+      # internal name could be published. vendor/ (the bats submodule, checked out
+      # for the test step) is third-party and excluded, matching CI's plain-checkout
+      # hygiene scope.
+      - name: Genericize gate (banned internal names)
+        run: |
+          set -euo pipefail
+          pattern='mythical-proj[e]ct|mythical-serv[e]r|mythical-asga[r]d|agent-remote-mc[p]|agent-local-mc[p]|agent-daemo[n]|agent-playbook[s]|agent-skill[s]|agent-we[b]|de-ne[t]|dene[t]|saas-dra[f]t|mythical-master-pl[a]n|hamed[d]k|esmile[y]|sattar[i]|/private/tmp|/opt/mythical'
+          if grep -rliIE "$pattern" . \
+              --exclude-dir=.git --exclude-dir=.github --exclude-dir=node_modules --exclude-dir=vendor
+          then
+            echo "::error::banned internal name(s) found — see the file(s) listed above"
+            exit 1
+          fi
+          echo "genericize gate: clean"
+
+      - name: Genericize gate (internal role moniker, case-sensitive)
+        run: |
+          set -euo pipefail
+          if grep -rlI --exclude-dir=.git --exclude-dir=.github --exclude-dir=node_modules --exclude-dir=vendor -E '\bB[O]SS\b' .
+          then
+            echo "::error::internal role moniker found (case-sensitive) — see the file(s) listed above"
+            exit 1
+          fi
+          echo "genericize gate (role moniker): clean"
+
+      - name: Community-health files are physically present
+        run: |
+          set -euo pipefail
+          missing=0
+          for f in LICENSE NOTICE README.md SECURITY.md CONTRIBUTING.md \
+                   CODE_OF_CONDUCT.md SUPPORT.md TRADEMARK.md; do
+            if [ -f "$f" ]; then echo "  ✓ $f"; else echo "  ✗ $f MISSING"; missing=1; fi
+          done
+          [ "$missing" -eq 0 ] || { echo "::error::required health file(s) missing from the tree"; exit 1; }
+
       - name: Stage release artifacts
         run: |
           set -euo pipefail

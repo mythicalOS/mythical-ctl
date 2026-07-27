@@ -155,3 +155,26 @@ setup_ledger() { load_mctl; mi_ensure_layout; hold_lock; }
   # the read path snapshots to a private .state/.ledger.read.* temp and MUST remove it
   [ -z "$(find "$MYTHICAL_HOME/.state" -name '.ledger.*' -print -quit)" ]
 }
+
+@test "ledger write fails closed when the hasher itself fails (no checksum-empty ledger)" {
+  setup_ledger
+  local badbin="$BATS_TEST_TMPDIR/badbin"; mkdir -p "$badbin"
+  printf '#!/usr/bin/env bash\nexit 3\n' > "$badbin/sha256sum"; chmod +x "$badbin/sha256sum"
+  printf '#!/usr/bin/env bash\nexit 3\n' > "$badbin/shasum";    chmod +x "$badbin/shasum"
+  run env PATH="$badbin:$PATH" bash -c \
+    'source '"$_MCTL_ROOT"'/lib/common.sh; source '"$_MCTL_ROOT"'/lib/layout.sh; source '"$_MCTL_ROOT"'/lib/ledger.sh; printf "identity\tid=abc\n" | mi_ledger_write'
+  [ "$status" -ne 0 ]
+  [ ! -f "$MYTHICAL_HOME/.state/ledger" ]     # nothing (esp. no checksum-empty ledger) was published
+}
+
+@test "ledger read fails closed when the hasher itself fails" {
+  setup_ledger
+  printf 'identity\tid=abc\n' | mi_ledger_write        # written with a WORKING hasher
+  local badbin="$BATS_TEST_TMPDIR/badbin2"; mkdir -p "$badbin"
+  printf '#!/usr/bin/env bash\nexit 3\n' > "$badbin/sha256sum"; chmod +x "$badbin/sha256sum"
+  printf '#!/usr/bin/env bash\nexit 3\n' > "$badbin/shasum";    chmod +x "$badbin/shasum"
+  run env PATH="$badbin:$PATH" bash -c \
+    'source '"$_MCTL_ROOT"'/lib/common.sh; source '"$_MCTL_ROOT"'/lib/layout.sh; source '"$_MCTL_ROOT"'/lib/ledger.sh; mi_ledger_read'
+  [ "$status" -ne 0 ]
+  [ "$status" -ne 3 ]
+}
