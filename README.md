@@ -8,8 +8,10 @@ afterwards — `install`, `start`, `stop`, `recreate`, `status`, `uninstall`. It
 environment) arrives from a manifest that product ships, never from logic baked in here.
 
 ```sh
-curl -fsS --proto '=https' --max-redirs 0 https://get.mythicalos.ai | bash          # choose interactively
-curl -fsS --proto '=https' --max-redirs 0 https://get.mythicalos.ai/brokkr | bash   # a specific product
+# fetch, check, run — deliberately not a one-liner (see below)
+curl -fsS --proto '=https' --max-redirs 0 -o mythical-install.sh \
+     -w '%{http_code}\n' https://get.mythicalos.ai/brokkr    # expect: 200
+bash mythical-install.sh
 ```
 
 > **Status: scaffolding.** This repository currently carries the project structure, its licence
@@ -69,17 +71,25 @@ small enough to read.
 **To run the CLI:** bash and a container runtime. No language runtime is required to install a
 product, which is why this is written in shell.
 
-**To install via the one-liner**, you additionally need **`curl`** and a SHA-256 implementation —
-`sha256sum` on Linux, `shasum` on macOS — because the bootstrap verifies the CLI it downloads
-before running it. If it cannot find a way to check the digest it **stops** rather than running
-an unverified script. Both are present by default on macOS and mainstream Linux; the requirement
-is stated because it is security-critical, not incidental.
+**To install**, you additionally need **`curl`** and a SHA-256 implementation — `sha256sum` on
+Linux, `shasum` on macOS — because the installer verifies the CLI it downloads before running
+it. If it cannot find a way to check the digest it **stops** rather than running an unverified
+script. Both are present by default on macOS and mainstream Linux; the requirement is stated
+because it is security-critical, not incidental.
 
-`wget` is deliberately **not** supported for the one-liner. It offers no way to constrain every
-hop of a redirect chain, so an `https → http → https` chain is undetectable — and at that point
-the bytes are already entering your shell. The published URL is the final URL: the command above
-follows no redirects at all (`--max-redirs 0`), so a redirect is an error rather than a silent
-hop somewhere else.
+### Why this is not a one-liner
+
+`curl … | bash` cannot reject a redirect. Without `-L`, curl does not *follow* a redirect — but
+it does not fail on one either: `-f` acts on 4xx and 5xx, so a `3xx` response is transferred
+like any other and **its body goes straight into your shell**. Anyone who controls a redirect
+controls that body. `--max-redirs 0` bounds following, not status handling.
+
+Downloading first makes the status checkable before anything executes. It is one extra line,
+and it is the difference between "we verify everything" and "we verify everything after the
+first thing already ran".
+
+`wget` is not supported here either: no flag constrains every hop of a redirect chain, so an
+`https → http → https` chain is undetectable.
 
 (Bash specifically, not POSIX `sh`: the CLI uses `set -o pipefail` and other bash features. Bash
 is present by default on macOS and every mainstream Linux distribution; where it is not — Alpine,
