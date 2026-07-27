@@ -88,11 +88,12 @@ mi_ledger_write() {
   f="$(_mi_ledger_path)"; dir="$(dirname "$f")"
 
   # Never destroy evidence: if a ledger exists it must be valid before we replace it. A missing
-  # ledger (status 3) is fine to create; a valid one is fine to replace; a corrupt one is refused.
-  if [ -f "$f" ]; then
-    local rc=0
-    mi_ledger_read >/dev/null 2>&1 || rc=$?
-    [ "$rc" -eq 0 ] || mi_die "existing ledger does not validate (rc=$rc) — refusing to overwrite it; run 'state repair'"
+  # ledger is fine to create; a valid one is fine to replace; a corrupt one is refused.
+  # Run the validation read in a SUBSHELL: on corruption mi_ledger_read calls mi_die (exit), which
+  # would otherwise terminate this writer before it could report. Containing it keeps the writer's
+  # own diagnostic reachable.
+  if [ -f "$f" ] && ! ( mi_ledger_read >/dev/null 2>&1 ); then
+    mi_die "existing ledger does not validate — refusing to overwrite it; run 'state repair'"
   fi
 
   tmp="$(mktemp "$dir/.ledger.XXXXXX")"

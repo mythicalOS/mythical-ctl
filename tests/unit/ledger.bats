@@ -113,6 +113,7 @@ setup_ledger() { load_mctl; mi_ensure_layout; hold_lock; }
   printf 'garbage-appended\n' >> "$MYTHICAL_HOME/.state/ledger"  # now corrupt
   run bash -c 'source '"$_MCTL_ROOT"'/lib/common.sh; source '"$_MCTL_ROOT"'/lib/layout.sh; source '"$_MCTL_ROOT"'/lib/ledger.sh; printf "x\ty=1\n" | mi_ledger_write'
   [ "$status" -ne 0 ]
+  assert_contains "validate"
   # the corrupt file must still be there — the writer preserved the evidence
   grep -q 'garbage-appended' "$MYTHICAL_HOME/.state/ledger"
 }
