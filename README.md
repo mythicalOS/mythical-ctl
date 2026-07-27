@@ -9,16 +9,18 @@ environment) arrives from a manifest that product ships, never from logic baked 
 
 ```sh
 # fetch, CHECK, run — deliberately not a one-liner (see below).
-# The subshell matters: without it, a failed download would exit your shell.
+# Subshell: without it, a failed download would exit your shell.
+# Explicit gates, not `set -e`: errexit is suppressed inside a subshell used
+# in an if/&&/|| context, so it cannot be relied on here.
 (
-  set -e
-  tmp=$(mktemp)
+  tmp=$(mktemp) || exit 1
   trap 'rm -f "$tmp"' EXIT
 
   # BOTH gates: curl must succeed AND the status must be exactly 200
   code=$(curl -fsS --proto '=https' --max-redirs 0 \
               -o "$tmp" -w '%{http_code}' \
-              https://get.mythicalos.ai/brokkr)
+              https://get.mythicalos.ai/brokkr) \
+    || { echo "download failed — refusing to run it"; exit 1; }
   [ "$code" = 200 ] || { echo "unexpected HTTP $code — refusing to run it"; exit 1; }
 
   bash "$tmp"
