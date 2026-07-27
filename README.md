@@ -8,9 +8,11 @@ afterwards — `install`, `start`, `stop`, `recreate`, `status`, `uninstall`. It
 environment) arrives from a manifest that product ships, never from logic baked in here.
 
 ```sh
-# fetch, check, run — deliberately not a one-liner (see below)
-curl -fsS --proto '=https' --max-redirs 0 -o mythical-install.sh \
-     -w '%{http_code}\n' https://get.mythicalos.ai/brokkr    # expect: 200
+# fetch, CHECK, run — deliberately not a one-liner (see below)
+code=$(curl -fsS --proto '=https' --max-redirs 0 \
+            -o mythical-install.sh -w '%{http_code}' \
+            https://get.mythicalos.ai/brokkr)
+[ "$code" = 200 ] || { echo "unexpected HTTP $code — refusing to run it"; exit 1; }
 bash mythical-install.sh
 ```
 
