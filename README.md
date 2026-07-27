@@ -9,11 +9,17 @@ environment) arrives from a manifest that product ships, never from logic baked 
 
 ```sh
 # fetch, CHECK, run — deliberately not a one-liner (see below)
+tmp=$(mktemp) || exit 1
+trap 'rm -f "$tmp"' EXIT
+
+# BOTH gates: curl must succeed AND the status must be exactly 200
 code=$(curl -fsS --proto '=https' --max-redirs 0 \
-            -o mythical-install.sh -w '%{http_code}' \
-            https://get.mythicalos.ai/brokkr)
+            -o "$tmp" -w '%{http_code}' \
+            https://get.mythicalos.ai/brokkr) \
+  || { echo "download failed — refusing to run it"; exit 1; }
 [ "$code" = 200 ] || { echo "unexpected HTTP $code — refusing to run it"; exit 1; }
-bash mythical-install.sh
+
+bash "$tmp"
 ```
 
 > **Status: scaffolding.** This repository currently carries the project structure, its licence
@@ -71,7 +77,8 @@ small enough to read.
 ## Requirements
 
 **To run the CLI:** bash and a container runtime. No language runtime is required to install a
-product, which is why this is written in shell.
+product, which is why this is written in shell. (Installing it needs `curl` and a digest tool
+too — see below.)
 
 **To install**, you additionally need **`curl`** and a SHA-256 implementation — `sha256sum` on
 Linux, `shasum` on macOS — because the installer verifies the CLI it downloads before running
