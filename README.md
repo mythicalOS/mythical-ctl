@@ -29,8 +29,8 @@ environment) arrives from a manifest that product ships, never from logic baked 
 
 > **Status: scaffolding.** This repository currently carries the project structure, its licence
 > and community files, and CI. **The lifecycle commands are not implemented** — `mythical-ctl`
-> today answers `--version` and `--help` and nothing else, so the invocations above do not work
-> yet. The product images are not published either; when the commands land, an install attempt
+> today answers `--version` and `--help` — there are no product commands yet, so the invocations
+> above do not work yet. The product images are not published either; when the commands land, an install attempt
 > before a product is public will report that it has not launched yet rather than failing with a
 > registry error.
 

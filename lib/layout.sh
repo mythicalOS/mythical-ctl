@@ -8,7 +8,7 @@ mi_ensure_layout() {
   local h; h="$(mi_home)"
   local d
   for d in bin .state; do
-    [ -d "$h/$d" ] || mkdir -p "$h/$d"
+    [ -d "$h/$d" ] || mkdir -p "$h/$d" || mi_die "cannot create $h/$d"
   done
   # transcripts/ and logs/ are user-data (MYTHICAL_HOME's original meaning): never created here,
   # never removed here. They appear when a product binds them.

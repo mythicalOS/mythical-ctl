@@ -30,6 +30,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
 
       # A tag that disagrees with the version the script reports would ship an
       # artifact that lies about itself — every later "which version do I have?"
@@ -52,10 +54,13 @@ jobs:
         run: command -v shellcheck >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck; }
 
       - name: shellcheck
-        run: shellcheck -x bin/* tests/*.sh
+        run: shellcheck -x bin/* lib/*.sh tests/*.sh tests/harness/*
 
       - name: Smoke tests
         run: ./tests/smoke.sh
+
+      - name: Bats unit tests
+        run: vendor/bats-core/bin/bats tests/unit
 
       - name: Stage release artifacts
         run: |

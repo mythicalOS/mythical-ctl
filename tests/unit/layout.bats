@@ -55,3 +55,13 @@ load '../lib/test_helper'
   # sha256("abc") = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
   [ "$(mi_digest "$MYTHICAL_HOME/f")" = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad ]
 }
+
+@test "mi_ensure_layout fails loudly when it cannot create the subtree" {
+  load_mctl
+  # A regular FILE as the parent makes mkdir -p under it fail deterministically (no chmod needed).
+  local blocker="$BATS_TEST_TMPDIR/blocker"; : > "$blocker"
+  run env MYTHICAL_HOME="$blocker/home" bash -c \
+    'source '"$_MCTL_ROOT"'/lib/common.sh; source '"$_MCTL_ROOT"'/lib/layout.sh; mi_ensure_layout'
+  [ "$status" -ne 0 ]
+  assert_contains "cannot create"
+}

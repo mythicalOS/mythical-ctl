@@ -11,12 +11,13 @@ mi_die()  { printf '%s\n' "$*" >&2; exit 1; }
 
 # Print the sha256 hex of a file. Floor: sha256sum (Linux) or shasum -a 256 (macOS).
 mi_digest() {
-  local f="$1"
+  local f="$1" out
   if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$f" | cut -d' ' -f1
+    out="$(sha256sum "$f")"    || mi_die "mi_digest: sha256sum failed for '$f'"
   elif command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$f" | cut -d' ' -f1
+    out="$(shasum -a 256 "$f")" || mi_die "mi_digest: shasum failed for '$f'"
   else
     mi_die "no sha256 implementation found (need sha256sum or shasum)"
   fi
+  printf '%s\n' "${out%% *}"
 }
