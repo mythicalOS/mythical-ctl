@@ -3,3 +3,9 @@ Copyright 2026 mythicalOS
 
 This product includes software developed by mythicalOS
 (https://github.com/mythicalOS).
+
+vendor/bats-core is a git submodule referencing Bats (bats-core), which is
+licensed separately under the MIT License:
+  - Bats — Copyright (c) 2017 bats-core contributors.
+See vendor/bats-core/LICENSE.md. It is a test-only dependency: it is never
+sourced by the shipped CLI and is not part of the release artifact.

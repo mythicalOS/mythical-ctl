@@ -109,11 +109,33 @@ first thing already ran".
 is present by default on macOS and every mainstream Linux distribution; where it is not — Alpine,
 some minimal images — it is a one-package install.)
 
-## Open core
+## Development
 
-`mythical-ctl` is open source under **Apache-2.0**, and so are the products it installs. What you
-get from this repository is the whole installer: there is no reduced "community edition" of it, and
-no feature here is withheld from the open-source build.
+The test runner is vendored as a git submodule, so **clone with submodules** — a plain `git clone`
+leaves `vendor/bats-core/` empty and the unit tests cannot run:
+
+```sh
+git clone --recurse-submodules https://github.com/mythicalOS/mythical-ctl.git
+# already cloned without it:
+git submodule update --init
+```
+
+The three checks CI runs, which you can run identically:
+
+```sh
+shellcheck -x bin/* lib/*.sh tests/*.sh tests/harness/*   # lint (zero findings expected)
+./tests/smoke.sh                                          # entrypoint smoke
+vendor/bats-core/bin/bats tests/unit                      # unit tests
+```
+
+`lib/` holds the shipped shell libraries; `tests/harness/` holds test-only helpers — a fake
+container runtime and filesystem-snapshot assertions — which shipped code never sources.
+
+## Licence and the paid tier
+
+`mythical-ctl` is open source under **Apache-2.0**, and so are the products it installs, as they
+are published. What you get from this repository is the whole installer: there is no reduced
+"community edition" of it, and no feature here is withheld from the open-source build.
 
 The commercial side of mythicalOS is a **separate, private, hosted service** — it is not a
 restricted version of anything in this repository, and nothing here calls into it. Running the
@@ -123,6 +145,5 @@ own, is permitted by Apache-2.0 and is not something this project asks you to li
 Contributions are welcome anywhere in this repository. See [CONTRIBUTING.md](CONTRIBUTING.md) —
 we use DCO sign-off, not a CLA.
 
-## Licence
-
-Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE). The licence covers the code, not the
+names and branding — see [`TRADEMARK.md`](TRADEMARK.md).

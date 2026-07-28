@@ -1,6 +1,17 @@
 # Release staging (built by .github/workflows/release.yml)
 dist/
 
+# never publish internal planning / orchestration artifacts to this repo
+.superpowers/
+docs/superpowers/
+.claude/
+AGENTS.md
+CLAUDE.md
+
+# Local secrets — never commit
+.env
+.env.*
+
 # Editor / OS noise
 .DS_Store
 *.swp
