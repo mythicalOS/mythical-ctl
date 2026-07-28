@@ -34,7 +34,19 @@ hold_lock() {
   # hostname or a build counter anywhere in the generator would break this and nothing else.
   local a="$BATS_TEST_TMPDIR/a" b="$BATS_TEST_TMPDIR/b"
   run "${_MCTL_ROOT}/tools/bundle.sh" "$a"; [ "$status" -eq 0 ]
-  run "${_MCTL_ROOT}/tools/bundle.sh" "$b"; [ "$status" -eq 0 ]
+
+  # Separate the builds by more than a second and change the ambient environment between them.
+  # Back-to-back builds in one instant cannot observe a `date +%s` in the generator — the two runs
+  # would land in the same second and compare equal — so the gate would pass while the artifact was
+  # NOT reproducible. The delay makes clock-dependence visible; TZ/umask/cwd make environment-
+  # dependence visible. Both are the ways a "reproducible" claim actually breaks.
+  sleep 1.1
+  run env TZ=UTC+7 --chdir=/ "${_MCTL_ROOT}/tools/bundle.sh" "$b"
+  if [ "$status" -ne 0 ]; then          # --chdir is GNU coreutils only; fall back without it
+    run env TZ=UTC+7 "${_MCTL_ROOT}/tools/bundle.sh" "$b"
+  fi
+  [ "$status" -eq 0 ]
+
   cmp "$a" "$b"
 }
 
@@ -46,6 +58,18 @@ hold_lock() {
 
   run grep -nE '(^|[^[:alnum:]_])(source|\.)[[:space:]]+[^[:space:]]*lib/' "$BUNDLE"
   [ "$status" -ne 0 ] || { echo "bundle still sources a lib/ path: $output" >&2; return 1; }
+
+  # The check above only sees a LITERAL lib/ path. The regression that actually threatens this
+  # artifact is the dev loader surviving as `source "${_MCTL_LIB}/${_m}.sh"` — no literal lib/ in it
+  # at all, and it would pass the check above while working in the repo (where ../lib exists) and
+  # failing once installed as one file. So assert the stronger property the bundle genuinely has:
+  # it sources NOTHING at runtime.
+  run grep -nE '^[[:space:]]*(source|\.)[[:space:]]' "$BUNDLE"
+  [ "$status" -ne 0 ] || { echo "bundle sources something at runtime: $output" >&2; return 1; }
+
+  # And the dev-mode library path must be gone by name, however it was spelled.
+  run grep -n '_MCTL_LIB' "$BUNDLE"
+  [ "$status" -ne 0 ] || { echo "dev-mode _MCTL_LIB survived into the bundle: $output" >&2; return 1; }
 }
 
 @test "the bundle's library surface is complete (__selftest)" {

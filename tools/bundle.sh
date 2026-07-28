@@ -55,7 +55,16 @@ declared="$(printf '%s\n' "${MODULES[@]}" | LC_ALL=C sort)"
 
 actual=""
 for f in "$LIBDIR"/*.sh; do
-  [ -e "$f" ] || break           # unmatched glob: no modules on disk at all
+  # An unmatched glob leaves the pattern itself; anything else is a REAL directory entry — including
+  # a DANGLING SYMLINK, for which `-e` is false because it follows the link. Skipping on `-e` alone
+  # (and worse, `break`ing) abandoned the rest of the scan, so every module sorting after the broken
+  # entry vanished from `actual`, the lists compared equal, and the build silently dropped real code:
+  # exactly the failure this gate exists to prevent. Detect the unmatched glob explicitly, and treat
+  # anything that is not a readable regular file as a hard error rather than a skip.
+  if [ ! -e "$f" ] && [ ! -L "$f" ]; then
+    continue                     # unmatched glob: no modules on disk at all
+  fi
+  [ -f "$f" ] && [ -r "$f" ] || die "lib entry is not a readable regular file (dangling symlink?): $f"
   b="$(basename "$f")"
   actual="${actual}${b%.sh}"$'\n'
 done
