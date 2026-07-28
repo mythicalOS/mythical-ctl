@@ -153,4 +153,12 @@ mv "$tmp" "$OUT"
 trap - EXIT
 
 printf '%s\n' "$OUT"
-printf 'sha256=%s\n' "$(digest "$OUT")"
+
+# The same swallow as the per-module digests, at the one place a human reads the number off the
+# terminal to compare against a published checksum: interpolated, a failure here would print
+# `sha256=` and still exit 0. The artifact is already on disk by now, so this cannot un-write it —
+# but it CAN refuse to hand back a build whose digest we could not compute, which is what stops the
+# release workflow from carrying on to stage and attest it.
+final="$(digest "$OUT")" || die "artifact written to '$OUT', but its digest could not be computed — refusing to report success"
+[ -n "$final" ] || die "artifact written to '$OUT', but its digest came back empty — refusing to report success"
+printf 'sha256=%s\n' "$final"
