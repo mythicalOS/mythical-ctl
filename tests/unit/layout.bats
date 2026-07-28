@@ -7,10 +7,10 @@ load '../lib/test_helper'
   assert_contains "mythical-ctl"
 }
 
-@test "__selftest sources whatever modules exist without aborting" {
-  # Runs the entrypoint (under its own `set -euo pipefail`). At Task 1 no lib/ module exists yet,
-  # so the guarded loop sources nothing and still prints ok — proving the dispatch and the [ -f ]
-  # guard hold. As later tasks add modules, this same test proves each one sources cleanly.
+@test "__selftest asserts the whole library surface is present" {
+  # Runs the entrypoint (under its own `set -euo pipefail`) and checks that every shipped library
+  # function is actually defined after the module-load region ran. The same assertion holds for the
+  # release bundle, where the modules are inlined and "did it source" has no answer.
   run_mctl __selftest
   assert_ok
   assert_contains "ok"

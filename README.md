@@ -120,16 +120,27 @@ git clone --recurse-submodules https://github.com/mythicalOS/mythical-ctl.git
 git submodule update --init
 ```
 
-The three checks CI runs, which you can run identically:
+The checks CI runs, which you can run identically:
 
 ```sh
-shellcheck -x bin/* lib/*.sh tests/*.sh tests/harness/*   # lint (zero findings expected)
-./tests/smoke.sh                                          # entrypoint smoke
-vendor/bats-core/bin/bats tests/unit                      # unit tests
+shellcheck -x bin/* lib/*.sh tests/*.sh tests/harness/* tools/*.sh  # lint (zero findings expected)
+./tests/smoke.sh                                                    # entrypoint smoke
+vendor/bats-core/bin/bats tests/unit                                # unit tests
+
+# and the same smoke suite against the artifact a release actually publishes
+tools/bundle.sh dist/mythical-ctl
+shellcheck dist/mythical-ctl
+MCTL_BIN="$PWD/dist/mythical-ctl" ./tests/smoke.sh
 ```
 
 `lib/` holds the shipped shell libraries; `tests/harness/` holds test-only helpers — a fake
 container runtime and filesystem-snapshot assertions — which shipped code never sources.
+
+A release does **not** publish `bin/mythical-ctl` as it sits here. `tools/bundle.sh` inlines
+`lib/*.sh` into the entrypoint's `mctl:modules` region and publishes a single self-contained file,
+because the installed layout is exactly one file — one artifact, one digest, one attestation, and
+no directory beside the installed CLI for it to source code out of on every later run. The bundle
+is byte-reproducible from a given tree, so a published checksum is one anyone can re-derive.
 
 ## Licence and the paid tier
 

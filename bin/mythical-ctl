@@ -19,7 +19,20 @@ VERSION="0.1.0"
 
 # Resolve lib/ relative to this script (symlink-safe enough for install + repo layouts).
 _MCTL_BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# >>> mctl:modules >>>
+# Dev/repo mode: load the shipped libraries from ../lib. The release bundler REPLACES
+# everything between these two sentinels with the modules inlined verbatim, so the published
+# artifact is a single self-contained file with no ../lib to resolve.
 _MCTL_LIB="${_MCTL_BIN}/../lib"
+for _m in common layout lock ledger; do
+  if [ -f "${_MCTL_LIB}/${_m}.sh" ]; then
+    # shellcheck disable=SC1090
+    source "${_MCTL_LIB}/${_m}.sh"
+  fi
+done
+unset _m
+# <<< mctl:modules <<<
 
 usage() {
   cat <<'EOF'
@@ -53,11 +66,16 @@ main() {
       usage
       ;;
     __selftest)
-      # Hidden: prove every SHIPPED lib/ module sources cleanly. Guarded exactly like load_mctl so
-      # it works at any task stage — a module a later task adds is simply skipped until it exists,
-      # never a fatal missing-source under the entrypoint's `set -e`. Used by the tests, undocumented.
-      # shellcheck disable=SC1090
-      for _m in common layout lock ledger; do [ -f "${_MCTL_LIB}/${_m}.sh" ] && source "${_MCTL_LIB}/${_m}.sh"; done
+      # Hidden, undocumented, used by the tests: assert the shipped library surface is actually
+      # present. Meaningful in both modes — in the release bundle the modules are inlined, so
+      # "did it source" is unanswerable, but "are the functions defined" is the real contract.
+      for _f in mi_log mi_warn mi_die mi_digest mi_home mi_ensure_layout mi_zone \
+                mi_lock_acquire mi_lock_release mi_ledger_read mi_ledger_write mi_ledger_get; do
+        if ! declare -F "$_f" >/dev/null 2>&1; then
+          printf 'mythical-ctl: missing library function: %s\n' "$_f" >&2
+          exit 1
+        fi
+      done
       printf 'ok\n'
       ;;
     *)
@@ -70,4 +88,8 @@ main() {
   esac
 }
 
-main "$@"
+# Run only when executed, not when sourced. Sourcing is how the bundle-equivalence tests load the
+# artifact's functions and exercise them exactly as they do the repo modules.
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  main "$@"
+fi

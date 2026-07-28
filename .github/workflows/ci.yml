@@ -89,15 +89,16 @@ jobs:
         run: |
           set -euo pipefail
           shellcheck --version
-          shellcheck -x bin/* lib/*.sh tests/*.sh tests/harness/*
+          shellcheck -x bin/* lib/*.sh tests/*.sh tests/harness/* tools/*.sh
           echo "shellcheck: clean"
 
-      # Shell that is not executable is shell that will not run when installed.
+      # Shell that is not executable is shell that will not run when installed. tools/bundle.sh is
+      # in scope because the release workflow invokes it directly, not via `bash tools/bundle.sh`.
       - name: Entrypoints are executable
         run: |
           set -euo pipefail
           rc=0
-          for f in bin/* tests/*.sh; do
+          for f in bin/* tests/*.sh tools/*.sh; do
             [ -x "$f" ] || { echo "::error file=$f::not executable"; rc=1; }
           done
           exit "$rc"
@@ -116,3 +117,24 @@ jobs:
 
       - name: Bats unit tests
         run: vendor/bats-core/bin/bats tests/unit
+
+      # The release publishes ONE self-contained file, not bin/mythical-ctl — so the bundle is what
+      # users actually run, and it has to clear the same bars the repository tree does. Building it
+      # on every push is what stops "works in the repo, broken when installed" reaching a tag.
+      - name: Build the release bundle
+        run: |
+          set -euo pipefail
+          tools/bundle.sh dist/mythical-ctl
+
+      - name: Ensure shellcheck is available
+        run: command -v shellcheck >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck; }
+
+      # No -x: the bundle has nothing to follow, and that is the property under test.
+      - name: shellcheck the bundle
+        run: |
+          set -euo pipefail
+          shellcheck dist/mythical-ctl
+          echo "shellcheck (bundle): clean"
+
+      - name: Smoke tests against the bundle
+        run: MCTL_BIN="$PWD/dist/mythical-ctl" ./tests/smoke.sh

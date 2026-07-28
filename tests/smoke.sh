@@ -5,7 +5,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CTL="$HERE/../bin/mythical-ctl"
+CTL="${MCTL_BIN:-$HERE/../bin/mythical-ctl}"
 
 pass=0
 fail=0

@@ -54,7 +54,7 @@ jobs:
         run: command -v shellcheck >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck; }
 
       - name: shellcheck
-        run: shellcheck -x bin/* lib/*.sh tests/*.sh tests/harness/*
+        run: shellcheck -x bin/* lib/*.sh tests/*.sh tests/harness/* tools/*.sh
 
       - name: Smoke tests
         run: ./tests/smoke.sh
@@ -99,11 +99,44 @@ jobs:
           done
           [ "$missing" -eq 0 ] || { echo "::error::required health file(s) missing from the tree"; exit 1; }
 
+      # The published artifact is a single self-contained file: the entrypoint with lib/*.sh inlined.
+      # There is deliberately no installed lib/ directory — one artifact, one digest, one attestation,
+      # and no directory on disk for the installed CLI to source code out of at every later run.
+      - name: Build the release bundle
+        run: |
+          set -euo pipefail
+          tools/bundle.sh dist/mythical-ctl
+
+      # Gates on the BUNDLE, before anything is staged or attested. Everything above tested the
+      # repository tree; these test the bytes that will actually be published.
+      #
+      # No -x: the bundle has nothing left to follow, and that is the property under test.
+      - name: shellcheck the bundle
+        run: |
+          set -euo pipefail
+          shellcheck dist/mythical-ctl
+          echo "shellcheck (bundle): clean"
+
+      - name: Smoke tests against the bundle
+        run: MCTL_BIN="$PWD/dist/mythical-ctl" ./tests/smoke.sh
+
+      # The tag was already checked against the repo entrypoint. Check it again against the artifact:
+      # a bundle that reports a different version than the tag must never reach a release page, and
+      # only this check is looking at the file the user will actually download.
+      - name: Bundle must report the tagged version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          reported="$(./dist/mythical-ctl --version | awk '{print $2}')"
+          echo "tag=${tag} bundle reported=${reported}"
+          if [ "$tag" != "$reported" ]; then
+            echo "::error::the release bundle reports ${reported}, not the tagged version ${tag}"
+            exit 1
+          fi
+
       - name: Stage release artifacts
         run: |
           set -euo pipefail
-          mkdir -p dist
-          cp bin/mythical-ctl dist/mythical-ctl
           chmod +x dist/mythical-ctl
           ( cd dist && sha256sum mythical-ctl > SHA256SUMS )
           cat dist/SHA256SUMS
