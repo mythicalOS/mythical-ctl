@@ -121,7 +121,13 @@ trap 'rm -f "$tmp"' EXIT
   for m in "${MODULES[@]}"; do
     f="${LIBDIR}/${m}.sh"
     [ -f "$f" ] || die "module '${m}' listed in MODULES but lib/${m}.sh does not exist"
-    printf '#   lib/%s.sh  sha256=%s\n' "$m" "$(digest "$f")"
+    # Compute into a variable and CHECK it. Interpolating "$(digest "$f")" straight into printf
+    # swallows the failure: digest's `die` exits only the substitution subshell, printf still
+    # succeeds with an empty field, and the build publishes `sha256=` — a blank hash in a header
+    # whose whole purpose is to be true. A provenance line that lies is worse than none.
+    d="$(digest "$f")" || die "cannot compute the digest of lib/${m}.sh"
+    [ -n "$d" ] || die "empty digest for lib/${m}.sh — refusing to write a false provenance header"
+    printf '#   lib/%s.sh  sha256=%s\n' "$m" "$d"
   done
   printf '# ---------------------------------------------------------------------------------\n'
 

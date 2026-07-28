@@ -41,14 +41,12 @@ hold_lock() {
   # NOT reproducible. The delay makes clock-dependence visible; TZ/umask/cwd make environment-
   # dependence visible. Both are the ways a "reproducible" claim actually breaks.
   sleep 1.1
-  # Decide UP FRONT whether this env(1) supports --chdir (GNU only). Retrying a FAILED build without
-  # it would mask a genuine failure: a generator that breaks only when cwd is / would fail the first
-  # build, pass the retry, and let cmp compare two good files — a green gate over a real defect.
-  if env --chdir=/ true 2>/dev/null; then
-    run env TZ=UTC+7 --chdir=/ "${_MCTL_ROOT}/tools/bundle.sh" "$b"
-  else
-    run env TZ=UTC+7 "${_MCTL_ROOT}/tools/bundle.sh" "$b"
-  fi
+  # Change directory with a plain `cd` in a subshell, not `env --chdir` — that flag is GNU-only, so
+  # on macOS the cwd would silently NOT change and a bundler embedding `pwd` would sail through with
+  # both builds run from the same place. A probe-and-fall-back is no better: it just moves the hole.
+  # `cd` works everywhere, so the cwd genuinely differs on every platform, and a failed build stays
+  # failed instead of being retried away.
+  run bash -c 'cd / && TZ=UTC+7 "$1" "$2"' _ "${_MCTL_ROOT}/tools/bundle.sh" "$b"
   [ "$status" -eq 0 ]
 
   cmp "$a" "$b"
@@ -92,6 +90,21 @@ hold_lock() {
   run bash "$home/bin/mythical-ctl" __selftest
   assert_ok
   case "$output" in *POISONED*) echo "__selftest sourced a planted lib/: $output" >&2; return 1 ;; esac
+
+  # Every reachable entry path, not just the two above: a leak placed inside usage() would execute
+  # on --help and on the unknown-command path (which also prints usage) while leaving the probes
+  # above green. A gate that only walks the happy path is not a gate.
+  run bash "$home/bin/mythical-ctl" --help
+  assert_ok
+  case "$output" in *POISONED*) echo "--help sourced a planted lib/: $output" >&2; return 1 ;; esac
+
+  run bash "$home/bin/mythical-ctl" not-a-real-command
+  assert_fail 2
+  case "$output" in *POISONED*) echo "the usage/error path sourced a planted lib/: $output" >&2; return 1 ;; esac
+
+  run bash "$home/bin/mythical-ctl"
+  assert_ok
+  case "$output" in *POISONED*) echo "the no-args path sourced a planted lib/: $output" >&2; return 1 ;; esac
 }
 
 @test "the bundle's library surface is complete (__selftest)" {
