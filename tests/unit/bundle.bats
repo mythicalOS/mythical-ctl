@@ -41,8 +41,12 @@ hold_lock() {
   # NOT reproducible. The delay makes clock-dependence visible; TZ/umask/cwd make environment-
   # dependence visible. Both are the ways a "reproducible" claim actually breaks.
   sleep 1.1
-  run env TZ=UTC+7 --chdir=/ "${_MCTL_ROOT}/tools/bundle.sh" "$b"
-  if [ "$status" -ne 0 ]; then          # --chdir is GNU coreutils only; fall back without it
+  # Decide UP FRONT whether this env(1) supports --chdir (GNU only). Retrying a FAILED build without
+  # it would mask a genuine failure: a generator that breaks only when cwd is / would fail the first
+  # build, pass the retry, and let cmp compare two good files — a green gate over a real defect.
+  if env --chdir=/ true 2>/dev/null; then
+    run env TZ=UTC+7 --chdir=/ "${_MCTL_ROOT}/tools/bundle.sh" "$b"
+  else
     run env TZ=UTC+7 "${_MCTL_ROOT}/tools/bundle.sh" "$b"
   fi
   [ "$status" -eq 0 ]
@@ -59,17 +63,35 @@ hold_lock() {
   run grep -nE '(^|[^[:alnum:]_])(source|\.)[[:space:]]+[^[:space:]]*lib/' "$BUNDLE"
   [ "$status" -ne 0 ] || { echo "bundle still sources a lib/ path: $output" >&2; return 1; }
 
-  # The check above only sees a LITERAL lib/ path. The regression that actually threatens this
-  # artifact is the dev loader surviving as `source "${_MCTL_LIB}/${_m}.sh"` — no literal lib/ in it
-  # at all, and it would pass the check above while working in the repo (where ../lib exists) and
-  # failing once installed as one file. So assert the stronger property the bundle genuinely has:
-  # it sources NOTHING at runtime.
-  run grep -nE '^[[:space:]]*(source|\.)[[:space:]]' "$BUNDLE"
-  [ "$status" -ne 0 ] || { echo "bundle sources something at runtime: $output" >&2; return 1; }
-
-  # And the dev-mode library path must be gone by name, however it was spelled.
+  # The dev-mode library path must be gone by name, however it was spelled.
   run grep -n '_MCTL_LIB' "$BUNDLE"
   [ "$status" -ne 0 ] || { echo "dev-mode _MCTL_LIB survived into the bundle: $output" >&2; return 1; }
+}
+
+@test "the bundle ignores a lib/ planted beside it — nothing is sourced at runtime" {
+  # Grep is the wrong instrument for this property: it cannot tell executable code from heredoc
+  # text (so a help line mentioning `source ...` would fail a perfectly good release), and a real
+  # leak can be spelled `builtin source`, `&& . "$x"`, or through a variable with no literal path
+  # in it at all. So assert the BEHAVIOUR, which has neither blind spot — and which is the actual
+  # security property: a directory sitting beside the installed CLI must never be a code-execution
+  # surface, because on a user's machine anything able to write there would own every later run.
+  local home="$BATS_TEST_TMPDIR/install" m
+  mkdir -p "$home/bin" "$home/lib"
+  cp "$BUNDLE" "$home/bin/mythical-ctl"
+  chmod +x "$home/bin/mythical-ctl"
+  # Exactly where the dev loader looked: "${_MCTL_BIN}/../lib". Hostile, and loud if it ever runs.
+  for m in common layout lock ledger; do
+    printf 'printf "POISONED\\n"\nexit 99\n' > "$home/lib/${m}.sh"
+  done
+
+  run bash "$home/bin/mythical-ctl" --version
+  assert_ok
+  assert_contains "mythical-ctl"
+  case "$output" in *POISONED*) echo "the bundle sourced a planted lib/: $output" >&2; return 1 ;; esac
+
+  run bash "$home/bin/mythical-ctl" __selftest
+  assert_ok
+  case "$output" in *POISONED*) echo "__selftest sourced a planted lib/: $output" >&2; return 1 ;; esac
 }
 
 @test "the bundle's library surface is complete (__selftest)" {
