@@ -2,10 +2,22 @@
 
 The installer and lifecycle CLI for the **mythicalOS** family of local-first containers.
 
-One command installs a product, keeps its configuration in a predictable place, and manages it
-afterwards — `install`, `start`, `stop`, `recreate`, `status`, `uninstall`. It is deliberately
-**product-agnostic**: everything specific to a product (image reference, ports, volumes,
-environment) arrives from a manifest that product ships, never from logic baked in here.
+> **Status: scaffolding — the lifecycle commands are not implemented yet.** `mythical-ctl` today
+> answers `--version` and `--help` and nothing else. What is built and tested is the foundation the
+> verbs will stand on: the `~/.mythical/` layout and its ownership rules, a single atomic
+> fail-closed state ledger, a family operation lock, and a hermetic test harness. Everything below
+> describing `install`/`start`/`stop` is the **design**, not shipped behaviour — read it as what
+> this is for, not what it does today. The products themselves are not published yet either.
+>
+> The install command below **does** work — but it is served by
+> [get.mythicalos.ai](https://get.mythicalos.ai), which installs product containers directly; it
+> does not yet download or use `mythical-ctl`. Until a product's image publishes it will tell you
+> so and install nothing.
+
+It is designed to be **product-agnostic**: everything specific to a product (image reference,
+ports, volumes, environment) will arrive from a manifest that product ships, never from logic baked
+in here. One command will install a product, keep its configuration in a predictable place, and
+manage it afterwards — `install`, `start`, `stop`, `recreate`, `status`, `uninstall`.
 
 ```sh
 # fetch, CHECK, run — deliberately not a one-liner (see below).
@@ -27,13 +39,6 @@ environment) arrives from a manifest that product ships, never from logic baked 
 )
 ```
 
-> **Status: scaffolding.** This repository currently carries the project structure, its licence
-> and community files, and CI. **The lifecycle commands are not implemented** — `mythical-ctl`
-> today answers `--version` and `--help` — there are no product commands yet, so the invocations
-> above do not work yet. The product images are not published either; when the commands land, an install attempt
-> before a product is public will report that it has not launched yet rather than failing with a
-> registry error.
-
 ## Why it exists
 
 Installing several products should not mean learning several installers. Before this existed, each
@@ -47,12 +52,16 @@ Products contribute a manifest describing themselves, and nothing more.
 
 ## One place for everything you edit
 
+The planned layout — the ownership rules below are implemented (`lib/layout.sh`), the mounting is
+not, because nothing here mounts anything yet:
+
 ```
 ~/.mythical/
-  mythical.conf        host-only configuration and bootstrap secrets — never mounted
-  <product>.conf       per-product settings — mounted into that product's container
+  mythical.conf        host-only configuration and bootstrap secrets — to be never mounted
+  <product>.conf       per-product settings — to be mounted into that product's container
   bin/                 this CLI, and its siblings
   <product>/           generated artifacts, owned by the installer
+  .state/              lock + ledger, owned by the installer — not an editing surface
   transcripts/ logs/   product data
 ```
 
@@ -68,10 +77,14 @@ container runtime. None of that is in this directory. So:
   documented volume-aware procedure will ship with the lifecycle commands.)
 - **Deleting `~/.mythical/` is not an uninstall.** The containers keep running.
 
-**Your data is never collateral.** The installer creates what is missing and reads what already
-exists. It does not overwrite a configuration file you have edited, and it does not delete
-transcripts, logs, or any directory you bound — re-installing on a machine that has been in use
-for a year is safe.
+**Your data must never be collateral — that is the rule the installer is being built to.** It will
+create what is missing and read what already exists; it will not overwrite a configuration file you
+have edited, and it will not delete transcripts, logs, or any directory you bound, so re-installing
+on a machine that has been in use for a year is meant to be safe. Today this is enforced only where
+there is code to enforce it: `mi_zone` classifies every path into an ownership class, and the
+layout helper creates missing directories and touches nothing else. **Do not read it as a
+guarantee over your data yet — nothing here reads, writes or deletes a configuration file,
+transcript or log at all.**
 
 ## Siblings
 
@@ -82,14 +95,18 @@ small enough to read.
 ## Requirements
 
 **To run the CLI:** bash and a container runtime. No language runtime is required to install a
-product, which is why this is written in shell. (Installing it needs `curl` and a digest tool
-too — see below.)
+product, which is why this is written in shell.
 
-**To install**, you additionally need **`curl`**, **`mktemp`**, and a SHA-256 implementation — `sha256sum` on
-Linux, `shasum` on macOS — because the installer verifies the CLI it downloads before running
-it. If it cannot find a way to check the digest it **stops** rather than running an unverified
-script. Both are present by default on macOS and mainstream Linux; the requirement is stated
-because it is security-critical, not incidental.
+**To install**, you additionally need **`curl`** and **`mktemp`** — the sequence above downloads the
+bootstrap to a temp file and checks its HTTP status before executing anything, rather than piping a
+response straight into a shell.
+
+**What is verified, and what is not.** The bootstrap installs each product image **pinned by
+content digest** (`@sha256:…`), which the container runtime checks on pull: if the bytes are not the
+bytes that were pinned, the pull fails and the installer **stops rather than installing
+unverified bytes**. A product with no published digest yet is reported as not launched and is not
+installed. The bootstrap script *itself* is authenticated by TLS to a known origin, not by a
+separate signature — that is a deliberate, stated limit of this model, not an oversight.
 
 ### Why this is not a one-liner
 
@@ -145,7 +162,7 @@ is byte-reproducible from a given tree, so a published checksum is one anyone ca
 ## Licence and the paid tier
 
 `mythical-ctl` is open source under **Apache-2.0**, and so are the products it installs, as they
-are published. What you get from this repository is the whole installer: there is no reduced
+are published. No part of the installer is withheld from the open-source build: there is no reduced
 "community edition" of it, and no feature here is withheld from the open-source build.
 
 The commercial side of mythicalOS is a **separate, private, hosted service** — it is not a
