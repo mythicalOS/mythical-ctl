@@ -64,7 +64,9 @@ for f in "$LIBDIR"/*.sh; do
   if [ ! -e "$f" ] && [ ! -L "$f" ]; then
     continue                     # unmatched glob: no modules on disk at all
   fi
-  [ -f "$f" ] && [ -r "$f" ] || die "lib entry is not a readable regular file (dangling symlink?): $f"
+  if [ ! -f "$f" ] || [ ! -r "$f" ]; then
+    die "lib entry is not a readable regular file (dangling symlink?): $f"
+  fi
   b="$(basename "$f")"
   actual="${actual}${b%.sh}"$'\n'
 done
