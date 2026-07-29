@@ -12,13 +12,12 @@
 
 MI_CONF_MAXLEN=4096
 # Whole-file ceiling for the container-writable <product>.conf. SNAP_LIMIT is one byte more, so a
-# bounded read that comes back full proves the original was over the ceiling. See _mi_conf_snap.
-# Not read anywhere in THIS file — the bounded-read logic that consumes them is Task 4's
-# _mi_conf_snap. Declared here (not there) because the ceiling is a property of the format, not of
-# one reader.
-# shellcheck disable=SC2034   # unused until Task 4 wires _mi_conf_snap; see comment above
+# bounded read that comes back full proves the original was over the ceiling. Both are consumed by
+# _mi_conf_snap below; they are declared HERE rather than beside it because the ceiling is a property
+# of the format, not of one reader. (They carried `shellcheck disable=SC2034` while nothing read them
+# yet — removed now that _mi_conf_snap does, because a disable that suppresses nothing is a lie
+# about the code.)
 MI_CONF_MAXBYTES=1048576
-# shellcheck disable=SC2034   # unused until Task 4 wires _mi_conf_snap; see comment above
 MI_CONF_SNAP_LIMIT=1048577
 MI_CONF_MARKER_PREFIX='#mythical-conf-sha256='
 
@@ -444,4 +443,423 @@ mi_conf_family_add() {
   # Atomic replace within the same directory, so rename() cannot cross filesystems.
   mv -f "$tmp" "$f" || { rm -f "$tmp"; mi_warn "config: cannot replace $f"; return 1; }
   return 0
+}
+
+# --- <product>.conf — bind-mounted, container-writable (D2/D19/D60) --------------------------------
+
+# A product name becomes a PATHNAME, so it is validated before it becomes one.
+#
+# Unchecked, `mi_conf_product_path mythical` resolves to ~/.mythical/mythical.conf — the host-only
+# file D2's entire split depends on being unreachable from the product side — and `../outside` or
+# `bin/x` leave the flat namespace altogether. The §4.1a identity checks cannot save us here: they
+# ask "is this file its own file", not "is this the file we meant".
+#
+# Grammar: lowercase letter, then lowercase letters, digits and hyphens; at most 64 characters. That
+# is the shape of every product name in the family, and it contains no path separator, no dot, and
+# no way to spell `..`.
+_mi_conf_product_name_ok() {
+  local p="$1"
+  local LC_ALL=C            # byte order, not locale collation — see _mi_conf_key_ok
+  # An `if`, not `A && B || C` — SC2015, which local shellcheck misses and CI flags. See the identical
+  # note on `netname` in Task 2.
+  if [ -z "$p" ] || [ "${#p}" -gt 64 ]; then return 1; fi
+  case "$p" in
+    mythical) return 1 ;;      # RESERVED: would collide with the host-only mythical.conf
+    [a-z]*)   : ;;
+    *)        return 1 ;;
+  esac
+  case "${p#?}" in *[!a-z0-9-]*) return 1 ;; esac
+  return 0
+}
+
+# `_mi_conf_unchanged` is NOT defined here — it is defined in **Task 3**, which is its first caller
+# (mi_conf_family_add's compare-and-swap gate) and which ships first. Defining it in this task, as an
+# earlier draft of this plan did, left Task 3 calling a function that did not exist yet: the call
+# resolved to "command not found" (127), `if ! _mi_conf_unchanged …` was therefore TRUE, and the
+# "changed while we were reading it" branch fired on every single write — failing most of Task 3's
+# suite for a reason nothing in Task 3 explained.
+#
+# There is deliberately NO mi_family_gid() in this module. D60 fixes the canonical family gid "in
+# the policy index", so the only honest source is authenticated policy — which Plan 3 builds. A
+# default here would be a SECOND authority for the same value, and the one that ships first wins by
+# accident. The gid is therefore a PARAMETER of mi_conf_product_add, supplied by a caller that has
+# already authenticated the policy index (Plan 3's mi_policy_family_gid reads it; Plan 4 wires it).
+#
+# There is also no MI_FAMILY_GID environment variable: an earlier draft read `${MI_FAMILY_GID:-…}`
+# "for tests", which would have shipped `MI_FAMILY_GID=0 mythical-ctl …` as a supported way to write
+# a root-group 0660 config file.
+
+mi_conf_product_path() {
+  if [ "$#" -ne 1 ] || ! _mi_conf_product_name_ok "$1"; then
+    mi_warn "config: '${1:-}' is not a valid product name (lowercase letters, digits and hyphens; 'mythical' is reserved)"
+    return 1
+  fi
+  printf '%s/%s.conf\n' "$(mi_home)" "$1"
+}
+
+# Refuse a config file whose identity is not its own (§4.1a). rc 0 ok, 1 refused (reported).
+#
+# The symlink check alone is NOT sufficient: a hardlink is a second name for the same inode, not a
+# link at the path level, so every symlink test passes it. brokkr.conf hardlinked to mythical.conf
+# turns a product write into a write to the host-only file; hardlinked to bin/mythical-ctl it
+# rewrites the CLI. Link count > 1 on a file this installer created is unexplainable, not merely
+# suspicious — so refuse outright rather than trying to identify the other name.
+_mi_conf_identity_ok() {
+  local f="$1" links
+  if [ -L "$f" ]; then
+    mi_warn "config: $f is a symlink — refusing (a config file must be its own file)"
+    return 1
+  fi
+  [ -e "$f" ] || return 0                     # absent is fine; a first write creates it
+  if [ ! -f "$f" ]; then
+    mi_warn "config: $f is not a regular file — refusing"
+    return 1
+  fi
+  # `ls -ld` is the portable link count: `stat` format strings differ between GNU and BSD, and
+  # `find -printf` is GNU-only. Field 2 of the long listing is the link count on both.
+  # shellcheck disable=SC2012   # parsing ls is deliberate here; find has no portable link-count output
+  links="$(ls -ld "$f" | awk 'NR==1{print $2}')"
+  case "$links" in ''|*[!0-9]*) mi_warn "config: cannot read the link count of $f — refusing"; return 1 ;; esac
+  if [ "$links" -gt 1 ]; then
+    mi_warn "config: $f has $links names (hardlinked) — refusing; this installer created it and nothing legitimate shares its inode"
+    return 1
+  fi
+  return 0
+}
+
+# rc 0 iff the file's LAST line is a marker line (whether or not it matches).
+_mi_conf_last_is_marker() {
+  local last
+  last="$(tail -n1 "$1" 2>/dev/null)" || return 1
+  case "$last" in "$MI_CONF_MARKER_PREFIX"*) return 0 ;; *) return 1 ;; esac
+}
+
+# rc 0 iff the trailing marker is present and matches the body above it.
+_mi_conf_marker_ok() {
+  local f="$1" last expected actual raw
+  _mi_conf_last_is_marker "$f" || return 1
+  last="$(tail -n1 "$f" 2>/dev/null)" || return 1
+  expected="${last#"$MI_CONF_MARKER_PREFIX"}"
+  # `sed | mi_digest` would return the DIGEST's status, not sed's — these libraries deliberately do
+  # not set pipefail (it would flip the sourcing shell). A sed that emitted a prefix and then died
+  # would be hashed as if it were the whole body, and the file's own author chooses the marker, so
+  # they could publish the prefix's digest and have it verify. Capture with a sentinel so the status
+  # is sed's own and the trailing newlines survive.
+  if ! raw="$(sed '$d' "$f" && printf X)"; then return 1; fi
+  raw="${raw%X}"
+  actual="$(printf '%s' "$raw" | mi_digest /dev/stdin)" || return 1
+  [ -n "$actual" ] && [ "$actual" = "$expected" ]
+}
+
+# Copy a config to a PRIVATE inode and print the snapshot's path. rc 1 on failure.
+#
+# The buffer goes in TMPDIR, not ~/.mythical/: a read must not write into the family home (it would
+# show up in the D9 filesystem snapshots and would fail outright on a read-only home). No rename is
+# involved, so there is no same-filesystem requirement to keep it local.
+# The copy is BOUNDED. <product>.conf is bind-mounted read-write into a container, so its size is
+# attacker-controlled: an unbounded `cat` would expand it into real TMPDIR storage, and the writer
+# would then build the whole body in a bash variable. The per-value 4096-byte cap does not help —
+# it bounds one value, not the count of them, the comments, or the file.
+#
+# `head -c` bounds the COPY rather than checking the size first, which would be its own TOCTOU (the
+# container can grow the file between the check and the read). Reading LIMIT bytes and finding the
+# buffer full means the original was at least LIMIT, so it is refused without ever holding it.
+# 1 MiB is far beyond any legitimate config: at the 4096-byte value cap that is hundreds of settings.
+_mi_conf_snap() {
+  local f="$1" snap sz
+  snap="$(mktemp "${TMPDIR:-/tmp}/mctl-conf.XXXXXX")" || { mi_warn "config: cannot create a read buffer"; return 1; }
+  if ! head -c "$MI_CONF_SNAP_LIMIT" "$f" > "$snap" 2>/dev/null; then
+    rm -f "$snap"; mi_warn "config: cannot read $f"; return 1
+  fi
+  sz="$(wc -c < "$snap" 2>/dev/null | tr -d ' ')"
+  case "$sz" in ''|*[!0-9]*) rm -f "$snap"; mi_warn "config: cannot size $f"; return 1 ;; esac
+  if [ "$sz" -ge "$MI_CONF_SNAP_LIMIT" ]; then
+    rm -f "$snap"
+    mi_warn "config: $f is larger than ${MI_CONF_MAXBYTES} bytes — refusing to read it"
+    return 1
+  fi
+  printf '%s\n' "$snap"
+}
+
+# Validate an already-taken snapshot and emit its validated records.
+# <snap> is the private copy; <label> names the real file in diagnostics. rc: 0 · 1 rejected · 4 torn.
+#
+# Shared by the reader and the writer so that BOTH work from bytes they own. The writer used to
+# validate a snapshot and then rebuild the body by re-opening the live file — a container could
+# swap the file in that gap and the host would hash and re-bless whatever it found, with a
+# perfectly valid marker. That is a CONTENT race, distinct from residual 8's pathname race, and
+# unlike that one it is closable: read the bytes once and never look at the file again.
+_mi_conf_snap_load() {
+  local snap="$1" label="$2" spec="$3" records rc
+  # Control bytes first: binary or CR-laden content is hostile input, not a torn write.
+  if ! _mi_conf_bytes_ok "$snap"; then
+    mi_warn "config: $label contains control bytes — refusing to parse it"; return 1
+  fi
+  # A file not ending in a newline was cut mid-line: torn, like a bad marker.
+  if [ -s "$snap" ] && [ -n "$(tail -c1 "$snap" 2>/dev/null)" ]; then
+    mi_warn "config: $label does not end in a newline — the last write was interrupted; using defaults"
+    return 4
+  fi
+  if ! _mi_conf_marker_ok "$snap"; then
+    mi_warn "config: $label does not match its integrity marker — using defaults."
+    mi_warn "  If you edited it by hand, recompute the marker (see docs/CONFIG-FORMAT.md);"
+    mi_warn "  if you did not, the last write was interrupted and the file is truncated."
+    return 4
+  fi
+  # `if records=...; then rc=0; else rc=$?; fi`, NOT `records=...; rc=$?`. An assignment whose
+  # command substitution fails carries that failure as the assignment's own status, so under the
+  # entrypoint's `set -e` the bare form terminates the CLI at the assignment and the rc handling
+  # below is never reached — the caller sees an abrupt exit instead of a contract return code.
+  # Same sentinel capture as _mi_conf_marker_ok, and for the same reason: piping sed into the
+  # scanner would report the SCANNER's status, so a truncated read would be validated as a complete
+  # — and shorter — configuration. Take sed's status first, then scan the bytes we actually hold.
+  local raw
+  if ! raw="$(sed '$d' "$snap" && printf X)"; then
+    mi_warn "config: cannot read the body of $label"; return 1
+  fi
+  raw="${raw%X}"
+  if records="$(printf '%s' "$raw" | _mi_conf_scan_stream "$label")"; then rc=0; else rc=$?; fi
+  [ "$rc" -eq 0 ] || return "$rc"
+  _mi_conf_validate "$records" "$label" "$spec"
+}
+
+# Read a product's config. rc: 0 ok · 1 rejected by the spec or identity · 3 absent · 4 TORN.
+#
+# The marker DETECTS TEARING; it does not authenticate content — the container writes both the body
+# and the marker, so an attacker controlling one controls the other. The parser is the security
+# control (D19); the marker is a crash detector.
+#
+# The marker gate comes FIRST and is STRICT (Decisions item 3, settled by the maintainer 2026-07-28):
+#   marker matches, body parses   → accept silently
+#   marker ABSENT or MISMATCHED   → TORN: rc 4, the caller uses defaults, and the report names BOTH
+#                                   causes — a hand edit whose marker needs recomputing, and a write
+#                                   that was interrupted — because the operator cannot tell them
+#                                   apart from the file alone
+#   marker matches, body broken   → rejected as MALFORMED (rc 1), not torn: the bytes are intact,
+#                                   they are simply not valid config. Telling an operator to repair a
+#                                   file that is byte-for-byte what was written sends them after the
+#                                   wrong problem.
+#
+# The strictness is the whole point, and the softer reading was considered and REJECTED: an in-place
+# write torn at a line boundary leaves a file that parses perfectly and is missing every setting
+# after the cut. Accepting that because "the body still parses" would silently revert a subset of
+# settings to defaults with no report — the exact failure D60's fail-closed rule exists to prevent,
+# and it would make the marker decorative. The accepted cost is that hand-editing this file is a
+# two-step operation; `docs/CONFIG-FORMAT.md` publishes the recompute recipe.
+#
+# Reading NEVER rewrites the file: a read that re-blessed the marker would mutate without holding the
+# lock and turn every status query into a write.
+mi_conf_product_load() {
+  # Arity before positional expansion — under `set -u` a short call would otherwise abort the CLI
+  # with "unbound variable" instead of refusing in our own words.
+  if [ "$#" -ne 2 ]; then
+    mi_warn "config: mi_conf_product_load needs a <product> and a <spec>"; return 1
+  fi
+  local product="$1" spec="$2" f snap rc
+  f="$(mi_conf_product_path "$product")" || return 1
+  _mi_conf_identity_ok "$f" || return 1
+  [ -f "$f" ] || return 3
+
+  # SNAPSHOT ONCE, then run every check on the same bytes.
+  #
+  # This file is bind-mounted read-write into a container, which makes it the most exposed input in
+  # the whole design: re-opening it for the marker check, then again for the byte gate, then again
+  # for the parse is a TOCTOU a compromised container wins by simply rewriting the file between two
+  # of those opens. It could pass the marker check with a good file and then be parsed as a torn,
+  # markerless one that still happens to be syntactically valid — loading with rc 0 and defeating
+  # D60's fail-closed rule outright. lib/ledger.sh closes exactly this window the same way; the
+  # ledger is never mounted and this file is, so it needs the snapshot more, not less.
+  #
+  snap="$(_mi_conf_snap "$f")" || return 1
+  # `if …; then …; else rc=$?; fi`, never a bare call followed by `rc=$?`. Under the entrypoint's
+  # `set -e` a bare failing command exits the shell on the spot: the cleanup below would be skipped
+  # (leaking the snapshot) AND, worse, this function would never RETURN 4 at all — the CLI would
+  # simply die, so the torn-file contract every caller depends on would exist only on paper.
+  if _mi_conf_snap_load "$snap" "$f" "$spec"; then rc=0; else rc=$?; fi
+  rm -f "$snap"
+  return "$rc"
+}
+
+# Merge KEY/VALUE pairs into a product's config. Requires the family lock.
+#
+# Pairs are ARGUMENTS, not records on stdin. A newline-delimited record stream cannot tell a newline
+# INSIDE a caller's value from a deliberate second record, so `printf '%s\t%s\n' "$k" "$v"` with a
+# value containing `\nOTHER_KEY\tvalue` would forge a key at the interface boundary — reintroducing
+# exactly the D19 forgery the file format's rules close. An argument list has no framing to escape.
+#
+# MERGE, not replace. `*.conf` is user-owned (mi_zone), so D9 forbids destroying content this call
+# did not create: comments, blank lines, key order and keys we were not asked to change all survive,
+# the same way mi_conf_family_add treats mythical.conf. One mental model for both files.
+#
+# IN PLACE, never mktemp+mv. <product>.conf is bind-mounted as a SINGLE FILE, and a bind mount
+# follows the inode: replacing it by rename detaches the container's view silently — the container
+# keeps reading and writing the old inode forever, with no error on either side. §4.5 established
+# this for the container's own writes; it binds the host writer for exactly the same reason.
+#
+# The residual is that an in-place write can tear (D60). It is mitigated, not eliminated: the whole
+# body is built in memory and emitted by ONE redirection, the marker is written last, and the
+# family lock serializes every host writer.
+mi_conf_product_add() {
+  # Arity BEFORE any positional expansion — under `set -u`, `local spec="$2"` on a short call aborts
+  # the CLI with "unbound variable" rather than refusing in our own words.
+  if [ "$#" -lt 5 ] || [ $(( ( $# - 3 ) % 2 )) -ne 0 ]; then
+    mi_warn "config: mi_conf_product_add needs <product> <spec> <gid> and one or more KEY VALUE pairs"
+    return 1
+  fi
+  local product="$1" spec="$2" gid="$3"; shift 3
+  case "$gid" in ''|*[!0-9]*) mi_warn "config: '$gid' is not a numeric group id"; return 1 ;; esac
+  mi_lock_assert_held "write ${product}.conf"
+  local f; f="$(mi_conf_product_path "$product")" || return 1
+  _mi_conf_identity_ok "$f" || return 1
+
+  # Validate EVERY pair before touching the file, so a rejected call leaves nothing behind.
+  # Copy "$@" into an array and index THAT — not `eval "k=\${$i}"`. Indirect positional access via
+  # eval is the traditional bash-3.2 idiom and it works, but reaching for eval inside the module
+  # whose entire premise is "this code never evaluates data" is how that premise erodes.
+  local -a args=("$@")
+  local -a pk pv placed
+  local i=0 k v type seen=""
+  while [ "$i" -lt "${#args[@]}" ]; do
+    k="${args[$i]}"; v="${args[$(( i + 1 ))]}"
+    if ! _mi_conf_key_ok "$k"; then
+      mi_warn "config: refusing to write invalid key name '$k' to ${product}.conf"; return 1
+    fi
+    if ! type="$(_mi_conf_spec_type "$spec" "$k")"; then
+      mi_warn "config: $k is not a key ${product}.conf accepts"; return 1
+    fi
+    if ! _mi_conf_value_ok "$v" || ! _mi_conf_type_ok "$type" "$v"; then
+      mi_warn "config: refusing to write an invalid value for $k"; return 1
+    fi
+    case "$seen" in
+      *"|${k}|"*) mi_warn "config: $k given twice — refusing to write ${product}.conf"; return 1 ;;
+    esac
+    seen="${seen}|${k}|"
+    pk[${#pk[@]}]="$k"; pv[${#pv[@]}]="$v"; placed[${#placed[@]}]=0
+    i=$(( i + 2 ))
+  done
+
+  # An existing file must load cleanly before we merge into it. Merging into a torn or off-spec file
+  # would re-bless damaged content with a fresh, valid-looking marker — turning a detectable problem
+  # into an undetectable one. rc 4 (torn) is reported as such so the operator gets the right remedy.
+  #
+  # `if cmd; then rc=0; else rc=$?; fi` — NOT `if ! cmd; then rc=$?; fi`. Inside the then-branch of a
+  # NEGATED condition, `$?` is the status of the `!` itself, which is 0 when the command failed. The
+  # negated form therefore records success for every failure and falls through to write — silently
+  # re-blessing a torn file with a fresh, valid-looking marker. Caught by running the code.
+  # Take OUR OWN snapshot, validate it, and build the new body from THE SAME BYTES. Calling
+  # mi_conf_product_load and then re-reading $f would validate one file and rewrite another: a
+  # container that swaps the file in that gap gets its content hashed and re-blessed with a valid
+  # marker by the host. Read once; never look at the live file again.
+  local rc=0 existing="" snap="" body="" line pre=""
+  if [ -e "$f" ]; then
+    snap="$(_mi_conf_snap "$f")" || return 1
+    if existing="$(_mi_conf_snap_load "$snap" "$f" "$spec" 2>/dev/null)"; then rc=0; else rc=$?; fi
+    if [ "$rc" -ne 0 ]; then
+      rm -f "$snap"
+      mi_warn "config: ${product}.conf does not load cleanly — refusing to modify it; fix or remove it first"
+      return "$rc"
+    fi
+    # Copy the existing body VERBATIM — every byte, comment and blank line, in order. `sed '$d'`
+    # drops exactly ONE line, the marker, which _mi_conf_snap_load has already proved is the final
+    # line. Done here, before the additive gate, so the snapshot is released on every path out.
+    #
+    # `$(cmd && printf X)`, not `< <(cmd)`. A process substitution's exit status is UNOBSERVABLE
+    # (pipefail does not reach it), so a `sed` that died after emitting half its output would leave
+    # the read loop reporting success — and the writer would then hash and write that truncated body
+    # under a perfectly valid marker, turning a read failure into silent data loss on a user-owned
+    # file. Chaining `&& printf X` makes the substitution's status sed's own, and the X is what
+    # protects the trailing newlines that command substitution would otherwise strip.
+    local raw
+    if ! raw="$(sed '$d' "$snap" && printf X)"; then
+      rm -f "$snap"
+      mi_warn "config: cannot read the existing ${product}.conf — refusing to rewrite it"
+      return 1
+    fi
+    body="${raw%X}"
+    # The snapshot is byte-identical to the file (it is under the size ceiling, or we refused), so
+    # its digest is the file's digest as of the read. Captured before the snapshot is released.
+    pre="$(mi_digest "$snap")" || { rm -f "$snap"; mi_warn "config: cannot digest the read buffer"; return 1; }
+    rm -f "$snap"
+  fi
+
+  # ADDITIVE ONLY, exactly as mi_conf_family_add is and for the same D9 reason: a key already
+  # present is either the operator's or the product UI's, and the installer cannot tell those from
+  # its own earlier value. Same value ⇒ nothing to do; different value ⇒ refuse. Changing a setting
+  # is D3's job (the product's UI writes the file directly) or Plan 4's compare-and-set.
+  # Look the current values up in the records mi_conf_product_load already returned, NOT by calling
+  # mi_conf_get on the file: the file still carries its trailing marker, which the scanner refuses.
+  # Reusing the validated records also means the gate and the integrity check cannot disagree.
+  local n=0 cur
+  while [ "$n" -lt "${#pk[@]}" ]; do
+    if cur="$(_mi_conf_record_value "$existing" "${pk[$n]}")"; then
+      if [ "$cur" != "${pv[$n]}" ]; then
+        mi_warn "config: ${pk[$n]} is already set to '$cur' in ${product}.conf — refusing to overwrite it"
+        return 1
+      fi
+      placed[n]=1                      # already exactly right: keep the existing line untouched
+    fi
+    n=$(( n + 1 ))
+  done
+
+  n=0
+  while [ "$n" -lt "${#pk[@]}" ]; do
+    if [ "${placed[$n]}" -eq 0 ]; then body="${body}${pk[$n]}=${pv[$n]}"$'\n'; fi
+    n=$(( n + 1 ))
+  done
+
+  local sum
+  sum="$(printf '%s' "$body" | mi_digest /dev/stdin)" || { mi_warn "config: cannot compute the integrity marker"; return 1; }
+  [ -n "$sum" ] || { mi_warn "config: empty integrity marker — refusing to write"; return 1; }
+
+  # Compare-and-swap on the whole file, for the same reason as mi_conf_family_add: D3 explicitly
+  # lets the product's UI write this file directly, and the family lock does not reach it. A UI save
+  # landing between our snapshot and this write would be silently discarded. See residual 11.
+  if ! _mi_conf_unchanged "$f" "$pre"; then
+    mi_warn "config: ${product}.conf changed while we were reading it — refusing to overwrite that change; re-run"
+    return 1
+  fi
+
+  # Create the file at 0600 BEFORE any content lands, so a new file is never briefly world- or
+  # group-readable at the process umask. Only for a file that does not exist yet: for an existing
+  # one this would be a second write, widening the tear window for no gain.
+  if [ ! -e "$f" ]; then
+    if ! ( umask 077; : > "$f" ); then
+      mi_warn "config: cannot create $f"; return 1
+    fi
+  fi
+
+  # Re-check identity immediately before the write. The check at the top of this function happened
+  # several reads ago, and a pathname check is only ever true of the moment it ran: §4.1a records
+  # "pathname TOCTOU" as an ACCEPTED, irreducible residual for a shell installer — "a property of
+  # checking a path and then using it", closable only with fd- or mount-namespace-based I/O, which
+  # portable bash does not have. This does not close the window; it makes it as small as the
+  # language allows, which is what §4.1a asks for. The family lock already excludes every other
+  # mythical-ctl process, so the remaining racer is a local process running as the operator.
+  _mi_conf_identity_ok "$f" || return 1
+
+  # One redirection: truncate and write in a single open, so the tear window is as small as a
+  # non-atomic write can be. The marker is last, so a crash leaves it stale rather than wrong.
+  if ! printf '%s%s%s\n' "$body" "$MI_CONF_MARKER_PREFIX" "$sum" > "$f"; then
+    mi_warn "config: cannot write $f"; return 1
+  fi
+
+  # D60: owner=operator, 0660, group = the canonical family gid, applied NUMERICALLY.
+  #
+  # When chgrp FAILS this returns rc 5 — "written, but NOT to D60's spec" — never 0. The file is left
+  # at 0600, because 0660 owned by the operator's PRIMARY group would grant unrelated local users
+  # access while granting the container none: strictly worse than 0600 on both counts.
+  #
+  # rc 5 exists because reporting success here would be a lie with consequences: D3 makes the
+  # product's UI the editor of its own settings, and without the group that UI cannot write the file
+  # at all. The library states the fact and returns a distinguishable status; whether that is fatal
+  # is the calling verb's decision (Plan 4), not a library default. See "Decisions" item 5 for the
+  # gap in D60 this exposes.
+  if chgrp "$gid" "$f" 2>/dev/null; then
+    chmod 660 "$f" || { mi_warn "config: cannot set mode on $f"; return 1; }
+    return 0
+  fi
+  chmod 600 "$f" || { mi_warn "config: cannot set mode on $f"; return 1; }
+  mi_warn "config: wrote $f, but could not set the family group $gid on it."
+  mi_warn "  It is mode 0600. The product's own settings screen will be READ-ONLY until the group is set."
+  return 5
 }
