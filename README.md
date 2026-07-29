@@ -5,9 +5,10 @@ The installer and lifecycle CLI for the **mythicalOS** family of local-first con
 > **Status: scaffolding — the lifecycle commands are not implemented yet.** `mythical-ctl` today
 > answers `--version` and `--help` and nothing else. What is built and tested is the foundation the
 > verbs will stand on: the `~/.mythical/` layout and its ownership rules, a single atomic
-> fail-closed state ledger, a family operation lock, and a hermetic test harness. Everything below
-> describing `install`/`start`/`stop` is the **design**, not shipped behaviour — read it as what
-> this is for, not what it does today. The products themselves are not published yet either.
+> fail-closed state ledger, a family operation lock, the two-config-file layer with its
+> non-executing parser, and a hermetic test harness. Everything below describing
+> `install`/`start`/`stop` is the **design**, not shipped behaviour — read it as what this is for,
+> not what it does today. The products themselves are not published yet either.
 >
 > The install command below **does** work — but it is served by
 > [get.mythicalos.ai](https://get.mythicalos.ai), which installs product containers directly; it
@@ -65,6 +66,12 @@ not, because nothing here mounts anything yet:
   transcripts/ logs/   product data
 ```
 
+Both files are `KEY=value` text. They are **never** executed — `mythical-ctl` parses them with a
+strict non-executing reader that allowlists keys and validates values by type, so a line like
+`KEY=$(...)` is refused rather than run. `mythical.conf` is host-only and never mounted into any
+container; `<product>.conf` is the only file a product can see or write, and no value in it reaches
+a container-launch argument. The format is specified in [`docs/CONFIG-FORMAT.md`](docs/CONFIG-FORMAT.md).
+
 Nothing is scattered across your home directory: every file you are expected to read or edit is
 in there.
 
@@ -81,10 +88,12 @@ container runtime. None of that is in this directory. So:
 create what is missing and read what already exists; it will not overwrite a configuration file you
 have edited, and it will not delete transcripts, logs, or any directory you bound, so re-installing
 on a machine that has been in use for a year is meant to be safe. Today this is enforced only where
-there is code to enforce it: `mi_zone` classifies every path into an ownership class, and the
-layout helper creates missing directories and touches nothing else. **Do not read it as a
-guarantee over your data yet — nothing here reads, writes or deletes a configuration file,
-transcript or log at all.**
+there is code to enforce it: `mi_zone` classifies every path into an ownership class, the layout
+helper creates missing directories and touches nothing else, and the config layer is additive by
+construction — it appends a key that is absent, refuses to change one that is already set to
+something else, and leaves every other byte, comment and blank line exactly as it found them.
+**Do not read it as a guarantee over your data yet** — nothing here touches a transcript or a log at
+all, and the only files it writes are the two configuration files.
 
 ## Siblings
 
