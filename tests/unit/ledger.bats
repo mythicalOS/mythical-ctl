@@ -12,7 +12,7 @@ setup_ledger() { load_mctl; mi_ensure_layout; hold_lock; }
 
 @test "missing ledger returns 3 and prints nothing" {
   load_mctl; mi_ensure_layout
-  run bash -c 'source '"$_MCTL_ROOT"'/lib/common.sh; source '"$_MCTL_ROOT"'/lib/layout.sh; source '"$_MCTL_ROOT"'/lib/ledger.sh; mi_ledger_read'
+  run bash -c 'source '"$_MCTL_ROOT"'/lib/common.sh; source '"$_MCTL_ROOT"'/lib/layout.sh; source '"$_MCTL_ROOT"'/lib/lock.sh; source '"$_MCTL_ROOT"'/lib/ledger.sh; mi_ledger_read'
   [ "$status" -eq 3 ]
   [ -z "$output" ]
 }
@@ -30,7 +30,7 @@ setup_ledger() { load_mctl; mi_ensure_layout; hold_lock; }
   load_mctl; mi_ensure_layout
   # `set -euo pipefail` mirrors the shipped entrypoint: without it the writer's token-read `sed`
   # on the absent lock file would abort silently and this test would pass for the wrong reason.
-  run bash -c 'set -euo pipefail; unset MI_LOCK_TOKEN; source '"$_MCTL_ROOT"'/lib/common.sh; source '"$_MCTL_ROOT"'/lib/layout.sh; source '"$_MCTL_ROOT"'/lib/ledger.sh; printf "x\ty=1\n" | mi_ledger_write'
+  run bash -c 'set -euo pipefail; unset MI_LOCK_TOKEN; source '"$_MCTL_ROOT"'/lib/common.sh; source '"$_MCTL_ROOT"'/lib/layout.sh; source '"$_MCTL_ROOT"'/lib/lock.sh; source '"$_MCTL_ROOT"'/lib/ledger.sh; printf "x\ty=1\n" | mi_ledger_write'
   [ "$status" -ne 0 ]
   assert_contains "lock"
 }
@@ -38,7 +38,7 @@ setup_ledger() { load_mctl; mi_ensure_layout; hold_lock; }
 @test "write is refused when the token does not match the lock file" {
   setup_ledger                            # lock file token=testtok, MI_LOCK_TOKEN=testtok
   export MI_LOCK_TOKEN=wrong-token        # now our token no longer matches the file on disk
-  run bash -c 'set -euo pipefail; source '"$_MCTL_ROOT"'/lib/common.sh; source '"$_MCTL_ROOT"'/lib/layout.sh; source '"$_MCTL_ROOT"'/lib/ledger.sh; printf "x\ty=1\n" | mi_ledger_write'
+  run bash -c 'set -euo pipefail; source '"$_MCTL_ROOT"'/lib/common.sh; source '"$_MCTL_ROOT"'/lib/layout.sh; source '"$_MCTL_ROOT"'/lib/lock.sh; source '"$_MCTL_ROOT"'/lib/ledger.sh; printf "x\ty=1\n" | mi_ledger_write'
   [ "$status" -ne 0 ]
   assert_contains "lock"
 }
@@ -111,7 +111,7 @@ setup_ledger() { load_mctl; mi_ensure_layout; hold_lock; }
   setup_ledger
   printf 'identity\tid=abc\n' | mi_ledger_write        # valid ledger exists
   printf 'garbage-appended\n' >> "$MYTHICAL_HOME/.state/ledger"  # now corrupt
-  run bash -c 'source '"$_MCTL_ROOT"'/lib/common.sh; source '"$_MCTL_ROOT"'/lib/layout.sh; source '"$_MCTL_ROOT"'/lib/ledger.sh; printf "x\ty=1\n" | mi_ledger_write'
+  run bash -c 'source '"$_MCTL_ROOT"'/lib/common.sh; source '"$_MCTL_ROOT"'/lib/layout.sh; source '"$_MCTL_ROOT"'/lib/lock.sh; source '"$_MCTL_ROOT"'/lib/ledger.sh; printf "x\ty=1\n" | mi_ledger_write'
   [ "$status" -ne 0 ]
   assert_contains "validate"
   # the corrupt file must still be there — the writer preserved the evidence
@@ -141,7 +141,7 @@ setup_ledger() { load_mctl; mi_ensure_layout; hold_lock; }
   printf 'tampered\tx=1\n' >> "$MYTHICAL_HOME/.state/ledger"   # body changed after the checksum
   # The test shell has no `set -o pipefail`; a bare `mi_ledger_read | while` would swallow the
   # reader's failure and report success with no records. The captured reader must propagate instead.
-  run bash -c 'set +o pipefail; source '"$_MCTL_ROOT"'/lib/common.sh; source '"$_MCTL_ROOT"'/lib/layout.sh; source '"$_MCTL_ROOT"'/lib/ledger.sh; mi_ledger_get initialized'
+  run bash -c 'set +o pipefail; source '"$_MCTL_ROOT"'/lib/common.sh; source '"$_MCTL_ROOT"'/lib/layout.sh; source '"$_MCTL_ROOT"'/lib/lock.sh; source '"$_MCTL_ROOT"'/lib/ledger.sh; mi_ledger_get initialized'
   [ "$status" -ne 0 ]
   [ "$status" -ne 3 ]
   assert_contains "checksum"
@@ -162,7 +162,7 @@ setup_ledger() { load_mctl; mi_ensure_layout; hold_lock; }
   printf '#!/usr/bin/env bash\nexit 3\n' > "$badbin/sha256sum"; chmod +x "$badbin/sha256sum"
   printf '#!/usr/bin/env bash\nexit 3\n' > "$badbin/shasum";    chmod +x "$badbin/shasum"
   run env PATH="$badbin:$PATH" bash -c \
-    'source '"$_MCTL_ROOT"'/lib/common.sh; source '"$_MCTL_ROOT"'/lib/layout.sh; source '"$_MCTL_ROOT"'/lib/ledger.sh; printf "identity\tid=abc\n" | mi_ledger_write'
+    'source '"$_MCTL_ROOT"'/lib/common.sh; source '"$_MCTL_ROOT"'/lib/layout.sh; source '"$_MCTL_ROOT"'/lib/lock.sh; source '"$_MCTL_ROOT"'/lib/ledger.sh; printf "identity\tid=abc\n" | mi_ledger_write'
   [ "$status" -ne 0 ]
   [ ! -f "$MYTHICAL_HOME/.state/ledger" ]     # nothing (esp. no checksum-empty ledger) was published
 }
@@ -174,7 +174,7 @@ setup_ledger() { load_mctl; mi_ensure_layout; hold_lock; }
   printf '#!/usr/bin/env bash\nexit 3\n' > "$badbin/sha256sum"; chmod +x "$badbin/sha256sum"
   printf '#!/usr/bin/env bash\nexit 3\n' > "$badbin/shasum";    chmod +x "$badbin/shasum"
   run env PATH="$badbin:$PATH" bash -c \
-    'source '"$_MCTL_ROOT"'/lib/common.sh; source '"$_MCTL_ROOT"'/lib/layout.sh; source '"$_MCTL_ROOT"'/lib/ledger.sh; mi_ledger_read'
+    'source '"$_MCTL_ROOT"'/lib/common.sh; source '"$_MCTL_ROOT"'/lib/layout.sh; source '"$_MCTL_ROOT"'/lib/lock.sh; source '"$_MCTL_ROOT"'/lib/ledger.sh; mi_ledger_read'
   [ "$status" -ne 0 ]
   [ "$status" -ne 3 ]
 }

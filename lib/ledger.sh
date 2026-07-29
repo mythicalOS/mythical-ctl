@@ -77,22 +77,9 @@ mi_ledger_read() {
 # family lock — proven by our token matching the on-disk lock file, not merely by an env flag a
 # caller could set. Fails closed rather than clobbering an existing ledger that does not validate.
 mi_ledger_write() {
-  # Prove we hold the lock: nonempty MI_LOCK_TOKEN that matches the lock file's token on disk.
-  # Read inline (no dependency on lock.sh being sourced at this call site).
-  local lf ltok=""
-  lf="$(mi_home)/.state/lock"
-  # Guard the token read behind the file test. Under the entrypoint's `set -e`, `sed` on an ABSENT
-  # lock file exits nonzero and the assignment would abort the CLI *before* the refusal below ever
-  # runs — a silent exit with sed's code, not our contract exit. (A bare `bash -c` test shell has no
-  # `set -e`, which is why the refusal test must opt into it or it passes for the wrong reason.)
-  # Read only when the file exists AND is exactly one newline-terminated line; then strict whole-record
-  # match (same shape as lib/lock.sh's parser, kept inline so this guard needs no lock.sh sourced): a
-  # multi-line / malformed / garbage / doubled-token record yields nothing → refuse (fail closed).
-  if [ -f "$lf" ] && [ -z "$(tail -c1 "$lf" 2>/dev/null)" ] && [ "$(awk 'END{print NR}' "$lf" 2>/dev/null)" = 1 ]; then
-    ltok="$(sed -n 's/^pid=[0-9][0-9]* start=[0-9][0-9]* token=\([^ ]*\)$/\1/p' "$lf" 2>/dev/null)" || ltok=""
-  fi
-  { [ -n "${MI_LOCK_TOKEN:-}" ] && [ -n "$ltok" ] && [ "$ltok" = "$MI_LOCK_TOKEN" ]; } \
-    || mi_die "refusing to write the ledger without holding the family lock (D28/§4b.3a)"
+  # Prove we hold the lock. Single implementation, in lib/lock.sh — this check used to be inlined
+  # here and is now shared with the config writer; two copies of a security check drift.
+  mi_lock_assert_held "write the ledger"
   local f dir tmp
   f="$(_mi_ledger_path)"; dir="$(dirname "$f")"
 

@@ -128,3 +128,24 @@ mi_lock_release() {
   unset MI_LOCK_HELD MI_LOCK_TOKEN || true
   return 0
 }
+
+# Prove this process holds the family lock, or die. The ONLY authorization for a mutating write.
+#
+# Proof is a token match against the lock file on disk — never a bare environment flag, which any
+# caller could set. `_mi_lock_owner_token` already gates on the record being exactly one clean,
+# newline-terminated, fully-matching line, so a malformed or doubled record yields nothing and we
+# refuse (fail closed).
+#
+# <what> completes the sentence "refusing to <what> without holding the family lock", so callers
+# name their own operation and the message stays specific.
+mi_lock_assert_held() {
+  local what="$1" lf ltok=""
+  lf="$(_mi_lock_file)"
+  if [ -f "$lf" ]; then
+    ltok="$(_mi_lock_owner_token "$lf")" || ltok=""
+  fi
+  if [ -n "${MI_LOCK_TOKEN:-}" ] && [ -n "$ltok" ] && [ "$ltok" = "$MI_LOCK_TOKEN" ]; then
+    return 0
+  fi
+  mi_die "refusing to $what without holding the family lock (D28/§4b.3a)"
+}

@@ -319,3 +319,129 @@ mi_conf_get() {
   done <<< "$records"
   return 3
 }
+
+# --- mythical.conf — host-only, never mounted (D2/D4) ---------------------------------------------
+
+mi_conf_family_path() { printf '%s/mythical.conf\n' "$(mi_home)"; }
+
+# The CORE spec: keys that are product-independent. Product-scoped keys (MYTHICAL_<PRODUCT>_PORT,
+# MYTHICAL_<PRODUCT>_WORK_BIND) are declared by that product's manifest and merged in by Plan 3 —
+# this plan owns the engine and the core vocabulary, not the product vocabularies.
+mi_conf_family_spec() {
+  printf 'MYTHICAL_NET\tnetname\n'
+  printf 'MYTHICAL_TELEMETRY_KEY\tstr:512\n'
+}
+
+mi_conf_family_load() {
+  mi_conf_load "$(mi_conf_family_path)" "$(mi_conf_family_spec)"
+}
+
+# Has the live file changed since it was digested? This is the ONLY sanctioned read of the live file
+# besides _mi_conf_snap, and it is safe for a reason worth stating: it compares a digest and never
+# derives configuration from what it reads, so it cannot become an injection path. It is a NAMED
+# function precisely so the structural test can permit exactly this one exception and nothing else —
+# an inline `mi_digest "$f"` in a writer would be indistinguishable from a regression.
+#
+# Defined HERE, in Task 3, because mi_conf_family_add below is its first caller. (`_mi_conf_snap` and
+# the structural test named above arrive in Task 4; this comment describes the end state.)
+_mi_conf_unchanged() {
+  local f="$1" pre="$2" now=""
+  if [ -f "$f" ]; then now="$(mi_digest "$f")" || now="?"; fi
+  [ "$now" = "$pre" ]
+}
+
+# ADD one key, preserving the rest of the file byte-for-byte (D9).
+#
+# ADDITIVE ONLY. Absent ⇒ written; already present with the SAME value ⇒ no-op success; present with
+# a DIFFERENT value ⇒ REFUSED. §10a requires a re-install to leave user-owned files byte-identical
+# "including an operator's hand edit", and a second product's install to make mythical.conf "gain
+# keys additively" — a primitive that blind-writes cannot satisfy either, because the installer
+# cannot tell its own earlier value from something the operator typed. Changing an existing value is
+# a compare-and-set, which §5.2's migration paths define and Plan 4 builds; not available here.
+#
+# Atomic replace is correct HERE and only here: mythical.conf is never bind-mounted (§4.1a), so
+# swapping the inode detaches nothing. <product>.conf must NOT be written this way — see
+# mi_conf_product_add.
+mi_conf_family_add() {
+  # Arity BEFORE any positional expansion: under the entrypoint's `set -u`, `local val="$2"` on a
+  # one-argument call aborts the CLI with "unbound variable" instead of refusing in our own words.
+  if [ "$#" -ne 2 ]; then
+    mi_warn "config: mi_conf_family_add needs exactly a KEY and a VALUE"; return 1
+  fi
+  local key="$1" val="$2" f dir tmp type existing rc
+  mi_lock_assert_held "write mythical.conf"
+  f="$(mi_conf_family_path)"; dir="$(dirname "$f")"
+
+  # Validate the key and value BEFORE touching the file. A newline in a value would forge a second
+  # key on the next read — the D19 "serialize safely on write" requirement — and _mi_conf_value_ok
+  # rejects it along with every other control byte.
+  if ! _mi_conf_key_ok "$key"; then
+    mi_warn "config: refusing to write invalid key name '$key'"; return 1
+  fi
+  if ! type="$(_mi_conf_spec_type "$(mi_conf_family_spec)" "$key")"; then
+    mi_warn "config: $key is not a key mythical.conf accepts"; return 1
+  fi
+  if ! _mi_conf_value_ok "$val" || ! _mi_conf_type_ok "$type" "$val"; then
+    mi_warn "config: refusing to write an invalid value for $key"; return 1
+  fi
+
+  # Never overwrite a file we cannot read. A config that does not parse may be an operator's
+  # half-finished edit or a hostile write; either way, silently rewriting it destroys evidence and
+  # could discard settings. Refuse and report. (An absent file is fine — that is a first write.)
+  # Gate on the FULL load, not merely on the syntax scan. A file holding a key outside the core
+  # schema scans perfectly and fails mi_conf_family_load — so gating on the scan alone would let this
+  # function "succeed" while producing a file its own reader rejects. Whatever we refuse to read, we
+  # refuse to modify.
+  if [ -f "$f" ] && ! mi_conf_family_load >/dev/null 2>&1; then
+    mi_warn "config: $f does not load cleanly — refusing to modify it; fix or remove it first"
+    return 1
+  fi
+
+  # The additive gate. mi_conf_get distinguishes absent (3) from a parse failure (1), which is why it
+  # exists — "the key is not set" and "the file is hostile" must never look the same to code deciding
+  # whether to write.
+  if [ -f "$f" ]; then
+    if existing="$(mi_conf_get "$f" "$key")"; then rc=0; else rc=$?; fi
+    if [ "$rc" -eq 0 ]; then
+      if [ "$existing" = "$val" ]; then
+        return 0                       # already exactly what we would write: nothing to do
+      fi
+      mi_warn "config: $key is already set to '$existing' in $f — refusing to overwrite it"
+      mi_warn "  An operator's value is never replaced silently; change it by hand, or remove the line."
+      return 1
+    fi
+    [ "$rc" -eq 3 ] || return "$rc"    # absent is the only status that authorizes a write
+  fi
+
+  tmp="$(mktemp "$dir/.mythical.conf.XXXXXX")" || { mi_warn "config: cannot create a temp file in $dir"; return 1; }
+  # 0600 BEFORE any content lands: mktemp is already 0600, but making it explicit means a future
+  # change to the temp mechanism cannot silently widen a file that holds bootstrap secrets.
+  chmod 600 "$tmp" || { rm -f "$tmp"; mi_warn "config: cannot set mode on $tmp"; return 1; }
+
+  # The key is known ABSENT (the gate above proved it), so this is a pure byte copy plus an append —
+  # every existing byte, comment, blank line and ordering survives unchanged, which is the D9
+  # guarantee stated as code rather than as a loop that could get it subtly wrong.
+  local pre=""
+  if [ -f "$f" ]; then
+    pre="$(mi_digest "$f")" || { rm -f "$tmp"; mi_warn "config: cannot read $f"; return 1; }
+    cat "$f" > "$tmp" || { rm -f "$tmp"; mi_warn "config: cannot read $f"; return 1; }
+  fi
+  printf '%s=%s\n' "$key" "$val" >> "$tmp"
+
+  # Compare-and-swap on the WHOLE FILE before replacing it. The family lock serializes every other
+  # mythical-ctl process, but not the two writers D9 explicitly expects: the operator in an editor,
+  # and (for <product>.conf) the product's own UI. Without this, a save landing between the read
+  # above and the rename below is silently discarded — §5.2's "the edit is lost" residual, which
+  # the design permits only when the command REPORTS it immediately. Refusing is better than
+  # reporting after the fact, and costs one extra read. It narrows the window rather than closing
+  # it; residual 11 states what is left.
+  if ! _mi_conf_unchanged "$f" "$pre"; then
+    rm -f "$tmp"
+    mi_warn "config: $f changed while we were reading it — refusing to overwrite that change; re-run"
+    return 1
+  fi
+
+  # Atomic replace within the same directory, so rename() cannot cross filesystems.
+  mv -f "$tmp" "$f" || { rm -f "$tmp"; mi_warn "config: cannot replace $f"; return 1; }
+  return 0
+}
