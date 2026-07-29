@@ -152,3 +152,166 @@ mi_conf_scan() {
   # shellcheck disable=SC2094   # "$f" here is only a LABEL for diagnostics; the redirect is the read
   _mi_conf_scan_stream "$f" < "$f"
 }
+
+# --- typed validation (D19) ----------------------------------------------------------------------
+# A SPEC is a newline-separated list of KEY<TAB>TYPE records. It is a PARAMETER, not a constant,
+# because <product>.conf's allowlist comes from that product's manifest (Plan 3) while
+# mythical.conf's is core-owned. One engine, several vocabularies.
+
+# Decimal-string range check without shell integer conversion, so a 30-digit value cannot overflow
+# `[ -ge ]` and wrap into range.
+#
+# NON-NEGATIVE ONLY, and the interface says so: no sign, no leading `+`, no surrounding space. Every
+# setting this format expresses (retention days, ports, counts) is non-negative, and a signed
+# comparison that also has to be overflow-safe is more machinery than any caller needs. A spec
+# writing `int:-10:10` is a spec bug, not a value that should validate.
+_mi_conf_int_ok() {
+  local v="$1" min="$2" max="$3"
+  case "$v" in ''|*[!0-9]*) return 1 ;; esac       # all digits, non-empty: no sign, no space, no +
+  # A leading zero would be re-read as OCTAL by the `[ -ge ]` below: `010` passes an int:1:100 check
+  # having compared as 8, and `0100` passes it having compared as 64 — a value textually out of range
+  # validating because the shell read a different number than the file spells. `0` itself is fine.
+  case "$v" in 0[0-9]*) return 1 ;; esac
+  [ "${#v}" -le 18 ] || return 1                   # beyond this, shell arithmetic is not reliable
+  [ "$v" -ge "$min" ] && [ "$v" -le "$max" ]
+}
+
+# Validate one value against one type. rc 0 ok, 1 reject.
+_mi_conf_type_ok() {
+  local type="$1" v="$2" p
+  case "$type" in
+    str:*)
+      p="${type#str:}"
+      [ "${#v}" -le "$p" ]
+      ;;
+    int:*:*)
+      p="${type#int:}"
+      _mi_conf_int_ok "$v" "${p%%:*}" "${p#*:}"
+      ;;
+    bool)
+      case "$v" in true|false) return 0 ;; *) return 1 ;; esac
+      ;;
+    enum:*)
+      # Delimit both sides so `re` does not match inside `red`, and an empty value does not match
+      # the empty string between two pipes.
+      [ -n "$v" ] || return 1
+      # Reject the DELIMITER itself before matching. Quoting `"|${v}|"` makes the expansion literal,
+      # so glob metacharacters in the value are inert — but a value that CONTAINS `|` forges a match
+      # against the joined list rather than a member of it: for enum:red|green, v='red|green' turns
+      # the pattern into *"|red|green|"*, which the subject "|red|green|" matches exactly. The format
+      # has no escaping, so no enum member can legitimately contain `|`.
+      case "$v" in *'|'*) return 1 ;; esac
+      case "|${type#enum:}|" in *"|${v}|"*) return 0 ;; *) return 1 ;; esac
+      ;;
+    path:*)
+      p="${type#path:}"
+      [ -n "$v" ] || return 1
+      case "$v" in /*) : ;; *) return 1 ;; esac
+      [ "${#v}" -le "$p" ] || return 1
+      # Reject a `..` PATH COMPONENT, not the substring: /srv/..hidden is a legitimate name.
+      case "/${v}/" in */../*) return 1 ;; esac
+      return 0
+      ;;
+    netname)
+      # Docker network name: [A-Za-z0-9] then [A-Za-z0-9_.-]*. Additionally refuse the two special
+      # modes §4b.2 bans from mythical.conf — `host` shares the host network namespace outright, and
+      # `container:<name>` joins another container's. Neither is a network this installer may own.
+      [ -n "$v" ] && [ "${#v}" -le 128 ] || return 1
+      case "$v" in
+        host|none|container:*) return 1 ;;
+      esac
+      case "$v" in [A-Za-z0-9]*) : ;; *) return 1 ;; esac
+      case "${v#?}" in *[!A-Za-z0-9_.-]*) return 1 ;; esac
+      return 0
+      ;;
+    *)
+      mi_warn "config: internal error — unknown spec type '$type'"
+      return 1
+      ;;
+  esac
+}
+
+# Look up a key's type in the spec. Prints the type, rc 1 if the key is not in the spec.
+_mi_conf_spec_type() {
+  local spec="$1" key="$2" line
+  while IFS= read -r line; do
+    case "$line" in
+      "$key"$'\t'*) printf '%s\n' "${line#*$'\t'}"; return 0 ;;
+    esac
+  done <<< "$spec"
+  return 1
+}
+
+# Validate already-scanned KEY<TAB>VALUE records (in $1) against a spec. <label> names the source in
+# diagnostics. rc: 0 ok · 1 rejected (reported).
+# An UNKNOWN key is a rejection, never a skip (D19): ignoring it would let a compromised container
+# accumulate keys that a later, wider spec silently activates.
+# Records are passed as an ARGUMENT, not on stdin, because a `| while` runs the loop in a subshell
+# where `rc=1` is lost — the classic way a validator reports success while having rejected something.
+#
+# Output is BUFFERED and emitted only if every record validates. Printing as it goes would hand a
+# consumer a PREFIX of attacker-influenced configuration whenever a later record is rejected — the
+# file "fails" but its first few keys were already on stdout. A caller that pipes this, or that gets
+# its status handling wrong, would act on them. Nothing escapes a rejected file.
+_mi_conf_validate() {
+  local records="$1" label="$2" spec="$3" rc=0 line key val type out=""
+  [ -n "$records" ] || return 0
+  while IFS= read -r line; do
+    key="${line%%$'\t'*}"
+    val="${line#*$'\t'}"
+    if ! type="$(_mi_conf_spec_type "$spec" "$key")"; then
+      mi_warn "config: $label: unknown key $key — not permitted by this configuration schema"
+      rc=1
+      continue
+    fi
+    if ! _mi_conf_type_ok "$type" "$val"; then
+      mi_warn "config: $label: value for $key is not valid for type $type"
+      rc=1
+      continue
+    fi
+    out="${out}${key}"$'\t'"${val}"$'\n'
+  done <<< "$records"
+  if [ "$rc" -ne 0 ]; then return "$rc"; fi
+  # `if`, not `[ -n "$out" ] && printf ...` — as the last command that would return 1 on an empty
+  # (legitimately keyless) config, turning a valid file into a rejection.
+  if [ -n "$out" ]; then printf '%s' "$out"; fi
+  return 0
+}
+
+# Parse a file and validate every record against the spec.
+# rc: 0 ok · 1 rejected (reported) · 3 file missing.
+mi_conf_load() {
+  if [ "$#" -ne 2 ]; then mi_warn "config: mi_conf_load needs a <file> and a <spec>"; return 1; fi
+  local f="$1" spec="$2" records
+  records="$(mi_conf_scan "$f")" || return $?
+  _mi_conf_validate "$records" "$f" "$spec"
+}
+
+# Print one raw (scanned, not spec-validated) value. rc: 0 ok · 1 parse failure · 3 absent.
+#
+# For MARKER-LESS files — mythical.conf, or a body already separated from its marker. A
+# <product>.conf still carrying its trailing marker is REJECTED here, by design: the scanner refuses
+# marker lines outright, and the way to read a product config is mi_conf_product_load, which strips
+# and validates the marker first. Reading one through this function would skip the integrity gate.
+_mi_conf_record_value() {
+  local records="$1" key="$2" line
+  while IFS= read -r line; do
+    case "$line" in "$key"$'\t'*) printf '%s\n' "${line#*$'\t'}"; return 0 ;; esac
+  done <<< "$records"
+  return 3
+}
+
+# Used where the caller wants a single key without a full spec — e.g. reading back a value this
+# process wrote. Propagates a parse failure rather than reporting the key absent: "the file is
+# hostile" and "the key is not set" must never look the same to a caller deciding whether to write.
+mi_conf_get() {
+  if [ "$#" -ne 2 ]; then mi_warn "config: mi_conf_get needs a <file> and a <key>"; return 1; fi
+  local f="$1" key="$2" records line
+  records="$(mi_conf_scan "$f")" || return $?
+  while IFS= read -r line; do
+    case "$line" in
+      "$key"$'\t'*) printf '%s\n' "${line#*$'\t'}"; return 0 ;;
+    esac
+  done <<< "$records"
+  return 3
+}
