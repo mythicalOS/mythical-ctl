@@ -155,6 +155,70 @@ EOF
   [ "$(ls -ldn "$f" | awk 'NR==1{print $4}')" = "$TEST_GID" ]
 }
 
+# A pure CONTENT no-op must not truncate and rewrite the live file. This is the ORDINARY path —
+# re-install idempotence is "call it again with the same values" — and on a single-file bind mount a
+# concurrently reading container can observe the truncated intermediate state, for zero content change.
+#
+# THE SIGNAL IS THE HARD PART, so it is built with its own control. Byte-identity and the inode cannot
+# tell a rewrite from a skip (an in-place rewrite preserves both, by design), and an mtime read at
+# 1-second granularity cannot be compared against a timestamp taken in the same second. So: plant a
+# reference file, wait past a full timestamp tick, and ask `find -newer` — POSIX, and it compares at
+# whatever resolution the filesystem actually keeps. mtime is the right clock precisely because the
+# chgrp/chmod that the no-op path still applies by contract move ctime only.
+#
+# The CONTROL at the end is what stops this passing vacuously: the same signal must SEE a real merge.
+# Without it, a `find` that never reports anything would make every assertion above trivially true.
+@test "a no-op merge does not rewrite the file" {
+  write_conf
+  local f ref before inode
+  f="$(mi_conf_product_path brokkr)"
+  before="$(mi_digest "$f")"
+  inode="$(ls -i "$f" | awk '{print $1}')"
+
+  ref="$BATS_TEST_TMPDIR/ref"; : > "$ref"
+  sleep 1
+
+  run write_conf                       # identical pairs: nothing to merge
+  [ "$status" -eq 0 ]
+  [ -z "$(find "$f" -newer "$ref")" ] || { echo "the no-op rewrote $f" >&2; return 1; }
+  [ "$(mi_digest "$f")" = "$before" ]
+  [ "$(ls -i "$f" | awk '{print $1}')" = "$inode" ]
+
+  run mi_conf_product_add brokkr "$SPEC" "$TEST_GID" MYTHICAL_BROKKR_THEME dark
+  [ "$status" -eq 0 ]
+  [ -n "$(find "$f" -newer "$ref")" ] \
+    || { echo "the -newer signal cannot see a real write — the assertion above proves nothing" >&2; return 1; }
+}
+
+# rc 1 in this module means "refused, file untouched" everywhere else, so a chmod failure — which
+# happens AFTER the bytes have landed — must not borrow it. That state is exactly what rc 5 names.
+@test "a chmod failure after the bytes have landed reports rc 5, not rc 1" {
+  local shim="$BATS_TEST_TMPDIR/chmodshim" f
+  mkdir -p "$shim"
+  cat > "$shim/chmod" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in 660|600) exit 1 ;; esac
+exec /bin/chmod "$@"
+EOF
+  chmod +x "$shim/chmod"                          # real chmod: the shim is not on PATH yet
+  f="$(mi_conf_product_path brokkr)"
+
+  # chgrp SUCCEEDS, chmod 660 fails.
+  PATH="$shim:$PATH" run write_conf
+  [ "$status" -eq 5 ]
+  [[ "$output" == *"0660"* ]]
+  # The distinction rc 5 carries and rc 1 would deny: the content is committed and readable.
+  [ -f "$f" ]
+  [ "$(pget MYTHICAL_BROKKR_RETENTION)" = "30" ]
+
+  # chgrp FAILS and so does the 0600 fallback — still rc 5, with its own message, and NOT the
+  # "It is mode 0600" claim, which would now be false.
+  PATH="$shim:$PATH" run write_records_gid 4294967000 MYTHICAL_BROKKR_RETENTION 30
+  [ "$status" -eq 5 ]
+  [[ "$output" == *"OR mode 0600"* ]]
+  [ "$(pget MYTHICAL_BROKKR_RETENTION)" = "30" ]
+}
+
 @test "a rewrite keeps the same inode — a bind mount must not be detached" {
   write_conf
   local f before after
@@ -289,6 +353,74 @@ EOF
   [ "$(head -n1 "$victim")" = "#!/usr/bin/env bash" ]
 }
 
+# OWNERSHIP. §4.5/D60 fixes owner=operator and mi_conf_product_add's comment asserts it, but nothing
+# verified it: the gate checked symlink, regular-file and link count only. On a rootful runtime with no
+# userid remapping, a compromised container can `chown 0:0 <product>.conf; chmod 0666` — every other
+# check still passes, the host reads and accepts the file, the content write SUCCEEDS because the mode
+# is world-writable, and only the chgrp/chmod afterwards fail. The file is left rewritten, root-owned
+# and world-writable, i.e. steerable by any local user.
+#
+# SHIMMING `ls` IS THE HONEST TEST HERE, and the alternative is worse. chown'ing to a uid we are not is
+# root-only, so a behavioural version of this test would have to `skip` on every developer machine and
+# in CI — permanently green, proving nothing. The check reads the owner through exactly ONE observable,
+# `ls -ldn` field 3, so substituting that observable exercises the real gate on the real code path: the
+# refusal itself, its ordering against the other gates, and that neither reader nor writer proceeds.
+# What the shim does not prove is that the kernel and `ls` agree about uids — which is not what is
+# under test, and is separately covered by running the whole suite under a BSD-only userland.
+@test "a product conf owned by another uid is refused on both read and write" {
+  local shim="$BATS_TEST_TMPDIR/lsshim" f before
+  mkdir -p "$shim"
+  # Rewrite ONLY the numeric long listing, where the owner is read. Everything else — including the
+  # `ls -ld` link count the gate above it uses — passes through untouched.
+  cat > "$shim/ls" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "-ldn" ]; then
+  /bin/ls "$@" | awk 'NR==1{$3="4294967000"}1'
+  exit $?
+fi
+exec /bin/ls "$@"
+EOF
+  chmod +x "$shim/ls"
+
+  write_conf
+  f="$(mi_conf_product_path brokkr)"
+  before="$(mi_digest "$f")"
+
+  PATH="$shim:$PATH" run mi_conf_product_load brokkr "$SPEC"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"owned by uid 4294967000"* ]]
+
+  PATH="$shim:$PATH" run mi_conf_product_add brokkr "$SPEC" "$TEST_GID" MYTHICAL_BROKKR_THEME dark
+  [ "$status" -ne 0 ]
+  # untouched: the refusal happens before the create and before the write
+  [ "$(mi_digest "$f")" = "$before" ]
+}
+
+# Guarded like the link count: an identity we cannot read is a refusal, never an assumption that the
+# file is ours.
+@test "an unreadable owner is refused rather than assumed to be ours" {
+  local shim="$BATS_TEST_TMPDIR/lsshim-mute" f before
+  mkdir -p "$shim"
+  cat > "$shim/ls" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "-ldn" ]; then exit 0; fi    # a listing that says nothing at all about the owner
+exec /bin/ls "$@"
+EOF
+  chmod +x "$shim/ls"
+
+  write_conf
+  f="$(mi_conf_product_path brokkr)"
+  before="$(mi_digest "$f")"
+
+  PATH="$shim:$PATH" run mi_conf_product_load brokkr "$SPEC"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"cannot read the owner"* ]]
+
+  PATH="$shim:$PATH" run mi_conf_product_add brokkr "$SPEC" "$TEST_GID" MYTHICAL_BROKKR_THEME dark
+  [ "$status" -ne 0 ]
+  [ "$(mi_digest "$f")" = "$before" ]
+}
+
 @test "a matching marker reads silently" {
   write_conf
   run mi_conf_product_load brokkr "$SPEC"
@@ -414,11 +546,22 @@ EOF
   local src="${_MCTL_ROOT}/lib/config.sh" fn
   [ -n "$(awk '/^_mi_conf_snap\(\) \{/,/^\}/' "$src" | grep -F 'head -c "$MI_CONF_SNAP_LIMIT" "$f" > "$snap"')" ]
   [ -n "$(awk '/^_mi_conf_snap_load\(\) \{/,/^\}/' "$src" | grep -F "sed '\$d' \"\$snap\"")" ]
-  # No function except _mi_conf_snap may READ the live file's content — by ANY means. Naming one
-  # forbidden command would be a fig leaf: a regression using `cat "$f"`, `tail "$f"` or `< "$f"`
-  # would sail past a check that only knows about `sed`. So this denies the whole class of
-  # content-reading commands applied to "$f", and permits the rest ([ -f "$f" ], chmod, chgrp,
-  # > "$f", identity checks, diagnostics) by not matching them.
+  # No function except _mi_conf_snap may READ the live file's content. Be honest about what this is:
+  # a DENYLIST. It names the plausible content-reading commands and the internal helpers that read on
+  # a caller's behalf, and catches the forms a regression would actually be written in — `cat "$f"`,
+  # `tail "$f"`, `< "$f"`, `_mi_conf_marker_ok "$f"`, and the same with braces. It does not and cannot
+  # prove the negative: a sufficiently inventive spelling would still get past it. (An earlier version
+  # of this comment claimed the pattern "denies the whole class" and called naming individual commands
+  # "a fig leaf" — while itself naming individual commands. Three evasions were green at the time:
+  # `od -c "$f"`, `nl "$f"`, and a braced `_mi_conf_marker_ok "${f}"`.)
+  #
+  # What keeps it from going VACUOUS — the failure mode that actually bit here — is the range
+  # assertion below: if the awk range ever stops matching the function it names, the loop fails loudly
+  # instead of silently checking nothing.
+  #
+  # The permitted uses ([ -f "$f" ], chmod, chgrp, > "$f", the identity checks, diagnostics) pass by
+  # not matching. `ls` is deliberately absent: _mi_conf_identity_ok only STATS the path — twice, since
+  # it reads the link count and the owner — and never its content.
   #
   # `index($0,f)==1` and not a -v regex: `awk -v f="^${fn}\\(\\) \\{"` mangles the escapes, awk warns
   # "escape sequence \( treated as plain (", the range matches ZERO lines, and the loop passes
@@ -427,14 +570,23 @@ EOF
   # are the quiet one — a regression calling `_mi_conf_marker_ok "$f"` reads the live file just as
   # thoroughly as `tail "$f"` does, and a check that only knew about commands would wave it through.
   # `_mi_conf_snap "$f"` and `_mi_conf_identity_ok "$f"` are deliberately absent: the first IS the
-  # sanctioned read, and the second only stats.
-  local READERS='\b(cat|sed|awk|grep|head|tail|cut|tr|wc|sort|source)\b[^#]*"\$f"'
-  local HELPERS='\b(_mi_conf_marker_ok|_mi_conf_last_is_marker|_mi_conf_bytes_ok|_mi_conf_scan_stream|_mi_conf_snap_load|mi_digest|mi_conf_scan|mi_conf_load|mi_conf_get)[[:space:]]+"\$f"'
+  # sanctioned read, and the second only stats. `_mi_conf_unchanged "$f"` is absent for the third
+  # reason given at its definition — it compares a digest and never derives configuration from what it
+  # reads, which is why it is a named function at all. Adding any of those three would fail this test
+  # against correct code.
+  #
+  # BRACE-TOLERANT: `"${f}"` reads the live file exactly as thoroughly as `"$f"` does, and a pattern
+  # that only knew the unbraced spelling waved it through. `[{]?`/`[}]?` rather than `\{?`/`\}?` — a
+  # bare `{` in an ERE starts an interval, and the escaped form is not equally accepted everywhere.
+  local F='"\$[{]?f[}]?"'
+  local READERS='\b(cat|sed|awk|grep|head|tail|cut|tr|wc|sort|source|od|nl|dd|rev|xxd|cmp|md5sum|shasum|sha256sum|python3|perl)\b[^#]*'"$F"
+  local HELPERS='\b(_mi_conf_marker_ok|_mi_conf_last_is_marker|_mi_conf_bytes_ok|_mi_conf_scan_stream|_mi_conf_snap_load|mi_digest|mi_conf_scan|mi_conf_load|mi_conf_get)[[:space:]]+'"$F"
+  local REDIR='<[[:space:]]*'"$F"
   for fn in mi_conf_product_load mi_conf_product_add _mi_conf_snap_load; do
     [ "$(awk -v f="${fn}() {" 'index($0,f)==1,/^\}/' "$src" | wc -l)" -gt 1 ] \
       || { echo "range for $fn matched nothing — the check would pass vacuously" >&2; return 1; }
     if awk -v f="${fn}() {" 'index($0,f)==1,/^\}/' "$src" | sed 's/#.*//' \
-         | grep -qE "${READERS}|${HELPERS}|<[[:space:]]*\"\\\$f\""; then
+         | grep -qE "${READERS}|${HELPERS}|${REDIR}"; then
       echo "$fn reads the live file's content — only _mi_conf_snap may" >&2; return 1
     fi
   done

@@ -505,7 +505,7 @@ mi_conf_product_path() {
 # rewrites the CLI. Link count > 1 on a file this installer created is unexplainable, not merely
 # suspicious — so refuse outright rather than trying to identify the other name.
 _mi_conf_identity_ok() {
-  local f="$1" links
+  local f="$1" links owner me
   if [ -L "$f" ]; then
     mi_warn "config: $f is a symlink — refusing (a config file must be its own file)"
     return 1
@@ -522,6 +522,33 @@ _mi_conf_identity_ok() {
   case "$links" in ''|*[!0-9]*) mi_warn "config: cannot read the link count of $f — refusing"; return 1 ;; esac
   if [ "$links" -gt 1 ]; then
     mi_warn "config: $f has $links names (hardlinked) — refusing; this installer created it and nothing legitimate shares its inode"
+    return 1
+  fi
+
+  # OWNERSHIP. This closes a gap the plan did not ask for: §4.5/D60 fixes owner=operator, and
+  # mi_conf_product_add's own comment ASSERTS it ("owner=operator, 0660, group = …") while nothing
+  # verified it. The check makes the assertion true.
+  #
+  # The failure it closes is concrete. On a rootful container runtime with no userid remapping, a
+  # compromised container does `chown 0:0 <product>.conf; chmod 0666`. Every check above still passes
+  # — it is a regular file, with one name, and not a symlink — so the host reads it, accepts it, and
+  # the content write SUCCEEDS because the file is world-writable. Only the chgrp and chmod
+  # afterwards fail (EPERM: we are not the owner), so the function returns a generic refusal having
+  # already rewritten a file it does not own, and leaves it root-owned and world-writable for any
+  # local user to steer that product's settings with.
+  #
+  # `ls -ldn` prints the NUMERIC uid in field 3 on both GNU and BSD — verified on GNU coreutils 9.7
+  # and macOS /bin/ls, including with the `@`/`+` mode suffixes BSD appends, which stay inside field
+  # 1 and shift nothing. A `stat` format string is not portable and `find -printf` is GNU-only.
+  # shellcheck disable=SC2012   # parsing ls is deliberate here; see the link-count note above
+  owner="$(ls -ldn "$f" | awk 'NR==1{print $3}')"
+  me="$(id -u)"
+  # Guarded exactly like the link count: an unreadable identity is a refusal, never an assumption
+  # that the file is ours.
+  case "$owner" in ''|*[!0-9]*) mi_warn "config: cannot read the owner of $f — refusing"; return 1 ;; esac
+  case "$me"    in ''|*[!0-9]*) mi_warn "config: cannot read our own uid — refusing to trust $f"; return 1 ;; esac
+  if [ "$owner" != "$me" ]; then
+    mi_warn "config: $f is owned by uid $owner, not by you (uid $me) — refusing; this installer created it and nothing legitimate takes it over"
     return 1
   fi
   return 0
@@ -708,8 +735,15 @@ mi_conf_product_add() {
   fi
   local product="$1" spec="$2" gid="$3"; shift 3
   case "$gid" in ''|*[!0-9]*) mi_warn "config: '$gid' is not a numeric group id"; return 1 ;; esac
-  mi_lock_assert_held "write ${product}.conf"
+  # Resolve the path BEFORE asserting the lock, because resolving it is what VALIDATES the product
+  # name. Asserted first, an unvalidated name is interpolated verbatim into the one message the design
+  # calls the sole authorization refusal — "refusing to write ../../evil.conf without holding the
+  # family lock". Nothing constructs a path from it, so that is cosmetic, but it is the wrong text in
+  # the wrong message. Validating first costs nothing and hides nothing: mi_conf_product_path is a
+  # pure function of its argument — no file access, no side effect — so this is the same
+  # check-your-arguments-before-acting discipline every other function in this module follows.
   local f; f="$(mi_conf_product_path "$product")" || return 1
+  mi_lock_assert_held "write ${product}.conf"
   _mi_conf_identity_ok "$f" || return 1
 
   # Validate EVERY pair before touching the file, so a rejected call leaves nothing behind.
@@ -750,7 +784,11 @@ mi_conf_product_add() {
   # mi_conf_product_load and then re-reading $f would validate one file and rewrite another: a
   # container that swaps the file in that gap gets its content hashed and re-blessed with a valid
   # marker by the host. Read once; never look at the live file again.
-  local rc=0 existing="" snap="" body="" line pre=""
+  # `line` used to be declared here too. It was a leftover from a `while read` loop this function no
+  # longer has — shellcheck does not flag an unused bare `local`, so it had to go by hand.
+  # `orig` and `had` serve the no-op check further down: `orig` is the pre-merge body and `had` says
+  # we actually hold one, so "nothing changed" can be decided from bytes already in hand.
+  local rc=0 existing="" snap="" body="" pre="" orig="" had=0
   if [ -e "$f" ]; then
     snap="$(_mi_conf_snap "$f")" || return 1
     if existing="$(_mi_conf_snap_load "$snap" "$f" "$spec" 2>/dev/null)"; then rc=0; else rc=$?; fi
@@ -776,6 +814,7 @@ mi_conf_product_add() {
       return 1
     fi
     body="${raw%X}"
+    orig="$body"; had=1          # keep the PRE-MERGE body: the no-op check below compares against it
     # The snapshot is byte-identical to the file (it is under the size ceiling, or we refused), so
     # its digest is the file's digest as of the read. Captured before the snapshot is released.
     pre="$(mi_digest "$snap")" || { rm -f "$snap"; mi_warn "config: cannot digest the read buffer"; return 1; }
@@ -819,6 +858,20 @@ mi_conf_product_add() {
     return 1
   fi
 
+  # Re-check identity immediately before we MUTATE anything — which means before the create as well as
+  # before the write. This check used to sit below the creation block, so the one mutating step it did
+  # not cover was the create: a dangling symlink planted at $f just before it made this function
+  # create a 0-byte file THROUGH the link, at a path of the attacker's choosing, and only then refuse.
+  #
+  # The check at the top of this function happened several reads ago, and a pathname check is only ever
+  # true of the moment it ran: §4.1a records "pathname TOCTOU" as an ACCEPTED, irreducible residual for
+  # a shell installer — "a property of checking a path and then using it", closable only with fd- or
+  # mount-namespace-based I/O, which portable bash does not have. This does not close the window; it
+  # makes it as small as the language allows across BOTH mutations, which is what §4.1a asks for. The
+  # family lock already excludes every other mythical-ctl process, so the remaining racer is a local
+  # process running as the operator.
+  _mi_conf_identity_ok "$f" || return 1
+
   # Create the file at 0600 BEFORE any content lands, so a new file is never briefly world- or
   # group-readable at the process umask. Only for a file that does not exist yet: for an existing
   # one this would be a second write, widening the tear window for no gain.
@@ -828,18 +881,27 @@ mi_conf_product_add() {
     fi
   fi
 
-  # Re-check identity immediately before the write. The check at the top of this function happened
-  # several reads ago, and a pathname check is only ever true of the moment it ran: §4.1a records
-  # "pathname TOCTOU" as an ACCEPTED, irreducible residual for a shell installer — "a property of
-  # checking a path and then using it", closable only with fd- or mount-namespace-based I/O, which
-  # portable bash does not have. This does not close the window; it makes it as small as the
-  # language allows, which is what §4.1a asks for. The family lock already excludes every other
-  # mythical-ctl process, so the remaining racer is a local process running as the operator.
-  _mi_conf_identity_ok "$f" || return 1
-
+  # A pure CONTENT no-op does not touch the bytes. Re-installing means calling this with the values the
+  # file already holds, so this is the ORDINARY path, not an edge case — and truncate-and-rewrite there
+  # is a real cost for zero content change: the file is bind-mounted as a SINGLE FILE, so a
+  # concurrently reading container can observe the truncated intermediate state. mi_conf_family_add
+  # already returns before writing in this case; now both writers mean the same thing by "no-op
+  # success".
+  #
+  # Decided from bytes we ALREADY HOLD, never by re-opening the live file — that would reintroduce the
+  # content race this function is arranged to close, and the structural test forbids it. `orig` is the
+  # snapshot's pre-merge body; when the merge appended nothing, `sum` is by construction the digest the
+  # snapshot's own marker line already carried (_mi_conf_snap_load proved it matched), so body plus
+  # marker is byte-for-byte the file that is already on disk.
+  #
+  # The chgrp/chmod below are deliberately NOT skipped. rc 5's documented repair is "sort the group out
+  # and run again", and a retry's merge is a complete no-op — so skipping the ownership block here
+  # would make rc 5 unrepairable.
+  if [ "$had" -eq 1 ] && [ "$body" = "$orig" ]; then
+    : # byte-identical: leave the bytes, the inode and the mtime exactly as they are
   # One redirection: truncate and write in a single open, so the tear window is as small as a
   # non-atomic write can be. The marker is last, so a crash leaves it stale rather than wrong.
-  if ! printf '%s%s%s\n' "$body" "$MI_CONF_MARKER_PREFIX" "$sum" > "$f"; then
+  elif ! printf '%s%s%s\n' "$body" "$MI_CONF_MARKER_PREFIX" "$sum" > "$f"; then
     mi_warn "config: cannot write $f"; return 1
   fi
 
@@ -854,11 +916,23 @@ mi_conf_product_add() {
   # at all. The library states the fact and returns a distinguishable status; whether that is fatal
   # is the calling verb's decision (Plan 4), not a library default. See "Decisions" item 5 for the
   # gap in D60 this exposes.
+  #
+  # Both chmod failures below return 5, NOT 1, and the reason is the rc contract rather than taste. By
+  # this point the bytes are COMMITTED — the content write has landed and the marker is valid — whereas
+  # every other rc 1 in this module means "refused, and the file was left untouched". rc 5 is precisely
+  # "written, but not to D60's spec", which is exactly what an unset mode is. Returning 1 here told a
+  # Plan 4 caller keying on that documented distinction the opposite of the truth.
   if chgrp "$gid" "$f" 2>/dev/null; then
-    chmod 660 "$f" || { mi_warn "config: cannot set mode on $f"; return 1; }
+    if ! chmod 660 "$f"; then
+      mi_warn "config: wrote $f and set the family group $gid, but could not set mode 0660 on it."
+      return 5
+    fi
     return 0
   fi
-  chmod 600 "$f" || { mi_warn "config: cannot set mode on $f"; return 1; }
+  if ! chmod 600 "$f"; then
+    mi_warn "config: wrote $f, but could not set the family group $gid OR mode 0600 on it."
+    return 5
+  fi
   mi_warn "config: wrote $f, but could not set the family group $gid on it."
   mi_warn "  It is mode 0600. The product's own settings screen will be READ-ONLY until the group is set."
   return 5
