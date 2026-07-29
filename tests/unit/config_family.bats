@@ -187,6 +187,21 @@ EOF
   [[ "$output" == *"family lock"* ]]
 }
 
+# The shared lock proof holds its own callers to the same arity discipline every public function here
+# applies. Under `set -u` an unguarded `local what="$1"` aborts with bash's raw "unbound variable"
+# instead of a refusal naming the problem — from the one function that authorizes every mutating
+# write. It fails closed either way; this asserts the diagnostic survives too.
+@test "mi_lock_assert_held refuses a no-argument call in its own words" {
+  run bash -c 'set -euo pipefail
+    for m in common layout config lock ledger; do source "'"$_MCTL_ROOT"'/lib/$m.sh"; done
+    export MI_LOCK_TOKEN=whatever
+    mi_lock_assert_held; echo UNREACHABLE'
+  [ "$status" -ne 0 ]
+  [[ "$output" != *UNREACHABLE* ]]
+  [[ "$output" != *"unbound variable"* ]]
+  [[ "$output" == *"naming the operation"* ]]
+}
+
 @test "the ledger's lock refusal is unchanged by the extraction" {
   mi_lock_release
   run bash -c 'set -euo pipefail

@@ -139,6 +139,19 @@ mi_lock_release() {
 # <what> completes the sentence "refusing to <what> without holding the family lock", so callers
 # name their own operation and the message stays specific.
 mi_lock_assert_held() {
+  # Arity BEFORE any positional expansion, the same discipline every public function in this codebase
+  # applies — and it matters most here, in the function this comment calls the ONLY authorization for
+  # a mutating write. Under the entrypoint's `set -u`, `local what="$1"` on a no-argument call aborts
+  # with bash's raw "unbound variable"; without errexit it produces "refusing to  without holding the
+  # family lock", a garbled message from a security primitive. It fails closed either way — what is
+  # lost is the diagnostic, and this is shared code a future caller will get wrong.
+  #
+  # `mi_die`, not `mi_warn` + `return 1`: this function's contract is that it never returns when
+  # authorization is absent. A caller that neglected to check a returned status would carry on and
+  # write unauthorized, so a refusal that can be ignored would be a real regression.
+  if [ "$#" -ne 1 ]; then
+    mi_die "mi_lock_assert_held needs a <what> naming the operation it is guarding"
+  fi
   local what="$1" lf ltok=""
   lf="$(_mi_lock_file)"
   if [ -f "$lf" ]; then
