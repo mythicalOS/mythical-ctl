@@ -216,7 +216,11 @@ _mi_conf_type_ok() {
       # Docker network name: [A-Za-z0-9] then [A-Za-z0-9_.-]*. Additionally refuse the two special
       # modes §4b.2 bans from mythical.conf — `host` shares the host network namespace outright, and
       # `container:<name>` joins another container's. Neither is a network this installer may own.
-      [ -n "$v" ] && [ "${#v}" -le 128 ] || return 1
+      # An `if`, not `A && B || C`: shellcheck 0.11 does not flag that construct but the version CI
+      # installs does (SC2015), and this repository already shipped three red commits on exactly
+      # this pattern (828a199). The logic happens to be right either way — C runs when B fails,
+      # which is what we want — but the line does not say so, and an `if` does.
+      if [ -z "$v" ] || [ "${#v}" -gt 128 ]; then return 1; fi
       case "$v" in
         host|none|container:*) return 1 ;;
       esac
