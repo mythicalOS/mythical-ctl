@@ -4,7 +4,9 @@
 
 _MCTL_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
-setup() {
+# The isolation itself, callable by name. A suite that needs its own setup() MUST call this first —
+# bats does not chain setup(), so defining one in a suite REPLACES the hook below.
+setup_test_env() {
   MYTHICAL_HOME="$(mktemp -d)"
   export MYTHICAL_HOME
   # Fake-runtime state lives OUTSIDE MYTHICAL_HOME, or its bookkeeping (calls.log, volume
@@ -17,10 +19,14 @@ setup() {
   export PATH
 }
 
-teardown() {
+teardown_test_env() {
   [ -n "${MYTHICAL_HOME:-}" ] && rm -rf "$MYTHICAL_HOME"
   [ -n "${FAKE_DOCKER_STATE:-}" ] && rm -rf "$FAKE_DOCKER_STATE"
+  return 0
 }
+
+setup()    { setup_test_env; }
+teardown() { teardown_test_env; }
 
 # Run the CLI under test, capturing status+output into bats' $status/$output.
 run_mctl() { run "${_MCTL_ROOT}/bin/mythical-ctl" "$@"; }
@@ -29,7 +35,7 @@ run_mctl() { run "${_MCTL_ROOT}/bin/mythical-ctl" "$@"; }
 # tests run before later tasks have created their modules (e.g. Task 2 has no lock.sh yet).
 load_mctl() {
   local m f
-  for m in common layout lock ledger; do
+  for m in common layout config lock ledger; do
     f="${_MCTL_ROOT}/lib/${m}.sh"
     # shellcheck disable=SC1090
     [ -f "$f" ] && source "$f"
