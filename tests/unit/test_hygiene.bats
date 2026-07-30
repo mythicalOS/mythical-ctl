@@ -40,7 +40,7 @@ setup() { setup_test_env; }
 # reported a clean suite while missing a real decorative assertion.
 #
 # Which is why the first test exists: the detector is run against a fixture with known answers, so it
-# cannot report clean on the real suites without first proving it catches all eight shapes.
+# cannot report clean on the real suites without first proving it catches all ten shapes.
 
 # Emit "file:line: statement" for every unguarded `[[ … ]]` assertion in the given .bats files.
 # Continuation lines are joined first: `[[ … ]] \` + `|| { … }` is CORRECT, and a scanner that judged
@@ -57,7 +57,7 @@ _scan_bats() {
     #                          `true`, so the assertion is not the deciding command and is decorative.
     #                          Exempting it because its LINE was last is exactly the miss that got
     #                          through round 5.
-    function flush_stmt(   j, m, semis, seg, k, q, parts, part, cond) {
+    function flush_stmt(   j, m, semis, seg, k, q, parts, part, cond, r, t, ors, op) {
       if (pending == "") return
       m = split(pending, semis, ";")
       for (j = 1; j <= m; j++) {
@@ -75,7 +75,18 @@ _scan_bats() {
           part = parts[k]
           sub(/^[ \t]+/, "", part); sub(/[ \t]+$/, "", part)
           if (part == "") continue
-          sn++; sseg[sn] = part; sln[sn] = pending_ln; sfull[sn] = pending; scond[sn] = cond
+          # And on `||`, for symmetry. An assertion on the RIGHT of an or-list — `false || [[ f ]]` —
+          # is decorative for the same reason as one in the middle of an and-list. What distinguishes
+          # it from a SOUND `[[ f ]] || handler` is position: part 1 of a multi-part or-list has its
+          # fallback to the right of it, so it does fail. Any later part does not.
+          r = split(part, ors, "\\|\\|")
+          for (t = 1; t <= r; t++) {
+            op = ors[t]
+            sub(/^[ \t]+/, "", op); sub(/[ \t]+$/, "", op)
+            if (op == "") continue
+            sn++; sseg[sn] = op; sln[sn] = pending_ln; sfull[sn] = pending; scond[sn] = cond
+            sguard[sn] = (t == 1 && r > 1)
+          }
         }
       }
       pending = ""
@@ -87,7 +98,7 @@ _scan_bats() {
                     # one whose status bats takes as the result.
                     for (i = 1; i < sn; i++) {
                       if (scond[i]) continue                                # inside an if/while condition
-                      if (sseg[i] ~ /\|\|/) continue                         # has a fallback: it fails
+                      if (sguard[i]) continue                               # has a `||` fallback to its right
                       if (sseg[i] ~ /^(if|while|until|elif|!)[ \t]/) continue  # a condition, not an assertion
                       if (sseg[i] ~ /^\[\[/) printf "%s:%d: %s\n", FILENAME, sln[i], sfull[i]
                     }
@@ -148,6 +159,8 @@ _bodies_seen() { sed -n 's/^BODIES=//p' "$MYTHICAL_HOME/bodies"; }
     printf '%s\n' '@test "bad 7: semicolon-hash pseudo-continuation" {' "  $A;# explanation \\" \
                   '  true || :' '  true' '}'
     printf '%s\n' '@test "bad 8: intermediate command of an and-list" {' "  true && $A && true" '  true' '}'
+    printf '%s\n' '@test "bad 9: right side of an or-list" {' "  false || $A" '  true' '}'
+    printf '%s\n' '@test "bad 10: right side of an or-list, inline" {' "  false || $A; true" '}'
     printf '%s\n' '@test "good 5: and-list whose condition really is a condition" {' \
                   "  if $A && $A; then true; fi" '  true' '}'
     printf '%s\n' '@test "good 1: guarded" {' "  $A || { echo boom >&2; return 1; }" '  true' '}'
@@ -160,8 +173,8 @@ _bodies_seen() { sed -n 's/^BODIES=//p' "$MYTHICAL_HOME/bodies"; }
   out="$(_scan_bats "$fx")"
 
   found="$(printf '%s\n' "$out" | grep -c . )"
-  [ "$found" -eq 8 ] \
-    || { echo "expected exactly 8 findings, got $found:" >&2; echo "$out" >&2; return 1; }
+  [ "$found" -eq 10 ] \
+    || { echo "expected exactly 10 findings, got $found:" >&2; echo "$out" >&2; return 1; }
   case "$out" in
     *'== "b" ]]'*) : ;;
     *) echo "findings do not name the offending statement: $out" >&2; return 1 ;;
@@ -172,8 +185,8 @@ _bodies_seen() { sed -n 's/^BODIES=//p' "$MYTHICAL_HOME/bodies"; }
   case "$out" in
     *'if [['*) echo "the scanner flagged a condition, not an assertion: $out" >&2; return 1 ;;
   esac
-  [ "$(_bodies_seen)" -eq 13 ] \
-    || { echo "the scanner saw $(_bodies_seen) bodies in a 13-test fixture" >&2; return 1; }
+  [ "$(_bodies_seen)" -eq 15 ] \
+    || { echo "the scanner saw $(_bodies_seen) bodies in a 15-test fixture" >&2; return 1; }
 }
 
 @test "no test asserts with a bare [[ ]] that bash 3.2 cannot fail on" {
