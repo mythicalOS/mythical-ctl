@@ -198,6 +198,55 @@ J='{"product":"brokkr","version":"0.1.13","ui_url":"http://localhost:7480/","com
   [ "$(mi_detect_field "$(cat "$f")" product)" = "ok" ]
 }
 
+# The scanner accumulates a bare literal one character at a time and only checks for its terminator
+# (a comma or the closing brace) WITHIN the current awk record (line). A raw LF inside
+# `true`/`false`/`null`/a number is invalid JSON -- whitespace may only separate tokens, never sit
+# inside one -- so each pair below is the SAME bytes as an already-refused case in "malformed
+# literals, delimiters and escapes are refused" above, just with a newline dropped into the middle
+# of the literal. Before this scanner terminated an in-progress literal at a record boundary, the
+# fragment before the newline and the fragment after it were validated together as though the
+# newline had never happened, so these were wrongly ACCEPTED. The equivalent case for a STRING value
+# is already refused (see "a raw LF inside a string" a few lines above `litok` in the scanner).
+@test "a raw LF inside a bare literal is refused, matching the same bytes refused on one line" {
+  local f="$BATS_TEST_TMPDIR/j"
+
+  printf '{"product":"ok","x":tru\ne}' > "$f"          # "tru"+"e" -> "true" if joined blind
+  run mi_detect_field "$(cat "$f")" product
+  [ "$status" -eq 1 ] \
+    || { echo "accepted a literal split tru|e by a raw LF: status=$status output=$output" >&2; return 1; }
+
+  printf '{"product":"ok","x":1\ne2}' > "$f"           # "1"+"e2" -> "1e2" if joined blind
+  run mi_detect_field "$(cat "$f")" product
+  [ "$status" -eq 1 ] \
+    || { echo "accepted a number split 1|e2 by a raw LF: status=$status output=$output" >&2; return 1; }
+
+  printf '{"product":"ok","x":1\n.2}' > "$f"           # "1"+".2" -> "1.2" if joined blind
+  run mi_detect_field "$(cat "$f")" product
+  [ "$status" -eq 1 ] \
+    || { echo "accepted a number split 1|.2 by a raw LF: status=$status output=$output" >&2; return 1; }
+
+  printf '{"product":"ok","x":tr\nue}' > "$f"          # "tr"+"ue" -> "true" if joined blind
+  run mi_detect_field "$(cat "$f")" product
+  [ "$status" -eq 1 ] \
+    || { echo "accepted a literal split tr|ue by a raw LF: status=$status output=$output" >&2; return 1; }
+}
+
+# The regression the fix above most plausibly causes: a bare literal is legitimately followed by
+# whitespace INCLUDING a newline in ordinary pretty-printed JSON, most commonly when it is the last
+# member of the object and the closing brace sits on the next line with no trailing comma. That
+# newline must still terminate and VALIDATE the literal (exactly like the in-record space/tab/CR
+# case just above it in the scanner), not refuse the document outright -- refusing here would be
+# strictly more broken than the defect this fix closes. Every field is read to prove the whole
+# document parsed cleanly: if the fix wrongly refused the response, `product`/`version`/`ui_url`
+# would fail too, not just the literal-valued fields.
+@test "a pretty-printed response ending each member, including bare literals, on its own line still reads" {
+  local resp
+  resp="$(printf '{\n  "product": "ok",\n  "version": "1.0",\n  "ui_url": "http://x",\n  "n": 3,\n  "b": true,\n  "z": null\n}')"
+  [ "$(mi_detect_field "$resp" product)" = "ok" ]
+  [ "$(mi_detect_field "$resp" version)" = "1.0" ]
+  [ "$(mi_detect_field "$resp" ui_url)" = "http://x" ]
+}
+
 @test "well-formed responses with every value kind still read" {
   [ "$(mi_detect_field '{"product":"a","n":123,"o":{"k":"v"},"arr":[1,2],"b":true,"z":null}' product)" = "a" ]
   [ "$(mi_detect_field '{"a":{"product":"nested"},"product":"top"}' product)" = "top" ]

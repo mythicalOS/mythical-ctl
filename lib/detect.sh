@@ -65,6 +65,14 @@ _mi_detect_toplevel() {
     }
     {
       if (NR > 1 && instr) { err = 1 }        # a raw LF inside a string
+      # A raw LF ending a record while a bare literal is mid-flight is JSON whitespace between
+      # tokens (valid) if what came before it is already a complete literal, and a malformed split
+      # otherwise -- so, unlike the string case above, this cannot be a blind refusal: it must
+      # validate/terminate exactly like the in-record whitespace branch below does, or a routine
+      # pretty-printed `true`/`false`/`null`/number on its own line, closed on the NEXT line, would
+      # start failing. Left alone, the token instead survives untouched into the new record and
+      # gets validated as though the newline had never happened -- the defect this guards against.
+      if (NR > 1 && st == 4) { if (!litok(lit)) err = 1; lit = ""; st = 3 }
       n = length($0)
       for (i = 1; i <= n; i++) {
         c = substr($0, i, 1)
