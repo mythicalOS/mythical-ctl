@@ -190,6 +190,15 @@ _mi_doc_type_ok() {
       if [ "${#repo}" -gt 255 ]; then return 1; fi     # an `if`, not A && B || C (A6)
       case "$repo" in *[!a-z0-9._/:-]*) return 1 ;; esac
       case "$repo" in /*|:*|*/|*:) return 1 ;; esac
+      # A repeated or adjacent separator brackets an EMPTY component — `a//b` is a repository with a
+      # blank segment between two slashes, `repo::5000/name` a blank host before the port, `a:/b` a
+      # blank port. None of these is a valid OCI/Docker repository reference even though every
+      # individual byte is inside the charset above, so the charset check alone accepts them. The
+      # digest half still pins the content either way, but a manifest naming one of these would pass
+      # validation here and only fail once something tries to actually run the image — a worse place
+      # to discover it than at the door. Checked as adjacent PAIRS, not lone separators, so a
+      # legitimate `host:port/path` (one `:` then, later, unrelated `/`s) is untouched.
+      case "$repo" in *'//'*|*'::'*|*':/'*|*'/:'*) return 1 ;; esac
       _mi_doc_type_ok sha256 "$hex" ;;
     productdigest)
       # <product>:<64 hex> — the family index's flat encoding of "this product's manifest must

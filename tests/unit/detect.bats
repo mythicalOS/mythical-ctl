@@ -162,6 +162,35 @@ J='{"product":"brokkr","version":"0.1.13","ui_url":"http://localhost:7480/","com
   [ "$(mi_detect_field "$(printf '{\n  "product" : "a" ,\n  "n" : 1\n}')" product)" = "a" ]
 }
 
+# MI_DETECT_MAXBYTES bounds the response in the SHELL, before a single byte reaches the awk scanner
+# — see the constant's own comment in lib/detect.sh for why: under BSD awk (macOS's /usr/bin/awk,
+# a first-class target), the scanner's per-character token accumulation is quadratic in the length of
+# the value being read, so an unbounded response lets a misbehaving or hostile product stall the
+# installer. Built with the bash `printf '%*s'` builtin plus `tr`, not brace expansion or `seq` —
+# both are external-tool-free, portable, and the size tracks the constant rather than a hardcoded
+# literal that could silently stop being "one over the cap" if the constant ever changes.
+@test "a response over the byte cap is refused before parsing, and the message names the cap" {
+  local n=$((MI_DETECT_MAXBYTES + 1))
+  local big; big="$(printf '%*s' "$n" '' | tr ' ' 'a')"
+  local j="{\"product\":\"x\",\"version\":\"${big}\"}"
+  [ "${#j}" -gt "$MI_DETECT_MAXBYTES" ]   # the fixture itself must be over the cap, or this proves nothing
+  run mi_detect_field "$j" version
+  [ "$status" -eq 1 ] || { echo "an over-cap response was not refused: status=$status output=$output" >&2; return 1; }
+  [[ "$output" == *"$MI_DETECT_MAXBYTES"* ]] \
+    || { echo "output does not name the cap $MI_DETECT_MAXBYTES: $output" >&2; return 1; }
+}
+
+@test "a response exactly at the byte cap is still read" {
+  local j0='{"product":""}'
+  local overhead=${#j0}   # the fixed bytes around the value, measured rather than hand-counted
+  local pad=$((MI_DETECT_MAXBYTES - overhead))
+  local val; val="$(printf '%*s' "$pad" '' | tr ' ' 'a')"
+  local j="{\"product\":\"${val}\"}"
+  [ "${#j}" -eq "$MI_DETECT_MAXBYTES" ] \
+    || { echo "fixture is ${#j} bytes, not exactly the $MI_DETECT_MAXBYTES cap" >&2; return 1; }
+  [ "$(mi_detect_field "$j" product)" = "$val" ]
+}
+
 # --- D10: the deprecated alias ---
 
 @test "version is preferred, and image_version is the fallback" {

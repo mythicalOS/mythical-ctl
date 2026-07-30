@@ -328,6 +328,28 @@ HEXB='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
   [ "$status" -eq 0 ] || { echo "rejected a legitimate registry:port repository: $output" >&2; return 1; }
 }
 
+# A repeated or adjacent separator brackets an EMPTY repository component: `a//b` has a blank
+# segment between the two slashes, `repo::5000/name` a blank host, `a:/b` a blank port. Every byte
+# in each is individually inside the charset, and none starts or ends on a separator, so neither
+# earlier gate catches these — this is the gate that must. None is a valid OCI/Docker repository
+# reference, even though the digest still pins the content either way.
+@test "digestref's repository component rejects empty segments: //, ::, and : adjacent to /" {
+  local spec; spec="$(printf 'ref\tdigestref\topt')"
+  local v
+  for v in 'registry.example//team/brokkr' 'repo::5000/name' 'a//b' 'a::b' 'a:/b' 'a/:b'; do
+    doc "ref=${v}@sha256:${HEXA}"
+    run mi_doc_load "$F" manifest "$spec"
+    [ "$status" -eq 1 ] || { echo "accepted a repository with an empty component: '$v'" >&2; return 1; }
+  done
+  # The legitimate shapes this gate must NOT touch — a single '/' and a single 'host:port' ':' are
+  # both still accepted, because only ADJACENT-pair separators are rejected, not lone ones.
+  for v in 'ghcr.io/example/brokkr' 'registry.example.com:5000/team/brokkr' 'r'; do
+    doc "ref=${v}@sha256:${HEXA}"
+    run mi_doc_load "$F" manifest "$spec"
+    [ "$status" -eq 0 ] || { echo "rejected a legitimate repository '$v': $output" >&2; return 1; }
+  done
+}
+
 @test "productdigest requires <product>:<64 hex>, exactly one colon" {
   local spec; spec="$(printf 'pd\tproductdigest\topt')"
   doc "pd=brokkr:${HEXA}"

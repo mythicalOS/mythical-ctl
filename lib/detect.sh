@@ -14,6 +14,36 @@
 
 MI_DETECT_UNKNOWN=unknown
 
+# Whole-response byte ceiling, checked in the SHELL by mi_detect_field BEFORE a single byte reaches
+# _mi_detect_toplevel's awk scanner.
+#
+# The scanner accumulates the current string token one character at a time (`tok = tok c`, in the
+# string-state branch below). Under GNU awk that append is amortised O(1) and the whole scan is O(n)
+# in the length of the response. Under BSD awk — /usr/bin/awk on macOS, a first-class target for this
+# installer, not a fallback — string concatenation re-copies the whole accumulated token on every
+# character, so the SAME scan is O(n^2). Measured on this worktree, under
+# `env -i PATH=/usr/bin:/bin HOME="$HOME" /bin/bash --noprofile --norc -c '…'` (BSD awk):
+#
+#   value length  25000 ->    66 ms
+#   value length  50000 ->   182 ms   (2.8x for 2x input)
+#   value length 100000 ->   614 ms   (3.4x)
+#   value length 200000 ->  2496 ms   (3.8x)
+#
+# — roughly quadrupling per doubling, so an unbounded ~1 MiB response costs on the order of a minute.
+# The SAME measurement under GNU awk (the default on this machine's ordinary PATH) is flat: 55 ms at
+# 25000, 114 ms at 200000. That gap is exactly why this must be bounded here rather than left as a
+# per-token cap inside the awk program: a cap inside awk would only hide the defect on whichever awk
+# happens to be on PATH, and this installer ships to both. A length check in the calling shell, before
+# awk ever starts, bounds the work regardless of which awk is present.
+#
+# /detect's response is a live HTTP reply from a product container: three short flat strings
+# (`product`, `version`, `ui_url`) plus whatever else a product chooses to include. 32768 (32 KiB) is
+# generous enough that no real response comes close, and cheap even at the cap itself — a response
+# exactly this size measured 92 ms under the same BSD-awk harness above, indistinguishable from any
+# other bounded local computation. The input is an HTTP response from a product container, so without
+# this bound a misbehaving or hostile product could stall the installer for as long as it liked.
+MI_DETECT_MAXBYTES=32768
+
 # Emit one record per DEPTH-1 member: `key<TAB>flag<TAB>value`, where flag is
 #   s = a plain string value we can read       e = a string we cannot read verbatim (any escape,
 #   x = a value that is not a plain string          or a raw control byte)
@@ -128,6 +158,13 @@ mi_detect_field() {
   local json="$1" field="$2" recs hits flag val
   local LC_ALL=C
   case "$field" in ''|*[!a-z0-9_]*) mi_warn "detect: '$field' is not a field name"; return 1 ;; esac
+
+  # Bounded HERE, before a single byte reaches the awk scanner — see MI_DETECT_MAXBYTES above for
+  # why the scan itself cannot be trusted to stay cheap regardless of size.
+  if [ "${#json}" -gt "$MI_DETECT_MAXBYTES" ]; then
+    mi_warn "detect: the response is ${#json} bytes, more than $MI_DETECT_MAXBYTES — refusing to parse it"
+    return 1
+  fi
 
   recs="$(_mi_detect_toplevel "$json")" || { mi_warn "detect: cannot read the response"; return 1; }
 

@@ -184,6 +184,16 @@ setup() {
 @test "an absent anchor reports rc 3, and is NOT treated as first use by mi_trust_check" {
   run mi_trust_anchor_get
   [ "$status" -eq 3 ]
+
+  # rc 3 from the getter is not, by itself, proof of the second half of this test's own name: that
+  # mi_trust_check does NOT treat an absent anchor as first use. That is a property of
+  # mi_trust_check's own anchor branch (mi_trust_check_only's three-way case on mi_trust_anchor_get),
+  # not of the getter, and nothing above exercises it. rc 4 is mi_trust_check's own, DISTINCT
+  # no-anchor code — never 0 (which first use WOULD be) and never plain 1 (an ordinary refusal) — see
+  # mi_trust_check_only's header comment for why the two are kept apart.
+  run mi_trust_check manifest:brokkr "$(mkdoc 3)"
+  [ "$status" -eq 4 ] \
+    || { echo "an absent anchor was not reported via mi_trust_check's distinct no-anchor code: status=$status output=$output" >&2; return 1; }
 }
 
 @test "the anchor round-trips and is replaceable" {
