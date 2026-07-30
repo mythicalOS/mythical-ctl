@@ -350,9 +350,27 @@ enough to find top-level members and tell a plain string apart from everything e
   mistaken for the top-level field of the same name — the scanner tracks brace/bracket depth
   precisely so this cannot happen, since this is the one way a naive pattern match could make the
   reader return a **wrong** answer instead of no answer at all.
-- Malformed document structure — unmatched or mismatched delimiters, bad member sequencing (a
-  missing comma), an invalid bare literal, an invalid escape — is refused wholesale, the same as a
-  malformed value. A response is not partially trusted.
+- Malformed document structure is refused — but **how deep that check reaches differs by kind, and
+  the difference is deliberate**, so it is worth stating exactly rather than claiming more than is
+  enforced:
+
+  | malformed structure | at the top level | inside a nested object or array |
+  |---|---|---|
+  | unmatched or mismatched delimiters | refused | **refused** |
+  | an invalid escape (`"\q"`, `"\u12"`) | refused | **refused** |
+  | an invalid bare literal (`tru`, `01`, `1e`) | refused | accepted |
+  | bad member sequencing (a missing comma) | refused | accepted |
+  | a repeated key | refused | accepted |
+
+  Delimiters and escapes are checked at **every** depth because the scanner has to track both in
+  order to know where a value ends — get either wrong and it could lose its place and report a
+  *nested* field as a top-level one, which is the single way this reader could return a wrong answer
+  instead of no answer. The other three are **not** checked inside a nested value, because doing so
+  would mean interpreting content this reader has no reason to interpret: it needs three top-level
+  flat strings, and a semantic error inside `components` neither affects them nor is any of its
+  business. This reader validates enough to guarantee *its own answer*; it is not, and does not
+  claim to be, a JSON validator. A response whose top level is well formed is answered from, even
+  if something deeper inside it is not valid JSON.
 
 **One asymmetry worth stating plainly: an escaped *key* is reported as absent, not unreadable.** A
 response containing `"product"` (which, decoded, spells `product`) is treated as not having a
