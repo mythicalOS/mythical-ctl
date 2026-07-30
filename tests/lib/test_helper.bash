@@ -35,7 +35,7 @@ run_mctl() { run "${_MCTL_ROOT}/bin/mythical-ctl" "$@"; }
 # tests run before later tasks have created their modules (e.g. Task 2 has no lock.sh yet).
 load_mctl() {
   local m f
-  for m in common layout config lock ledger doc trust policy manifest detect; do
+  for m in common layout config lock ledger doc trust policy manifest detect runtime; do
     f="${_MCTL_ROOT}/lib/${m}.sh"
     # shellcheck disable=SC1090
     [ -f "$f" ] && source "$f"
@@ -46,6 +46,19 @@ load_mctl() {
 assert_ok()       { [ "$status" -eq 0 ]  || { echo "expected exit 0, got $status: $output" >&2; return 1; }; }
 assert_fail()     { [ "$status" -eq "$1" ] || { echo "expected exit $1, got $status: $output" >&2; return 1; }; }
 assert_contains() { case "$output" in *"$1"*) : ;; *) echo "output missing '$1': $output" >&2; return 1;; esac; }
+
+# The fixture helper image's entrypoint. The probe and the copy tasks install real scripts here;
+# until then a test that needs a helper sets FAKE_HELPER_BIN itself.
+fake_helper() {
+  local body="$1" p
+  p="$(mktemp "${BATS_TEST_TMPDIR}/helper.XXXXXX")"
+  printf '#!/usr/bin/env bash\n%s\n' "$body" > "$p"
+  chmod 755 "$p"
+  FAKE_HELPER_BIN="$p"; export FAKE_HELPER_BIN
+}
+
+# A digest-pinned image reference, for fixtures that need a valid `digestref`.
+a_digestref() { printf 'ghcr.io/mythicalos/%s@sha256:%s\n' "${1:-fixture}" "$(printf 'a%.0s' $(seq 1 64))"; }
 
 # A guaranteed-dead PID for stale-lock fixtures. A literal like 999999 is NOT reliably dead — Linux
 # pid_max can exceed it — so spawn a child, reap it, and reuse its PID: reaped, and not reallocatable

@@ -26,7 +26,7 @@ END='# <<< mctl:modules <<<'
 
 # Explicit, ordered dependency list. Order is load order — `common` defines the primitives the rest
 # call, so alphabetical or glob order would be a latent bug the day a module runs code at load time.
-MODULES=(common layout config lock ledger doc trust policy manifest detect)
+MODULES=(common layout config lock ledger doc trust policy manifest detect runtime)
 
 die() { printf 'bundle: %s\n' "$*" >&2; exit 1; }
 

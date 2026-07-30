@@ -61,16 +61,21 @@ snap_fs() {
         done ) | LC_ALL=C sort > "$out"
 }
 
+# Snapshot the RUNTIME world. §10a requires every case to assert over both worlds: checking only the
+# filesystem is how "nothing partial survives" passes while leaving an orphaned volume behind.
 snap_runtime() {
-  local out="$1" state="${FAKE_DOCKER_STATE:-${MYTHICAL_HOME}/.fake-docker}"
-  if [ -d "$state/volumes" ]; then
-    ( cd "$state/volumes" && for v in *; do
-        [ -e "$v" ] || continue
-        printf 'volume\t%s\t%s\n' "$v" "$(cat "$v")"
-      done ) | LC_ALL=C sort > "$out"
-  else
-    : > "$out"
-  fi
+  local out="$1" state="${FAKE_DOCKER_STATE:-${MYTHICAL_HOME}/.fake-docker}" d f
+  : > "$out"
+  for d in volumes networks containers; do
+    [ -d "$state/$d" ] || continue
+    for f in "$state/$d"/*; do
+      [ -f "$f" ] || continue
+      case "$(basename "$f")" in *.XXXXXX*|*.tmp*|.*) continue ;; esac
+      # One line per object, every recorded field sorted, so a diff names the field that changed.
+      printf '%s\t%s\t%s\n' "${d%s}" "$(_snap_enc "$(basename "$f")")" \
+        "$(_snap_enc "$(LC_ALL=C sort "$f" | tr '\n' '|')")"
+    done
+  done | LC_ALL=C sort > "$out"
 }
 
 # Diff two snapshots. Prints the diff and returns 1 on any difference (or diff error); 0 if same.
