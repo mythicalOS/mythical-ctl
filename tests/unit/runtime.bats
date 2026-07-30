@@ -174,6 +174,31 @@ pulled_image() {
   [ "$(printf '%s\n' "$output" | wc -l | tr -d ' ')" = 2 ]
 }
 
+@test "the family network is created with an EXPLICIT bridge driver (D29)" {
+  # `--driver bridge` is a security guard, and the ordinary assertion cannot pin it: `bridge` is
+  # ALREADY the daemon's default, so a network created with the flag and one created without it look
+  # identical. Deleting the flag would leave `n.driver` reporting `bridge` and the suite green —
+  # which is how the flag came to be untestable in the first place.
+  #
+  # So the second half of this test asks the question the guard exists to answer. D29's stated threat
+  # is "a daemon-level default change silently removes the NAT wall"; the fake is told to default to
+  # something that is not a NAT bridge, and the adapter's network must STILL be a bridge, which it can
+  # only be if the adapter named the driver itself.
+  local net other
+  net="$(mi_rt_network_create mythical-i1-net i1 n-nonce)"
+  run mi_rt_inspect network n.driver "$net"
+  [ "$status" -eq 0 ]
+  [ "$output" = "bridge" ] \
+    || { echo "the family network's driver is '$output', not bridge" >&2; return 1; }
+
+  export FAKE_DOCKER_NET_DEFAULT_DRIVER=macvlan   # a daemon whose default is not a NAT bridge
+  other="$(mi_rt_network_create mythical-i2-net i2 n-nonce)"
+  unset FAKE_DOCKER_NET_DEFAULT_DRIVER
+  run mi_rt_inspect network n.driver "$other"
+  [ "$output" = "bridge" ] \
+    || { echo "with a non-bridge daemon default the family network came out '$output' — the adapter is relying on the default, not naming the driver" >&2; return 1; }
+}
+
 @test "image pull failures are distinguishable" {
   # DISTINGUISHABLE is the claim, so the registry's own words are what gets asserted. Checking only
   # `-ne 0` per outcome is satisfied by an implementation that folds all three into one generic

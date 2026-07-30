@@ -16,11 +16,27 @@
 #     pull pass its tests and fail against a real daemon.
 #   * `--mount type=bind` REFUSES a source that does not exist — the documented reason the adapter
 #     uses `--mount` rather than `-v`, which silently creates one.
+#   * A `--network` value is RESOLVED against the networks this fake actually has, and the attachment
+#     is recorded under the network's ID — never under the name it was reached by.
+#   * `network create` records the driver it was ASKED for, so `--driver bridge` is a flag a test can
+#     observe rather than one the fake assumes.
 #
 # Knobs: FAKE_DOCKER_DOWN, FAKE_DOCKER_SERVER_VERSION, FAKE_DOCKER_ROOTLESS,
 #        FAKE_DOCKER_CONTEXT_HOST, FAKE_DOCKER_PULL, FAKE_DOCKER_NET_DUPLICATE,
-#        FAKE_DOCKER_NET_DRIVER, FAKE_DOCKER_NET_THI, FAKE_DOCKER_HELPER_FAIL,
-#        FAKE_DOCKER_CONNECT_FAIL, FAKE_DOCKER_DISCONNECT_SILENT
+#        FAKE_DOCKER_NET_DRIVER, FAKE_DOCKER_NET_DEFAULT_DRIVER, FAKE_DOCKER_NET_THI,
+#        FAKE_DOCKER_HELPER_FAIL, FAKE_DOCKER_CONNECT_FAIL, FAKE_DOCKER_DISCONNECT_SILENT
+#
+# The two driver knobs are NOT the same thing, and the difference is load-bearing:
+#
+#   FAKE_DOCKER_NET_DRIVER          OVERRIDES whatever driver was requested. It exists to FABRICATE a
+#                                   network the adapter cannot legitimately create — a macvlan or
+#                                   ipvlan one — so the preflight refusals have something to refuse.
+#                                   It has to keep winning: honouring `--driver` naively would make
+#                                   those refusals untestable, trading one fidelity gap for another.
+#   FAKE_DOCKER_NET_DEFAULT_DRIVER  the driver used when the caller passes NO `--driver` at all. It
+#                                   models D29's stated threat — a daemon whose default is not a NAT
+#                                   bridge — which is the only condition under which an EXPLICIT
+#                                   `--driver bridge` is observably different from omitting it.
 set -euo pipefail
 
 STATE="${FAKE_DOCKER_STATE:-${MYTHICAL_HOME:-/tmp}/.fake-docker}"
@@ -86,8 +102,11 @@ rec_set() {
 #     supplies an invalid name AND an unpulled image.
 #   * IMAGE REFERENCES are NOT checked here — a reference legitimately contains `/`, `:` and `@`.
 #     They are safe for a different reason: image_key() below hashes the reference instead of
-#     spelling it into a path. `--network` is likewise not checked: `container:<name>` is a real
-#     network mode, and it is not used as a path.
+#     spelling it into a path. A `--network` VALUE is not name-checked either: `container:<name>` is a
+#     real network mode, so the class does not fit it, and the value is not spelled into a path —
+#     resolve_netid() compares it against stored records and refuses anything that matches none,
+#     which is a stricter answer than this rule would give. The container half of
+#     `container:<name>` IS a path, and does go through check_name.
 #
 # The `*/*` arm is not redundant with the character class: bash pattern ranges are locale-collated,
 # so `[a-zA-Z0-9_.-]` is only approximately the set it reads as. The one character that turns a name
@@ -154,6 +173,70 @@ check_mounts() {
     src="${spec#*source=}"; src="${src%%,*}"
     [ -e "$src" ] || die "invalid mount config for type \"bind\": bind source path does not exist: $src"
   done
+}
+
+# --- networks: resolution and drivers ---
+# A real daemon RESOLVES a network reference — by ID or by name — against the networks it has, and
+# refuses one it does not. This fake required only a non-empty string, so `container create --network
+# nonexistent` and `network connect nonexistent c1` both succeeded here and are both rejected there.
+#
+# The cost is bigger than the fidelity gap. Bring-up's step 2 is "verify the container is attached to
+# exactly the EXPECTED network ID", and a fake that accepts any string as a network — and then echoes
+# that string back as the attachment — cannot fail a missing or broken ID-propagation guard. So the
+# lookup below returns the network's ID, and the attachment is recorded under THAT, never under the
+# name the caller happened to use.
+#
+# ONE lookup, used by inspect, rm, connect, create and run: `network inspect` already had this loop
+# inline, and a second copy is how two answers to "does this network exist?" start to differ.
+find_network() {
+  local key="$1" n
+  for n in "$STATE"/networks/*; do
+    [ -e "$n" ] || continue
+    if [ "$(rec_get "$n" id)" = "$key" ] || [ "$(rec_get "$n" name)" = "$key" ]; then
+      printf '%s' "$n"; return 0
+    fi
+  done
+  return 1
+}
+
+# Resolve a `--network` value the way the daemon does and echo what the attachment must be recorded
+# under. Dies (in the caller's subshell) when the network is absent.
+#
+# The PRE-DEFINED modes are deliberately accepted WITHOUT a lookup. `none`, `host`, `bridge` and
+# `container:<name>` are real values a real daemon takes, and lib/runtime.sh refuses three of them
+# itself (D26/D42) — so a fake that refused them here would be the one doing the refusing, and the
+# adapter's guard could be deleted with the suite green. That is finding 2's failure class wearing a
+# different hat, and it is why "stricter than Docker" is not automatically the safe direction.
+# `container:<name>` names a container, which a real daemon does resolve, so it is looked up.
+resolve_netid() {
+  local spec="$1" f c
+  case "$spec" in
+    bridge|host|none) printf '%s' "$spec"; return 0 ;;
+    container:*)
+      c="${spec#container:}"
+      check_name "$c" container
+      [ -e "$STATE/containers/$c" ] || die "no such container: $c"
+      printf '%s' "$spec"; return 0 ;;
+  esac
+  if f="$(find_network "$spec")"; then rec_get "$f" id; return 0; fi
+  die "network $spec not found"
+}
+
+# `--driver` was consumed and DISCARDED, and every network was recorded as bridge. So
+# `--driver bridge` — the D29 NAT wall, passed explicitly precisely because relying on a daemon
+# default for a security property is how the wall disappears without a diff — could be deleted from
+# the adapter with the entire suite still green. A guard no test can pin is decoration.
+#
+# The accepted set is the local, non-swarm one. `overlay` needs a swarm manager and `host`/`none` are
+# pre-defined networks, and a real daemon refuses both requests on an ordinary single-node host —
+# which is the only host this installer supports.
+check_driver() {
+  case "$1" in
+    ''|bridge|macvlan|ipvlan) return 0 ;;
+    host|none) die "only one instance of \"$1\" network is allowed" ;;
+    overlay)   die "This node is not a swarm manager. Use \"docker swarm init\" or \"docker swarm join\" to connect this node to swarm and try again" ;;
+    *)         die "could not find plugin $1 in v1 plugin registry: plugin not found" ;;
+  esac
 }
 
 # --- label parsing, shared by every create ---
@@ -302,18 +385,27 @@ case "${1:-}" in
     shift
     case "${1:-}" in
       create)
-        shift; name=""
+        shift; name=""; driver=""
         while [ "$#" -gt 0 ]; do
           case "$1" in
             --label) parse_label "$2"; shift 2 ;;
             --label=*) parse_label "${1#--label=}"; shift ;;
-            --driver) shift 2 ;;
+            --driver) driver="$2"; shift 2 ;;
+            --driver=*) driver="${1#--driver=}"; shift ;;
             --) shift ;;
             *) name="$1"; shift ;;
           esac
         done
         [ -n "$name" ] || die "network create: no name"
         check_name "$name" network
+        check_driver "$driver"
+        # The requested driver, then the daemon's default for an omitted flag, then the fabrication
+        # knob on top of both. Only the REQUEST goes through check_driver: FAKE_DOCKER_NET_DRIVER
+        # exists to produce a network the adapter cannot legitimately create, so validating its value
+        # against the same accept-set would defeat the one thing it is for.
+        effdrv="$driver"
+        [ -n "$effdrv" ] || effdrv="${FAKE_DOCKER_NET_DEFAULT_DRIVER:-bridge}"
+        [ -z "${FAKE_DOCKER_NET_DRIVER:-}" ] || effdrv="${FAKE_DOCKER_NET_DRIVER}"
         # D38: Docker does NOT guarantee name-conflict detection for networks, so a delayed original
         # and a reissue can both succeed with the same name AND nonce. Reproduced under the knob;
         # the second record gets a distinct on-disk key so both are listable.
@@ -327,7 +419,7 @@ case "${1:-}" in
         rec_set "$target" id "$id"
         rec_set "$target" name "$name"
         rec_set "$target" labels "$labels"
-        rec_set "$target" driver "${FAKE_DOCKER_NET_DRIVER:-bridge}"
+        rec_set "$target" driver "$effdrv"
         rec_set "$target" thi "${FAKE_DOCKER_NET_THI:-}"
         printf '%s\n' "$id"
         ;;
@@ -339,12 +431,7 @@ case "${1:-}" in
         # A network is looked up by id OR name, and both go through the same rule: the ids this fake
         # mints are 64 digits, which is inside the class.
         check_name "$key" network
-        f=""
-        for n in "$STATE"/networks/*; do
-          [ -e "$n" ] || continue
-          if [ "$(rec_get "$n" id)" = "$key" ] || [ "$(rec_get "$n" name)" = "$key" ]; then f="$n"; break; fi
-        done
-        [ -n "$f" ] || die "network $key not found"
+        f="$(find_network "$key")" || die "network $key not found"
         render "$tmpl" "$f" network
         ;;
       ls)
@@ -362,13 +449,8 @@ case "${1:-}" in
         shift; key=""
         while [ "$#" -gt 0 ]; do case "$1" in --) shift ;; *) key="$1"; shift ;; esac; done
         check_name "$key" network
-        for n in "$STATE"/networks/*; do
-          [ -e "$n" ] || continue
-          if [ "$(rec_get "$n" id)" = "$key" ] || [ "$(rec_get "$n" name)" = "$key" ]; then
-            rm -f "$n"; printf '%s\n' "$key"; exit 0
-          fi
-        done
-        die "network $key not found"
+        f="$(find_network "$key")" || die "network $key not found"
+        rm -f "$f"; printf '%s\n' "$key"
         ;;
       connect)
         shift; alias=""; gw=0; netid=""; c=""
@@ -383,7 +465,17 @@ case "${1:-}" in
         # Both arguments name a resource, and the container one becomes a path directly below.
         check_name "$netid" network
         check_name "$c" container
+        # The knob is answered BEFORE the lookup on purpose: it fabricates a daemon-side attach
+        # failure, and a fixture using it should not also have to materialise the network. Either way
+        # the command fails — the knob can only change which error a caller sees, never whether the
+        # attach happens.
         [ -z "${FAKE_DOCKER_CONNECT_FAIL:-}" ] || die "failed to connect $c to $netid"
+        # A plain lookup, NOT resolve_netid: connect takes a real network, not a network MODE.
+        # `bridge` is not a network this fake holds, and a real daemon refuses `host`/`none` here too
+        # (in its own words); the adapter refuses all three before it ever calls this
+        # (_mi_rt_netmode_ok), so the only deviation is a stricter answer for `bridge`.
+        nf="$(find_network "$netid")" || die "network $netid not found"
+        netid="$(rec_get "$nf" id)"
         f="$STATE/containers/$c"; [ -e "$f" ] || die "no such container: $c"
         nets="$(rec_get "$f" nets)"; al="$(rec_get "$f" aliases)"
         if [ "$(rec_get "$f" state)" = running ]; then a="$(addr_for "$c" "$netid")"; else a=""; fi
@@ -436,6 +528,11 @@ case "${1:-}" in
         # still leaves a container behind for the next assertion to find.
         require_image "$image"
         [ ! -e "$STATE/containers/$name" ] || die "Conflict. The container name \"/$name\" is already in use"
+        # `--network` is RESOLVED, and what comes back is the network's ID: every attachment below is
+        # recorded under that, so a caller naming the network is answered with the same id a caller
+        # naming the id is. (The relative order of these three refusals is not measured against a real
+        # daemon and is not a contract — what is, is that all of them precede the record write.)
+        netid="$(resolve_netid "$netid")" || exit 1
         check_mounts "$mounts"
         f="$STATE/containers/$name"; : > "$f"
         rec_set "$f" id "$(next_id)"
@@ -522,11 +619,12 @@ case "${1:-}" in
         # The pinned helper (D49/D54). Its result comes from the fixture image script so a test can
         # make the probe answer, fail, or be unobtainable.
         shift
-        img=""; cmd=""; rest=""; mounts=""
+        img=""; cmd=""; rest=""; mounts=""; netid=""
         while [ "$#" -gt 0 ]; do
           case "$1" in
             --rm) shift ;;
-            --network|--user|--label) shift 2 ;;
+            --network) netid="$2"; shift 2 ;;
+            --user|--label) shift 2 ;;
             --mount) mounts="${mounts}${2};"; shift 2 ;;
             --) shift; img="$1"; shift; cmd="${1:-}"; shift || true; rest="$*"; break ;;
             *) shift ;;
@@ -537,6 +635,15 @@ case "${1:-}" in
         # is now the ABSENT-IMAGE error and no longer doubles as "the fixture entrypoint is unset",
         # which is a harness misconfiguration and says so.
         require_image "$img"
+        # `run` resolves the network exactly as `create` does. A fake that is faithful in one arm and
+        # permissive in the other is the shape wave 1 already met with the image gate and wave 2 with
+        # the name rule: the guard survives, with a door beside it. The probe helper (D42 step 5) is
+        # launched onto the family network through THIS arm, so "the probe ran on a network that does
+        # not exist" has to be a failure here too. `none` — the copy container's mode (D54) — is a
+        # pre-defined mode and needs no lookup.
+        # (The resolved id is discarded: `run --rm` records no attachment for anyone to inspect, so
+        # the refusal is the whole of what this call is for.)
+        if [ -n "$netid" ]; then resolve_netid "$netid" >/dev/null || exit 1; fi
         check_mounts "$mounts"
         [ -z "${FAKE_DOCKER_HELPER_FAIL:-}" ] || die "helper: ${FAKE_DOCKER_HELPER_FAIL}"
         [ -x "${FAKE_HELPER_BIN:-}" ] || die "fake docker: FAKE_HELPER_BIN is not set to an executable fixture entrypoint"

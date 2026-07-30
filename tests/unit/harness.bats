@@ -226,6 +226,120 @@ relocate_fake_state() {
   assert_ok
 }
 
+# --- a network the daemon does not have ------------------------------------------------------------
+# `--network` and `network connect`'s first argument are RESOLVED by a real daemon, against the
+# networks it actually has. This fake required only a non-empty string, so a container could be
+# created on, and connected to, a network that exists nowhere — accepted here, refused there.
+
+@test "a container cannot be created on a network that does not exist" {
+  # MEASURED against the pre-fix fake: `container create --network nonexistent` exited 0 and recorded
+  # an attachment to a network no `network create` ever made. Two costs. The fake was more permissive
+  # than the daemon, which is the one thing it must never be; and bring-up's step 2 — "the container
+  # is attached to exactly the EXPECTED network ID" — had nothing that could fail it, so a missing or
+  # broken ID-propagation guard in a later task would read as green.
+  local net
+  docker image pull demo/img:tag >/dev/null
+  net="$(docker network create n1)"
+
+  run docker container create --name c1 --network nonexistent -- demo/img:tag
+  [ "$status" -ne 0 ] || { echo "create accepted a network that does not exist" >&2; return 1; }
+  assert_contains "network nonexistent not found"
+  [ ! -e "$FAKE_DOCKER_STATE/containers/c1" ] \
+    || { echo "the refused create still recorded a container" >&2; return 1; }
+
+  # The positive controls: a real daemon resolves the network by ID *and* by name, so both must work
+  # here or the refusal above would be indistinguishable from a create that simply stopped working.
+  run docker container create --name c1 --network "$net" -- demo/img:tag
+  assert_ok
+  run docker container create --name c2 --network n1 -- demo/img:tag
+  assert_ok
+  # And the attachment is recorded under the network's ID, never under the name it was reached by.
+  # That ID is precisely what bring-up compares against; a fake that echoed the name back would make
+  # the comparison pass for the wrong reason.
+  run docker container inspect \
+    --format '{{range $k,$v := .NetworkSettings.Networks}}{{$v.NetworkID}}={{$v.IPAddress}};{{end}}' -- c2
+  [ "$output" = "${net}=;" ] \
+    || { echo "attached as '$output', expected the network ID '${net}=;'" >&2; return 1; }
+
+  # `container run` — the helper arm, which is how the probe joins the family network (D42 step 5) —
+  # resolves the same way. A fake that is faithful in one arm and permissive in the other is a guard
+  # with a door beside it. The MESSAGE is pinned because this arm dies for a second reason anyway
+  # (no fixture entrypoint), and a status-only assertion would pass on that instead.
+  run docker container run --rm --network nonexistent -- demo/img:tag selfcheck
+  [ "$status" -ne 0 ] || { echo "run accepted a network that does not exist" >&2; return 1; }
+  assert_contains "network nonexistent not found"
+}
+
+@test "network connect refuses a network that does not exist, and attaches by ID" {
+  # The other half of the same gap: `network connect` validated only the SPELLING of its arguments
+  # (wave 2's traversal rule), never whether the network was there. Pre-fix this succeeded and left
+  # the container attached to a fabricated id.
+  local net net2
+  docker image pull demo/img:tag >/dev/null
+  net="$(docker network create n1)"
+  net2="$(docker network create n2)"
+  docker container create --name c1 --network "$net" -- demo/img:tag >/dev/null
+
+  run docker network connect --alias a --gw-priority 0 -- nonexistent c1
+  [ "$status" -ne 0 ] || { echo "connect accepted a network that does not exist" >&2; return 1; }
+  assert_contains "network nonexistent not found"
+  run docker container inspect \
+    --format '{{range $k,$v := .NetworkSettings.Networks}}{{$v.NetworkID}}={{$v.IPAddress}};{{end}}' -- c1
+  [ "$output" = "${net}=;" ] \
+    || { echo "the refused connect changed the attachments: $output" >&2; return 1; }
+
+  # Positive control, by NAME, recorded under the ID — same rule as create.
+  run docker network connect --alias a --gw-priority 0 -- n2 c1
+  assert_ok
+  run docker container inspect \
+    --format '{{range $k,$v := .NetworkSettings.Networks}}{{$v.NetworkID}}={{$v.IPAddress}};{{end}}' -- c1
+  [ "$output" = "${net}=;${net2}=;" ] \
+    || { echo "attached as '$output', expected '${net}=;${net2}=;'" >&2; return 1; }
+}
+
+@test "network create records the driver it was ASKED for, not an assumed one" {
+  # `--driver` was consumed and thrown away, and the record was written as
+  # `${FAKE_DOCKER_NET_DRIVER:-bridge}` regardless. The consequence is not cosmetic: `--driver bridge`
+  # could be DELETED from the adapter with the whole suite green, and that flag is the D29 NAT wall
+  # (the default is already `bridge`; it is passed explicitly so a daemon-level default change cannot
+  # silently remove it). A knob that answers `bridge` no matter what was asked cannot tell the two
+  # apart, so it made the guard untestable.
+  local d
+  docker network create --driver macvlan m1 >/dev/null
+  run docker network inspect --format '{{.Driver}}' -- m1
+  [ "$output" = "macvlan" ] || { echo "driver recorded as '$output', asked for macvlan" >&2; return 1; }
+  # The `--driver=<value>` spelling is the same flag.
+  docker network create --driver=ipvlan i1 >/dev/null
+  run docker network inspect --format '{{.Driver}}' -- i1
+  [ "$output" = "ipvlan" ] || { echo "driver recorded as '$output', asked for ipvlan" >&2; return 1; }
+  # No --driver at all is `bridge`, exactly as a real daemon's default is.
+  docker network create d1 >/dev/null
+  run docker network inspect --format '{{.Driver}}' -- d1
+  [ "$output" = "bridge" ] || { echo "the default driver is '$output', not bridge" >&2; return 1; }
+
+  # A driver the daemon has no plugin for is refused, and nothing is recorded.
+  run docker network create --driver bogus b1
+  [ "$status" -ne 0 ] || { echo "an unknown driver was accepted" >&2; return 1; }
+  assert_contains "bogus"
+  [ ! -e "$FAKE_DOCKER_STATE/networks/b1" ] \
+    || { echo "the refused create still recorded a network" >&2; return 1; }
+  # `host` and `none` are PRE-DEFINED networks; a real daemon refuses to create another.
+  for d in host none; do
+    run docker network create --driver "$d" "x-$d"
+    [ "$status" -ne 0 ] || { echo "network create --driver $d was accepted" >&2; return 1; }
+  done
+
+  # FAKE_DOCKER_NET_DRIVER still OVERRIDES the requested driver, and must keep doing so: it is how a
+  # test fabricates a macvlan/ipvlan network the adapter cannot legitimately create, which is what
+  # the preflight refusals are tested against. Honouring `--driver` must not cost that.
+  export FAKE_DOCKER_NET_DRIVER=macvlan
+  docker network create --driver bridge k1 >/dev/null
+  unset FAKE_DOCKER_NET_DRIVER
+  run docker network inspect --format '{{.Driver}}' -- k1
+  [ "$output" = "macvlan" ] \
+    || { echo "FAKE_DOCKER_NET_DRIVER no longer wins: got '$output'" >&2; return 1; }
+}
+
 @test "the lock file and its temps (incl. the recovery gate) are excluded from the fs snapshot" {
   load_mctl; mi_ensure_layout; mi_lock_acquire
   # A normal acquire creates no recovery/temp files, so plant the transient artifacts a stale-break
