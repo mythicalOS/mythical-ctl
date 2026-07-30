@@ -54,10 +54,81 @@ rec_set() {
   mv -f "$t" "$f"
 }
 
+# --- resource names ---
+# Docker-controlled names are used below as PATH COMPONENTS ($STATE/<kind>/<name>). Unvalidated they
+# are a traversal, MEASURED against this fake before the check existed, with $STATE two levels down
+# and a file holding 'IMPORTANT DATA' beside it:
+#
+#   docker network create   ../../escapee     → rc 0, a 122-byte network record CREATED outside $STATE
+#   docker volume create    ../../canary      → rc 0, the outside file ADOPTED as an existing volume
+#   docker volume inspect   ../../canary      → rc 0, { "Name": "../../canary", … } — outside file READ
+#   docker container start  ../../canary      → rc 0, rec_set's `mv -f` REWROTE the outside file
+#
+# Two things are wrong with that. It escapes test isolation — a suite can clobber anything the
+# developer running it can write — and it makes this fake MORE PERMISSIVE THAN THE REAL DAEMON, which
+# is the one thing it must never be. Moby refuses these names outright: container names against
+# `^/?[a-zA-Z0-9][a-zA-Z0-9_.-]+$` (its own error names that class), and local volume names against
+# the same character class. A guard that only ever runs against a fake that accepts what Docker
+# rejects is decoration, and can be deleted with the whole suite green.
+#
+# Applied on EVERY subcommand that takes a name, not only create: inspect, rm, start, stop, connect
+# and disconnect all resolve their argument into the same directory, as the two rc-0 lookups above
+# show. The empty name is refused here too — `$STATE/containers/` is the containers DIRECTORY, `[ -e ]`
+# accepts it, and the pre-check fake rendered a field from it and exited 0.
+#
+# Three deliberate boundaries, stated rather than hidden:
+#   * NETWORKS. libnetwork's own rule is only "non-empty after trimming", so this class is STRICTER
+#     than the real daemon for networks. Stricter is the safe direction — it can only refuse early,
+#     where looser turns a load-bearing guard into decoration — and every name this installer
+#     constructs comes from lib/manifest.sh's mi_name_* helpers, well inside the class.
+#   * ORDER. This fake refuses an invalid name BEFORE it resolves the image, where the real daemon
+#     resolves the image first. Both refuse; only the message differs, and only for a caller that
+#     supplies an invalid name AND an unpulled image.
+#   * IMAGE REFERENCES are NOT checked here — a reference legitimately contains `/`, `:` and `@`.
+#     They are safe for a different reason: image_key() below hashes the reference instead of
+#     spelling it into a path. `--network` is likewise not checked: `container:<name>` is a real
+#     network mode, and it is not used as a path.
+#
+# The `*/*` arm is not redundant with the character class: bash pattern ranges are locale-collated,
+# so `[a-zA-Z0-9_.-]` is only approximately the set it reads as. The one character that turns a name
+# into a path is pinned explicitly and cannot depend on the operator's locale.
+check_name() {
+  local n="$1" kind="$2"
+  case "$n" in
+    ''|*/*|[!a-zA-Z0-9]*|*[!a-zA-Z0-9_.-]*) : ;;
+    *) return 0 ;;
+  esac
+  case "$kind" in
+    container) die "Invalid container name ($n), only [a-zA-Z0-9][a-zA-Z0-9_.-] are allowed" ;;
+    volume)    die "create $n: \"$n\" includes invalid characters for a local volume name, only \"[a-zA-Z0-9][a-zA-Z0-9_.-]\" are allowed. If you intended to pass a host directory, use absolute path" ;;
+    *)         die "invalid network name ($n), only [a-zA-Z0-9][a-zA-Z0-9_.-] are allowed" ;;
+  esac
+}
+
 # --- image presence, shared by pull, inspect, create and run ---
 # ONE derivation of the on-disk key, so `pull` and the gates below cannot disagree about what counts
 # as the same image.
-image_key() { printf '%s/images/%s' "$STATE" "$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_')"; }
+#
+# It is a DIGEST of the exact reference, not a character fold. `tr -c 'A-Za-z0-9._-' '_'` mapped
+# `foo/bar:tag` and `foo_bar:tag` to the same key `foo_bar_tag`, so pulling either satisfied the
+# create/run gate for the other — and that gate is the thing that stops a task which forgot to pull
+# from passing here and failing against a real daemon. An aliasing key does not weaken the gate a
+# little; it means the gate no longer asserts "this reference was pulled" at all. Real Docker treats
+# the two as different repositories.
+#
+# sha256sum (Linux) or shasum -a 256 (macOS) — the same floor lib/common.sh's mi_digest uses, spelled
+# out again on purpose: this harness is a standalone script on PATH and must not source lib/.
+image_key() {
+  local h
+  if command -v sha256sum >/dev/null 2>&1; then
+    h="$(printf '%s' "$1" | sha256sum)"
+  elif command -v shasum >/dev/null 2>&1; then
+    h="$(printf '%s' "$1" | shasum -a 256)"
+  else
+    die "fake docker: no sha256 implementation found (need sha256sum or shasum)"
+  fi
+  printf '%s/images/%s' "$STATE" "${h%% *}"
+}
 
 # Real Docker cannot create or run a container from an image it does not hold: it attempts a pull and
 # then errors. A fake that records the container regardless lets a later task that FORGOT to pull
@@ -175,6 +246,7 @@ case "${1:-}" in
           esac
         done
         [ -n "$name" ] || die "volume create: no name"
+        check_name "$name" volume
         # REAL semantics: an existing name succeeds and the new labels are NOT applied.
         if [ ! -e "$STATE/volumes/$name" ]; then
           : > "$STATE/volumes/$name"
@@ -188,6 +260,7 @@ case "${1:-}" in
         while [ "$#" -gt 0 ]; do
           case "$1" in --format) tmpl="$2"; shift 2 ;; --) shift ;; *) name="$1"; shift ;; esac
         done
+        check_name "$name" volume
         [ -e "$STATE/volumes/$name" ] || die "no such volume: $name"
         # No --format is not an unknown template — it is real docker's default, the whole document.
         # A volume genuinely has no Id, which is what the harness suite pins here.
@@ -217,6 +290,7 @@ case "${1:-}" in
         shift; name=""
         while [ "$#" -gt 0 ]; do case "$1" in --) shift ;; *) name="$1"; shift ;; esac; done
         [ -n "$name" ] || die "volume rm: no name"
+        check_name "$name" volume
         [ -e "$STATE/volumes/$name" ] || die "no such volume: $name"
         rm -f "$STATE/volumes/$name"; printf '%s\n' "$name"
         ;;
@@ -239,6 +313,7 @@ case "${1:-}" in
           esac
         done
         [ -n "$name" ] || die "network create: no name"
+        check_name "$name" network
         # D38: Docker does NOT guarantee name-conflict detection for networks, so a delayed original
         # and a reissue can both succeed with the same name AND nonce. Reproduced under the knob;
         # the second record gets a distinct on-disk key so both are listable.
@@ -261,6 +336,9 @@ case "${1:-}" in
         while [ "$#" -gt 0 ]; do
           case "$1" in --format) tmpl="$2"; shift 2 ;; --) shift ;; *) key="$1"; shift ;; esac
         done
+        # A network is looked up by id OR name, and both go through the same rule: the ids this fake
+        # mints are 64 digits, which is inside the class.
+        check_name "$key" network
         f=""
         for n in "$STATE"/networks/*; do
           [ -e "$n" ] || continue
@@ -283,6 +361,7 @@ case "${1:-}" in
       rm)
         shift; key=""
         while [ "$#" -gt 0 ]; do case "$1" in --) shift ;; *) key="$1"; shift ;; esac; done
+        check_name "$key" network
         for n in "$STATE"/networks/*; do
           [ -e "$n" ] || continue
           if [ "$(rec_get "$n" id)" = "$key" ] || [ "$(rec_get "$n" name)" = "$key" ]; then
@@ -301,6 +380,9 @@ case "${1:-}" in
             *) if [ -z "$netid" ]; then netid="$1"; else c="$1"; fi; shift ;;
           esac
         done
+        # Both arguments name a resource, and the container one becomes a path directly below.
+        check_name "$netid" network
+        check_name "$c" container
         [ -z "${FAKE_DOCKER_CONNECT_FAIL:-}" ] || die "failed to connect $c to $netid"
         f="$STATE/containers/$c"; [ -e "$f" ] || die "no such container: $c"
         nets="$(rec_get "$f" nets)"; al="$(rec_get "$f" aliases)"
@@ -314,6 +396,8 @@ case "${1:-}" in
         while [ "$#" -gt 0 ]; do
           case "$1" in --) shift ;; *) if [ -z "$netid" ]; then netid="$1"; else c="$1"; fi; shift ;; esac
         done
+        check_name "$netid" network
+        check_name "$c" container
         f="$STATE/containers/$c"; [ -e "$f" ] || die "no such container: $c"
         # FAKE_DOCKER_DISCONNECT_SILENT reproduces §10a's "one detach silently fails in phase 4":
         # the command reports success and the attachment survives.
@@ -345,6 +429,7 @@ case "${1:-}" in
           esac
         done
         [ -n "$name" ] || die "container create: no name"
+        check_name "$name" container
         [ -n "$netid" ] || die "container create: no network"
         # In real Docker's order: the image is resolved first, then the name conflict, then the mount
         # config. Every one of these must refuse BEFORE the record is written, or a refused create
@@ -375,6 +460,7 @@ case "${1:-}" in
       start)
         shift; name=""
         while [ "$#" -gt 0 ]; do case "$1" in --) shift ;; *) name="$1"; shift ;; esac; done
+        check_name "$name" container
         f="$STATE/containers/$name"; [ -e "$f" ] || die "no such container: $name"
         rec_set "$f" state running
         out=""
@@ -387,6 +473,7 @@ case "${1:-}" in
       stop)
         shift; name=""
         while [ "$#" -gt 0 ]; do case "$1" in --) shift ;; *) name="$1"; shift ;; esac; done
+        check_name "$name" container
         f="$STATE/containers/$name"; [ -e "$f" ] || die "no such container: $name"
         rec_set "$f" state exited
         # Docker RELEASES the address on stop (verified). Reproducing it is what stops a test from
@@ -401,6 +488,7 @@ case "${1:-}" in
       rm)
         shift; name=""
         while [ "$#" -gt 0 ]; do case "$1" in -f|--force) shift ;; --) shift ;; *) name="$1"; shift ;; esac; done
+        check_name "$name" container
         f="$STATE/containers/$name"; [ -e "$f" ] || die "no such container: $name"
         rm -f "$f"; printf '%s\n' "$name"
         ;;
@@ -409,6 +497,7 @@ case "${1:-}" in
         while [ "$#" -gt 0 ]; do
           case "$1" in --format) tmpl="$2"; shift 2 ;; --) shift ;; *) name="$1"; shift ;; esac
         done
+        check_name "$name" container
         [ -e "$STATE/containers/$name" ] || die "No such object: $name"
         render "$tmpl" "$STATE/containers/$name" container
         ;;
@@ -466,8 +555,9 @@ case "${1:-}" in
         while [ "$#" -gt 0 ]; do case "$1" in --) shift ;; *) ref="$1"; shift ;; esac; done
         [ -n "$ref" ] || die "image pull: no reference"
         case "${FAKE_DOCKER_PULL:-ok}" in
-          ok)       : > "$(image_key "$ref")"
-                    rec_set "$(image_key "$ref")" ref "$ref"
+          ok)       k="$(image_key "$ref")"
+                    : > "$k"
+                    rec_set "$k" ref "$ref"
                     printf 'Status: Downloaded newer image for %s\n' "$ref" ;;
           notfound) die "manifest for $ref not found: manifest unknown" ;;
           auth)     die "denied: requested access to the resource is denied" ;;
