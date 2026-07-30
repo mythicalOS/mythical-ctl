@@ -55,6 +55,9 @@ MI_CONF_MAXKEYS=1024
 # sending an operator after a hostile-content problem when what they have is a permission problem.
 # Stated limitation: this catches the unopenable file, not an I/O error part-way through a read, which
 # still reports as a byte failure.
+#
+# NOTE: lib/doc.sh reuses this for the authenticated documents — one audited implementation of the
+# byte gate, not two that can drift.
 _mi_conf_bytes_ok() {
   [ -r "$1" ] || return 2
   # shellcheck disable=SC2094   # both sides only READ $1; nothing in this pipeline writes it
@@ -79,6 +82,9 @@ _mi_conf_bytes_ok() {
 # `local LC_ALL=C` forces [[:cntrl:]] to mean the ASCII control set rather than whatever the
 # operator's locale defines (same technique lib/ledger.sh uses for byte collation). NUL needs no
 # test: a bash variable cannot hold one.
+#
+# NOTE: lib/doc.sh reuses this for the authenticated documents — one audited implementation of the
+# value rule, not two that can drift.
 _mi_conf_value_ok() {
   local v="$1"
   local LC_ALL=C
@@ -246,6 +252,10 @@ _mi_conf_int_ok() {
 # LC_ALL=en_US.UTF-8 and rc 1 under LC_ALL=C — the same bytes validating differently per locale, in
 # the one function that decides whether attacker-controlled input is acceptable. `netname` diverged
 # the same way, accepting `aéb` under UTF-8 and refusing it under C. The published caps are BYTES.
+#
+# NOTE: lib/doc.sh reuses this for the authenticated documents — `_mi_doc_type_ok`'s default branch
+# delegates every one of Plan 2's types here rather than reimplementing them, so this is the widest
+# blast radius of the three reused primitives.
 _mi_conf_type_ok() {
   local type="$1" v="$2" p
   local LC_ALL=C
