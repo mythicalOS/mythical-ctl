@@ -57,7 +57,7 @@ DOC_MARKER='#mythical-conf-sha256='
   printf '%s%s\n' "$DOC_MARKER" "$sum" >> "$f"
   run mi_conf_product_load brokkr "$SPEC"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"MYTHICAL_BROKKR_RETENTION"$'\t'"7"* ]]
+  [[ "$output" == *"MYTHICAL_BROKKR_RETENTION"$'\t'"7"* ]] || { echo "the CLI did not accept the hand-built file: $output" >&2; return 1; }
   [[ "$output" == *"MYTHICAL_BROKKR_THEME"$'\t'"light"* ]]
 }
 

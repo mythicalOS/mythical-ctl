@@ -44,7 +44,10 @@ plant_conf() {
   write_conf
   local f; f="$(mi_conf_product_path brokkr)"
   [ -f "$f" ]
-  [[ "$(tail -n1 "$f")" == '#mythical-conf-sha256='* ]]
+  # Prints the SUBJECT, not $output: this test does not use `run`, so $output is unset here and
+  # referencing it under `set -u` would abort with "unbound variable" instead of reporting anything.
+  [[ "$(tail -n1 "$f")" == '#mythical-conf-sha256='* ]] \
+    || { echo "the last line is not an integrity marker: $(tail -n1 "$f")" >&2; return 1; }
   [ "$(pget MYTHICAL_BROKKR_RETENTION)" = "30" ]
 }
 
@@ -83,7 +86,7 @@ plant_conf() {
   [ -f "$f" ]
   [ "$(ls -l "$f" | awk 'NR==1{print substr($1,1,10)}')" = "-rw-------" ]
   [ "$(ls -ldn "$f" | awk 'NR==1{print $4}')" != "4294967000" ]
-  [[ "$output" == *"READ-ONLY"* ]]
+  [[ "$output" == *"READ-ONLY"* ]] || { echo "rc 5 does not warn that the settings screen is READ-ONLY: $output" >&2; return 1; }
   # rc 5 has THREE states and this is state (a). Each message must name its own, so that a caller
   # keying on rc 5 to explain it to an operator cannot print a diagnosis belonging to another state.
   #
@@ -329,7 +332,7 @@ EOF
     for m in common layout config lock ledger; do source "'"$_MCTL_ROOT"'/lib/$m.sh"; done
     mi_conf_product_add brokkr; echo UNREACHABLE'
   [ "$status" -ne 0 ]
-  [[ "$output" != *UNREACHABLE* ]]
+  [[ "$output" != *UNREACHABLE* ]] || { echo "execution continued past the refusal: $output" >&2; return 1; }
   [[ "$output" != *"unbound variable"* ]]
 }
 
@@ -418,7 +421,7 @@ EOF
 
   PATH="$shim:$PATH" run mi_conf_product_load brokkr "$SPEC"
   [ "$status" -eq 1 ]
-  [[ "$output" == *"owned by uid 4294967000"* ]]
+  [[ "$output" == *"owned by uid 4294967000"* ]] || { echo "the refusal does not name the foreign owner: $output" >&2; return 1; }
 
   PATH="$shim:$PATH" run mi_conf_product_add brokkr "$SPEC" "$TEST_GID" MYTHICAL_BROKKR_THEME dark
   [ "$status" -ne 0 ]
@@ -444,7 +447,7 @@ EOF
 
   PATH="$shim:$PATH" run mi_conf_product_load brokkr "$SPEC"
   [ "$status" -eq 1 ]
-  [[ "$output" == *"cannot read the owner"* ]]
+  [[ "$output" == *"cannot read the owner"* ]] || { echo "the refusal does not name an unreadable owner: $output" >&2; return 1; }
 
   PATH="$shim:$PATH" run mi_conf_product_add brokkr "$SPEC" "$TEST_GID" MYTHICAL_BROKKR_THEME dark
   [ "$status" -ne 0 ]
@@ -504,7 +507,7 @@ EOF
   printf 'MYTHICAL_BROKKR_RETENT\n#mythical-conf-sha256=deadbeef\n' > "$f"
   run mi_conf_product_load brokkr "$SPEC"
   [ "$status" -eq 4 ]
-  [[ "$output" == *"recompute the marker"* ]]
+  [[ "$output" == *"recompute the marker"* ]] || { echo "the torn report does not name the recompute remedy: $output" >&2; return 1; }
   [[ "$output" == *"interrupted"* ]]
 }
 
@@ -562,7 +565,7 @@ EOF
     for m in common layout config lock ledger; do source "'"$_MCTL_ROOT"'/lib/$m.sh"; done
     mi_conf_product_load brokkr; echo UNREACHABLE'
   [ "$status" -ne 0 ]
-  [[ "$output" != *UNREACHABLE* ]]
+  [[ "$output" != *UNREACHABLE* ]] || { echo "execution continued past the refusal: $output" >&2; return 1; }
   [[ "$output" != *"unbound variable"* ]]
 }
 

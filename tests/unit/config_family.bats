@@ -67,7 +67,7 @@ EOF
   cp "$f" "$MYTHICAL_HOME/before"
   run mi_conf_family_add MYTHICAL_NET our-default
   [ "$status" -ne 0 ]
-  [[ "$output" == *their-choice* ]]
+  [[ "$output" == *their-choice* ]] || { echo "the refusal does not quote the operator's existing value: $output" >&2; return 1; }
   diff -u "$MYTHICAL_HOME/before" "$f"
 }
 
@@ -85,7 +85,7 @@ EOF
     for m in common layout config lock ledger; do source "'"$_MCTL_ROOT"'/lib/$m.sh"; done
     mi_conf_family_add MYTHICAL_NET; echo UNREACHABLE'
   [ "$status" -ne 0 ]
-  [[ "$output" != *UNREACHABLE* ]]
+  [[ "$output" != *UNREACHABLE* ]] || { echo "execution continued past the refusal: $output" >&2; return 1; }
   [[ "$output" != *"unbound variable"* ]]
 }
 
@@ -146,7 +146,7 @@ EOF
   _mi_conf_unchanged() { return 1; }
   run mi_conf_family_add MYTHICAL_TELEMETRY_KEY t
   [ "$status" -ne 0 ]
-  [[ "$output" == *"changed while we were reading it"* ]]
+  [[ "$output" == *"changed while we were reading it"* ]] || { echo "the refusal does not name the concurrent change: $output" >&2; return 1; }
   diff -u "$MYTHICAL_HOME/before" "$f"
 }
 
@@ -220,7 +220,7 @@ EOF
     source "'"$_MCTL_ROOT"'/lib/lock.sh"
     mi_conf_family_add MYTHICAL_NET n'
   [ "$status" -ne 0 ]
-  [[ "$output" == *"family lock"* ]]
+  [[ "$output" == *"family lock"* ]] || { echo "the refusal does not name the family lock: $output" >&2; return 1; }
   [ ! -f "$(mi_conf_family_path)" ]
 }
 
@@ -241,8 +241,8 @@ EOF
     export MI_LOCK_TOKEN=whatever
     mi_lock_assert_held; echo UNREACHABLE'
   [ "$status" -ne 0 ]
-  [[ "$output" != *UNREACHABLE* ]]
-  [[ "$output" != *"unbound variable"* ]]
+  [[ "$output" != *UNREACHABLE* ]] || { echo "execution continued past the refusal: $output" >&2; return 1; }
+  [[ "$output" != *"unbound variable"* ]] || { echo "aborted on an unbound variable instead of refusing: $output" >&2; return 1; }
   [[ "$output" == *"naming the operation"* ]]
 }
 

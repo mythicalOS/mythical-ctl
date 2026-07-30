@@ -9,7 +9,7 @@ follow it is rejected, and rejection is not a bug.
 | | `~/.mythical/mythical.conf` | `~/.mythical/<product>.conf` |
 |---|---|---|
 | Who writes it | the operator, or `mythical-ctl` | the operator, `mythical-ctl`, or the product's UI |
-| Mounted into a container | **never** | yes — as a single file, read-write |
+| Mounted into a container | **never** | to be mounted, as a single file, read-write |
 | Owner | the user running `mythical-ctl` | the user running `mythical-ctl` |
 | Mode | 0600 | 0660 — see [When the mode and group cannot be set](#when-the-mode-and-group-cannot-be-set) |
 | Group | not constrained — 0600 makes it irrelevant | the family group |
@@ -18,8 +18,18 @@ follow it is rejected, and rejection is not a bug.
 | Key-count ceiling | **1024 keys** | **1024 keys** |
 | Holds | host secrets and the launch spec | that product's own settings |
 
-A product's UI writes **only** `<product>.conf`. `mythical.conf` is not mounted into any container,
-and no value in `<product>.conf` ever reaches a container-launch argument.
+A product's UI writes **only** `<product>.conf`.
+
+**What is shipped, and what is design.** Everything this document says about the *file format* is
+implemented and tested today: the two paths, the syntax, the byte policy, the ownership and identity
+requirements, the typed validation, the integrity marker, and both size ceilings. The **runtime**
+around it is not — this version of `mythical-ctl` mounts nothing and launches no container, because
+the lifecycle commands are not implemented yet. So read the mounting, and the guarantees that
+`mythical.conf` will never be mounted and that no value in `<product>.conf` will ever reach a
+container-launch argument, as the design this format exists to serve rather than as behaviour you can
+verify against this release. They are stated here because they are *why* the format is shaped the way
+it is — why `<product>.conf` must be written in place, why it needs a marker, and why its size is
+treated as attacker-controlled. Nothing here should be read as a delivered security guarantee.
 
 ## Ownership and identity
 
