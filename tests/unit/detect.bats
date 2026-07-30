@@ -15,6 +15,36 @@ J='{"product":"brokkr","version":"0.1.13","ui_url":"http://localhost:7480/","com
   [ "$(mi_detect_field '{ "product" : "brokkr" }' product)" = "brokkr" ]
 }
 
+# Space, tab and CR outside the root object are valid JSON whitespace and must not be refused — a
+# product's HTTP response carrying insignificant leading/trailing whitespace is still a well-formed
+# response. (A leading/trailing LF is not tested here: awk's default line splitting drops it before
+# the scanner's character loop ever sees it, which is a different mechanism from the explicit
+# space/tab/CR handling this test pins.) Written with printf so the whitespace bytes are exact —
+# a shell literal for tab/CR would not survive quoting.
+@test "leading and trailing JSON whitespace (space, tab, CR) outside the root object is accepted" {
+  local f="$BATS_TEST_TMPDIR/j" ws
+  for ws in ' ' "$(printf '\t')" "$(printf '\r')"; do
+    printf '%s{"version":"1"}' "$ws" > "$f"
+    run mi_detect_field "$(cat "$f")" version
+    [ "$status" -eq 0 ] && [ "$output" = "1" ] \
+      || { echo "leading whitespace rejected: status=$status output=$output" >&2; return 1; }
+
+    printf '{"version":"1"}%s' "$ws" > "$f"
+    run mi_detect_field "$(cat "$f")" version
+    [ "$status" -eq 0 ] && [ "$output" = "1" ] \
+      || { echo "trailing whitespace rejected: status=$status output=$output" >&2; return 1; }
+  done
+}
+
+# Non-whitespace content outside the root object must still be refused. The two-object case is
+# already pinned in "malformed JSON is refused" below; this adds the single-character case so the
+# accept-whitespace fix above cannot be read as having widened acceptance beyond whitespace itself.
+@test "non-whitespace content after the root object is still refused" {
+  run mi_detect_field '{"version":"1"} x' version
+  [ "$status" -eq 1 ] \
+    || { echo "accepted trailing garbage: status=$status output=$output" >&2; return 1; }
+}
+
 @test "an absent field reports rc 3, distinct from unreadable" {
   run mi_detect_field "$J" nothing
   [ "$status" -eq 3 ]
@@ -55,6 +85,19 @@ J='{"product":"brokkr","version":"0.1.13","ui_url":"http://localhost:7480/","com
   [ "$status" -eq 1 ]
   [[ "$output" == *ambiguous* ]] \
     || { echo "output missing the ambiguity-gate's own message: $output" >&2; return 1; }
+}
+
+# docs/DOCUMENT-FORMAT.md's malformed-structure table used to say a repeated key is refused "at the
+# top level" without qualification. In fact mi_detect_field only rejects a repeat of the field it was
+# ASKED for — it checks whether its own answer is ambiguous, not whether the response contains any
+# duplicate key. Pin both halves: querying the field that IS repeated is refused (already covered
+# above for the single-field case); querying a DIFFERENT field succeeds even though some other
+# top-level key is repeated.
+@test "only a repeat of the requested field is refused; a repeat of a different top-level key is not inspected" {
+  [ "$(mi_detect_field '{"x":"a","x":"b","version":"1"}' version)" = "1" ]
+  run mi_detect_field '{"x":"a","x":"b","version":"1"}' x
+  [ "$status" -eq 1 ] \
+    || { echo "querying the repeated field itself was not refused: status=$status output=$output" >&2; return 1; }
 }
 
 # T3: the scanner's raw-control-byte gate (`if (c < " ") { err = 1; continue }`, inside a string) is

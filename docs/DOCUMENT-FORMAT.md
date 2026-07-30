@@ -145,7 +145,7 @@ Types specific to these authenticated documents:
 | `epoch` | a non-negative decimal integer, bounded to 18 digits | Unix seconds. Compared against the host clock — see the residual on clock dependence below. |
 | `ident` | `[a-z][a-z0-9-]{0,63}` | A product or role identifier. |
 | `sha256` | exactly 64 lowercase hex characters | A raw digest, compared as a literal string — an uppercase-but-otherwise-correct digest does not match. |
-| `digestref` | `<repository>@sha256:<64 hex>` | An image reference **pinned by content digest**. A tag (`:latest`, `:v1`) is not a digest and is never accepted here — there is no floating reference this format can express, by construction, not by a denylist of tags an attacker would simply avoid. |
+| `digestref` | `<repository>@sha256:<64 hex>` | An image reference **pinned by content digest**: the value must carry `@sha256:` followed by exactly 64 lowercase hex characters, and a bare tag with no digest (`:latest`, `:v1`) is refused — there is no floating reference this format can express, by construction, not by a denylist of tags an attacker would simply avoid. The `<repository>` half is shape- and charset-bounded (see below) but is **not** fully parsed — telling a tag apart from a registry-host port (`host:5000/repo`) needs Docker's full reference grammar, which this project deliberately does not implement. So a tag **may** appear alongside the digest (`repo:latest@sha256:<64 hex>`) and is simply ignored: the digest is what selects the image, so the value is still pinned to one exact content hash either way. |
 | `productdigest` | `<product>:<64 hex>` | The family index's flat encoding of "this product's manifest must hash to this." Exactly one colon. |
 | `coreversion` | `MAJOR[.MINOR[.PATCH]]`, numeric components only | Deliberately not full semver — pre-release and build-metadata suffixes have ordering rules a shell comparator would get subtly wrong, and a minimum-core requirement has no need of them. |
 | `rolemount` | `<role>:/<absolute path>` | The flat encoding of what would be an object (`{role, mount}`) in a format that could nest. See [Residual: the format cannot nest](#residual-the-format-cannot-nest). No `..` component. |
@@ -339,6 +339,13 @@ So it reads those three fields with a small bounded scanner that understands JSO
 enough to find top-level members and tell a plain string apart from everything else, and it
 **refuses** — rather than guesses at — anything it cannot read unambiguously:
 
+- **The whole response is capped at 32768 bytes (32 KiB)**, checked in the shell before a single byte
+  reaches the scanner, and a response over the cap is refused outright, naming the cap in the refusal.
+  Some awk implementations' string handling is superlinear in the length of the value being
+  accumulated, so an unbounded response could stall the installer on a misbehaving or hostile
+  product; bounding the input before it ever reaches the scanner keeps the cost bounded regardless of
+  which awk is on `PATH`. No real `/detect` response comes close to the cap.
+
 - A value containing any escape sequence (`\"`, `\\`, `\n`, `\uXXXX`, …) is refused, not decoded. A
   product that starts escaping characters in `product`, `version`, or `ui_url` will see its response
   reported as unreadable; the fix is on the product side, not a reason to add a decoder here.
@@ -360,7 +367,8 @@ enough to find top-level members and tell a plain string apart from everything e
   | an invalid escape (`"\q"`, `"\u12"`) | refused | **refused** |
   | an invalid bare literal (`tru`, `01`, `1e`) | refused | accepted |
   | bad member sequencing (a missing comma) | refused | accepted |
-  | a repeated key | refused | accepted |
+  | a repeated key — the field being queried | refused | accepted |
+  | a repeated key — any other top-level key | accepted | accepted |
 
   Delimiters and escapes are checked at **every** depth because the scanner has to track both in
   order to know where a value ends — get either wrong and it could lose its place and report a
@@ -372,10 +380,19 @@ enough to find top-level members and tell a plain string apart from everything e
   claim to be, a JSON validator. A response whose top level is well formed is answered from, even
   if something deeper inside it is not valid JSON.
 
+  **The repeated-key row splits in two because "refused" there means something narrower than for the
+  other rows: only a repeat of the field being queried is refused.** `mi_detect_field` checks whether
+  *its own answer* is ambiguous, not whether the response contains a duplicate key anywhere. Querying
+  `version` in `{"x":"a","x":"b","version":"1"}` succeeds and returns `1`; querying `x` in that same
+  response is refused as ambiguous. A duplicate of some other top-level key is never inspected,
+  because it does not affect the field being asked about — consistent with the same "guarantees its
+  own answer, not a JSON validator" limit stated above.
+
 **One asymmetry worth stating plainly: an escaped *key* is reported as absent, not unreadable.** A
-response containing `"product"` (which, decoded, spells `product`) is treated as not having a
-`product` field at all, because escapes are never decoded anywhere in this reader — including in
-keys — so it has no way to know that key was meant to be `product`. This is a narrower guarantee
+response containing the key `"pro\u0064uct"` (which, decoded, spells
+`product`) is treated as not having a `product` field at all, because escapes are never decoded
+anywhere in this reader — including in keys — so it has no way to know that key was meant to be
+`product`. This is a narrower guarantee
 than "every way of spelling this key is recognized"; it is stated here because it is the one case
 where the honest answer ("this reader cannot tell") and the intuitive one ("that key was clearly
 meant as `product`") diverge, and the honest one is what ships.

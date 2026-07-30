@@ -42,6 +42,24 @@ man() { { printf 'mythical-manifest 1\nversion=1\nexpires=4102444800\nproduct=br
   done
 }
 
+# Every fixture above has no `@sha256:...` suffix at all, so that test would still pass whether a
+# TAG-PLUS-DIGEST reference were wrongly accepted or wrongly rejected — it never exercises that shape.
+# `repo:tag@sha256:<64 hex>` is legitimate OCI syntax and IS digest-pinned: the `@sha256:` suffix is
+# still mandatory, so no floating reference can pass; the tag is simply ignored because the digest is
+# what selects the image. The repository charset permits one colon anywhere (a registry host may
+# carry a port), and telling a tag apart from a port needs Docker's full reference grammar — the same
+# "do not grow a parser" line this project draws for JSON. This is not "fixed": docs/DOCUMENT-FORMAT.md
+# is corrected to say so, and this test pins both directions.
+@test "a tag alongside a digest is accepted (still pinned by the digest); a bare tag with no digest is refused" {
+  { printf 'mythical-manifest 1\nversion=1\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nmin_core=0.1.0\nimage=ghcr.io/example/brokkr:latest@%s\n' "$DIG"; } > "$F"
+  run mi_manifest_load "$F"
+  [ "$status" -eq 0 ] || { echo "rejected a legitimate tag-plus-digest reference: $output" >&2; return 1; }
+
+  { printf 'mythical-manifest 1\nversion=1\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nmin_core=0.1.0\nimage=ghcr.io/example/brokkr:latest\n'; } > "$F"
+  run mi_manifest_load "$F"
+  [ "$status" -eq 1 ] || { echo "accepted a bare tag with no digest" >&2; return 1; }
+}
+
 @test "mi_manifest_image returns the pinned reference" {
   man ''
   local m; m="$(mi_manifest_load "$F")"
