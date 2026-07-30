@@ -86,27 +86,47 @@ step's failure mode is a different, specific answer, and collapsing two into one
 the wrong diagnosis. In the order they actually run, for every document handled through this
 project's acceptance path (`mi_accept_index`, `mi_accept_policy`, `mi_accept_manifest`):
 
-1. **Is the file readable at all, and within the byte policy?** A control byte anywhere in the file,
-   or a file that cannot be read, is rejected before a single field is parsed.
-2. **Does the document authenticate against its digest?** The expected digest for an index comes
-   from the trust anchor (see [Trust model](#trust-model)); the expected digest for a policy index
-   or a manifest comes from the *already-authenticated* parent document (the family index) that
-   names it. A digest that does not match is rejected, and the bytes are **never parsed** — only a
-   verified copy is handed to the parser, never the live pathname a second time.
-3. **Does it parse?** The header line, the grammar above, and the document's own schema (which
-   fields exist, their types, their cardinality).
-4. **Is it fresh?** A version is present, an expiry is present and has not passed, and the version is
+1. **Does the document authenticate against its digest?** This runs **first**, over the file's raw
+   bytes — before the byte policy, the grammar, or the schema are applied to those bytes at all.
+   (The file must of course be openable to be hashed in the first place; that is a mechanical
+   precondition for computing anything, not a content check with its own diagnosis — the byte policy
+   below is what inspects what the bytes actually *contain*, and that is what step 2 gates on.) The
+   expected digest for an index comes from the trust anchor (see [Trust model](#trust-model)); the
+   expected digest for a policy index or a manifest comes from the *already-authenticated* parent
+   document (the family index) that names it. A digest that does not match is rejected immediately,
+   and the bytes are **never inspected further** — only a verified copy is handed to anything that
+   reads content, never the live pathname a second time. Verifying the digest before looking at the
+   content is the whole point: nothing may be judged on what it says until something
+   already-authenticated has vouched for its bytes.
+2. **Only once the digest matches** are the bytes handed to anything that looks at their content —
+   and the byte policy (readable at all; no control bytes; ends in a newline) is the *first* thing
+   that content-reading step does, immediately followed by the header line, the grammar above, and
+   the document's own schema (which fields exist, their types, their cardinality). A control byte, a
+   missing trailing newline, or a malformed line is rejected here — but only ever for a document that
+   has already authenticated.
+3. **Is it fresh?** A version is present, an expiry is present and has not passed, and the version is
    not below the highest one this installation has already accepted for that document (anti-rollback
    — see [Trust model](#trust-model)).
-5. **Is it authorized?** (Manifests only.) Every role, secret, and mount the manifest selects must
+4. **Is it authorized?** (Manifests only.) Every role, secret, and mount the manifest selects must
    already be granted to that product by the policy index — a manifest can be perfectly authentic
    and still ask for something it was never entitled to.
-6. **Does it declare compatibility?** (Manifests only.) The manifest's declared minimum core version
+5. **Does it declare compatibility?** (Manifests only.) The manifest's declared minimum core version
    must be one this build satisfies.
 
 A document that fails any earlier step is refused for *that* step's reason, never re-diagnosed by a
-later one — an unreadable file is never reported as "expired," and an expired document is never
-reported as "unauthorized."
+later one — a document that fails step 2 is never reported as "expired," and an expired document is
+never reported as "unauthorized."
+
+**A practical consequence worth stating plainly: if you hand-edit an authenticated document, what
+you get back is a digest mismatch, not a diagnosis of what you changed.** Editing a byte anywhere in
+the file — fixing a typo, "cleaning up" whitespace, adding a comment — changes the bytes the digest
+was computed over, so step 1 fails before step 2 ever runs. You will never see "contains control
+bytes" or "line 4: invalid key name" from an edited copy of an authenticated document, even if the
+edit also happens to introduce exactly that problem — you will see a digest mismatch, because that
+is the first and only thing checked before anything about the edit's content is looked at. This is
+not a diagnostic gap to close; it is the same property that makes authentication meaningful at all —
+a check that ran on content *before* that content was proven to come from where it claims to could be
+satisfied by an attacker's edit just as easily as by the operator's.
 
 ## Types
 
@@ -132,6 +152,30 @@ Types specific to these authenticated documents:
 
 Every type is checked in byte order (`LC_ALL=C`), so the same document validates identically
 whatever locale the reader runs under.
+
+### What a `sha256` digest covers
+
+This matters for every value typed `sha256` above — `policy_digest`, and the hex half of each
+`manifest` entry — because a publisher computing one has to reproduce it exactly, and nothing in
+this document tells you what bytes go in unless it says so explicitly, here:
+
+**A digest is a plain SHA-256 over the entire raw file, byte for byte, exactly as it sits on disk.**
+That means the header line, every comment line, every blank line, and the mandatory trailing
+newline are all part of what gets hashed — nothing is stripped, trimmed, reordered, or normalized
+before hashing. Compute it the same way the reference tooling does: `sha256sum <file>` (or
+`shasum -a 256 <file>` where that's what's available) over the file exactly as it will be shipped,
+and take the lowercase hex digest.
+
+**There is no canonicalization of any kind, and that is deliberate, not an oversight.** A publisher
+who reasonably strips comments, sorts keys, or normalizes the trailing newline before hashing —
+on the assumption that the digest covers "the meaningful content" — will produce a digest that
+silently never matches the one the reader computes over the shipped file. Per
+[Precedence](#precedence-the-order-these-checks-run-in) above, the only diagnosis you will ever see
+for that mismatch is "does not match the digest the family index vouches for" — never a hint that
+the difference was a stripped comment or a missing trailing newline. Canonicalizing before hashing
+would mean writing a second parser whose entire job is to decide which bytes "count" — and a second
+parser is a second thing to get wrong, on the one value this format uses to decide whether to trust
+anything else in the document. Hash the file exactly as you ship it.
 
 ## The family index (`mythical-index 1`)
 
@@ -275,6 +319,15 @@ been offline. A version floor, once recorded, only moves down through an explici
 recorded downgrade — never through the ordinary acceptance path — because an emergency rollback that
 could happen silently would not be an emergency rollback, it would be exactly the replay this model
 exists to prevent.
+
+Every digest in this chain — the anchor, `policy_digest`, each `manifest` entry — is computed the
+same way: a plain SHA-256 over a document's entire raw bytes, header line and trailing newline
+included, with no canonicalization (see [What a `sha256` digest covers](#what-a-sha256-digest-covers)
+above). This is why digest verification is the *first* check run against any of these documents, not
+merely *a* check among several (see [Precedence](#precedence-the-order-these-checks-run-in)): a
+digest computed over exact, unmodified bytes is only meaningful if it is checked before those bytes
+have been touched by anything — a byte-policy pass, a parser, a canonicalizer — that might read,
+normalize, or reject them on the way.
 
 ## `/detect`: the one place this project reads JSON, and does not parse it
 

@@ -50,6 +50,29 @@ J='{"product":"brokkr","version":"0.1.13","ui_url":"http://localhost:7480/","com
   [ "$status" -eq 1 ]
 }
 
+# --- the escaped-key asymmetry (docs/DOCUMENT-FORMAT.md: "one asymmetry worth stating plainly") ---
+# Escapes are never decoded anywhere in this reader -- including in KEYS. Every escape test above
+# escapes a VALUE; these two escape a KEY, which no other test in this file does. Written with
+# printf so the escape bytes are exact, not eaten by shell quoting.
+#
+# Verified by hand against a modified copy of the scanner that decodes \uXXXX in keys (the exact
+# "later improvement" this asymmetry warns about): it turns the first case's rc 3 into rc 0, and
+# turns the second case's clean single-hit lookup into a false "ambiguous" refusal -- so both tests
+# below would fail, silently, under that regression.
+
+@test "a key spelled only with an escape is reported absent, never matched by its decoded spelling" {
+  local f="$BATS_TEST_TMPDIR/j"
+  printf '{"pro\\u0064uct":"x"}' > "$f"
+  run mi_detect_field "$(cat "$f")" product
+  [ "$status" -eq 3 ]
+}
+
+@test "an escaped-spelling key never masks or collides with the literal key of the same name" {
+  local f="$BATS_TEST_TMPDIR/j"
+  printf '{"pro\\u0064uct":"x","product":"y"}' > "$f"
+  [ "$(mi_detect_field "$(cat "$f")" product)" = "y" ]
+}
+
 # Malformed SEQUENCING is refused too, not only malformed values. An earlier version reacted to the
 # tokens it recognised and ignored the rest, so {"a":"1" "b":"2"} — no comma — parsed happily.
 @test "malformed JSON is refused, including bad member sequencing" {
@@ -129,4 +152,12 @@ J='{"product":"brokkr","version":"0.1.13","ui_url":"http://localhost:7480/","com
 @test "a version is never inherited from a sibling field" {
   run mi_detect_version '{"product":"x","components":{"ui":"1.2.3"}}'
   [ "$output" = "unknown" ]
+}
+
+@test "an empty version string falls back to the deprecated alias, exactly like an absent one" {
+  [ "$(mi_detect_version '{"product":"x","version":"","image_version":"9.9"}')" = "9.9" ]
+}
+
+@test "a present-but-unreadable version is reported unknown and never falls back to the alias" {
+  [ "$(mi_detect_version '{"product":"x","version":123,"image_version":"9.9"}')" = "unknown" ]
 }

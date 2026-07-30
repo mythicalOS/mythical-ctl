@@ -159,15 +159,26 @@ mi_detect_field() {
 # D10: `version` is the product version; `image_version` is a DEPRECATED ALIAS retained for one
 # release cycle. An image with no stamp reports an explicit unknown marker — it never fabricates a
 # value and never inherits a sibling's, because unmeasured is not measured-clean (§9).
+#
+# `version` can come back three ways, and the alias is consulted for exactly two of them:
+#   - ABSENT (rc 3)                     — no version was reported at all → fall back.
+#   - present but EMPTY (rc 0, "")      — `""` is a syntactically valid flat string, but a product
+#                                          reporting `"version":""` has no version to report, which
+#                                          is exactly what the fallback is for → fall back.
+#   - present but UNREADABLE (rc 1)     — an escape, a number, `null`, a nested object: something WAS
+#                                          reported and this reader failed to read it. The alias must
+#                                          NOT mask that: reporting `image_version` here would answer
+#                                          a question about a field we failed to read with the value
+#                                          of a different one, so this case alone never falls back.
 mi_detect_version() {
   if [ "$#" -ne 1 ]; then mi_warn "detect: mi_detect_version needs <json>"; return 1; fi
   local v rc
   if v="$(mi_detect_field "$1" version)"; then rc=0; else rc=$?; fi
   if [ "$rc" -eq 0 ] && [ -n "$v" ]; then printf '%s\n' "$v"; return 0; fi
-  # Fall back to the deprecated alias ONLY when `version` is ABSENT (rc 3). If `version` is present
-  # but unreadable (rc 1), the alias must not mask it: reporting image_version there would answer a
-  # question about a field we failed to read with the value of a different one.
-  if [ "$rc" -ne 3 ]; then
+  # rc 1 (present but unreadable) is the ONLY case that must not fall back — see the three-way note
+  # above. Both remaining cases reaching this line — rc 3 (absent) and rc 0 with an empty value —
+  # are treated alike: `version` carries nothing usable, so the deprecated alias is consulted.
+  if [ "$rc" -eq 1 ]; then
     printf '%s\n' "$MI_DETECT_UNKNOWN"; return 0
   fi
   if v="$(mi_detect_field "$1" image_version)" && [ -n "$v" ]; then
