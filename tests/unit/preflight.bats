@@ -190,22 +190,42 @@ teardown() { teardown_test_env; }
   assert_contains "not detectable"
 }
 
-@test "a version with a numeric major but no minor is refused, not accepted on the major alone" {
-  # `28.` parses to major 28 and was ACCEPTED, contradicting this module's stated rule that an
-  # unparseable version is a refusal. Measured scope when it was found: every malformed value that
-  # got through had a major >= the floor and `27.` was already refused, so nothing older than the
-  # floor was ever admitted — this pins the rule, it does not close a bypass.
-  FAKE_DOCKER_SERVER_VERSION=28. run mi_preflight_daemon
-  [ "$status" -ne 0 ]
-  FAKE_DOCKER_SERVER_VERSION=28.. run mi_preflight_daemon
-  [ "$status" -ne 0 ]
+@test "the engine-version grammar refuses every malformed shape, not just the reported one" {
+  # Pinned as a CLASS, deliberately. Three review rounds each produced the next malformed string that
+  # slipped past a prefix check — `28.`, then `28..`, then `28.0..`/`28.0-`/`28.0__`/`28.0.0--` — so
+  # the table below is every shape raised across all of them plus the degenerate ones. Testing one
+  # instance is what let this recur twice.
+  #
+  # Scope: none of these was ever exploitable. Each accepted value had a major at or above the floor
+  # and `27.` was refused throughout, so no malformed version ever admitted an engine older than the
+  # floor. This pins the module's stated rule, it does not close a bypass.
+  local v
+  for v in '28.' '28..' '28.0..' '28.0-' '28.0__' '28.0.0--' '28.0.0-' '.28' '-28.0' '+28' \
+           'dev' '28x' '1e9' '9999999999999.0' '..' '-' '+'; do
+    if _mi_pf_engine_major_ok "$v"; then
+      echo "malformed version '$v' was ACCEPTED" >&2; return 1
+    fi
+  done
+  # and the floor still holds for a well-formed old version
+  if _mi_pf_engine_major_ok '27.9.9'; then echo "27.9.9 accepted" >&2; return 1; fi
 }
 
-@test "a real pre-release version is still accepted — the fix must not refuse legitimate versions" {
-  # The counterpart to the test above, and the reason the suffix grammar is deliberately NOT
-  # validated: a false refusal here strands every install on a supported daemon.
+@test "every real Docker version shape is still accepted — the grammar must not over-refuse" {
+  # The counterpart, and the reason the suffix's CONTENT is deliberately not parsed: a false refusal
+  # strands every install on a supported daemon, which is the more expensive error when only the
+  # major decides the gate.
+  local v
+  for v in '28' '28.0' '28.1.4' '2025.1' '100.0.0' '0028.0' \
+           '28.0.0-beta.1' '28.0.0-rc.1' '28.0.0-dev' '28.0.0+build.7'; do
+    if ! _mi_pf_engine_major_ok "$v"; then
+      echo "real version '$v' was REFUSED" >&2; return 1
+    fi
+  done
+}
+
+@test "a malformed version is refused through the public preflight path, not only the helper" {
+  FAKE_DOCKER_SERVER_VERSION=28. run mi_preflight_daemon
+  [ "$status" -ne 0 ]
   FAKE_DOCKER_SERVER_VERSION=28.0.0-beta.1 run mi_preflight_daemon
-  [ "$status" -eq 0 ]
-  FAKE_DOCKER_SERVER_VERSION=28.1.4 run mi_preflight_daemon
   [ "$status" -eq 0 ]
 }

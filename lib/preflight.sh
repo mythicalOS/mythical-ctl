@@ -29,35 +29,50 @@
 # other variables are locals.
 # shellcheck disable=SC2154
 _mi_pf_engine_major_ok() {
-  local v="$1" major="${1%%.*}" rest
-  case "$v" in
-    ''|*[!0-9.a-zA-Z+_-]*) return 1 ;;
-  esac
-  case "$major" in ''|*[!0-9]*) return 1 ;; esac
-  [ "${#major}" -le 9 ] || return 1
+  local v="$1" core suffix major comp rest a b
+  [ -n "$v" ] || return 1
+  case "$v" in *[!0-9.a-zA-Z+_-]*) return 1 ;; esac
 
-  # The MINOR must exist and start with a digit when there is a dot at all. Without this, the
-  # charset check above accepts `28.`, `28..` and `28.0.0-`, whose major parses to 28 and which are
-  # therefore ACCEPTED while not being version strings.
+  # A COMPLETE grammar, not a prefix check. Two earlier revisions validated only the major, then only
+  # the major and the first byte of the minor, and each time a reviewer produced the next malformed
+  # string that slipped through — `28.`, then `28..`, then `28.0..`, `28.0-`, `28.0__`, `28.0.0--`.
+  # Patching one instance at a time was the wrong shape of fix; this closes the class.
   #
-  # Scope, stated honestly: this is a contract-consistency fix, NOT a security fix. Measured across
-  # the malformed inputs — `28.`, `28..`, `28.0.0-`, `.28`, `-28.0`, `+28`, `27.`, `28x`, `1e9`,
-  # `0028.0`, `9999999999999.0` — **every one that was accepted had a major of 28 or greater**, and
-  # `27.` was already refused. No malformed value admitted an engine older than the floor. What was
-  # actually wrong is that the file states "an UNPARSEABLE version is a REFUSAL" and then accepted
-  # three unparseable ones, so a later reader could not trust the rule as written.
-  case "$v" in
-    *.*) rest="${v#*.}"
-         case "$rest" in ''|[!0-9]*) return 1 ;; esac ;;
-  esac
+  # Accepted: `<digits>(.<digits>)*` with an OPTIONAL non-empty pre-release/build suffix introduced
+  # by the first `-` or `+`. So `28`, `28.1.4`, `2025.1`, `28.0.0-beta.1` and `28.0.0+build.7` pass;
+  # `28.`, `28..`, `28.0..`, `28.0__`, `28.0-`, `.28`, `-28.0`, `dev` and `` are refused.
+  #
+  # Scope, stated plainly so nobody re-files this as a security bug: at no point was any of this
+  # exploitable. Measured across every malformed input raised, each one that was accepted had a major
+  # at or above the floor, and `27.` was refused throughout — no malformed version ever admitted an
+  # engine older than the floor. What was wrong is that the file promised "an UNPARSEABLE version is
+  # a REFUSAL" and did not deliver it, so the rule could not be trusted as written.
+  #
+  # The suffix is deliberately NOT parsed beyond "present and non-empty": its contents are Docker's
+  # business, and inventing a grammar for them risks REFUSING a legitimate future version. A false
+  # refusal strands every install on a supported daemon, which is the more expensive error when only
+  # the major decides the gate.
+  a="${v%%-*}"; b="${v%%+*}"
+  if [ "${#a}" -le "${#b}" ]; then core="$a"; else core="$b"; fi
+  if [ "$core" != "$v" ]; then
+    suffix="${v#"$core"}"; suffix="${suffix#?}"
+    # Non-empty AND starting alphanumeric. "Non-empty" alone still admitted `28.0.0--`, whose suffix
+    # is a lone `-`. Every real suffix Docker emits begins alphanumeric (`beta.1`, `rc.1`, `dev`,
+    # `build.7`), so this is the weakest constraint that finishes the matrix without inventing a
+    # grammar for content that is Docker's to define.
+    case "$suffix" in ''|[!0-9a-zA-Z]*) return 1 ;; esac
+  fi
 
-  # What this deliberately still ACCEPTS, and why: `28.0.0-`. Its minor exists and is numeric, and a
-  # trailing suffix after the patch is exactly the shape of a real pre-release version — Docker ships
-  # `28.0.0-beta.1`, which must keep working. Validating the suffix grammar would risk REFUSING a
-  # legitimate future Docker version, and a false refusal here strands every install on a supported
-  # daemon. Since only the major decides the gate and this major is unambiguous, accepting it is the
-  # cheaper error. Refusing malformed values whose major cannot be trusted is the point; refusing
-  # unusual-but-unambiguous ones is not.
+  rest="$core"
+  while :; do
+    comp="${rest%%.*}"
+    case "$comp" in ''|*[!0-9]*) return 1 ;; esac
+    [ "${#comp}" -le 9 ] || return 1
+    [ "$rest" != "$comp" ] || break
+    rest="${rest#*.}"
+  done
+
+  major="${core%%.*}"
   [ "$major" -ge "$MI_RT_MIN_ENGINE" ]
 }
 
