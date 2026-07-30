@@ -528,10 +528,22 @@ mi_conf_family_add() {
     # look the same to code deciding whether to write.
     if existing="$(mi_conf_get "$tmp" "$key")"; then rc=0; else rc=$?; fi
     if [ "$rc" -eq 0 ]; then
-      rm -f "$tmp"
       if [ "$existing" = "$val" ]; then
-        return 0                       # already exactly what we would write: nothing to do
+        # Already exactly what we would write — but the copy this was read from is a snapshot, so
+        # confirm the live file still matches it before reporting success. Returning 0 straight from
+        # here would mean "the setting you asked for is present" on the strength of bytes that may
+        # have been replaced since: an editor save landing in this window makes the claim false, and
+        # a caller told the value is set has no reason to look again. mi_conf_product_add cannot have
+        # this bug because it always reaches its CAS; this writer's early return skipped it.
+        if ! _mi_conf_unchanged "$f" "$pre"; then
+          rm -f "$tmp"
+          mi_warn "config: $f changed while we were reading it — refusing to report $key as already set; re-run"
+          return 1
+        fi
+        rm -f "$tmp"
+        return 0
       fi
+      rm -f "$tmp"
       mi_warn "config: $key is already set to '$existing' in $f — refusing to overwrite it"
       mi_warn "  An operator's value is never replaced silently; change it by hand, or remove the line."
       return 1
@@ -560,6 +572,19 @@ mi_conf_family_add() {
     mi_warn "config: $f changed while we were reading it — refusing to overwrite that change; re-run"
     return 1
   fi
+
+  # Re-check identity immediately before the replace, exactly as mi_conf_product_add does before its
+  # write. The check at the top of this function ran several reads ago, and a pathname check is only
+  # ever true of the instant it ran: a symlink swapped in afterwards is copied from, validated, hashed
+  # and then replaced by `mv` — which is precisely the "silently adopts foreign content and reports
+  # success" outcome the hardening comment above says this check prevents. Without this second call the
+  # claim is false, because the digest CAS is satisfied (it digests the link target both times).
+  #
+  # This NARROWS the window; it does not close it. §4.1a records pathname TOCTOU as an accepted,
+  # irreducible residual for a shell installer — closing it needs fd- or mount-namespace-based I/O that
+  # portable bash does not have. The family lock already excludes every other mythical-ctl process, so
+  # the remaining racer is a local process running as the operator, who can write this file directly.
+  _mi_conf_identity_ok "$f" || { rm -f "$tmp"; return 1; }
 
   # Atomic replace within the same directory, so rename() cannot cross filesystems.
   mv -f "$tmp" "$f" || { rm -f "$tmp"; mi_warn "config: cannot replace $f"; return 1; }

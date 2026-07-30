@@ -193,6 +193,24 @@ EOF
   mi_conf_family_load >/dev/null
 }
 
+# The no-op-success path reads its answer from a SNAPSHOT, so it has to confirm the live file still
+# matches before reporting "already set". Returning 0 on the strength of bytes that may since have been
+# replaced tells a caller the setting it asked for is present when it is not, and a caller told that has
+# no reason to look again. mi_conf_product_add cannot have this bug because it always reaches its CAS;
+# this writer's early return skipped it.
+@test "same-value no-op does not report success if the file changed under us" {
+  local f; f="$(mi_conf_family_path)"
+  mi_conf_family_add MYTHICAL_NET same
+  cp "$f" "$MYTHICAL_HOME/before"
+  # stand in for an editor save landing after the snapshot was taken
+  _mi_conf_unchanged() { return 1; }
+  run mi_conf_family_add MYTHICAL_NET same
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"changed while we were reading it"* ]] \
+    || { echo "the no-op path reported success despite a concurrent change: $output" >&2; return 1; }
+  diff -u "$MYTHICAL_HOME/before" "$f"
+}
+
 # --- identity (hardening, beyond what the plan scoped) --------------------------------------------
 # The plan put the §4.1a identity checks on the container-writable <product>.conf only, reasoning that
 # mythical.conf is host-only and not attacker-controlled. True of the threat, and it still left a bad
@@ -203,6 +221,29 @@ EOF
 # success. Bounded (the attacker must already be able to create files in ~/.mythical/ as the operator,
 # who could write mythical.conf directly), so no privilege is gained — but "silently adopts foreign
 # content and reports success" is not a failure mode to ship.
+# The identity check at the top of the writer is true only of the instant it ran. A symlink swapped in
+# afterwards is copied from, validated, hashed, and then replaced by `mv` — and the digest CAS is
+# satisfied, because it digests the link target both times. So without a second check immediately
+# before the replace, the hardening comment's claim is false. `_mi_conf_unchanged` is the last thing
+# that touches the live path before the replace, so overriding it is the precise hook for planting the
+# swap deterministically.
+@test "a symlink planted after the first identity check is still refused before the replace" {
+  local f foreign; f="$(mi_conf_family_path)"; foreign="$MYTHICAL_HOME/foreign.conf"
+  printf 'MYTHICAL_TELEMETRY_KEY=foreign\n' > "$foreign"; chmod 600 "$foreign"
+  printf 'MYTHICAL_TELEMETRY_KEY=ours\n'    > "$f";       chmod 600 "$f"
+  cp "$foreign" "$MYTHICAL_HOME/foreign-before"
+
+  # racer: replace the pathname with a symlink to a clean, schema-valid foreign file, then report the
+  # file unchanged so the CAS lets us through to the replace.
+  eval '_mi_conf_unchanged() { ln -sf "'"$foreign"'" "'"$f"'"; return 0; }'
+  run mi_conf_family_add MYTHICAL_NET good-net
+  [ "$status" -ne 0 ]
+  [[ "$output" == *symlink* ]] \
+    || { echo "the pre-replace identity check did not refuse the planted symlink: $output" >&2; return 1; }
+  # the foreign file was neither written through nor adopted
+  diff -u "$MYTHICAL_HOME/foreign-before" "$foreign"
+}
+
 @test "a symlinked mythical.conf is refused, not followed and adopted" {
   local f target
   f="$(mi_conf_family_path)"
