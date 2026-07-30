@@ -92,20 +92,44 @@ mi_ledger_write() {
     mi_die "existing ledger does not validate — refusing to overwrite it; run 'state repair'"
   fi
 
-  tmp="$(mktemp "$dir/.ledger.XXXXXX")"
+  tmp="$(mktemp "$dir/.ledger.XXXXXX")" || mi_die "ledger: cannot create a temp file in $dir — refusing (fail closed)"
   # Buffer the whole body, then guarantee it ends in exactly one newline before the checksum line,
   # so a final record lacking its own newline cannot fuse onto '#sha256='. An empty body is legal.
-  local body; body="$(cat)"
-  {
-    printf '#mythical-ctl-ledger schema=%s\n' "$MI_LEDGER_SCHEMA"
-    if [ -n "$body" ]; then printf '%s\n' "$body"; fi
-  } > "$tmp"
+  local body
+  body="$(cat)" || { rm -f "$tmp"; mi_die "ledger: cannot read the records to write — refusing (fail closed)"; }
+
+  # EVERY construction write is checked, and each one separately. This module is a PURE library that
+  # must be correct WITHOUT ambient errexit — the entrypoint's `set -e` masks the problem, but nothing
+  # else does. Unchecked, a failed write here (a full disk, a read-only temp, an ENOSPC mid-record)
+  # falls straight through to the `mv -f` below and ATOMICALLY REPLACES A VALID LEDGER WITH A
+  # TRUNCATED ONE — the precise inverse of the never-destroy-evidence guarantee asserted twenty lines
+  # above. Reproduced with a `mktemp` shim handing back a 0444 file: the old code wrote nothing,
+  # digested the empty file happily, appended nothing, and renamed the empty temp over a good ledger,
+  # returning 0.
+  #
+  # The header and the body are written as two checked statements rather than one `{ … } > "$tmp"`
+  # group, because a group's status is only its LAST command's: with an empty body the group ends on a
+  # false `if` test, which is status 0, so a failed header write would have been reported as success.
+  if ! printf '#mythical-ctl-ledger schema=%s\n' "$MI_LEDGER_SCHEMA" > "$tmp"; then
+    rm -f "$tmp"; mi_die "ledger: cannot write the header — refusing (fail closed)"
+  fi
+  if [ -n "$body" ]; then
+    if ! printf '%s\n' "$body" >> "$tmp"; then
+      rm -f "$tmp"; mi_die "ledger: cannot write the records — refusing (fail closed)"
+    fi
+  fi
+
   local sum
   sum="$(mi_digest "$tmp")" || { rm -f "$tmp"; mi_die "ledger: failed to compute checksum — refusing (fail closed)"; }
   [ -n "$sum" ] || { rm -f "$tmp"; mi_die "ledger: empty checksum — refusing (fail closed)"; }
-  printf '#sha256=%s\n' "$sum" >> "$tmp"
-  # Atomic replace: same directory, so rename() cannot cross filesystems.
-  mv -f "$tmp" "$f"
+  if ! printf '#sha256=%s\n' "$sum" >> "$tmp"; then
+    rm -f "$tmp"; mi_die "ledger: cannot write the checksum line — refusing (fail closed)"
+  fi
+
+  # Atomic replace: same directory, so rename() cannot cross filesystems. Checked too — an unchecked
+  # `mv` leaves the temp behind on failure and reports whatever status the caller's shell options
+  # happen to produce.
+  mv -f "$tmp" "$f" || { rm -f "$tmp"; mi_die "ledger: cannot replace $f — refusing (fail closed)"; }
 }
 
 # Convenience: print records of <kind>, or the value of <key> within them.

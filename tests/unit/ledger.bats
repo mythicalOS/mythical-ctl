@@ -178,3 +178,51 @@ setup_ledger() { load_mctl; mi_ensure_layout; hold_lock; }
   [ "$status" -ne 0 ]
   [ "$status" -ne 3 ]
 }
+
+# Every construction write in mi_ledger_write is checked, and this is why. Unchecked, a failed write
+# falls through to the `mv -f` and atomically replaces a VALID ledger with a truncated one — the exact
+# inverse of the never-destroy-evidence guarantee the function asserts. Found by a cross-model gate.
+#
+# The shim hands back a temp path that already exists and is mode 0444, so the header write fails while
+# everything after it still "succeeds": mi_digest happily digests the empty file, the checksum append
+# fails silently too, and `mv -f` needs no write permission on its SOURCE — only on the directory — so
+# the empty temp lands on top of the good ledger. Measured against the pre-fix code: rc 0, and the
+# ledger reduced to 0 bytes.
+@test "a failed ledger write refuses instead of replacing a valid ledger" {
+  setup_ledger
+  local shim="$BATS_TEST_TMPDIR/shim" f before
+  mkdir -p "$shim"
+  # Intercept ONLY the WRITER's template. mi_ledger_read makes its own snapshot with
+  # `.ledger.read.XXXXXX`, and a shim that hijacked that too would make the read fail — so the writer
+  # would refuse at its "existing ledger does not validate" gate and never reach the write checks this
+  # test is about. Measured: with a broad shim the test passed against the PRE-FIX code, i.e. it proved
+  # nothing. `*/.ledger.XXXXXX` does not match `.ledger.read.XXXXXX`.
+  cat > "$shim/mktemp" <<EOF
+#!/usr/bin/env bash
+case "\$1" in
+  */.ledger.XXXXXX)
+    p="$MYTHICAL_HOME/readonly.ledger.tmp"
+    : > "\$p"
+    chmod 0444 "\$p"
+    printf '%s\n' "\$p"
+    exit 0 ;;
+esac
+exec /usr/bin/mktemp "\$@"
+EOF
+  chmod +x "$shim/mktemp"
+
+  # a valid ledger to protect
+  printf 'identity\tid=abc\n' | mi_ledger_write
+  f="$MYTHICAL_HOME/.state/ledger"
+  [ -s "$f" ] || { echo "the fixture ledger is empty — this test would prove nothing" >&2; return 1; }
+  before="$(mi_digest "$f")"
+
+  run env PATH="$shim:$PATH" bash -c \
+    'source '"$_MCTL_ROOT"'/lib/common.sh; source '"$_MCTL_ROOT"'/lib/layout.sh; source '"$_MCTL_ROOT"'/lib/lock.sh; source '"$_MCTL_ROOT"'/lib/ledger.sh; printf "identity\tid=xyz\n" | mi_ledger_write'
+  [ "$status" -ne 0 ]
+
+  # the good ledger is byte-identical, and still loads
+  [ "$(mi_digest "$f")" = "$before" ] \
+    || { echo "the valid ledger was replaced — it now holds: $(cat "$f")" >&2; return 1; }
+  mi_ledger_read >/dev/null
+}
