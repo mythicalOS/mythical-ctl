@@ -43,6 +43,47 @@ _mi_rt_strip_zeros() {
   printf '%s' "$n"
 }
 
+# --- mount components -----------------------------------------------------------------------------
+# A mount reaches the runtime as `--mount type=bind,source=…,target=…` — a COMMA-separated key=value
+# list, not the colon-separated triple the spec grammar above it uses. So a comma inside a component
+# does not stay inside that component. MEASURED here, with the spec taken verbatim from the caller:
+#
+#   bind=/host:/container,bind-propagation=rshared:rw
+#     → --mount type=bind,source=/host,target=/container,bind-propagation=rshared
+#   volume=v,volume-opt=o=bind,volume-opt=device=/etc:/d:rw
+#     → --mount type=volume,source=v,volume-opt=o=bind,volume-opt=device=/etc,target=/d
+#
+# The second is the serious one: it turns a NAMED VOLUME into a host bind mount, i.e. a container
+# escape expressed through the one API whose whole purpose is to make an unsafe launch inexpressible.
+# Splitting on `:` and checking "starts with /" cannot see either, because both components are
+# well-formed paths as far as that check is concerned.
+#
+# No volume name and no path this code constructs ever contains a comma, so refusing one closes
+# Docker's option grammar at no cost to any legitimate caller. There is ONE implementation of each
+# rule, used by both the container arm and the helper arm — two copies of a security check drift.
+
+# A bind SOURCE or a mount TARGET: comma-free, absolute, `..`-free. <what> only names the field in
+# the refusal, so the operator is told which component of which spec was rejected.
+_mi_rt_bind_path_ok() {
+  local p="$1" what="$2"
+  case "$p" in *,*) mi_warn "runtime: $what '$p' contains a comma, which would open Docker's mount option list"; return 1 ;; esac
+  _mi_rt_arg_ok "$p" || { mi_warn "runtime: $what is empty, over-long, or contains a control byte"; return 1; }
+  case "$p" in /*) : ;; *) mi_warn "runtime: $what '$p' is not absolute"; return 1 ;; esac
+  case "/${p}/" in */../*) mi_warn "runtime: $what '$p' contains a .. component"; return 1 ;; esac
+  return 0
+}
+
+# A volume SOURCE is a NAME, not a path. Absolute is refused as well as comma-bearing: a `/`-leading
+# "name" is a bind mount wearing the volume spec's clothes, and the whole point of the two spec kinds
+# is that the caller cannot choose which one it gets.
+_mi_rt_volume_name_ok() {
+  local n="$1"
+  case "$n" in *,*) mi_warn "runtime: volume name '$n' contains a comma, which would open Docker's mount option list"; return 1 ;; esac
+  case "$n" in /*) mi_warn "runtime: '$n' is an absolute path, not a volume name"; return 1 ;; esac
+  _mi_rt_arg_ok "$n" || { mi_warn "runtime: volume name is empty, over-long, or contains a control byte"; return 1; }
+  return 0
+}
+
 # Exec the runtime with pre-validated arguments. Every public function funnels through this.
 _mi_rt() {
   local a
@@ -212,9 +253,14 @@ mi_rt_network_rm() {
 # LOWER priority than the source so the route does not move before phase 4.
 mi_rt_network_connect() {
   if [ "$#" -ne 4 ]; then mi_warn "runtime: mi_rt_network_connect needs <netid> <container> <alias> <gw-priority>"; return 1; fi
-  local netid="$1" c="$2" alias="$3" gw="$4"
+  local netid="$1" c="$2" alias="$3" gw="$4" gwd
   _mi_rt_netmode_ok "$netid" || return 1
-  case "$gw" in ''|*[!0-9-]*) mi_warn "runtime: gateway priority must be numeric"; return 1 ;; esac
+  # A character-SET test (`*[!0-9-]*`) constrains which bytes may appear and nothing about their
+  # arrangement, so `1-2`, `-` and `--` all satisfy it and reach Docker. The priority is an
+  # optionally-negative integer: strip at most one leading `-`, then require digits and only digits.
+  gwd="$gw"
+  case "$gwd" in -*) gwd="${gwd#-}" ;; esac
+  case "$gwd" in ''|*[!0-9]*) mi_warn "runtime: gateway priority '$gw' is not an integer"; return 1 ;; esac
   _mi_rt network connect --alias "$alias" --gw-priority "$gw" -- "$netid" "$c"
 }
 
@@ -305,8 +351,7 @@ mi_rt_container_create() {
         p1="${body%%:*}"; body="${body#*:}"
         p2="${body%%:*}"; p3="${body#*:}"
         case "$p3" in ro|rw) : ;; *) mi_warn "runtime: mount spec '$s' must end in :ro or :rw"; return 1 ;; esac
-        case "$p2" in /*) : ;; *) mi_warn "runtime: mount target '$p2' is not absolute"; return 1 ;; esac
-        case "/${p2}/" in */../*) mi_warn "runtime: mount target '$p2' contains a .. component"; return 1 ;; esac
+        _mi_rt_bind_path_ok "$p2" "mount target" || { mi_warn "runtime: refusing mount spec '$s'"; return 1; }
         # An `if`, not `$( [ "$p3" = ro ] && printf ',readonly' )`. MEASURED on this machine: a
         # command substitution whose last command FAILS makes the enclosing ASSIGNMENT fail, and an
         # array append is an assignment — so under the entrypoint's ambient `set -e` the whole CLI
@@ -316,13 +361,13 @@ mi_rt_container_create() {
         ro=""
         if [ "$p3" = ro ]; then ro=",readonly"; fi
         if [ "$kind" = bind ]; then
-          case "$p1" in /*) : ;; *) mi_warn "runtime: bind source '$p1' is not absolute"; return 1 ;; esac
-          case "/${p1}/" in */../*) mi_warn "runtime: bind source '$p1' contains a .. component"; return 1 ;; esac
+          _mi_rt_bind_path_ok "$p1" "bind source" || { mi_warn "runtime: refusing mount spec '$s'"; return 1; }
           # `type=bind` explicitly: the --mount form refuses to create a missing source, where -v
           # silently creates a DIRECTORY. A missing single-file bind silently becoming a directory is
           # how <product>.conf stops being the file the product writes (§4.1a).
           rtargv+=(--mount "type=bind,source=${p1},target=${p2}${ro}")
         else
+          _mi_rt_volume_name_ok "$p1" || { mi_warn "runtime: refusing mount spec '$s'"; return 1; }
           rtargv+=(--mount "type=volume,source=${p1},target=${p2}${ro}")
         fi
         ;;
@@ -427,13 +472,22 @@ mi_rt_run_helper() {
   local s
   for s in "$@"; do
     case "$s" in
+      # Every one of the three below is VALIDATED, not interpolated. The callers are this codebase's
+      # own code today, but the guarantee this module documents is STRUCTURAL — "no caller can express
+      # an unsafe launch" — and a later task passes an operator-influenced destination through
+      # `staging=`. Unvalidated, `staging=/host,bind-propagation=rshared` becomes a real
+      # bind-propagation option on the one writable mount the helper has.
+      #
       # The SOURCE volume is mounted READ-ONLY: the copy has no reason to write to what it is
       # preserving, and a bug or a hostile payload that mutates the source destroys the original
       # before the copy is verified (D54).
-      srcvol=*)  rtargv+=(--mount "type=volume,source=${s#srcvol=},target=/src,readonly") ;;
+      srcvol=*)  _mi_rt_volume_name_ok "${s#srcvol=}" || { mi_warn "runtime: refusing helper spec '$s'"; return 1; }
+                 rtargv+=(--mount "type=volume,source=${s#srcvol=},target=/src,readonly") ;;
       # STAGING IS THE ONLY WRITABLE MOUNT, and nothing else from the host is mounted at all.
-      staging=*) rtargv+=(--mount "type=bind,source=${s#staging=},target=/dst") ;;
-      dstro=*)   rtargv+=(--mount "type=bind,source=${s#dstro=},target=/dst,readonly") ;;
+      staging=*) _mi_rt_bind_path_ok "${s#staging=}" "helper staging source" || return 1
+                 rtargv+=(--mount "type=bind,source=${s#staging=},target=/dst") ;;
+      dstro=*)   _mi_rt_bind_path_ok "${s#dstro=}" "helper read-only source" || return 1
+                 rtargv+=(--mount "type=bind,source=${s#dstro=},target=/dst,readonly") ;;
       # An argument to the CLOSED command word, INSIDE the container — never a docker flag. Every
       # value passed this way is a container-internal path or an alias this code computed.
       arg=*)     rtpost+=("${s#arg=}") ;;

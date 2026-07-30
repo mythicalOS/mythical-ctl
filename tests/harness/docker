@@ -11,6 +11,11 @@
 #     FAKE_DOCKER_NET_DUPLICATE, because Docker does not guarantee name-conflict detection there.
 #   * `inspect` of an absent object exits nonzero while `version` still answers, which is how the
 #     adapter distinguishes "absent" (rc 3) from "daemon down" (rc 1).
+#   * `container create` and `container run` REFUSE an image that was never pulled, as a real daemon
+#     does. Permissiveness here is not a harmless simplification: it lets a caller that forgot to
+#     pull pass its tests and fail against a real daemon.
+#   * `--mount type=bind` REFUSES a source that does not exist — the documented reason the adapter
+#     uses `--mount` rather than `-v`, which silently creates one.
 #
 # Knobs: FAKE_DOCKER_DOWN, FAKE_DOCKER_SERVER_VERSION, FAKE_DOCKER_ROOTLESS,
 #        FAKE_DOCKER_CONTEXT_HOST, FAKE_DOCKER_PULL, FAKE_DOCKER_NET_DUPLICATE,
@@ -47,6 +52,37 @@ rec_set() {
   t="$(mktemp "${f%/*}/.tmp-XXXXXX")"
   { grep -av "^${k}=" "$f" 2>/dev/null || true; printf '%s=%s\n' "$k" "$v"; } > "$t"
   mv -f "$t" "$f"
+}
+
+# --- image presence, shared by pull, inspect, create and run ---
+# ONE derivation of the on-disk key, so `pull` and the gates below cannot disagree about what counts
+# as the same image.
+image_key() { printf '%s/images/%s' "$STATE" "$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_')"; }
+
+# Real Docker cannot create or run a container from an image it does not hold: it attempts a pull and
+# then errors. A fake that records the container regardless lets a later task that FORGOT to pull
+# pass its tests and fail against a real daemon — and it makes two §10a rows unprovable, since
+# "not launched ⇒ no pull attempted" and "launched manifest + image not found ⇒ loud release error"
+# both rest on create being the thing that cannot succeed without the image.
+require_image() {
+  [ -n "$1" ] || die "no image reference"
+  [ -e "$(image_key "$1")" ] || die "Unable to find image '$1' locally"
+}
+
+# --- mount validation ---
+# `--mount type=bind` REFUSES a source that does not exist. That refusal is the stated reason the
+# adapter uses `--mount` rather than `-v`, which silently CREATES a missing source as a directory —
+# which is how a single-file bind stops being the file the product writes. The fake checked nothing,
+# so the guarantee that comment claims was asserted by no test at all.
+check_mounts() {
+  local spec src
+  local IFS=';'
+  # shellcheck disable=SC2086   # deliberate split: the mount list is `;`-separated by the parser above
+  for spec in $1; do
+    case "$spec" in type=bind,*) : ;; *) continue ;; esac
+    src="${spec#*source=}"; src="${src%%,*}"
+    [ -e "$src" ] || die "invalid mount config for type \"bind\": bind source path does not exist: $src"
+  done
 }
 
 # --- label parsing, shared by every create ---
@@ -310,7 +346,12 @@ case "${1:-}" in
         done
         [ -n "$name" ] || die "container create: no name"
         [ -n "$netid" ] || die "container create: no network"
+        # In real Docker's order: the image is resolved first, then the name conflict, then the mount
+        # config. Every one of these must refuse BEFORE the record is written, or a refused create
+        # still leaves a container behind for the next assertion to find.
+        require_image "$image"
         [ ! -e "$STATE/containers/$name" ] || die "Conflict. The container name \"/$name\" is already in use"
+        check_mounts "$mounts"
         f="$STATE/containers/$name"; : > "$f"
         rec_set "$f" id "$(next_id)"
         rec_set "$f" image "$image"
@@ -392,16 +433,24 @@ case "${1:-}" in
         # The pinned helper (D49/D54). Its result comes from the fixture image script so a test can
         # make the probe answer, fail, or be unobtainable.
         shift
-        img=""; cmd=""; rest=""
+        img=""; cmd=""; rest=""; mounts=""
         while [ "$#" -gt 0 ]; do
           case "$1" in
-            --rm|--network|--user|--label|--mount) if [ "$1" = --rm ]; then shift; else shift 2; fi ;;
+            --rm) shift ;;
+            --network|--user|--label) shift 2 ;;
+            --mount) mounts="${mounts}${2};"; shift 2 ;;
             --) shift; img="$1"; shift; cmd="${1:-}"; shift || true; rest="$*"; break ;;
             *) shift ;;
           esac
         done
+        # The image gate applies to `run` exactly as it does to `create`: a helper whose pinned image
+        # was never pulled is the same defect. Note the wording move — "Unable to find image locally"
+        # is now the ABSENT-IMAGE error and no longer doubles as "the fixture entrypoint is unset",
+        # which is a harness misconfiguration and says so.
+        require_image "$img"
+        check_mounts "$mounts"
         [ -z "${FAKE_DOCKER_HELPER_FAIL:-}" ] || die "helper: ${FAKE_DOCKER_HELPER_FAIL}"
-        [ -x "${FAKE_HELPER_BIN:-}" ] || die "Unable to find image '$img' locally"
+        [ -x "${FAKE_HELPER_BIN:-}" ] || die "fake docker: FAKE_HELPER_BIN is not set to an executable fixture entrypoint"
         # shellcheck disable=SC2086   # deliberate split: $rest carries the helper's own arguments
         "$FAKE_HELPER_BIN" "$cmd" $rest
         ;;
@@ -415,9 +464,10 @@ case "${1:-}" in
       pull)
         shift; ref=""
         while [ "$#" -gt 0 ]; do case "$1" in --) shift ;; *) ref="$1"; shift ;; esac; done
+        [ -n "$ref" ] || die "image pull: no reference"
         case "${FAKE_DOCKER_PULL:-ok}" in
-          ok)       : > "$STATE/images/$(printf '%s' "$ref" | tr -c 'A-Za-z0-9._-' '_')"
-                    rec_set "$STATE/images/$(printf '%s' "$ref" | tr -c 'A-Za-z0-9._-' '_')" ref "$ref"
+          ok)       : > "$(image_key "$ref")"
+                    rec_set "$(image_key "$ref")" ref "$ref"
                     printf 'Status: Downloaded newer image for %s\n' "$ref" ;;
           notfound) die "manifest for $ref not found: manifest unknown" ;;
           auth)     die "denied: requested access to the resource is denied" ;;
@@ -430,7 +480,8 @@ case "${1:-}" in
         while [ "$#" -gt 0 ]; do
           case "$1" in --format) tmpl="$2"; shift 2 ;; --) shift ;; *) ref="$1"; shift ;; esac
         done
-        k="$STATE/images/$(printf '%s' "$ref" | tr -c 'A-Za-z0-9._-' '_')"
+        [ -n "$ref" ] || die "image inspect: no reference"
+        k="$(image_key "$ref")"
         [ -e "$k" ] || die "No such image: $ref"
         if [ "$tmpl" = '{{.Id}}' ]; then printf 'sha256:%s\n' "$(next_id)"; else render "$tmpl" "$k" image; fi
         ;;
