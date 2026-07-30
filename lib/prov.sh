@@ -380,7 +380,22 @@ mi_prov_tombstone() {
   # written. The kind is this module's own constant. What remains variable is what is checked.
   _mi_led_fields_ok "key=${key}" "name=${name}" || return 1
 
-  if rec="$(mi_prov_find "$class" "$name")"; then
+  # WHERE THE IDENTITY COMES FROM, AND WHAT A REPEAT MUST NOT LOSE. The object record is
+  # authoritative while it exists. Once it is gone, THE TOMBSTONE IS the surviving record of what was
+  # there — so a second removal of the same object has to copy it forward. Reading only the object
+  # record left the retry with nothing to read: it re-initialised nonce="" gen=0, dropped the
+  # tombstone it had written a moment earlier and replaced it with an empty one. Retrying is safe
+  # everywhere else in this module, and this is the one operation whose entire purpose is preserving
+  # the identity of something removed, so a retry destroying exactly that inverted the supersession
+  # rule below — "supersedes the earlier tombstone" has to mean "with equivalent content".
+  if rec="$(mi_prov_find "$class" "$name")"; then :
+  elif rec="$(mi_led_find "$MI_PROV_TOMB" key "$key")"; then :
+  else rec=""
+  fi
+  # An unreadable ledger reaches this as an empty record and is caught by the read below, which
+  # returns its status rather than writing — a tombstone is never written over a ledger we could not
+  # read, so an empty record here cannot become an empty tombstone on disk.
+  if [ -n "$rec" ]; then
     nonce="$(mi_led_field "$rec" nonce)" || nonce=""
     gen="$(mi_led_field "$rec" gen)" || gen=0
   fi
@@ -502,20 +517,45 @@ mi_first_use() {
     return 1
   fi
 
+  # ONE SWEEP, ONE PRESENCE QUESTION, ASKED OF EVERY ENTRY. This was two loops over two globs, and
+  # THE GLOB — not the test beside it — was what decided which entries got judged:
+  #
+  #   for p in "$h"/*/ ; do [ -d "$p" ] || continue
+  #
+  # bash expands a trailing-slash pattern by testing each candidate for DIRECTORY-ness, so
+  # `$h/brokkr -> /gone` never became a candidate and the `[ -d ]` never ran on it. Patching that
+  # test would have fixed nothing; measured, `[ -L "$h/link/" ]` is false even for a live link to a
+  # directory, so a trailing slash defeats every test one could put next to it. `"$h"/*` offers
+  # every entry — file, directory, live link and dangling link alike — and the tests below decide.
   local found=""
-  local p
-  for p in "$h"/*.conf; do
-    # Presence, again: a DANGLING symlink named <product>.conf is as much a trace of a previous
-    # installation as a readable file is, and `-e` alone cannot see one. (An unmatched glob is
-    # neither, so the literal `*.conf` is still skipped here.)
-    [ -e "$p" ] || [ -L "$p" ] || continue
-    case "$(basename "$p")" in mythical.conf) continue ;; esac   # the family file alone is not product state
-    found="${found} $(basename "$p")"
-  done
-  for p in "$h"/*/; do
-    [ -d "$p" ] || continue
-    case "$(basename "$p")" in bin|.state|transcripts|logs) continue ;; esac
-    found="${found} $(basename "$p")/"
+  local p b
+  for p in "$h"/*; do
+    b="${p##*/}"
+    # PRESENCE, NOT READABILITY. `-e` follows a symlink, so it is false for a dangling one; `-L` is
+    # the only test that sees the link itself. An unmatched glob expands to the literal pattern,
+    # which is neither, so an empty home still falls through here.
+    if [ -e "$p" ] || [ -L "$p" ]; then : ; else continue; fi
+    case "$b" in
+      # DELIBERATE EXEMPTIONS, and each for its own reason — not "these are not traces":
+      #   mythical.conf         the family file is not evidence of any PRODUCT being installed.
+      #   bin, .state           this installer's own scaffolding, created by mi_ensure_layout on
+      #                         every run including the one asking the question, so counting them
+      #                         would make no machine ever read as first use.
+      #   transcripts, logs     user-data (§6c): they are MYTHICAL_HOME's original meaning and can
+      #                         predate the installer entirely, so they are not evidence of a
+      #                         previous INSTALLATION. They are still swept as data everywhere else.
+      # Each is exempt whatever it is on disk — a dangling symlink named `bin` is exempt too, on
+      # purpose, because the exemption is about what the NAME means, not about what is at the path.
+      mythical.conf|bin|.state|transcripts|logs) continue ;;
+      # A per-product config, readable or not: a dangling symlink named <product>.conf is as much a
+      # trace of a previous installation as a readable file is.
+      *.conf) found="${found} ${b}"; continue ;;
+    esac
+    # A per-product directory — or a link standing where one was. `-d` follows the link, so it is
+    # true for a link to a live directory and false for a dangling one; `-L` catches what is left.
+    if [ -d "$p" ]; then found="${found} ${b}/"; continue; fi
+    if [ -L "$p" ]; then found="${found} ${b}"; continue; fi
+    # Anything else here is a plain file at a name this installer never creates — not evidence.
   done
 
   # A STAGING ledger is its own third state (§6c/D59): an in-progress restore is not first use and not
@@ -551,6 +591,13 @@ mi_first_use() {
   # never got to ask. That is a fail-open on the single thing this function decides, and it inverts
   # the rule the whole module is built on: every other function here refuses when it cannot
   # establish a fact. Refuse here too, and say which listing failed.
+  #
+  # THIS IS THE FOURTH AND LAST TRACE QUESTION THIS FUNCTION ASKS, and the only one with no
+  # filesystem path behind it — the other three (the ledger path, the staging marker, the home
+  # sweep) are all `-e || -L` presence tests because a symlink can stand at any of them. There is no
+  # symlink to see here, so that rule has no meaning for this one; its equivalent is the
+  # answered-versus-could-not-be-asked distinction below, which is what makes the exemption safe
+  # rather than merely true.
   local anyobj="" unasked="" kind names n
   for kind in container volume network; do
     if names="$(_mi_prov_list_all "$kind")"; then

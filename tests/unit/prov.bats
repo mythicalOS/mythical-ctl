@@ -326,6 +326,14 @@ teardown() { mi_lock_release; teardown_test_env; }
   run mi_first_use
   [ "$status" -eq 1 ]
   assert_contains "restore is in progress"
+  rm -rf "$MYTHICAL_HOME/.state/ledger.staging"
+  # COVERAGE, not a fix: the `-e || -L` here already saw this input. It is pinned now because the
+  # dangling link is the input the other three trace sites each got wrong in turn, and this was the
+  # one site where it was handled but nothing would have noticed it regressing.
+  ln -s "$MYTHICAL_HOME/.state/gone" "$MYTHICAL_HOME/.state/ledger.staging"
+  run mi_first_use
+  [ "$status" -eq 1 ]
+  assert_contains "restore is in progress"
 }
 
 @test "a DANGLING SYMLINK product conf is a trace too — presence is the test, not readability" {
@@ -333,4 +341,48 @@ teardown() { mi_lock_release; teardown_test_env; }
   run mi_first_use
   [ "$status" -eq 1 ]
   assert_contains "brokkr.conf"
+}
+
+@test "a product DIRECTORY entry is a trace whether it is real, a link, or a dangling link" {
+  # THE GLOB WAS THE FILTER, NOT THE TEST. The sweep globbed `"$h"/*/`, and bash expands a
+  # trailing-slash pattern by testing each candidate for directory-ness — so a dangling symlink was
+  # never offered to the `[ -d ]` beside it, and changing that test alone would have fixed nothing.
+  # Measured: `[ -L "$h/link/" ]` is false even for a live link to a directory, so a trailing slash
+  # defeats every test that could be put next to it.
+  ln -s "$MYTHICAL_HOME/gone" "$MYTHICAL_HOME/brokkr"
+  run mi_first_use
+  [ "$status" -eq 1 ]
+  assert_contains "already holds"
+  assert_contains "brokkr"
+  rm -f "$MYTHICAL_HOME/brokkr"
+
+  # The other two answers the same question has on disk. The link target is deliberately OUTSIDE the
+  # home, or the target directory would itself be the trace and the assertion would prove nothing.
+  mkdir -p "$BATS_TEST_TMPDIR/elsewhere"
+  ln -s "$BATS_TEST_TMPDIR/elsewhere" "$MYTHICAL_HOME/saga"
+  run mi_first_use
+  [ "$status" -eq 1 ]
+  assert_contains "saga"
+  rm -f "$MYTHICAL_HOME/saga"
+
+  mkdir -p "$MYTHICAL_HOME/skuld"
+  run mi_first_use
+  [ "$status" -eq 1 ]
+  assert_contains "skuld"
+}
+
+@test "a REPEATED tombstone keeps the identity the tombstone exists to preserve" {
+  mi_ident_ensure >/dev/null
+  mi_prov_record volume v1 nonce-a
+  mi_prov_tombstone volume v1
+  # A retry is safe everywhere else in this module, and the second call had nothing to read: the
+  # object record is gone by then, so it re-initialised nonce="" gen=0, dropped the tombstone it had
+  # just written and replaced it with an EMPTY one — a repeat of the operation whose entire purpose
+  # is preserving the identity of something removed destroyed exactly that.
+  mi_prov_tombstone volume v1
+  run mi_led_all tombstone
+  [ "$status" -eq 0 ]
+  [ "$(printf '%s\n' "$output" | grep -ac 'name=v1')" = 1 ]
+  assert_contains "nonce=nonce-a"
+  assert_contains "gen=1"
 }
