@@ -72,6 +72,20 @@ man() { { printf 'mythical-manifest 1\nversion=1\nexpires=4102444800\nproduct=br
   [[ "$output" == *launched* ]]
 }
 
+# T5: through mi_manifest_load, the `launched` key is typed `bool` (lib/doc.sh's _mi_doc_type_ok
+# refuses anything but true/false at PARSE time), so mi_manifest_launched's own non-boolean arm can
+# never be reached through the normal door — it only guards a caller (public, on the roster) that
+# hands it hand-built records directly, the same way this file already pins mi_manifest_core_ok and
+# policy.bats pins mi_policy_family_gid on hand-built records rather than only through the loader.
+@test "T5: mi_manifest_launched refuses a non-boolean launch state rather than reporting it launched" {
+  local records; records="$(printf 'launched\tmaybe\n')"
+  run mi_manifest_launched "$records"
+  [ "$status" -eq 1 ] \
+    || { echo "a non-boolean launch state was not refused with rc 1: status=$status output=$output" >&2; return 1; }
+  [[ "$output" == *"not true or false"* ]] \
+    || { echo "output missing the malformed-value message: $output" >&2; return 1; }
+}
+
 # --- §8.1: entitlement enforcement ---
 
 @test "a manifest selecting only entitled things passes the check" {
@@ -257,6 +271,45 @@ mkindex() {   # writes $MYTHICAL_HOME/{policy,mb,ms,index}
   run mi_accept_manifest "$MYTHICAL_HOME/index" "$MYTHICAL_HOME/policy" "$MYTHICAL_HOME/mb" brokkr
   [ "$status" -ne 0 ]
   [[ "$output" == *digest* ]]
+}
+
+# T5: mi_accept_manifest's OWN step 1 (`idx="$(mi_accept_index "$ixf")"`) authenticates the family
+# index — as distinct from merely parsing it. Nothing above isolates this specific call: step 2
+# (mi_accept_policy) re-derives its own authentication of the SAME "$ixf" from the SAME anchor, so on
+# every unmutated path here a broken step 1 is silently backstopped by step 2 re-checking the
+# identical file — swapping step 1's mi_accept_index for mi_index_load changes no test's outcome
+# above, because mi_accept_policy still refuses. (A "no anchor at all" fixture does not isolate it
+# either: mi_trust_check_only, reached later for the MANIFEST's own freshness, independently refuses
+# on anchor absence too.) This test removes both backstops: the anchor IS recorded (so the later
+# freshness gate's anchor-presence check is satisfied), the cached index is tampered so its real
+# bytes no longer match that anchor, and mi_accept_policy is stubbed to succeed unconditionally (the
+# same function-shadowing technique tests/unit/trust.bats already uses on mi_trust_anchor_get) so it
+# cannot independently re-catch the tampering by re-deriving from the same file. Only step 1's own
+# digest check stands between this forged index and full acceptance.
+@test "T5: mi_accept_manifest's own index authentication cannot be bypassed even when the policy step is stubbed" {
+  mkindex
+  local d="$MYTHICAL_HOME" dig="sha256:$(printf 'a%.0s' {1..64})"
+  mi_trust_anchor_set "$(mi_digest "$d/index")"     # anchors the REAL, untampered index
+
+  # A forged manifest an attacker with local write access (but not the anchor) wants accepted.
+  printf 'mythical-manifest 1\nversion=1\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nmin_core=0.1.0\nimage=r@%s\nvolume=state:/data\n' "$dig" > "$d/forged-mb"
+
+  # The cached index is rewritten to vouch for it, without ever touching the recorded anchor.
+  { printf 'mythical-index 1\nversion=1\nexpires=4102444800\npolicy_digest=%s\n' "$(mi_digest "$d/policy")"
+    printf 'manifest=brokkr:%s\n' "$(mi_digest "$d/forged-mb")"; } > "$d/index"
+
+  # Grants exactly what the forged manifest asks for, so nothing downstream of step 1 can
+  # independently refuse — entitlement, min_core and launch state would all otherwise pass too.
+  mi_accept_policy() {
+    printf 'family_gid\t60748\n'
+    printf 'brokkr.permitted_role\tstate\n'
+    return 0
+  }
+  run mi_accept_manifest "$d/index" "$d/policy" "$d/forged-mb" brokkr
+  [ "$status" -eq 1 ] \
+    || { echo "a forged index was accepted through step 1 alone: status=$status output=$output" >&2; return 1; }
+  [[ "$output" == *digest* ]] \
+    || { echo "output missing a digest-mismatch message: $output" >&2; return 1; }
 }
 
 @test "the chain accepts an untampered index, policy and manifest" {

@@ -97,6 +97,67 @@ setup() {
   [ "$status" -ne 0 ]
 }
 
+# D2: mi_trust_floor_override used to write the lowered floor and its audit record as two SEPARATE
+# ledger writes (two calls to _mi_trust_put). _mi_trust_put_many exists precisely so a pair lands
+# together — mi_trust_commit uses it for exactly this reason, and its own header says a downgrade
+# must "survive in the audit trail rather than living in someone's shell history". The fix is one
+# _mi_trust_put_many call carrying both triples.
+#
+# The failure is injected by CONTENT, not by call order: any ledger write whose body would add a
+# trust-downgrade record is refused. Pre-fix, the FIRST write (floor only, no downgrade content
+# yet) still succeeds and only the SECOND (the one adding the audit record) is refused — leaving the
+# floor lowered with no record of why. Post-fix there is only ONE write, it already carries the
+# downgrade content, and it is refused whole: nothing lands, which is what this test pins.
+@test "D2: a failed write leaves neither the floor lowered nor a partial audit record" {
+  mi_trust_floor_set manifest:brokkr 7
+  run bash -c '
+    for m in common layout config lock ledger doc trust; do source "'"$_MCTL_ROOT"'/lib/$m.sh"; done
+    eval "$(declare -f mi_ledger_write | sed "1s/^mi_ledger_write/_real_mi_ledger_write/")"
+    mi_ledger_write() {
+      local body; body="$(cat)"
+      case "$body" in
+        *trust-downgrade*)
+          printf "simulated failure writing the downgrade record\n" >&2
+          return 1 ;;
+      esac
+      printf "%s" "$body" | _real_mi_ledger_write
+    }
+    mi_trust_floor_override manifest:brokkr 3 "emergency rollback of a bad release"
+  '
+  [ "$status" -ne 0 ]
+  [ "$(mi_trust_floor_get manifest:brokkr)" = "7" ] \
+    || { echo "the floor moved despite the write failing: $(mi_trust_floor_get manifest:brokkr)" >&2; return 1; }
+  run mi_ledger_get trust-downgrade manifest:brokkr
+  [ "$status" -eq 0 ]
+  [ -z "$output" ] \
+    || { echo "a partial downgrade record was written despite the write failing: $output" >&2; return 1; }
+}
+
+# D3: the reason string is written verbatim into a ledger record — a record-forgery guard, not just
+# cosmetics. Every other validator in this file sets `local LC_ALL=C` so a character class means the
+# ASCII set rather than whatever the operator's locale defines; the reason check did not. It was also
+# unbounded, where the config module's value rule (_mi_conf_value_ok) caps at MI_CONF_MAXLEN (4096).
+@test "D3: an over-long downgrade reason is refused, matching the config module's value cap" {
+  mi_trust_floor_set manifest:brokkr 7
+  local reason; reason="$(printf 'a%.0s' {1..4097})"
+  [ "${#reason}" -eq 4097 ]     # the fixture itself must be over the 4096 cap, or this proves nothing
+  run mi_trust_floor_override manifest:brokkr 3 "$reason"
+  [ "$status" -ne 0 ] || { echo "accepted a ${#reason}-byte reason" >&2; return 1; }
+  [ "$(mi_trust_floor_get manifest:brokkr)" = "7" ]
+}
+
+# D4: the headline verb must follow the ACTUAL direction of the change — this override is not
+# restricted to lowering a floor (nothing here refuses version > cur), so unconditionally printing
+# "DOWNGRADING" misleads an operator who raises or re-records one through it.
+@test "D4: the message does not say DOWNGRADING when the override raises or repeats the floor" {
+  mi_trust_floor_set manifest:brokkr 3
+  run mi_trust_floor_override manifest:brokkr 9 "correcting an under-recorded floor"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *DOWNGRADING* ]] \
+    || { echo "output wrongly says DOWNGRADING for a raise: $output" >&2; return 1; }
+  [ "$(mi_trust_floor_get manifest:brokkr)" = "9" ]
+}
+
 @test "setting the same floor again is accepted" {
   mi_trust_floor_set manifest:brokkr 5
   run mi_trust_floor_set manifest:brokkr 5
@@ -208,6 +269,59 @@ mkindex() {   # writes $MYTHICAL_HOME/{policy,mb,ms,index}; prints nothing
   [ "$status" -eq 1 ]
   [[ "$output" == *"$bogus"* ]] || { echo "output missing the recorded (expected) anchor $bogus: $output" >&2; return 1; }
   [[ "$output" == *"$real"* ]] || { echo "output missing the file's real digest $real: $output" >&2; return 1; }
+}
+
+# D1: mi_accept_index sits on the trust root and used to fold rc 3 ("no anchor, first use") and rc 1
+# ("a recorded anchor exists and could not be read") into one rc 4 — telling a caller with a DAMAGED
+# ledger the same thing it tells a fresh installation. mi_trust_check_only already documents this
+# exact hazard and handles it with a three-way case; this is the mirror of that pair, pointed at
+# mi_accept_index, so both codes are pinned in both directions through the function every door in
+# this plan actually calls.
+@test "D1: an ABSENT anchor is first use for mi_accept_index too, and it is rc 4" {
+  mkindex
+  mi_trust_anchor_get() { return 3; }
+  run mi_accept_index "$MYTHICAL_HOME/index"
+  [ "$status" -eq 4 ]
+}
+
+@test "D1: an anchor that cannot be READ is refused by mi_accept_index, never reported as first use" {
+  mkindex
+  mi_trust_anchor_get() { return 1; }
+  run mi_accept_index "$MYTHICAL_HOME/index"
+  [ "$status" -eq 1 ]                                   # emphatically NOT 4
+  printf '%s' "$output" | grep -aq 'could not be read'
+}
+
+# T2: mi_accept_index's own freshness gate (mi_trust_check index "$records") is the WIRING at this
+# door, not the predicate — _mi_trust_fresh_ok is already well tested standalone. Every mkindex
+# fixture elsewhere in this suite uses the same far-future expires, so nothing exercises an EXPIRED
+# index actually reaching mi_accept_index while its digest still matches the anchor. Deleting that
+# call would accept a stale family index forever, offline, past its own stated expiry — the exact
+# replay §8.1's mandatory expiry field exists to close.
+@test "T2: mi_accept_index refuses an expired family index even though its digest matches the anchor" {
+  mkindex
+  local d="$MYTHICAL_HOME"
+  { printf 'mythical-index 1\nversion=1\nexpires=1\npolicy_digest=%s\n' "$(mi_digest "$d/policy")"
+    printf 'manifest=brokkr:%s\nmanifest=skuld:%s\n' "$(mi_digest "$d/mb")" "$(mi_digest "$d/ms")"; } > "$d/index"
+  mi_trust_anchor_set "$(mi_digest "$d/index")"
+  run mi_accept_index "$d/index"
+  [ "$status" -eq 1 ] || { echo "an expired index was accepted, status=$status: $output" >&2; return 1; }
+  [[ "$output" == *expired* ]] || { echo "output missing 'expired': $output" >&2; return 1; }
+}
+
+# T5: _mi_index_manifest_digest returns THIS product's own digest, never merely the first entry that
+# happens to contain a colon. Nothing calls it directly today — mi_accept_manifest is the only
+# caller, and every mkindex-based fixture in the suite asks for "brokkr", which is also the FIRST
+# manifest= line mkindex writes, so a match against `*:*` instead of `"${product}:"*` would return
+# the correct answer there by coincidence. Asking for the SECOND product ("skuld") is what forces the
+# case pattern to actually discriminate.
+@test "T5: _mi_index_manifest_digest returns THIS product's digest, never merely any colon-bearing entry" {
+  local records dig_b dig_s
+  dig_b="$(printf 'a%.0s' {1..64})"; dig_s="$(printf 'b%.0s' {1..64})"
+  records="$(printf 'manifest\tbrokkr:%s\nmanifest\tskuld:%s\n' "$dig_b" "$dig_s")"
+  run _mi_index_manifest_digest "$records" skuld
+  [ "$status" -eq 0 ]
+  [ "$output" = "$dig_s" ] || { echo "expected skuld's own digest $dig_s, got: $output" >&2; return 1; }
 }
 
 # --- the combined check ---

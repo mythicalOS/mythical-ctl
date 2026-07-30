@@ -262,3 +262,47 @@ mkchain() {   # writes $MYTHICAL_HOME/{policy,index}; does NOT set the anchor
   run mi_accept_policy "$MYTHICAL_HOME/index" "$MYTHICAL_HOME/policy"
   [ "$status" -eq 4 ]
 }
+
+# T1: mi_accept_policy's own first step is to AUTHENTICATE the family index (mi_accept_index), not
+# merely parse it (mi_index_load) — the two have the same signature and same success shape (records
+# on stdout), so a swap at this call site changes nothing about how the rest of the function reads.
+# Every other test in this file either never reaches mi_accept_index at all, or supplies a chain
+# where the index file on disk still matches the recorded anchor — so a swap to the unauthenticated
+# parser is invisible to them. This is the one case that is not: the anchor is recorded for the
+# REAL index, then the cached index file is rewritten (as an attacker with local write access but
+# not the anchor could) to vouch for a forged policy that grants an unentitled role. An authenticated
+# door refuses on the digest mismatch; a door that merely parsed the index would sail through and
+# hand back the forged entitlements.
+@test "T1: mi_accept_policy refuses a forged index it would otherwise merely have parsed" {
+  mkchain
+  local d="$MYTHICAL_HOME"
+  mi_trust_anchor_set "$(mi_digest "$d/index")"     # anchors the REAL, untampered index
+  # D53-valid on its own (permitted, not bindable) so the only thing standing between an attacker
+  # and acceptance is the index's OWN authentication — not an unrelated structural refusal.
+  { printf 'mythical-policy 1\nversion=1\nexpires=4102444800\nfamily_gid=1\n'
+    printf 'brokkr.permitted_role=secrets\n'; } > "$d/forged-policy"
+  # An attacker who can write the cached index (but not the anchor) points it at the forged policy,
+  # without ever touching the recorded anchor.
+  printf 'mythical-index 1\nversion=1\nexpires=4102444800\npolicy_digest=%s\n' \
+    "$(mi_digest "$d/forged-policy")" > "$d/index"
+  run mi_accept_policy "$d/index" "$d/forged-policy"
+  [ "$status" -eq 1 ] || { echo "a forged index was accepted, status=$status: $output" >&2; return 1; }
+  [[ "$output" == *digest* ]] || { echo "output missing a digest-mismatch message: $output" >&2; return 1; }
+}
+
+# T2: the freshness gate (mi_trust_check policy "$records") is the WIRING at this door, not the
+# predicate itself — _mi_trust_fresh_ok is already well tested on its own. Nothing above exercises an
+# EXPIRED policy through mi_accept_policy: every fixture in this file uses the same far-future
+# `expires=4102444800`. Deleting the mi_trust_check call would accept an expired policy forever, which
+# is the exact replay §8.1's mandatory expiry field exists to close.
+@test "T2: mi_accept_policy refuses an expired policy even though its digest matches the index" {
+  local d="$MYTHICAL_HOME"
+  { printf 'mythical-policy 1\nversion=1\nexpires=1\nfamily_gid=60748\n'
+    printf 'brokkr.permitted_role=state\nbrokkr.bindable_role=state\n'; } > "$d/policy"
+  printf 'mythical-index 1\nversion=1\nexpires=4102444800\npolicy_digest=%s\n' \
+    "$(mi_digest "$d/policy")" > "$d/index"
+  mi_trust_anchor_set "$(mi_digest "$d/index")"
+  run mi_accept_policy "$d/index" "$d/policy"
+  [ "$status" -eq 1 ] || { echo "an expired policy was accepted, status=$status: $output" >&2; return 1; }
+  [[ "$output" == *expired* ]] || { echo "output missing 'expired': $output" >&2; return 1; }
+}

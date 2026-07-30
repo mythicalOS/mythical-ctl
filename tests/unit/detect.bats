@@ -45,9 +45,33 @@ J='{"product":"brokkr","version":"0.1.13","ui_url":"http://localhost:7480/","com
   [ "$(mi_detect_field '{"ui_url":"u","url":"v"}' url)" = "v" ]
 }
 
-@test "a repeated field is refused as ambiguous" {
+# T4: this used to assert only `[ "$status" -eq 1 ]`, which passes even with the ambiguity gate
+# itself (the `*)` arm on the hits-count case) deleted — with two hits, `flag` and `val` each
+# capture TWO lines via command substitution, `[ "$flag" != "s" ]` is still true (a two-line string
+# can never equal the one-char "s"), and the function returns 1 anyway from that unrelated
+# downstream check. The message pins WHICH refusal actually fired.
+@test "a repeated field is refused as ambiguous, not merely refused for some other reason" {
   run mi_detect_field '{"product":"a","product":"b"}' product
   [ "$status" -eq 1 ]
+  [[ "$output" == *ambiguous* ]] \
+    || { echo "output missing the ambiguity-gate's own message: $output" >&2; return 1; }
+}
+
+# T3: the scanner's raw-control-byte gate (`if (c < " ") { err = 1; continue }`, inside a string) is
+# the only thing stopping a raw TAB byte embedded in a JSON string from forging the internal
+# `key<TAB>flag<TAB>value` record format that mi_detect_field splits on. Without it, a key string
+# containing embedded TABs shaped like `<field><TAB>s<TAB><forged value>` bleeds straight into the
+# emitted record, and the downstream `awk -F'\t' '$1==k'` lookup matches field 1 exactly — reporting
+# the forged value with rc 0. The input is a product container's own HTTP response, so this is a
+# record-forgery gate, not a formatting nicety. Written with `printf` so the TAB bytes are exact —
+# passing `\t` as a shell string literal would write a backslash and a `t` and prove nothing (see
+# the escaped-key tests below for the same discipline).
+@test "T3: a raw control byte inside a JSON string cannot forge a field via the TAB-delimited record format" {
+  local f="$BATS_TEST_TMPDIR/j"
+  printf '{"version\ts\t9.9.9-PWNED":"x"}' > "$f"
+  run mi_detect_field "$(cat "$f")" version
+  [ "$status" -eq 1 ] \
+    || { echo "a raw control byte forged a version field: status=$status output=$output" >&2; return 1; }
 }
 
 # --- the escaped-key asymmetry (docs/DOCUMENT-FORMAT.md: "one asymmetry worth stating plainly") ---

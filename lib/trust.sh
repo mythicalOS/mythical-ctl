@@ -188,6 +188,15 @@ mi_trust_floor_override() {
   local docid="$1" version="$2" reason="$3" cur rc
   _mi_trust_docid_ok "$docid" || { mi_warn "trust: invalid document id '$docid'"; return 1; }
   _mi_doc_digits_ok "$version" || { mi_warn "trust: '$version' is not a document version"; return 1; }
+  # Same value rule as lib/config.sh's _mi_conf_value_ok, checked the same way and in the same
+  # order (length first): this string is written verbatim into a ledger record, so it gets the
+  # same LC_ALL=C byte-order guard every other validator in this file uses for a character class,
+  # and the same bound the config module's value rule enforces (MI_CONF_MAXLEN).
+  local LC_ALL=C
+  if [ "${#reason}" -gt "$MI_CONF_MAXLEN" ]; then
+    mi_warn "trust: a downgrade reason must be $MI_CONF_MAXLEN characters or fewer"
+    return 1
+  fi
   case "$reason" in
     ''|*[[:cntrl:]]*) mi_warn "trust: a downgrade needs a one-line reason, recorded with it"; return 1 ;;
   esac
@@ -197,12 +206,30 @@ mi_trust_floor_override() {
     return 1
   fi
   [ "$rc" -eq 0 ] || return "$rc"
-  mi_warn "trust: DOWNGRADING the version floor for $docid: $cur → $version"
-  mi_warn "  reason: $reason"
-  mi_warn "  Every document between these versions becomes acceptable again, including any that were"
-  mi_warn "  withdrawn. This is recorded in the ledger."
-  _mi_trust_put "$MI_TRUST_FLOOR_KIND" "$docid" "$version" || return 1
-  _mi_trust_put "$MI_TRUST_DOWNGRADE_KIND" "$docid" "from=${cur} to=${version} reason=${reason}"
+  # The headline verb follows the ACTUAL direction of the change, compared via the ledger's
+  # overflow-safe decimal comparator (never `[ -gt ]`, for the same reason every other version
+  # comparison in this file uses it) — this override is not restricted to lowering a floor, so
+  # printing "DOWNGRADING" unconditionally would mislead an operator on a same-or-higher override.
+  if _mi_num_gt "$cur" "$version"; then
+    mi_warn "trust: DOWNGRADING the version floor for $docid: $cur → $version"
+    mi_warn "  reason: $reason"
+    mi_warn "  Every document between these versions becomes acceptable again, including any that were"
+    mi_warn "  withdrawn. This is recorded in the ledger."
+  elif _mi_num_gt "$version" "$cur"; then
+    mi_warn "trust: RAISING the version floor for $docid via override: $cur → $version"
+    mi_warn "  reason: $reason"
+  else
+    mi_warn "trust: RE-RECORDING the version floor for $docid at its current value ($version)"
+    mi_warn "  reason: $reason"
+  fi
+  # ONE ledger write, not two. _mi_trust_put_many exists precisely so a pair lands together —
+  # mi_trust_commit uses it for the floor+anchor pair for the same reason. Two separate
+  # _mi_trust_put calls here would be two atomic writes with a window between them: if the second
+  # (the audit record) failed, the floor would already be lowered with no reason recorded beside
+  # it, while the operator is told the command failed — the exact opposite of surviving in the
+  # audit trail rather than living in someone's shell history.
+  _mi_trust_put_many "$MI_TRUST_FLOOR_KIND" "$docid" "$version" \
+                     "$MI_TRUST_DOWNGRADE_KIND" "$docid" "from=${cur} to=${version} reason=${reason}"
 }
 
 mi_trust_anchor_set() {
@@ -267,11 +294,29 @@ mi_accept_index() {
   if [ "$#" -ne 1 ]; then mi_warn "trust: mi_accept_index needs an <index file>"; return 1; fi
   local f="$1" anchor records rc
   if anchor="$(mi_trust_anchor_get)"; then rc=0; else rc=$?; fi
-  if [ "$rc" -ne 0 ]; then
-    mi_warn "trust: no family-index anchor has been recorded, so $f cannot be verified."
-    mi_warn "  Run once with network access to establish the anchor; a local copy is not evidence."
-    return 4
-  fi
+  # ABSENT and UNREADABLE are not the same answer, and here the difference is the trust root
+  # itself — see mi_trust_check_only's own note, which this mirrors. rc 3 is FIRST USE (no anchor
+  # has ever been recorded); anything else means a recorded anchor exists and could not be read,
+  # which is a damaged trust record, not a fresh installation. Folding the two into one rc 4 would
+  # tell a damaged installation to re-bootstrap — replacing the anchor with whatever the origin
+  # serves next, with nothing compared against the anchor it already had, which is the one thing
+  # an anchor exists to prevent.
+  case "$rc" in
+    0) : ;;
+    3)
+      mi_warn "trust: no family-index anchor has been recorded, so $f cannot be verified."
+      mi_warn "  Run once with network access to establish the anchor; a local copy is not evidence."
+      return 4
+      ;;
+    *)
+      mi_warn "trust: this installation HAS a recorded family-index anchor and it could not be read."
+      mi_warn "  That is a damaged trust record, not a new installation, so $f is refused rather than"
+      mi_warn "  anchored afresh — re-anchoring here would replace the anchor with whatever the origin"
+      mi_warn "  served, which is the one thing an anchor exists to prevent. Repair the ledger"
+      mi_warn "  ('mythical-ctl state repair') and re-run."
+      return 1
+      ;;
+  esac
   # SNAPSHOT, then verify and parse THE SAME BYTES. Hashing $f and then re-opening it is a TOCTOU:
   # an attacker who can replace the pathname between the two presents digest-matching bytes for
   # verification and unauthenticated bytes for parsing, which is D21's boundary defeated by a
