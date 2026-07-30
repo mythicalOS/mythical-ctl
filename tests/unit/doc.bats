@@ -294,8 +294,13 @@ HEXB='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
   [ "$status" -eq 0 ] || { echo "rejected a valid digestref: $output" >&2; return 1; }
 
   # Two "@sha256:" occurrences: `%` strips the SHORTEST trailing match, which is the LAST occurrence,
-  # leaving an '@' inside what mi_doc_load treats as the repository — caught by the "exactly one @"
-  # check. Worth a test rather than a sentence: this is the kind of boundary that silently drifts.
+  # leaving an '@' inside what mi_doc_load treats as the repository.
+  #
+  # What this asserts is that the value is REFUSED — deliberately not which gate refuses it. Two
+  # independent checks reject it (the "exactly one @" case and the repository charset bound, since
+  # `@` is not in that charset), so removing either one on its own leaves this test green. That is a
+  # property of the code, not a weakness of the test: no input can isolate the `@` rule, which is why
+  # lib/doc.sh marks it redundant-by-construction and says why it is kept anyway.
   doc "ref=repo@sha256:${HEXA}@sha256:${HEXB}"
   run mi_doc_load "$F" manifest "$spec"
   [ "$status" -eq 1 ] || { echo "accepted a digestref with two @sha256: occurrences" >&2; return 1; }
@@ -330,7 +335,9 @@ HEXB='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
   [ "$status" -eq 0 ] || { echo "rejected a valid productdigest: $output" >&2; return 1; }
 
   # Two colons: must be refused rather than resolving to the first, exactly like the spec-duplicate-key
-  # rule above — a second delimiter is ambiguity, not data.
+  # rule above — a second delimiter is ambiguity, not data. As with digestref's `@` above, this asserts
+  # the refusal and not which gate produces it: a `:` cannot appear in a 64-character hex digest, so
+  # the sha256 check would reject this value even with the explicit colon check removed.
   doc "pd=brokkr:extra:${HEXA}"
   run mi_doc_load "$F" manifest "$spec"
   [ "$status" -eq 1 ] || { echo "accepted a productdigest with two colons" >&2; return 1; }

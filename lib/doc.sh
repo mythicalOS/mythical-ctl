@@ -175,7 +175,12 @@ _mi_doc_type_ok() {
       case "$v" in *@sha256:*) : ;; *) return 1 ;; esac
       local repo="${v%@sha256:*}" hex="${v##*@sha256:}"
       [ -n "$repo" ] || return 1
-      case "$repo" in *@*) return 1 ;; esac      # exactly one @
+      # Exactly one @. REDUNDANT BY CONSTRUCTION, and kept on purpose: `@` is not in the repository
+      # charset enforced below, so this can never be the check that rejects a value — no input reaches
+      # the charset gate with an `@` still in it. It stays as an explicit statement of the rule so that
+      # relaxing the charset later cannot silently drop the "exactly one @" guarantee. Do not "clean it
+      # up" as dead code without moving the guarantee somewhere it is still stated.
+      case "$repo" in *@*) return 1 ;; esac
       # The digest half is what carries the security property here — it pins the image to one exact
       # content hash, so a floating reference is structurally impossible. This is only a SANITY bound
       # on the half that does NOT carry that property: lowercase letters, digits, and `. _ - / :` (a
@@ -191,6 +196,10 @@ _mi_doc_type_ok() {
       # hash to this".
       case "$v" in *:*) : ;; *) return 1 ;; esac
       local pd_p="${v%%:*}" pd_h="${v#*:}"
+      # Exactly one colon — redundant by construction for the same reason as digestref's `@` check
+      # above: a `:` is not a hex character, so a pd_h holding one can never satisfy the fixed-length
+      # sha256 check below, and this can never be the sole rejector. Retained as the explicit
+      # statement of the rule rather than leaving it implied by a downstream type check.
       case "$pd_h" in *:*) return 1 ;; esac
       _mi_doc_type_ok ident "$pd_p" || return 1
       _mi_doc_type_ok sha256 "$pd_h" ;;
