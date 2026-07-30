@@ -569,13 +569,26 @@ EOF
   [[ "$output" != *"unbound variable"* ]]
 }
 
-# The file is container-writable, so every byte examined must come from ONE snapshot. A behavioural
-# test cannot interleave a container's rewrite between two internal opens without a hook, so this
-# locks in the structure: the only place the live file is read is the snapshot copy, and NEITHER
-# public function re-opens it afterwards. Both races this closes are real — the reader's (validate
-# then parse) and the writer's (validate then rebuild the body) — and the writer's is the worse one,
-# because it ends with the host re-blessing the swapped content with a valid marker.
-@test "the live file is read exactly once, into a snapshot" {
+# The file is container-writable, so every byte whose CONTENT is used must come from ONE snapshot. A
+# behavioural test cannot interleave a container's rewrite between two internal opens without a hook,
+# so this locks in the structure instead: `_mi_conf_snap` is the only place the live file's content is
+# read, and neither public product function re-derives anything from the live path afterwards. Both
+# races this closes are real — the reader's (validate then parse) and the writer's (validate then
+# rebuild the body) — and the writer's is the worse one, because it ends with the host re-blessing the
+# swapped content with a valid marker.
+#
+# NOT "read exactly once", which this test used to be called and which is FALSE: `_mi_conf_unchanged`
+# opens the live file again to digest it, deliberately, and the writer's identity re-check stats it
+# again. The invariant is narrower and worth stating precisely — no CONTENT-derived read outside the
+# snapshot. A digest is not content: it cannot become an injection path, because nothing downstream is
+# derived from it beyond an equality test. That is why `_mi_conf_unchanged` is a named function and is
+# deliberately absent from the helper denylist below.
+#
+# And this is a DENYLIST, so it catches the plausible spellings rather than the whole class — a
+# regression using `od`, `nl` or `dd` would pass. The range assertion below is what stops it going
+# vacuous; the fixture-driven guard in test_hygiene.bats is the model for making a scanner prove
+# itself, and this one has not been given that treatment.
+@test "no live-file CONTENT read happens outside the snapshot" {
   local src="${_MCTL_ROOT}/lib/config.sh" fn
   [ -n "$(awk '/^_mi_conf_snap\(\) \{/,/^\}/' "$src" | grep -F 'head -c "$MI_CONF_SNAP_LIMIT" "$f" > "$snap"')" ]
   [ -n "$(awk '/^_mi_conf_snap_load\(\) \{/,/^\}/' "$src" | grep -F "sed '\$d' \"\$snap\"")" ]
@@ -666,4 +679,33 @@ EOF
   run write_conf
   [ "$status" -ne 0 ]
   [ ! -f "$(mi_conf_product_path brokkr)" ]
+}
+
+# §4.1a's identity rules are not only about links. A path that is not a regular file at all must be
+# refused, and the FIFO case matters for a specific reason: `head -c` on a FIFO with no writer BLOCKS,
+# so if the `-f` gate did not precede the snapshot copy, a hostile mkfifo would hang the CLI instead of
+# being rejected. That is a denial-of-service on the installer, reachable by anything that can create a
+# path in ~/.mythical/, and it is invisible to a symlink or link-count test.
+@test "a FIFO at the product path is refused, and does not block" {
+  local f; f="$(mi_conf_product_path brokkr)"
+  mkfifo "$f"
+  run mi_conf_product_load brokkr "$SPEC"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"not a regular file"* ]] \
+    || { echo "the refusal does not name the file type: $output" >&2; return 1; }
+  run write_conf
+  [ "$status" -ne 0 ]
+  [ -p "$f" ]                        # still a FIFO: nothing was written through it
+}
+
+@test "a directory at the product path is refused" {
+  local f; f="$(mi_conf_product_path brokkr)"
+  mkdir "$f"
+  run mi_conf_product_load brokkr "$SPEC"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"not a regular file"* ]] \
+    || { echo "the refusal does not name the file type: $output" >&2; return 1; }
+  run write_conf
+  [ "$status" -ne 0 ]
+  [ -d "$f" ]
 }

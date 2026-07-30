@@ -61,8 +61,11 @@ with the file left untouched — no partial write, and no fallback to defaults e
 refusal and not a torn-file report.
 
 **What the check does and does not promise.** It describes the pathname *at the moment it runs*. That
-is a real limit, not a hedge: a shell tool cannot hold a path open and operate on the held object, so
-between the last check and the operation the pathname can in principle be replaced. `mythical-ctl`
+is a real limit, not a hedge. Shell can hold a file descriptor open — that is not the problem. What
+portable shell lacks is the sequence needed to *bind* the checked identity to the object it then
+operates on: opening with `O_NOFOLLOW`, verifying the open descriptor itself, and writing through that
+same descriptor. Every step here works on the pathname instead, so between the last check and the
+operation the pathname can in principle be replaced. `mythical-ctl`
 re-checks immediately before every mutation to make that window as small as the language allows, and a
 family operation lock excludes every other `mythical-ctl` process — but the window is not zero, and
 closing it would need file-descriptor- or mount-namespace-based I/O that portable shell does not have.
@@ -268,12 +271,16 @@ a fixed order, and the first one to fail decides the outcome:
 
 1. **Is the file there at all?** An absent `<product>.conf` is **absent**, not torn. It is the ordinary
    state before anything has been configured — no defaults-with-a-warning, no damage report.
-2. **Does it obey the byte policy?** A file containing a control byte (NUL, CR, TAB, DEL) is **rejected
+2. **Is it within the size ceiling?** A file at or over 1048577 bytes is **rejected as malformed**, and
+   this happens before any byte of it is examined — the reader copies a bounded prefix and refuses if
+   that prefix comes back full, so it never holds an oversized file at all. An oversized file that
+   *also* contains a control byte is reported as oversized, not as a byte-policy failure.
+3. **Does it obey the byte policy?** A file containing a control byte (NUL, CR, TAB, DEL) is **rejected
    as malformed**, whatever its marker says. This is checked *before* the marker, so a NUL-bearing file
    with no marker is malformed — not torn. Hostile or binary content is not a damaged config.
-3. **Does it end in a newline?** If not, the last write was cut mid-line: **torn**.
-4. **Does the marker match?** Only now. Absent or mismatched ⇒ **torn**.
-5. **Does the body parse and satisfy the schema?** If not, **rejected as malformed** — the bytes are
+4. **Does it end in a newline?** If not, the last write was cut mid-line: **torn**.
+5. **Does the marker match?** Only now. Absent or mismatched ⇒ **torn**.
+6. **Does the body parse and satisfy the schema?** If not, **rejected as malformed** — the bytes are
    intact, so this is not damage.
 
 So "torn" means specifically *byte-clean content whose marker does not vouch for it*. Anything that

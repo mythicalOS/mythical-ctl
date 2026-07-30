@@ -275,6 +275,22 @@ doc_conf_of_size() {
   doc_write 'MYTHICAL_BROKKR_RETENTION=999'
   check 1 'marker matches, value fails its type'
 
+  printf 'MYTHICAL_BROKKR_RETENTION=30\n' > "$MYTHICAL_HOME/body.txt"
+  sum="$(doc_hash_stream "$MYTHICAL_HOME/body.txt")"
+  printf 'MYTHICAL_BROKKR_RETENTION=30\n%s%s trailing\n' "$DOC_MARKER" "$sum" > "$f"
+  check 4 'marker line has trailing text'
+
+  doc_write "$(printf '%sdeadbeef\nMYTHICAL_BROKKR_RETENTION=30' "$DOC_MARKER")"
+  check 1 'a marker-prefix line anywhere but the final line'
+
+  { printf 'MYTHICAL_BROKKR_RETENTION=30\n'
+    head -c 1048576 /dev/zero | tr '\0' '#'; printf '\n'; } > "$f"
+  check 1 'over the size ceiling — reported as oversize, ahead of the byte policy'
+
+  { printf 'MYTHICAL_BROKKR_RETENTION=30\000\n'
+    head -c 1048576 /dev/zero | tr '\0' '#'; printf '\n'; } > "$f"
+  check 1 'oversize AND a control byte — size is decided first'
+
   doc_write 'MYTHICAL_BROKKR_RETENTION=30'
   check 0 'marker matches and the body is valid'
 }

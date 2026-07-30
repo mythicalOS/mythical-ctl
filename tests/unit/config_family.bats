@@ -342,3 +342,36 @@ EOF
   [ "$status" -ne 0 ]
   [[ "$output" == *"refusing to write the ledger without holding the family lock"* ]]
 }
+
+# The identity gate on mythical.conf is the same function the product path uses, so it carries the same
+# rules — including the two a symlink or link-count test cannot see. Covered here because the plan
+# scoped identity to the product file, so nothing else asserts that the family writer inherited them.
+@test "a foreign-owned mythical.conf is refused" {
+  local f; f="$(mi_conf_family_path)"
+  # A real chown needs root. Shim `ls` so `ls -ldn` reports a uid that is not ours — the gate reads
+  # field 3 of that output, so this exercises the gate itself; a permanently-skipped test would not.
+  local shim="$BATS_TEST_TMPDIR/shim"; mkdir -p "$shim"
+  printf 'MYTHICAL_NET=ours\n' > "$f"; chmod 600 "$f"
+  cp "$f" "$MYTHICAL_HOME/before"
+  cat > "$shim/ls" <<'EOF'
+#!/bin/bash
+if [ "$1" = "-ldn" ]; then printf -- '-rw-------  1 4294967000  20  14 Jan  1 00:00 %s\n' "$2"; exit 0; fi
+exec /bin/ls "$@"
+EOF
+  chmod +x "$shim/ls"
+  PATH="$shim:$PATH" run mi_conf_family_add MYTHICAL_TELEMETRY_KEY tok
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"owned by uid 4294967000"* ]] \
+    || { echo "the refusal does not name the foreign owner: $output" >&2; return 1; }
+  diff -u "$MYTHICAL_HOME/before" "$f"
+}
+
+@test "a non-regular mythical.conf is refused" {
+  local f; f="$(mi_conf_family_path)"
+  mkfifo "$f"
+  run mi_conf_family_add MYTHICAL_NET n
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"not a regular file"* ]] \
+    || { echo "the refusal does not name the file type: $output" >&2; return 1; }
+  [ -p "$f" ]
+}
