@@ -96,6 +96,13 @@ mi_trust_anchor_get() {
 # the second one makes an installation refuse its own verified cache.
 _mi_trust_put_many() {      # <kind> <key> <value> [<kind> <key> <value>...]
   local records line out="" drop="" pfx rc
+  # ARRAY-TYPED LOCAL. tools/bundle.sh concatenates every module into one file in MODULES order, and
+  # in a flat file shellcheck's array tracking is no longer per-function — so a later module that uses
+  # this name for an ordinary scalar draws SC2178 there plus an SC2128 on every use, while the repo
+  # tree lints clean and only `shellcheck dist/mythical-ctl` goes red. The names already spoken for
+  # this way are `args`, `pk`, `pv`, `placed` (lib/config.sh), `fields` (lib/ledger.sh) and `triples`
+  # here; a module loaded after them must not reuse one for a string. `f` was on that list until it
+  # was deliberately freed for filenames.
   local -a triples
   mi_lock_assert_held "record trust state"
   if [ "$#" -lt 3 ] || [ "$(( $# % 3 ))" -ne 0 ]; then
