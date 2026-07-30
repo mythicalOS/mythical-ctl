@@ -261,9 +261,15 @@ doc_conf_of_size() {
   printf 'MYTHICAL_BROKKR_RETENTION=99\n%sdeadbeef\n' "$DOC_MARKER" > "$f"
   check 4 'marker absent or mismatched'
 
-  doc_write 'MYTHICAL_BROKKR_RETENTION=30'
-  row="$(tail -n1 "$f" | tr 'a-f' 'A-F')"
-  printf 'MYTHICAL_BROKKR_RETENTION=30\n%s\n' "$row" > "$f"
+  # Uppercase the DIGEST only. `tail -n1 | tr a-f A-F` would also hit the prefix — the literal
+  # `#mythical-conf-sha256=` contains a, c and f — producing `#mythiCAl-ConF-shA256=`, which is no
+  # longer a marker line at all. rc 4 would then come from "no marker present", not from a literal
+  # comparison against an uppercase digest, and this row would pass while testing nothing of the sort.
+  printf 'MYTHICAL_BROKKR_RETENTION=30\n' > "$MYTHICAL_HOME/body.txt"
+  sum="$(doc_hash_stream "$MYTHICAL_HOME/body.txt")"
+  row="$(printf '%s' "$sum" | tr 'a-f' 'A-F')"
+  [ "$row" != "$sum" ] || { echo 'the digest has no hex letters — this row proves nothing' >&2; return 1; }
+  printf 'MYTHICAL_BROKKR_RETENTION=30\n%s%s\n' "$DOC_MARKER" "$row" > "$f"
   check 4 'marker correct but UPPERCASE — the compare is literal'
 
   : > "$f"
