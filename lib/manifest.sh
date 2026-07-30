@@ -3,8 +3,12 @@
 #
 # A manifest declares ROLES; the core derives NAMES. The manifest says "I have a state volume
 # mounted at /data", never "mythical-brokkr-state" — so a manifest has no vocabulary in which to
-# name a sibling's resources, and two installations on one daemon cannot collide. This is why the
-# grammar below has no key for a volume name, a network name, or a config path: absence is the
+# name a sibling's resources: the colliding role would have to be granted by the authenticated
+# policy and the colliding product vouched for by the authenticated index, so THIS guarantee holds
+# unconditionally from this module alone. The STRONGER claim — that two installations on one daemon
+# cannot collide — is conditional on a hyphen discipline in the installation identity that this
+# module does not state or enforce; see "NOT INJECTIVE" at the naming functions below. This is why
+# the grammar below has no key for a volume name, a network name, or a config path: absence is the
 # enforcement.
 #
 # PURE library — no side effects at source time; no `set -euo pipefail`.
@@ -37,6 +41,15 @@ mi_manifest_spec() {
   # shipping one learns immediately instead of shipping a silently dead field.
 }
 
+# rc 0 · 1 rejected (reported) · 3 file missing (mi_doc_scan's contract, carried through unchanged).
+#
+# rc 3 IS OVERLOADED IN THIS MODULE. mi_manifest_launched (below) and the door (mi_accept_manifest)
+# both also use rc 3, for an entirely different meaning: "authentic, but launched=false". Neither of
+# those call sites is confused — each only ever sees a 3 from the meaning it defines, since the door
+# never lets a missing-file 3 from this function reach a caller (mi_accept_manifest returns 1 first,
+# from the snapshot step, on anything it cannot read). The risk is a FUTURE caller that forwards this
+# function's own status code outward: it would report "not launched" for what was actually a missing
+# file. Keep the two meanings at their own call sites; do not let one flow through as the other's.
 mi_manifest_load() {
   if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then mi_warn "manifest: mi_manifest_load needs a <file> and an optional <label>"; return 1; fi
   mi_doc_load "$1" manifest "$(mi_manifest_spec)" "${2:-$1}"
@@ -51,7 +64,9 @@ mi_manifest_image() {
 #
 # Rc 3 is §7.3's contract code, carried from here so a caller cannot accidentally map "not launched"
 # onto 0 (a script would read that as "installed and running") or onto 1 (indistinguishable from a
-# registry outage).
+# registry outage). NOTE THE REUSE: mi_manifest_load's own rc 3 means something else entirely ("file
+# missing", from mi_doc_scan) — the two never collide at a single call site today, but a caller that
+# forwards mi_manifest_load's status onward and reads a 3 from it as "not launched" would be wrong.
 mi_manifest_launched() {
   if [ "$#" -ne 1 ]; then mi_warn "manifest: mi_manifest_launched needs <records>"; return 1; fi
   local v
@@ -108,20 +123,34 @@ mi_manifest_check() {
 # any file you hand it — that is correct for a parser and catastrophic as an acceptance policy, so
 # the acceptance policy is here, in one place, in this order:
 #
-#   1. the family index must vouch for THIS product          (an index that does not list it is not
+#   1. the family index (ixf) must itself be authenticated against the trust anchor
+#      (mi_accept_index) — nothing below is meaningful against an index that was merely parsed
+#   2. the policy index (polf) must be authenticated against THAT SAME family index
+#      (mi_accept_policy) — a digest is not authentication, and entitlement enforcement (step 7
+#      below) against a policy this door merely PARSED rather than VERIFIED would let a locally
+#      tampered policy grant anything it likes
+#   3. the family index must vouch for THIS product          (an index that does not list it is not
 #                                                              silence, it is a refusal)
-#   2. the bytes must hash to the digest the index names     (a digest is not authentication — the
+#   4. the bytes must hash to the digest the index names     (a digest is not authentication — the
 #                                                              expectation came from an authenticated
 #                                                              document, which is what makes it one)
-#   3. only then parse
-#   4. the manifest's own product must equal the expected one (§10a: "manifest for a different
+#   5. only then parse
+#   6. the manifest's own product must equal the expected one (§10a: "manifest for a different
 #                                                              product" — a perfectly valid sibling
 #                                                              manifest is still the wrong answer)
-#   5. freshness: version floor and expiry
-#   6. entitlements: nothing outside what the policy index already grants
-#   7. the minimum core version this product requires (§8)
-#   8. §7.3's launch state, LAST — "not launched" is only trustworthy once the document saying it
-#      has been authenticated
+#   7. freshness CHECKED (version floor and expiry) — but the floor is not yet COMMITTED; see step 10
+#   8. entitlements: nothing outside what the policy index already grants
+#   9. the minimum core version this product requires (§8)
+#   10. THEN, and only then, the version floor is committed. Checking freshness (7) and committing it
+#       (10) are deliberately two different steps around (8) and (9): a manifest that is fresh but
+#       fails entitlement or min_core must be refused WITHOUT raising the replay bar, or a publisher's
+#       typo (an unentitled role, a min_core bump nothing here can satisfy) permanently blocks every
+#       future version at or below the one that was refused — including a perfectly good earlier
+#       release. See lib/trust.sh's AMENDMENT A2 for why the check/commit split exists at all; this
+#       door is the reason it exists.
+#   11. §7.3's launch state, LAST — "not launched" is only trustworthy once the document saying it
+#       has been authenticated. This is still an ACCEPTANCE (the floor was already committed in step
+#       10): an authentic manifest that says "not launched" is not a manifest to be replayed around.
 #
 # rc 0 accept (prints the records) · 1 refused (reported) · 3 AUTHENTIC but declares not-launched
 # (§7.3's contract code, carried through unchanged) · 4 no anchor.
@@ -149,9 +178,12 @@ mi_accept_manifest() {
   [ "$rc" -eq 0 ] || return 1
 
   # Same snapshot discipline: verify and parse one private copy, never the live pathname twice.
+  # The label ("$f") keeps a digest-mismatch diagnostic naming the operator's pathname rather than
+  # the private snapshot's — the snapshot is removed a few lines below and would no longer exist by
+  # the time anyone read a message naming it.
   local snap rc2
   snap="$(_mi_conf_snap "$f")" || return 1
-  if mi_trust_verify_digest "$snap" "$expected"; then rc2=0; else rc2=$?; fi
+  if mi_trust_verify_digest "$snap" "$expected" "$f"; then rc2=0; else rc2=$?; fi
   if [ "$rc2" -eq 0 ]; then
     if records="$(mi_manifest_load "$snap" "$f")"; then rc2=0; else rc2=$?; fi
   fi
@@ -164,12 +196,27 @@ mi_accept_manifest() {
     return 1
   fi
 
-  mi_trust_check "manifest:${want}" "$records" || return $?
+  # FIX: freshness is CHECKED here (mi_trust_check_only), but the floor is deliberately NOT committed
+  # yet. mi_trust_check — check-then-commit in one call — used to run here, which advances the
+  # persisted version floor as part of a check that is not this door's last word: entitlement (below)
+  # and min_core (below that) can still refuse this exact manifest. A manifest refused for either
+  # reason must not have already raised the replay bar — that would turn a publisher's typo (an
+  # unentitled role, an unsatisfiable min_core) into a permanent block on every future manifest at or
+  # below the refused version, including a perfectly good EARLIER one already in the field. This is
+  # the exact shape lib/trust.sh's AMENDMENT A2 documents; this door is the reason the split exists,
+  # and this is the fix for not having used it.
+  mi_trust_check_only "manifest:${want}" "$records" || return $?
   mi_manifest_check "$records" "$pol" || return 1
 
   # §8's minimum core, before ANY success is reported. An authenticated manifest that needs
   # semantics this CLI does not have must not be acted on merely because it is authentic.
   mi_manifest_core_ok "$records" || return 1
+
+  # Commit the floor NOW — fresh, entitled, and satisfying min_core: every gate that can refuse this
+  # manifest outright has run. "Not launched" (rc 3, below) is checked AFTER this commit on purpose:
+  # it is still an ACCEPTANCE (the manifest is authentic, entitled, and compatible), not a refusal, so
+  # it must still advance the floor like any other accepted document.
+  mi_trust_commit "manifest:${want}" "$records" || return $?
 
   # §7.3's launch state, checked LAST and reported as rc 3 — after the manifest has been proved
   # authentic, because "not launched" is only trustworthy if the document saying so is. The records
@@ -218,10 +265,22 @@ _mi_version_ge() {
 }
 
 # rc 0 iff THIS core satisfies the manifest's declared minimum.
+#
+# PUBLIC, and on the roster later plans call directly (§/__selftest) — so it cannot assume its
+# caller already typed <records> the way mi_manifest_load's `coreversion`-typed spec would have.
+# Through the door (mi_accept_manifest), min_core is already bounded to MAJOR[.MINOR[.PATCH]] by
+# that spec and mi_manifest_load already refuses a 4th component. Called directly against a
+# hand-built or otherwise unvalidated records string, no such gate has run — and _mi_version_ge
+# compares at most three components, so a value with a stray 4th (`0.1.0.9`) is silently truncated
+# to `0.1.0` rather than refused, and a core can appear to satisfy a requirement it does not.
 mi_manifest_core_ok() {
   if [ "$#" -ne 1 ]; then mi_warn "manifest: mi_manifest_core_ok needs <records>"; return 1; fi
   local need
   need="$(mi_doc_value "$1" min_core)" || { mi_warn "manifest: no minimum core version declared"; return 1; }
+  if ! _mi_doc_type_ok coreversion "$need"; then
+    mi_warn "manifest: '$need' is not a valid core version (MAJOR[.MINOR[.PATCH]]) — refusing rather than comparing it"
+    return 1
+  fi
   if _mi_version_ge "$MI_CORE_VERSION" "$need"; then return 0; fi
   mi_warn "manifest: this product needs mythical-ctl $need or newer; this core is $MI_CORE_VERSION"
   mi_warn "  Upgrade mythical-ctl — a newer manifest may rely on semantics this core does not have."
@@ -232,6 +291,28 @@ mi_manifest_core_ok() {
 # Runtime identifiers are computed from the INSTALLATION identity plus the product identity.
 # ~/.mythical/ is per-user, but container and volume names are daemon-global: two OS users on one
 # daemon would otherwise compute the same names and adopt or delete each other's containers.
+#
+# NOT INJECTIVE. `-` is inside the `ident` charset (lib/doc.sh's `ident` type — what
+# `_mi_name_part_ok` validates every part against below), so the flat `<prefix>-<a>-<b>-<c>` join is
+# ambiguous about where one part ends and the next begins: `mi_name_volume inst1 brokkr state-x` and
+# `mi_name_volume inst1 brokkr-state x` both yield `mythical-inst1-brokkr-state-x`, and
+# `mi_name_alias inst1-brokkr` equals `mi_name_container inst1 brokkr` — a collision in the SAME DNS
+# namespace (both are resolved as container/network aliases on the daemon). A manifest alone cannot
+# reach this: as the header above notes, the colliding role must be granted by the authenticated
+# policy and the colliding product vouched for by the authenticated index, so "a manifest cannot name
+# a sibling's resources" still holds. But two DIFFERENT installation identities that happen to
+# collide under this join are not something this module can rule out on its own — it is a
+# precondition on the STRING CHOSEN for the installation identity (a hyphen discipline), and `ident`
+# cannot enforce it, because `ident` is exactly what allows the hyphen in the first place. Nothing in
+# this repository produces an installation identity yet; whichever later plan does inherits this
+# precondition, and must either forbid `-` in one of the parts it joins here or reserve a non-`ident`
+# separator.
+#
+# BOUNDED, BUT NOT BY THIS MODULE. A derived name can also exceed the 63-character DNS label limit a
+# container runtime enforces: a 64-character product identifier (the `ident` type allows up to 64)
+# yields a 73-character alias. This module does not refuse that — the identity producer above must
+# respect the bound; failing loudly at the container runtime is a known, later concern, not a
+# security problem for this module to close.
 
 _mi_name_part_ok() {
   _mi_doc_type_ok ident "$1"
@@ -266,10 +347,9 @@ mi_name_network() {
 # `mythical-<identity>-<product>`, scoped to an installation identity a sibling has no way to know.
 # The alias is the stable, guessable name that makes cross-product discovery possible at all.
 #
-# So it has to be the name the siblings actually resolve, and they resolve the PREFIXED one. The
-# shipped family contract is stated as data in `mythical-saga/core/family-peers.ts`, which calls
-# itself the single source of truth and is mirrored by brokkr's `ui/src/server/route-family.ts`
-# candidate ②:
+# So it has to be the name the siblings actually resolve, and they resolve the PREFIXED one. Each
+# shipped product states this contract as data in its own source, as a table it calls the single
+# source of truth, for candidate ②:
 #
 #     product   container          UI port   service DNS
 #     brokkr    mythical-brokkr    7480      http://mythical-brokkr:7480
@@ -278,7 +358,7 @@ mi_name_network() {
 #
 # TWO DIFFERENT NAMES, AND CONFLATING THEM IS WHAT PUT THE BARE FORM HERE. The DNS name is
 # `mythical-<product>`; the `product` STRING each sibling reports at `GET /detect` is the BARE key
-# (`brokkr`, not `mythical-brokkr`) — family-peers.ts says so explicitly, and notes the family
+# (`brokkr`, not `mythical-brokkr`) — that source says so explicitly, and notes the family
 # converged there so that "there is no long-name/short-alias accept-set any more". An earlier
 # revision of this plan defended a bare ALIAS by citing those accept-sets, which are about the
 # identity string in the response body and say nothing about the hostname the request goes to.

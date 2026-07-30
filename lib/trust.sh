@@ -31,21 +31,30 @@ _mi_trust_hex64_ok() {
 # The malformed-expectation case is a refusal, not a comparison: an empty or uppercase expectation
 # would otherwise "not match" for the right reason by accident, and a caller that built the
 # expectation wrongly would see a plain mismatch instead of its own bug.
+#
+# <label> names the source in diagnostics and defaults to <file> — the same convention
+# mi_doc_load/mi_doc_scan use, and for the same reason: every caller here verifies a PRIVATE
+# snapshot (see mi_accept_index/mi_accept_policy/mi_accept_manifest's snapshot discipline), so
+# without a label a mismatch would report a `mktemp` path that no longer exists by the time an
+# operator reads it, naming neither the document nor which one it was.
 mi_trust_verify_digest() {
-  if [ "$#" -ne 2 ]; then mi_warn "trust: mi_trust_verify_digest needs a <file> and an <expected digest>"; return 1; fi
-  local f="$1" expected="$2" actual
+  if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
+    mi_warn "trust: mi_trust_verify_digest needs a <file>, an <expected digest> and an optional <label>"
+    return 1
+  fi
+  local f="$1" expected="$2" label="${3:-$1}" actual
   if ! _mi_trust_hex64_ok "$expected"; then
     mi_warn "trust: '$expected' is not a sha256 digest (64 lowercase hex characters) — refusing to compare"
     return 1
   fi
   if [ ! -f "$f" ]; then
-    mi_warn "trust: cannot verify $f — it does not exist"
+    mi_warn "trust: cannot verify $label — it does not exist"
     return 1
   fi
-  actual="$(mi_digest "$f")" || { mi_warn "trust: cannot digest $f"; return 1; }
-  [ -n "$actual" ] || { mi_warn "trust: empty digest for $f"; return 1; }
+  actual="$(mi_digest "$f")" || { mi_warn "trust: cannot digest $label"; return 1; }
+  [ -n "$actual" ] || { mi_warn "trust: empty digest for $label"; return 1; }
   if [ "$actual" != "$expected" ]; then
-    mi_warn "trust: $f does not match the digest the family index vouches for"
+    mi_warn "trust: $label does not match the digest the family index vouches for"
     mi_warn "  expected: $expected"
     mi_warn "  actual:   $actual"
     return 1
@@ -269,7 +278,7 @@ mi_accept_index() {
   # rename. The label keeps diagnostics naming the operator's file.
   local snap rc2
   snap="$(_mi_conf_snap "$f")" || return 1
-  if mi_trust_verify_digest "$snap" "$anchor"; then rc2=0; else rc2=$?; fi
+  if mi_trust_verify_digest "$snap" "$anchor" "$f"; then rc2=0; else rc2=$?; fi
   if [ "$rc2" -eq 0 ]; then
     if records="$(mi_index_load "$snap" "$f")"; then rc2=0; else rc2=$?; fi
   fi

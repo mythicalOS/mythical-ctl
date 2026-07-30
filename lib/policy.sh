@@ -170,7 +170,7 @@ mi_accept_policy() {
   # Same snapshot discipline as mi_accept_index: verify and parse one private copy.
   local snap rc2
   snap="$(_mi_conf_snap "$f")" || return 1
-  if mi_trust_verify_digest "$snap" "$expected"; then rc2=0; else rc2=$?; fi
+  if mi_trust_verify_digest "$snap" "$expected" "$f"; then rc2=0; else rc2=$?; fi
   if [ "$rc2" -eq 0 ]; then
     if records="$(mi_policy_load "$snap" "$f")"; then rc2=0; else rc2=$?; fi
   fi

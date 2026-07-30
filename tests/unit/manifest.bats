@@ -351,3 +351,148 @@ mkindex() {   # writes $MYTHICAL_HOME/{policy,mb,ms,index}
   [ "$status" -eq 1 ]
   [[ "$output" == *secrets* ]]
 }
+
+# --- Fix 1: mi_accept_manifest must not advance the floor before its later gates ---
+#
+# Before the fix, this door called mi_trust_check (check-then-commit) ahead of entitlement/min_core,
+# so a manifest refused for either reason had already raised the persisted version floor — a
+# publisher's typo would permanently block every future manifest at or below the refused version,
+# including a perfectly good earlier one. The fix splits the door into mi_trust_check_only (here)
+# and a later mi_trust_commit, placed after entitlement and min_core but before the launch-state
+# check (rc 3 is still an acceptance).
+
+@test "Fix 1: an entitlement violation leaves the version floor unchanged" {
+  mkindex
+  local d="$MYTHICAL_HOME" dig="sha256:$(printf 'a%.0s' {1..64})"
+  # version=7, asking for the 'secrets' role — NOT entitled under mkindex's policy (brokkr only has
+  # 'state' there). A pre-fix door would have committed floor=7 for manifest:brokkr before reaching
+  # this refusal.
+  printf 'mythical-manifest 1\nversion=7\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nmin_core=0.1.0\nimage=r@%s\nvolume=secrets:/run/secrets\n' "$dig" > "$d/mb7"
+  { printf 'mythical-index 1\nversion=1\nexpires=4102444800\npolicy_digest=%s\n' "$(mi_digest "$d/policy")"
+    printf 'manifest=brokkr:%s\nmanifest=skuld:%s\n' "$(mi_digest "$d/mb7")" "$(mi_digest "$d/ms")"; } > "$d/index"
+  mi_trust_anchor_set "$(mi_digest "$d/index")"
+  run mi_accept_manifest "$d/index" "$d/policy" "$d/mb7" brokkr
+  [ "$status" -eq 1 ]
+  [[ "$output" == *secrets* ]] || { echo "output missing 'secrets': $output" >&2; return 1; }
+  # rc 3 = "no floor was ever recorded" (mi_trust_floor_get's own contract) — the refusal above must
+  # not have written one.
+  run mi_trust_floor_get "manifest:brokkr"
+  [ "$status" -eq 3 ] || { echo "expected no floor recorded for manifest:brokkr, got status $status: $output" >&2; return 1; }
+}
+
+@test "Fix 1: an accepted-but-not-launched manifest still advances the version floor" {
+  mkindex
+  local d="$MYTHICAL_HOME" dig="sha256:$(printf 'a%.0s' {1..64})"
+  printf 'mythical-manifest 1\nversion=5\nexpires=4102444800\nproduct=brokkr\nlaunched=false\nmin_core=0.1.0\nimage=r@%s\nvolume=state:/data\n' "$dig" > "$d/mb5"
+  { printf 'mythical-index 1\nversion=1\nexpires=4102444800\npolicy_digest=%s\n' "$(mi_digest "$d/policy")"
+    printf 'manifest=brokkr:%s\nmanifest=skuld:%s\n' "$(mi_digest "$d/mb5")" "$(mi_digest "$d/ms")"; } > "$d/index"
+  mi_trust_anchor_set "$(mi_digest "$d/index")"
+  run mi_accept_manifest "$d/index" "$d/policy" "$d/mb5" brokkr
+  [ "$status" -eq 3 ]
+  run mi_trust_floor_get "manifest:brokkr"
+  [ "$status" -eq 0 ]
+  [ "$output" = "5" ] || { echo "expected floor=5 for manifest:brokkr, got: $output" >&2; return 1; }
+}
+
+# --- Fix 2: the door's freshness gate cannot be silently deleted -------------------------------------
+
+@test "Fix 2: an expired manifest is refused through the door" {
+  mkindex
+  local d="$MYTHICAL_HOME" dig="sha256:$(printf 'a%.0s' {1..64})"
+  printf 'mythical-manifest 1\nversion=1\nexpires=1\nproduct=brokkr\nlaunched=true\nmin_core=0.1.0\nimage=r@%s\nvolume=state:/data\n' "$dig" > "$d/mbx"
+  { printf 'mythical-index 1\nversion=1\nexpires=4102444800\npolicy_digest=%s\n' "$(mi_digest "$d/policy")"
+    printf 'manifest=brokkr:%s\nmanifest=skuld:%s\n' "$(mi_digest "$d/mbx")" "$(mi_digest "$d/ms")"; } > "$d/index"
+  mi_trust_anchor_set "$(mi_digest "$d/index")"
+  run mi_accept_manifest "$d/index" "$d/policy" "$d/mbx" brokkr
+  [ "$status" -eq 1 ]
+  [[ "$output" == *expired* ]] || { echo "output missing 'expired': $output" >&2; return 1; }
+}
+
+@test "Fix 2: a version rollback is refused through the door" {
+  mkindex
+  local d="$MYTHICAL_HOME" dig="sha256:$(printf 'a%.0s' {1..64})"
+  mi_trust_anchor_set "$(mi_digest "$d/index")"
+  run mi_accept_manifest "$d/index" "$d/policy" "$d/mb" brokkr    # mkindex's mb is version=1
+  [ "$status" -eq 0 ]
+
+  printf 'mythical-manifest 1\nversion=2\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nmin_core=0.1.0\nimage=r@%s\nvolume=state:/data\n' "$dig" > "$d/mb2"
+  { printf 'mythical-index 1\nversion=1\nexpires=4102444800\npolicy_digest=%s\n' "$(mi_digest "$d/policy")"
+    printf 'manifest=brokkr:%s\nmanifest=skuld:%s\n' "$(mi_digest "$d/mb2")" "$(mi_digest "$d/ms")"; } > "$d/index"
+  mi_trust_anchor_set "$(mi_digest "$d/index")"
+  run mi_accept_manifest "$d/index" "$d/policy" "$d/mb2" brokkr   # floor advances to 2
+  [ "$status" -eq 0 ]
+
+  # Roll back to the original version=1 file/index — must be refused as a replay, and no floor
+  # should ever have been written if freshness were skipped entirely.
+  { printf 'mythical-index 1\nversion=1\nexpires=4102444800\npolicy_digest=%s\n' "$(mi_digest "$d/policy")"
+    printf 'manifest=brokkr:%s\nmanifest=skuld:%s\n' "$(mi_digest "$d/mb")" "$(mi_digest "$d/ms")"; } > "$d/index"
+  mi_trust_anchor_set "$(mi_digest "$d/index")"
+  run mi_accept_manifest "$d/index" "$d/policy" "$d/mb" brokkr
+  [ "$status" -eq 1 ]
+  [[ "$output" == *replay* ]] || { echo "output missing 'replay': $output" >&2; return 1; }
+}
+
+# --- Fix 3: the door's authentication of the policy index cannot be silently deleted -----------------
+# Replacing mi_accept_policy with mi_policy_load at the door's call site would leave a locally
+# tampered policy file honoured, because mi_policy_load only PARSES — it never checks the file
+# against the digest the family index vouches for.
+
+@test "Fix 3: a policy tampered with locally after the chain was built is refused, naming the digest mismatch" {
+  mkindex
+  local d="$MYTHICAL_HOME" dig="sha256:$(printf 'a%.0s' {1..64})"
+  # A manifest asking for the 'secrets' role — NOT entitled under mkindex's real (untampered)
+  # policy, where brokkr has only 'state'.
+  printf 'mythical-manifest 1\nversion=1\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nmin_core=0.1.0\nimage=r@%s\nvolume=secrets:/run/secrets\n' "$dig" > "$d/mbs"
+  { printf 'mythical-index 1\nversion=1\nexpires=4102444800\npolicy_digest=%s\n' "$(mi_digest "$d/policy")"
+    printf 'manifest=brokkr:%s\n' "$(mi_digest "$d/mbs")"; } > "$d/index"
+  mi_trust_anchor_set "$(mi_digest "$d/index")"
+
+  # An attacker with local write access rewrites the policy file to grant the role the manifest
+  # wants, WITHOUT touching the index or its already-recorded policy_digest.
+  { printf 'mythical-policy 1\nversion=1\nexpires=4102444800\nfamily_gid=60748\n'
+    printf 'brokkr.permitted_role=state\nbrokkr.permitted_role=secrets\nbrokkr.bindable_role=state\n'
+    printf 'skuld.permitted_role=state\n'; } > "$d/policy"
+
+  run mi_accept_manifest "$d/index" "$d/policy" "$d/mbs" brokkr
+  [ "$status" -ne 0 ]
+  [[ "$output" == *digest* ]] || { echo "output missing 'digest': $output" >&2; return 1; }
+}
+
+# --- Fix 5: mi_manifest_core_ok is public and must type-check min_core itself ------------------------
+# Through the door, min_core is already bounded by mi_manifest_spec's `coreversion` type and
+# mi_manifest_load's 3-component cap. Called directly against a hand-built records string, no such
+# gate has run, and _mi_version_ge compares only the first 3 dot-components — silently ignoring a
+# 4th rather than refusing it.
+
+@test "Fix 5: mi_manifest_core_ok refuses a min_core value with a stray 4th component" {
+  local records; records="$(printf 'min_core\t0.1.0.9\n')"
+  run mi_manifest_core_ok "$records"
+  [ "$status" -eq 1 ] || { echo "accepted an invalid min_core '0.1.0.9': $output" >&2; return 1; }
+  [[ "$output" == *"0.1.0.9"* ]] || { echo "output missing the rejected value: $output" >&2; return 1; }
+}
+
+# --- Fix 6: MI_CORE_VERSION, the comparator's left operand, must itself be a valid coreversion -------
+# _mi_version_ge is not called through mi_manifest_core_ok's new type gate for its OWN left operand —
+# that gate only validates the manifest's min_core. MI_CORE_VERSION's validity currently rests on a
+# coupling between this assertion and the smoke-test regex in tests/smoke.sh, which never reference
+# each other; this test localizes the invariant so a bad MI_CORE_VERSION fails here, at its source.
+
+@test "Fix 6: MI_CORE_VERSION is itself a valid coreversion" {
+  _mi_doc_type_ok coreversion "$MI_CORE_VERSION" \
+    || { echo "MI_CORE_VERSION '$MI_CORE_VERSION' is not a valid coreversion" >&2; return 1; }
+}
+
+# --- Fix 7: digest-mismatch diagnostics must name the operator's file, not the private snapshot ------
+
+@test "Fix 7: a digest mismatch through the door names the operator's manifest path, not the temp snapshot" {
+  mkindex
+  local d="$MYTHICAL_HOME" dig="sha256:$(printf 'a%.0s' {1..64})"
+  mi_trust_anchor_set "$(mi_digest "$d/index")"
+  # Tamper with the manifest bytes AFTER the index has already recorded a digest for the untampered
+  # ones — the door must refuse on the mismatch and name $d/mb, not the private snapshot it read.
+  printf 'mythical-manifest 1\nversion=2\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nmin_core=0.1.0\nimage=r@%s\nvolume=state:/data\n' "$dig" > "$d/mb"
+  run mi_accept_manifest "$d/index" "$d/policy" "$d/mb" brokkr
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"$d/mb"* ]] || { echo "output missing the operator's path $d/mb: $output" >&2; return 1; }
+  [[ "$output" != *mctl-conf.* ]] || { echo "output leaked the temp snapshot path: $output" >&2; return 1; }
+}
