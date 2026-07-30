@@ -83,27 +83,69 @@ _mi_led_args_ok() {
 # mi_prov_tombstone serializes a record itself and must reach the identical check — two copies of a
 # serialization rule drift, and this one is the difference between a record and a forged record.
 _mi_led_fields_ok() {
-  local f
+  local f k seen=""
   for f in "$@"; do
     if ! _mi_led_field_ok "$f"; then
       mi_warn "prov: refusing to write ledger field '$f' — fields are key=value, with no tab or newline"
       return 1
     fi
+    # ONE NAME, ONE FIELD — and this is a property of the LIST, not of a field, which is why it is
+    # judged here rather than inside _mi_led_field_ok.
+    #
+    # A record's extra fields are passed through from the caller, so a record could be given a SECOND
+    # `key=`. The matcher below accepts a record when ANY of its fields equals the selector, so such a
+    # record answers the lookup for a DIFFERENT object's key while describing its own — and the
+    # authority check then reads ITS nonce and compares it against the OTHER object's label. That is
+    # authority over something this installer never created, assembled entirely out of accepted field
+    # syntax. Every reader here (mi_led_field, mi_ledger_get) also takes the first hit and ignores the
+    # rest, so a duplicate name is ambiguous even where it is not hostile.
+    k="${f%%=*}"
+    # `seen` is one space-delimited string on purpose: bash 3.2 has no associative arrays, and
+    # _mi_led_field_ok has already proved the name is [a-z_]+, so no name can contain a space and the
+    # padded comparison below cannot match a prefix by accident.
+    case " ${seen} " in
+      *" ${k} "*)
+        mi_warn "prov: refusing a ledger record that carries '${k}' twice — one name, one field"
+        return 1 ;;
+    esac
+    seen="${seen} ${k}"
   done
   return 0
 }
 
-# Does <record> carry <field>=<value>? Used to key an edit.
+# Does <record> carry <field>=<value>, EXACTLY ONCE? Used to key an edit.
+#
+# "Exactly once" is the whole guarantee, and returning on the first hit was not it: a record carrying
+# two `key=` fields matched two different selectors, so one record could be superseded, deleted or
+# retrieved as if it were another object's. mi_led_put refuses to write such a record, but the ledger
+# is a file — a restore puts one there that this installation never authored, and a checksum proves
+# integrity, not provenance. So the reader has to refuse it too, and independently.
+#
+# An ambiguous record matches NOTHING, including its own key: it is inert rather than deleted. Any
+# mismatch preserves — the record stays on disk, is reported, and grants nothing.
 _mi_led_record_matches() {
-  local record="$1" field="$2" value="$3" tok
+  local record="$1" field="$2" value="$3" tok hits=0 matched=1
   local IFS
   IFS=$'\t'
   # shellcheck disable=SC2086   # deliberate IFS split on TAB of a record we wrote ourselves
   set -- $record
   for tok in "$@"; do
-    [ "$tok" = "${field}=${value}" ] && return 0
+    case "$tok" in
+      "${field}="*)
+        hits=$((hits + 1))
+        if [ "$tok" = "${field}=${value}" ]; then matched=0; fi ;;
+    esac
   done
-  return 1
+  # Restore word-splitting BEFORE reporting: mi_warn joins its arguments with the first character of
+  # IFS, so a message emitted while IFS is a TAB would come out tab-joined the day someone gives it a
+  # second argument. Cheap here, invisible to find later.
+  IFS=$' \t\n'
+  if [ "$hits" -gt 1 ]; then
+    mi_warn "prov: a ledger record carries '${field}' ${hits} times — it is ambiguous, so it matches"
+    mi_warn "  nothing and grants nothing. Run 'mythical-ctl state repair'."
+    return 1
+  fi
+  return "$matched"
 }
 
 # Replace (or insert) one record of <kind> whose <field> equals <value>, preserving every other
@@ -317,14 +359,49 @@ _mi_prov_class_ok() {
 # reason.
 _mi_prov_key() { printf '%s:%s\n' "$1" "$2"; }
 
-# The generation of the record currently held for <class>/<name>, or 0.
+# A VALUE PARSED OUT OF A FILE IS NOT A NUMBER UNTIL IT HAS BEEN CHECKED, AND `$(( ))` IS NOT A
+# PARSER — IT IS AN EVALUATOR.
+#
+# Bash evaluates a command substitution inside an arithmetic ARRAY SUBSCRIPT, so `n=$((v + 1))` with
+# v='a[$(…)]' runs whatever is in the subscript. A value like that passes the field rule above
+# untouched, because a field is only ever asked to hold no TAB and no newline — so a `gen=` written
+# through this module's own public editor, or arriving in a ledger restored from a backup, executed
+# arbitrary commands the next time anything recorded provenance for that object. The checksum on the
+# ledger proves integrity, not provenance: it says the bytes were not altered after they were
+# written, not that this installation wrote them.
+#
+# THE RULE, for whoever writes the next one: never let a value read from a file, a label, a manifest
+# or a runtime answer reach `$(( ))`, `let`, an array subscript or `[ … -eq … ]` — all four evaluate
+# arithmetic — until a check like this one has proved it is decimal digits and nothing else. This is
+# the only arithmetic in the shipped tree operating on a parsed value; every other `$(( ))` in lib/
+# and bin/ counts a loop or `$#`, both shell-controlled. If you add a second, bring this with you.
+# (lib/ledger.sh keeps the schema number away from `[ -gt ]` for the neighbouring overflow reason.)
+_mi_prov_gen_ok() {
+  case "$1" in ''|*[!0-9]*) return 1 ;; esac
+  # 18 digits is the widest value 64-bit signed arithmetic evaluates without wrapping. A bound also
+  # keeps a megabyte of digits out of the evaluator.
+  [ "${#1}" -le 18 ]
+}
+
+# The generation of the record currently held for <class>/<name>, or 0 when there is no record.
+#
+# A record that IS there and whose generation is not a number is refused, not reset: a silent reset to
+# 0 is how a tampered record erases the generation history that would show it had been tampered with,
+# and refusing is what this module does with every other fact it cannot read.
 mi_prov_gen() {
   if [ "$#" -ne 2 ]; then mi_warn "prov: mi_prov_gen needs <class> <name>"; return 1; fi
   local rec g rc
   if rec="$(mi_prov_find "$1" "$2")"; then rc=0; else rc=$?; fi
   if [ "$rc" -eq 3 ]; then printf '0\n'; return 0; fi
   [ "$rc" -eq 0 ] || return "$rc"
-  if g="$(mi_led_field "$rec" gen)"; then printf '%s\n' "$g"; else printf '0\n'; fi
+  g="$(mi_led_field "$rec" gen)" || g=""
+  if ! _mi_prov_gen_ok "$g"; then
+    mi_warn "prov: the record for '$2' carries a generation that is not a number ('$g') — refusing."
+    mi_warn "  The ledger is checksummed, which proves it was not altered, not that this installation"
+    mi_warn "  wrote it. Preserving it and reporting; run 'mythical-ctl state repair'."
+    return 1
+  fi
+  printf '%s\n' "$g"
 }
 
 # Record (or supersede) provenance for one object. Extra `key=value` fields are passed through — an
@@ -340,6 +417,9 @@ mi_prov_record() {
   local class="$1" name="$2" nonce="$3"; shift 3
   _mi_prov_class_ok "$class" || return 1
   local gen
+  # `gen` came out of the ledger, i.e. out of a FILE, and the line below EVALUATES it — see
+  # _mi_prov_gen_ok, which is where that is proved to be digits. There is deliberately no second
+  # check here: a guard whose removal changes nothing observable is a guard that gets removed.
   gen="$(mi_prov_gen "$class" "$name")" || return 1
   gen=$((gen + 1))
   mi_led_put "$MI_PROV_KIND" key "$(_mi_prov_key "$class" "$name")" \
@@ -397,7 +477,17 @@ mi_prov_tombstone() {
   # read, so an empty record here cannot become an empty tombstone on disk.
   if [ -n "$rec" ]; then
     nonce="$(mi_led_field "$rec" nonce)" || nonce=""
-    gen="$(mi_led_field "$rec" gen)" || gen=0
+    gen="$(mi_led_field "$rec" gen)" || gen=""
+    # THE SAME RULE AS THE READER'S, because this is the module's second reader of `gen` and its only
+    # writer of a gen it did not compute. Nothing here evaluates the value — but copying a generation
+    # this module has just refused to read into the record that OUTLIVES the object would preserve it
+    # for the next reader instead of reporting it, and a module that will not read a value must not
+    # write it back either.
+    if ! _mi_prov_gen_ok "$gen"; then
+      mi_warn "prov: the record for '$name' carries a generation that is not a number ('$gen') —"
+      mi_warn "  refusing to carry it into a tombstone. Run 'mythical-ctl state repair'."
+      return 1
+    fi
   fi
   trec=$'\t'"key=${key}"$'\t'"class=${class}"$'\t'"name=${name}"$'\t'"nonce=${nonce}"$'\t'"gen=${gen}"
   records="$(mi_ledger_read)" || {
@@ -461,6 +551,30 @@ mi_prov_authority() {
     return 1
   fi
   [ "$rc" -eq 0 ] || return 1
+
+  # THE RECORD MUST BE ABOUT WHAT WAS ASKED ABOUT — the third door, and the one that stays shut when
+  # the other two are walked around.
+  #
+  # A record is retrieved by its `key=` field, but `key`, `class` and `name` are three independent
+  # fields: nothing made them agree. A record whose key says one object while its class and name
+  # describe another answers the lookup for the first and then hands this function the SECOND
+  # object's nonce, which is compared against the FIRST object's label — and if they happen to match,
+  # deletion of an object this installer never created is authorized.
+  #
+  # Checked here rather than in mi_prov_find, in ONE place: this is the only function that turns a
+  # record into permission to delete, and a check in both would be a check in neither — whichever ran
+  # first would shadow the other, and the shadowed one could then be deleted with nothing observable
+  # changing.
+  local rclass rname
+  rclass="$(mi_led_field "$rec" class)" || rclass=""
+  rname="$(mi_led_field "$rec" name)" || rname=""
+  if [ "$rclass" != "$class" ] || [ "$rname" != "$name" ]; then
+    mi_warn "prov: the record found for ${class} '${name}' does not describe it — it describes"
+    mi_warn "  ${rclass:-<no class>} '${rname:-<no name>}'. A record that is about something else is"
+    mi_warn "  not authority over this, so it is PRESERVED and reported."
+    mi_warn "  Run 'mythical-ctl state repair'."
+    return 1
+  fi
 
   recorded="$(mi_led_field "$rec" nonce)" || recorded=""
   if [ -z "$recorded" ]; then

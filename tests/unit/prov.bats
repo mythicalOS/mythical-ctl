@@ -371,6 +371,100 @@ teardown() { mi_lock_release; teardown_test_env; }
   assert_contains "skuld"
 }
 
+# --- a value parsed out of a file is not a number, and a record answers for ONE object -------------
+
+@test "a GENERATION out of the ledger is DIGITS before arithmetic — it is never EVALUATED" {
+  mi_ident_ensure >/dev/null
+  marker="${BATS_TEST_TMPDIR}/gen-payload-ran"
+  # A field is only ever asked to carry no TAB and no newline, so the value below is a VALID field
+  # and reaches the ledger through this module's own public editor — as it also would in a ledger
+  # restored from a backup, which the checksum proves unaltered but does not prove ours. `$(( ))` is
+  # an evaluator, not a parser: bash evaluates a command substitution inside an arithmetic array
+  # subscript, so `gen=$((gen + 1))` RUNS this the next time anything records the object.
+  mi_led_put object key volume:v1 "key=volume:v1" "class=volume" "name=v1" "nonce=n1" \
+    "gen=a[\$(touch '${marker}')]"
+  run mi_prov_record volume v1 n2
+  [ "$status" -ne 0 ]
+  assert_contains "not a number"
+  # THE RETURN VALUE ALONE PROVES NOTHING. Code that refused AFTER the substitution had already run
+  # satisfies the assertion above and has still executed the payload, which is the failure mode that
+  # matters here — so the marker, not the status, is what separates "refused" from "refused too late".
+  [ ! -e "$marker" ] || { echo "the payload EXECUTED: '$marker' was created" >&2; return 1; }
+  # The bound is part of the rule rather than decoration: 64-bit arithmetic wraps silently past 19
+  # digits, and a generation that wrapped reads exactly like a legitimate one afterwards.
+  mi_led_put object key volume:v2 "key=volume:v2" "class=volume" "name=v2" "nonce=n1" \
+    "gen=99999999999999999999"
+  run mi_prov_record volume v2 n2
+  [ "$status" -ne 0 ]
+}
+
+@test "a generation this module refuses to READ is never carried into a tombstone either" {
+  mi_ident_ensure >/dev/null
+  mi_led_put object key volume:v1 "key=volume:v1" "class=volume" "name=v1" "nonce=n1" "gen=9-9"
+  # Nothing in the tombstone path evaluates the value — but this is the module's only writer of a
+  # generation it did not compute, and copying one it has just refused to read into the record that
+  # OUTLIVES the object would preserve it for the next reader instead of reporting it.
+  run mi_prov_tombstone volume v1
+  [ "$status" -ne 0 ]
+  assert_contains "not a number"
+  # Any mismatch preserves: the record it could not read is still there.
+  run mi_led_all object
+  assert_contains "name=v1"
+}
+
+@test "a record carrying one field name TWICE is refused — it would answer for two objects" {
+  mi_ident_ensure >/dev/null
+  mi_prov_record volume target target-nonce
+  # A record's extra fields are passed straight through, so a record this installer legitimately owns
+  # could be given a SECOND `key=`. The matcher accepts a record when ANY field equals the selector,
+  # so that record then answers the lookup for the OTHER object's key while describing its own — and
+  # authority reads ITS nonce and compares it against the other object's label.
+  run mi_prov_record volume installer-owned n1 "key=volume:target"
+  [ "$status" -ne 0 ]
+  assert_contains "twice"
+  # The object it tried to speak for is untouched and still answers for itself; the forged one exists
+  # nowhere.
+  run mi_prov_find volume target
+  [ "$status" -eq 0 ]
+  assert_contains "nonce=target-nonce"
+  run mi_prov_find volume installer-owned
+  [ "$status" -eq 3 ]
+}
+
+@test "a record ALREADY carrying a duplicate selector matches nothing — not even its own key" {
+  mi_ident_ensure >/dev/null
+  # mi_led_put now refuses to WRITE this record, so put it there the way a restore does: through the
+  # ledger writer, checksum and all. A checksum proves the bytes were not altered after they were
+  # written; it does not prove this installation wrote them. So the reader has to refuse the record
+  # independently of the writer, or the writer's rule is only a rule for well-behaved ledgers.
+  { mi_ledger_read
+    printf 'object\tkey=volume:mine\tclass=volume\tname=mine\tnonce=n1\tgen=1\tkey=volume:target\n'
+  } | mi_ledger_write
+  run mi_prov_find volume target
+  [ "$status" -eq 3 ]
+  assert_contains "ambiguous"
+  run mi_prov_find volume mine
+  [ "$status" -eq 3 ]
+  # Inert, not deleted — any mismatch preserves and reports.
+  run mi_led_all object
+  assert_contains "key=volume:mine"
+}
+
+@test "authority checks that the record it found DESCRIBES the object it was asked about" {
+  mi_ident_ensure >/dev/null
+  id="$(mi_ident_get)"
+  mi_rt_volume_create target target-nonce "$id"
+  # One `key=` field, so neither duplicate rule sees this, and the key genuinely names `target` — but
+  # the record describes something else. `key`, `class` and `name` are three independent fields and
+  # nothing made them agree. The nonce here MATCHES what the volume actually carries, so without the
+  # check this authorizes deleting an object the record is not about.
+  mi_led_put object key volume:target "key=volume:target" "class=volume" "name=installer-owned" \
+    "nonce=target-nonce" "gen=1"
+  run mi_prov_authority volume target
+  [ "$status" -ne 0 ]
+  assert_contains "does not describe it"
+}
+
 @test "a REPEATED tombstone keeps the identity the tombstone exists to preserve" {
   mi_ident_ensure >/dev/null
   mi_prov_record volume v1 nonce-a
