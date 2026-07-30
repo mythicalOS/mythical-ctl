@@ -152,6 +152,19 @@ mi_lock_assert_held() {
   if [ "$#" -ne 1 ]; then
     mi_die "mi_lock_assert_held needs a <what> naming the operation it is guarding"
   fi
+  # WHAT THIS AUTHORIZES IS THE OPERATION, NOT THE PROCESS — stated because it looks like an
+  # oversight and is not. The token is compared against the on-disk lock; the pid recorded beside it
+  # is deliberately NOT compared with `$$`, and `_mi_lock_try` exports the token on purpose, so a
+  # child process in the operation's own tree inherits authority and can perform a guarded write.
+  # That is required: a verb that shells out is still the same operation, and a pid check would
+  # refuse it. The consequence is real and worth knowing — anything running inside the operation's
+  # process tree is inside the lock with it, so two writers that a caller deliberately runs
+  # concurrently would both pass this gate and the later atomic replace would win.
+  #
+  # It is not a way in from outside. The lock file is created 0600, so on a multi-user host no other
+  # user can read the token, and anyone who can is already this user — for whom the lock was never a
+  # security boundary, only a serialization one. A separate CLI invocation has no token and must
+  # acquire the lock normally.
   local what="$1" lf ltok=""
   lf="$(_mi_lock_file)"
   if [ -f "$lf" ]; then
