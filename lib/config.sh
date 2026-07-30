@@ -164,6 +164,28 @@ _mi_conf_scan_stream() {
 
 # File-level preconditions, then the stream scan.
 # rc: 0 ok · 1 malformed (already reported) · 3 file missing.
+#
+# SCOPE, and a residual worth being exact about. This function opens the live path several times: the
+# byte gate reads it (twice, inside `tr | cmp`), the trailing-newline check reads it, and then the
+# scanner reads it again through the redirect below. Each check therefore describes the bytes present
+# when *it* ran, not the bytes the scanner ends up parsing. A local process able to rewrite the file
+# between two of those opens can pass the byte gate with clean content and have the parser read
+# NUL-bearing content — and bash cannot hold a NUL in `read` data, so the byte simply vanishes and the
+# value silently changes meaning between what was validated and what was emitted.
+#
+# That is accepted here, deliberately, and the reasoning is about WHICH files reach this function:
+#
+#   - `<product>.conf` — the attacker-controlled one — NEVER does. It is read through `_mi_conf_snap`
+#     into a private inode and parsed from that copy, and a structural test enforces that neither
+#     public product function re-opens the live file. That is where the race actually matters and it
+#     is closed there, not here.
+#   - `mythical.conf` is host-only and never mounted, so the only racer is a local process running as
+#     the operator — who can write the file directly and gains nothing from the race.
+#
+# So the byte gate's guarantee is precisely "no NUL, CR or TAB was in this file when the gate ran",
+# which is what a non-racing read needs and all it claims. It is NOT "the bytes the scanner parses
+# contain no control byte" — only reading once can promise that. `mi_conf_family_add` needs the
+# stronger property because it WRITES, and it gets it by copying first and validating the copy.
 mi_conf_scan() {
   if [ "$#" -ne 1 ]; then mi_warn "config: mi_conf_scan needs a <file>"; return 1; fi
   local f="$1" brc
@@ -458,24 +480,55 @@ mi_conf_family_add() {
   # check that refuses it also refuses a hardlinked or foreign-owned mythical.conf for free.
   _mi_conf_identity_ok "$f" || return 1
 
-  # Never overwrite a file we cannot read. A config that does not parse may be an operator's
-  # half-finished edit or a hostile write; either way, silently rewriting it destroys evidence and
-  # could discard settings. Refuse and report. (An absent file is fine — that is a first write.)
-  # Gate on the FULL load, not merely on the syntax scan. A file holding a key outside the core
-  # schema scans perfectly and fails mi_conf_family_load — so gating on the scan alone would let this
-  # function "succeed" while producing a file its own reader rejects. Whatever we refuse to read, we
-  # refuse to modify.
-  if [ -f "$f" ] && ! mi_conf_family_load >/dev/null 2>&1; then
-    mi_warn "config: $f does not load cleanly — refusing to modify it; fix or remove it first"
-    return 1
-  fi
+  tmp="$(mktemp "$dir/.mythical.conf.XXXXXX")" || { mi_warn "config: cannot create a temp file in $dir"; return 1; }
+  # 0600 BEFORE any content lands: mktemp is already 0600, but making it explicit means a future
+  # change to the temp mechanism cannot silently widen a file that holds bootstrap secrets.
+  chmod 600 "$tmp" || { rm -f "$tmp"; mi_warn "config: cannot set mode on $tmp"; return 1; }
 
-  # The additive gate. mi_conf_get distinguishes absent (3) from a parse failure (1), which is why it
-  # exists — "the key is not set" and "the file is hostile" must never look the same to code deciding
-  # whether to write.
+  # COPY FIRST, then validate and gate on THE COPY. This ordering is the whole correctness argument of
+  # this function, so it is worth stating why the obvious ordering is wrong.
+  #
+  # An earlier version validated the live file, digested it, and only then ran `cat "$f" > "$tmp"` —
+  # three separate opens. A concurrent writer that swapped the file to off-schema bytes for the
+  # duration of the `cat` and then restored the original byte-for-byte defeated all of it: the digest
+  # compare-and-swap below saw the file it expected (the bytes were back), and the temp file held
+  # content nobody had validated. REPRODUCED, with a `cat` shim standing in for the racer: the function
+  # returned **0**, the operator's comment header and their existing key were **destroyed**, an
+  # unvalidated `MYTHICAL_EVIL=pwned` was persisted, and the resulting mythical.conf was refused by its
+  # own reader. It reported success while breaking the D9 non-destructive invariant and falsifying this
+  # function's own claim that whatever it refuses to read it refuses to modify. A digest CAS cannot see
+  # an A→B→A sequence; only reading the bytes once can.
+  #
+  # So: one content read of the live file (`cat` into our own private inode), and every later decision
+  # — the parse, the schema check, the additive gate, the digest — made against those same bytes. The
+  # only other touch of the live path is `_mi_conf_unchanged`, which compares a digest and never
+  # derives configuration from what it reads. This is the shape mi_conf_product_add already uses for
+  # the container-writable file; the two writers now agree structurally as well as behaviourally.
+  local pre=""
   if [ -f "$f" ]; then
-    if existing="$(mi_conf_get "$f" "$key")"; then rc=0; else rc=$?; fi
+    cat "$f" > "$tmp" || { rm -f "$tmp"; mi_warn "config: cannot read $f"; return 1; }
+    # The digest of the bytes we actually hold — not of a separate read of the live file.
+    pre="$(mi_digest "$tmp")" || { rm -f "$tmp"; mi_warn "config: cannot digest the copy of $f"; return 1; }
+
+    # Never overwrite a file we cannot read. A config that does not parse may be an operator's
+    # half-finished edit or a hostile write; either way, silently rewriting it destroys evidence and
+    # could discard settings. Refuse and report. (An absent file is fine — that is a first write.)
+    # Gate on the FULL load, not merely on the syntax scan: a file holding a key outside the core
+    # schema scans perfectly and fails the schema check, so gating on the scan alone would let this
+    # function "succeed" while producing a file its own reader rejects. The diagnostic is discarded
+    # because it would name the temp path; the message below names the real file.
+    if ! mi_conf_load "$tmp" "$(mi_conf_family_spec)" >/dev/null 2>&1; then
+      rm -f "$tmp"
+      mi_warn "config: $f does not load cleanly — refusing to modify it; fix or remove it first"
+      return 1
+    fi
+
+    # The additive gate, also against the copy. mi_conf_get distinguishes absent (3) from a parse
+    # failure (1), which is why it exists — "the key is not set" and "the file is hostile" must never
+    # look the same to code deciding whether to write.
+    if existing="$(mi_conf_get "$tmp" "$key")"; then rc=0; else rc=$?; fi
     if [ "$rc" -eq 0 ]; then
+      rm -f "$tmp"
       if [ "$existing" = "$val" ]; then
         return 0                       # already exactly what we would write: nothing to do
       fi
@@ -483,23 +536,17 @@ mi_conf_family_add() {
       mi_warn "  An operator's value is never replaced silently; change it by hand, or remove the line."
       return 1
     fi
-    [ "$rc" -eq 3 ] || return "$rc"    # absent is the only status that authorizes a write
+    if [ "$rc" -ne 3 ]; then           # absent is the only status that authorizes a write
+      rm -f "$tmp"
+      return "$rc"
+    fi
   fi
 
-  tmp="$(mktemp "$dir/.mythical.conf.XXXXXX")" || { mi_warn "config: cannot create a temp file in $dir"; return 1; }
-  # 0600 BEFORE any content lands: mktemp is already 0600, but making it explicit means a future
-  # change to the temp mechanism cannot silently widen a file that holds bootstrap secrets.
-  chmod 600 "$tmp" || { rm -f "$tmp"; mi_warn "config: cannot set mode on $tmp"; return 1; }
-
-  # The key is known ABSENT (the gate above proved it), so this is a pure byte copy plus an append —
-  # every existing byte, comment, blank line and ordering survives unchanged, which is the D9
-  # guarantee stated as code rather than as a loop that could get it subtly wrong.
-  local pre=""
-  if [ -f "$f" ]; then
-    pre="$(mi_digest "$f")" || { rm -f "$tmp"; mi_warn "config: cannot read $f"; return 1; }
-    cat "$f" > "$tmp" || { rm -f "$tmp"; mi_warn "config: cannot read $f"; return 1; }
-  fi
-  printf '%s=%s\n' "$key" "$val" >> "$tmp"
+  # The key is known ABSENT (the gate above proved it), so the temp file is already a byte-exact copy
+  # of the original and this is a pure append — every existing byte, comment, blank line and ordering
+  # survives unchanged, which is the D9 guarantee stated as code rather than as a loop that could get
+  # it subtly wrong.
+  printf '%s=%s\n' "$key" "$val" >> "$tmp" || { rm -f "$tmp"; mi_warn "config: cannot write $tmp"; return 1; }
 
   # Compare-and-swap on the WHOLE FILE before replacing it. The family lock serializes every other
   # mythical-ctl process, but not the two writers D9 explicitly expects: the operator in an editor,

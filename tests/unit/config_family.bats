@@ -150,6 +150,49 @@ EOF
   diff -u "$MYTHICAL_HOME/before" "$f"
 }
 
+# A digest compare-and-swap cannot see an A -> B -> A sequence, so validating the live file and then
+# separately copying it is not enough: a writer that swaps in other bytes for the duration of the copy
+# and restores the original before the digest check wins. Found by a cross-model review after four
+# same-model reviews had passed over this function.
+#
+# Measured against the pre-fix code with this exact shim: rc **0**, the operator's comment header and
+# their existing key DESTROYED, an unvalidated MYTHICAL_EVIL=pwned persisted, and the resulting file
+# refused by mythical.conf's own reader — success reported while breaking the D9 non-destructive
+# invariant. The fix is structural, so this test guards the structure: copy once, then validate, gate
+# and digest THAT copy.
+@test "bytes swapped in during the copy are validated, not persisted" {
+  local shim="$BATS_TEST_TMPDIR/shim" f
+  mkdir -p "$shim"
+  cat > "$shim/cat" <<'EOF'
+#!/bin/bash
+# Stand in for a concurrent writer: off-schema bytes for the duration of the copy, original restored
+# byte-for-byte before anyone can digest the live file again.
+if [ "$1" = "$RACE_TARGET" ]; then
+  cp "$RACE_TARGET" "$RACE_TARGET.orig"
+  printf 'MYTHICAL_EVIL=pwned\n' > "$RACE_TARGET"
+  /bin/cat "$RACE_TARGET"
+  cp "$RACE_TARGET.orig" "$RACE_TARGET"
+  rm -f "$RACE_TARGET.orig"
+  exit 0
+fi
+exec /bin/cat "$@"
+EOF
+  chmod +x "$shim/cat"
+
+  f="$(mi_conf_family_path)"
+  printf '# operator header\nMYTHICAL_TELEMETRY_KEY=ok\n' > "$f"; chmod 600 "$f"
+  cp "$f" "$MYTHICAL_HOME/before"
+
+  RACE_TARGET="$f" PATH="$shim:$PATH" run mi_conf_family_add MYTHICAL_NET good-net
+  [ "$status" -ne 0 ]
+  # the swapped-in bytes were seen and refused, rather than copied and blessed
+  [[ "$output" == *"does not load cleanly"* ]] \
+    || { echo "the refusal does not name the unreadable content: $output" >&2; return 1; }
+  # and the operator's file is byte-identical, so nothing was destroyed on the way
+  diff -u "$MYTHICAL_HOME/before" "$f"
+  mi_conf_family_load >/dev/null
+}
+
 # --- identity (hardening, beyond what the plan scoped) --------------------------------------------
 # The plan put the §4.1a identity checks on the container-writable <product>.conf only, reasoning that
 # mythical.conf is host-only and not attacker-controlled. True of the threat, and it still left a bad
