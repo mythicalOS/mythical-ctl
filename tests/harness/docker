@@ -20,8 +20,32 @@
 #     is recorded under the network's ID — never under the name it was reached by.
 #   * `network create` records the driver it was ASKED for, so `--driver bridge` is a flag a test can
 #     observe rather than one the fake assumes.
+#   * Every subcommand answers only the FLAGS and TEMPLATES it implements, and takes only the number
+#     of positional arguments it can act on. An unimplemented flag is a hard error, never a silent
+#     no-op (§"the closed surface" below).
+#   * A resource that is still REFERENCED cannot be removed: a network with an attached container, a
+#     volume a container mounts, a running container without `-f`.
+#   * A container joins a network under its own NAME as well as any explicit alias, so an omitted
+#     `--alias` is observable rather than invisible.
+#   * `container run` WITHOUT `--rm` leaves the container behind, as a real daemon does.
 #
-# Knobs: FAKE_DOCKER_DOWN, FAKE_DOCKER_SERVER_VERSION, FAKE_DOCKER_ROOTLESS,
+# THE CLOSED SURFACE — why an unimplemented flag is fatal here.
+# Every parse loop below used to end in a catch-all that either swallowed the word (`*) shift`) or
+# took it as the name. MEASURED against that version:
+#
+#   docker container run --network none -v /:/hostroot -- img selfcheck   → rc 0, the `-v` IGNORED
+#   docker container create --name c1 … --user 1000 --env-file /nope …    → rc 0, both IGNORED
+#   docker volume create v2 v3                                            → rc 0, created v3 only
+#   docker container create … -- img sleep infinity                       → the COMMAND became the image
+#
+# A fake that ignores a flag is worse than one that lacks it: the first case is a container escape a
+# test would report as clean. So an unknown flag DIES, and the message says `fake docker:` rather
+# than borrowing Docker's `unknown flag:` — the fake cannot tell "Docker has no such flag" from
+# "Docker has it and this fake does not implement it", and pretending otherwise would put words in a
+# real daemon's mouth. The `--flag=value` spelling is implemented only where a caller uses it
+# (`--label=`, `--driver=`); elsewhere it is refused rather than accepted and ignored.
+#
+# Knobs: FAKE_DOCKER_DOWN, FAKE_DOCKER_SERVER_VERSION, FAKE_DOCKER_CLIENT_VERSION, FAKE_DOCKER_ROOTLESS,
 #        FAKE_DOCKER_CONTEXT_HOST, FAKE_DOCKER_PULL, FAKE_DOCKER_NET_DUPLICATE,
 #        FAKE_DOCKER_NET_DRIVER, FAKE_DOCKER_NET_DEFAULT_DRIVER, FAKE_DOCKER_NET_THI,
 #        FAKE_DOCKER_HELPER_FAIL, FAKE_DOCKER_CONNECT_FAIL, FAKE_DOCKER_DISCONNECT_SILENT
@@ -68,6 +92,35 @@ rec_set() {
   t="$(mktemp "${f%/*}/.tmp-XXXXXX")"
   { grep -av "^${k}=" "$f" 2>/dev/null || true; printf '%s=%s\n' "$k" "$v"; } > "$t"
   mv -f "$t" "$f"
+}
+
+# --- argument discipline (see "THE CLOSED SURFACE" above) ------------------------------------------
+# One flag the fake does not implement; one positional argument too many. Both were silent.
+bad_flag() { die "fake docker: $1 does not implement the flag $2"; }
+# <already-taken> <arm> <what> <new>. Docker's CLI errors on a second positional ("requires exactly 1
+# argument"); this fake kept the LAST and discarded the rest, so a stray or typo'd word looked fine.
+one_only() {
+  [ -z "$1" ] || die "fake docker: $2 takes exactly one $3 (got '$1' and '$4')"
+}
+
+# A `ls --format` template was parsed off and thrown away, so EVERY template printed the name. An
+# adapter asking for the driver, the id or the image would have been answered with names and the
+# lookup that consumed them would have "worked". Same rule as render(): only what is implemented.
+check_ls_format() {
+  case "$1:$2" in
+    volume:|network:|container:) return 0 ;;
+    volume:'{{.Name}}'|network:'{{.Name}}'|container:'{{.Names}}') return 0 ;;
+    *) die "fake docker: unsupported $1 ls template: $2" ;;
+  esac
+}
+
+# `--filter` is honoured for `label=` only, and a second one is refused rather than silently
+# replacing the first: real Docker ANDs them, and a fake that keeps the last would answer a
+# two-filter query with a one-filter result. A non-label filter matched NOTHING here and reported
+# success, which is the emptiest possible wrong answer.
+set_filter() {
+  [ -z "$1" ] || die "fake docker: $2 supports one --filter, not two (got '$1' and '$3')"
+  case "$3" in label=*) : ;; *) die "fake docker: $2 implements only label= filters, not '$3'" ;; esac
 }
 
 # --- resource names ---
@@ -175,6 +228,30 @@ check_mounts() {
   done
 }
 
+# A NAMED VOLUME that does not exist is CREATED by the daemon as part of the container create — the
+# asymmetry with bind mounts above is real and deliberate on Docker's part. This fake recorded the
+# mount and created nothing, which is the permissiveness gap read from the other side: the runtime
+# world it showed had FEWER objects in it than a real daemon's would, so a §10a assertion of the
+# "nothing partial survives" kind could pass here over an orphan volume that really would be left
+# behind. The auto-created volume carries no labels, exactly as the daemon's does — which is also why
+# it is worth seeing: an unlabelled volume is invisible to every find-by-label sweep in §6a.
+create_missing_volumes() {
+  local spec name
+  local IFS=';'
+  # shellcheck disable=SC2086   # deliberate split: the mount list is `;`-separated by the parser above
+  for spec in $1; do
+    case "$spec" in type=volume,*) : ;; *) continue ;; esac
+    name="${spec#*source=}"; name="${name%%,*}"
+    [ -n "$name" ] || continue
+    check_name "$name" volume
+    if [ ! -e "$STATE/volumes/$name" ]; then
+      : > "$STATE/volumes/$name"
+      rec_set "$STATE/volumes/$name" labels ""
+      rec_set "$STATE/volumes/$name" driver local
+    fi
+  done
+}
+
 # --- networks: resolution and drivers ---
 # A real daemon RESOLVES a network reference — by ID or by name — against the networks it has, and
 # refuses one it does not. This fake required only a non-empty string, so `container create --network
@@ -239,6 +316,33 @@ check_driver() {
   esac
 }
 
+# --- what is still USING a resource -----------------------------------------------------------------
+# A real daemon refuses to remove something that is still referenced, and the refusal is the whole
+# safety property in §6b's teardown ordering: detach, THEN remove. This fake removed either happily
+# and left every container holding an id that resolves to nothing — so a teardown that removed the
+# network first, or removed a volume out from under a live container, passed here and would fail (or
+# worse, half-succeed) against a real daemon.
+#
+# Attachments are stored as `nets=<id>=<addr>;…` and mounts as `mounts=volume|<name>||<dst>|<rw>;…`,
+# so both scans prefix a `;` and match a delimited field — never a bare substring, which would make
+# volume `v` look like a user of `vv`.
+container_ids_on_network() {
+  local c out=""
+  for c in "$STATE"/containers/*; do
+    [ -e "$c" ] || continue
+    case ";$(rec_get "$c" nets)" in *";${1}="*) out="${out}$(rec_get "$c" id) " ;; esac
+  done
+  printf '%s' "${out% }"
+}
+container_ids_using_volume() {
+  local c out=""
+  for c in "$STATE"/containers/*; do
+    [ -e "$c" ] || continue
+    case ";$(rec_get "$c" mounts)" in *"volume|${1}|"*) out="${out}$(rec_get "$c" id) " ;; esac
+  done
+  printf '%s' "${out% }"
+}
+
 # --- label parsing, shared by every create ---
 labels=""
 parse_label() { labels="${labels}${1};"; }
@@ -293,26 +397,100 @@ render() {
   esac
 }
 
+# The alias list an attachment gets: the EXPLICIT alias, if any, and then the container's own name,
+# which a real daemon adds by itself on a user-defined network.
+#
+# That automatic name is not decoration. Without it an omitted `--alias` / `--network-alias` recorded
+# an EMPTY alias list, which is indistinguishable from nothing at all — so §6b.2's "the alias is
+# passed explicitly, because a container joining under its own installation-scoped name is a name no
+# sibling can guess" was a guarantee no test could fail on. With the name always present, dropping
+# the flag leaves the list holding the container name ALONE, which is exactly the failure §9 calls
+# "family DNS fails silently, indistinguishable from an absent peer".
+#
+# The ORDER (explicit first) is this fake's own, not a fidelity claim: Docker's Aliases/DNSNames
+# ordering has changed across engine versions and nothing here should depend on it.
+alias_list() {
+  if [ -n "$1" ]; then printf '%s,%s,' "$1" "$2"; else printf '%s,' "$2"; fi
+}
+
 # The address a started container gets on a network. Deterministic per (container, netid).
 addr_for() { printf '10.88.%d.%d\n' $(( $(printf '%s' "$1$2" | cksum | cut -d' ' -f1) % 250 + 1 )) $(( ${#1} % 250 + 2 )); }
 
 case "${1:-}" in
   version)
-    printf '%s\n' "${FAKE_DOCKER_SERVER_VERSION:-28.0.0}"
+    # The SERVER version, and only when that is what was asked for. This arm printed the server
+    # version for EVERY template, including `{{.Client.Version}}` — so the adapter could have been
+    # reading the CLI's own version and the preflight engine-version gate (D29, engine 28+) would
+    # have compared the wrong number with the suite green. `docker version` mixes client and server
+    # fields in one document; which one a caller asked for is exactly the thing worth pinning.
+    shift; tmpl=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --format) tmpl="$2"; shift 2 ;;
+        --format=*) tmpl="${1#--format=}"; shift ;;
+        -*) bad_flag "version" "$1" ;;
+        *) die "fake docker: version accepts no arguments (got '$1')" ;;
+      esac
+    done
+    case "$tmpl" in
+      # No --format: real docker prints a client block and a server block. Both are printed here so
+      # a bare `docker version` still answers, and so the two are visibly DIFFERENT fields.
+      '') printf 'Client:\n Version: %s\n\nServer:\n Engine:\n  Version: %s\n' \
+            "${FAKE_DOCKER_CLIENT_VERSION:-99.0.0}" "${FAKE_DOCKER_SERVER_VERSION:-28.0.0}" ;;
+      '{{.Server.Version}}') printf '%s\n' "${FAKE_DOCKER_SERVER_VERSION:-28.0.0}" ;;
+      '{{.Client.Version}}') printf '%s\n' "${FAKE_DOCKER_CLIENT_VERSION:-99.0.0}" ;;
+      *) die "fake docker: unsupported version template: ${tmpl}" ;;
+    esac
     ;;
   info)
     # Real `docker info` answers BOTH of these formats, and so does this fake. The adapter only ever
     # asks for SecurityOptions (mi_rt_rootless), but the harness's own suite asserts the server
     # version through `info` — dropping that branch would have broken a passing test for a reason
     # that has nothing to do with the runtime adapter.
-    if [ "${2:-}" = --format ] && [ "${3:-}" = '{{.ServerVersion}}' ]; then
-      printf '%s\n' "${FAKE_DOCKER_SERVER_VERSION:-28.0.0}"
-    elif [ -n "${FAKE_DOCKER_ROOTLESS:-}" ]; then printf 'name=rootless name=seccomp \n'
-    else printf 'name=seccomp name=apparmor \n'; fi
+    #
+    # Every OTHER template used to be answered with the SecurityOptions string, so `info --format
+    # '{{.OSType}}'` reported `name=seccomp name=apparmor` and the rootless gate could have been
+    # reading any field at all. Same rule as render(): an unimplemented template is a hard error.
+    shift; tmpl=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --format) tmpl="$2"; shift 2 ;;
+        --format=*) tmpl="${1#--format=}"; shift ;;
+        -*) bad_flag "info" "$1" ;;
+        *) die "fake docker: info accepts no arguments (got '$1')" ;;
+      esac
+    done
+    if [ -n "${FAKE_DOCKER_ROOTLESS:-}" ]; then secopt='name=rootless name=seccomp '
+    else secopt='name=seccomp name=apparmor '; fi
+    case "$tmpl" in
+      '') printf ' Server Version: %s\n Security Options:\n  %s\n' \
+            "${FAKE_DOCKER_SERVER_VERSION:-28.0.0}" "$secopt" ;;
+      '{{.ServerVersion}}') printf '%s\n' "${FAKE_DOCKER_SERVER_VERSION:-28.0.0}" ;;
+      '{{range .SecurityOptions}}{{.}} {{end}}') printf '%s\n' "$secopt" ;;
+      *) die "fake docker: unsupported info template: ${tmpl}" ;;
+    esac
     ;;
   context)
-    [ "${2:-}" = inspect ] || die "fake docker: unsupported context subcommand: ${2:-}"
-    printf '%s\n' "${FAKE_DOCKER_CONTEXT_HOST:-unix:///var/run/docker.sock}"
+    # Same again: this arm printed the endpoint for any template and for any context NAME, so D30's
+    # "refuse a remote daemon" check could have been reading a field that is not the endpoint at all.
+    # A named context is refused rather than answered as if it were the current one — the adapter
+    # asks about the ACTIVE context, and silently treating `inspect other-context` as `inspect` is
+    # how a test about the wrong daemon passes.
+    shift
+    [ "${1:-}" = inspect ] || die "fake docker: unsupported context subcommand: ${1:-}"
+    shift; tmpl=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --format) tmpl="$2"; shift 2 ;;
+        --format=*) tmpl="${1#--format=}"; shift ;;
+        -*) bad_flag "context inspect" "$1" ;;
+        *) die "fake docker: context inspect for a named context is not implemented (got '$1')" ;;
+      esac
+    done
+    case "$tmpl" in
+      '{{.Endpoints.docker.Host}}') printf '%s\n' "${FAKE_DOCKER_CONTEXT_HOST:-unix:///var/run/docker.sock}" ;;
+      *) die "fake docker: unsupported context template: ${tmpl}" ;;
+    esac
     ;;
 
   volume)
@@ -325,7 +503,8 @@ case "${1:-}" in
             --label) parse_label "$2"; shift 2 ;;
             --label=*) parse_label "${1#--label=}"; shift ;;
             --) shift ;;
-            *) name="$1"; shift ;;
+            -*) bad_flag "volume create" "$1" ;;
+            *) one_only "$name" "volume create" name "$1"; name="$1"; shift ;;
           esac
         done
         [ -n "$name" ] || die "volume create: no name"
@@ -341,7 +520,14 @@ case "${1:-}" in
       inspect)
         shift; tmpl=""; name=""
         while [ "$#" -gt 0 ]; do
-          case "$1" in --format) tmpl="$2"; shift 2 ;; --) shift ;; *) name="$1"; shift ;; esac
+          case "$1" in
+            --format) tmpl="$2"; shift 2 ;;
+            --) shift ;;
+            -*) bad_flag "volume inspect" "$1" ;;
+            # Real docker inspects several objects at once; this fake acts on ONE, and used to act on
+            # the LAST silently — `volume inspect a b` answered about b and said nothing about a.
+            *) one_only "$name" "volume inspect" name "$1"; name="$1"; shift ;;
+          esac
         done
         check_name "$name" volume
         [ -e "$STATE/volumes/$name" ] || die "no such volume: $name"
@@ -355,10 +541,16 @@ case "${1:-}" in
         fi
         ;;
       ls)
-        shift; filt=""
+        shift; filt=""; tmpl=""
         while [ "$#" -gt 0 ]; do
-          case "$1" in --filter) filt="$2"; shift 2 ;; --format) shift 2 ;; *) shift ;; esac
+          case "$1" in
+            --filter) set_filter "$filt" "volume ls" "$2"; filt="$2"; shift 2 ;;
+            --format) tmpl="$2"; shift 2 ;;
+            -*) bad_flag "volume ls" "$1" ;;
+            *) die "fake docker: volume ls accepts no arguments (got '$1')" ;;
+          esac
         done
+        check_ls_format volume "$tmpl"
         for v in "$STATE"/volumes/*; do
           [ -e "$v" ] || continue
           case "$(basename "$v")" in *.XXXXXX*|*.tmp*) continue ;; esac
@@ -371,10 +563,21 @@ case "${1:-}" in
         # `--` separator set name="" and died on every call — so `uninstall --purge` reported success
         # while removing nothing, and its acceptance case failed for a reason in the harness.
         shift; name=""
-        while [ "$#" -gt 0 ]; do case "$1" in --) shift ;; *) name="$1"; shift ;; esac; done
+        while [ "$#" -gt 0 ]; do
+          case "$1" in
+            --) shift ;;
+            -*) bad_flag "volume rm" "$1" ;;
+            *) one_only "$name" "volume rm" name "$1"; name="$1"; shift ;;
+          esac
+        done
         [ -n "$name" ] || die "volume rm: no name"
         check_name "$name" volume
         [ -e "$STATE/volumes/$name" ] || die "no such volume: $name"
+        # A volume a container MOUNTS cannot be removed — the daemon refuses, and the container keeps
+        # its data. This fake removed it and left the mount pointing at nothing, so a teardown that
+        # removed volumes before containers passed here and would fail there.
+        users="$(container_ids_using_volume "$name")"
+        [ -z "$users" ] || die "remove $name: volume is in use - [$users]"
         rm -f "$STATE/volumes/$name"; printf '%s\n' "$name"
         ;;
       *) die "fake docker: unsupported volume subcommand: ${1:-}" ;;
@@ -393,7 +596,8 @@ case "${1:-}" in
             --driver) driver="$2"; shift 2 ;;
             --driver=*) driver="${1#--driver=}"; shift ;;
             --) shift ;;
-            *) name="$1"; shift ;;
+            -*) bad_flag "network create" "$1" ;;
+            *) one_only "$name" "network create" name "$1"; name="$1"; shift ;;
           esac
         done
         [ -n "$name" ] || die "network create: no name"
@@ -426,19 +630,31 @@ case "${1:-}" in
       inspect)
         shift; tmpl=""; key=""
         while [ "$#" -gt 0 ]; do
-          case "$1" in --format) tmpl="$2"; shift 2 ;; --) shift ;; *) key="$1"; shift ;; esac
+          case "$1" in
+            --format) tmpl="$2"; shift 2 ;;
+            --) shift ;;
+            -*) bad_flag "network inspect" "$1" ;;
+            *) one_only "$key" "network inspect" network "$1"; key="$1"; shift ;;
+          esac
         done
         # A network is looked up by id OR name, and both go through the same rule: the ids this fake
         # mints are 64 digits, which is inside the class.
         check_name "$key" network
         f="$(find_network "$key")" || die "network $key not found"
+        [ -n "$tmpl" ] || die "fake docker: network inspect without --format is not implemented"
         render "$tmpl" "$f" network
         ;;
       ls)
-        shift; filt=""
+        shift; filt=""; tmpl=""
         while [ "$#" -gt 0 ]; do
-          case "$1" in --filter) filt="$2"; shift 2 ;; --format) shift 2 ;; *) shift ;; esac
+          case "$1" in
+            --filter) set_filter "$filt" "network ls" "$2"; filt="$2"; shift 2 ;;
+            --format) tmpl="$2"; shift 2 ;;
+            -*) bad_flag "network ls" "$1" ;;
+            *) die "fake docker: network ls accepts no arguments (got '$1')" ;;
+          esac
         done
+        check_ls_format network "$tmpl"
         for n in "$STATE"/networks/*; do
           [ -e "$n" ] || continue
           if [ -n "$filt" ]; then has_label "$(rec_get "$n" labels)" "${filt#label=}" || continue; fi
@@ -447,9 +663,20 @@ case "${1:-}" in
         ;;
       rm)
         shift; key=""
-        while [ "$#" -gt 0 ]; do case "$1" in --) shift ;; *) key="$1"; shift ;; esac; done
+        while [ "$#" -gt 0 ]; do
+          case "$1" in
+            --) shift ;;
+            -*) bad_flag "network rm" "$1" ;;
+            *) one_only "$key" "network rm" network "$1"; key="$1"; shift ;;
+          esac
+        done
         check_name "$key" network
         f="$(find_network "$key")" || die "network $key not found"
+        # A network with a container still attached CANNOT be removed. This fake removed it and left
+        # every attached container holding an id that resolves to nothing — the exact state §6b's
+        # teardown ordering (detach, then remove) exists to avoid, and no test could fail on it.
+        eps="$(container_ids_on_network "$(rec_get "$f" id)")"
+        [ -z "$eps" ] || die "error while removing network: network $key id $(rec_get "$f" id) has active endpoints"
         rm -f "$f"; printf '%s\n' "$key"
         ;;
       connect)
@@ -459,7 +686,9 @@ case "${1:-}" in
             --alias) alias="$2"; shift 2 ;;
             --gw-priority) gw="$2"; shift 2 ;;
             --) shift ;;
-            *) if [ -z "$netid" ]; then netid="$1"; else c="$1"; fi; shift ;;
+            -*) bad_flag "network connect" "$1" ;;
+            *) if [ -z "$netid" ]; then netid="$1"
+               else one_only "$c" "network connect" container "$1"; c="$1"; fi; shift ;;
           esac
         done
         # Both arguments name a resource, and the container one becomes a path directly below.
@@ -475,24 +704,57 @@ case "${1:-}" in
         # (in its own words); the adapter refuses all three before it ever calls this
         # (_mi_rt_netmode_ok), so the only deviation is a stricter answer for `bridge`.
         nf="$(find_network "$netid")" || die "network $netid not found"
-        netid="$(rec_get "$nf" id)"
+        ref="$netid"; netid="$(rec_get "$nf" id)"
         f="$STATE/containers/$c"; [ -e "$f" ] || die "no such container: $c"
         nets="$(rec_get "$f" nets)"; al="$(rec_get "$f" aliases)"
+        # A container in PRIVATE (none) mode cannot join a network — the daemon says so in these
+        # words, and lib/runtime.sh's D26/D42 comment cites that refusal as the reason `none` is
+        # rejected at creation. The fake attached it happily, so the claim the comment makes was
+        # modelled nowhere.
+        case ";${nets}" in
+          *';none='*) die "container cannot be connected to multiple networks with one of the networks in private (none) mode" ;;
+        esac
+        # Connecting the SAME network twice is a conflict, not a second endpoint. This fake appended
+        # one attachment per call, so `c.nets` grew a duplicate id and a reconciliation loop that
+        # re-connected on every pass looked idempotent here while erroring against a real daemon.
+        case ";${nets}" in
+          *";${netid}="*) die "endpoint with name $c already exists in network $ref" ;;
+        esac
         if [ "$(rec_get "$f" state)" = running ]; then a="$(addr_for "$c" "$netid")"; else a=""; fi
         rec_set "$f" nets "${nets}${netid}=${a};"
-        rec_set "$f" aliases "${al}${netid}:${alias},;"
+        rec_set "$f" aliases "${al}${netid}:$(alias_list "$alias" "$c");"
         rec_set "$f" gw "$(rec_get "$f" gw)${netid}=${gw};"
         ;;
       disconnect)
         shift; netid=""; c=""
         while [ "$#" -gt 0 ]; do
-          case "$1" in --) shift ;; *) if [ -z "$netid" ]; then netid="$1"; else c="$1"; fi; shift ;; esac
+          case "$1" in
+            --) shift ;;
+            -*) bad_flag "network disconnect" "$1" ;;
+            *) if [ -z "$netid" ]; then netid="$1"
+               else one_only "$c" "network disconnect" container "$1"; c="$1"; fi; shift ;;
+          esac
         done
+        # The spelling rule first, for BOTH arguments, before any lookup: an invalid name must be
+        # refused as a name, not reported as a missing network.
         check_name "$netid" network
         check_name "$c" container
+        # Disconnect RESOLVES its network exactly as connect does. This arm took the argument as a
+        # literal id and filtered attachments by prefix, so a detach naming the network by NAME
+        # matched nothing and reported success, and a detach from a network that does not exist
+        # reported success too — an "everything detached" result from a call that detached nothing.
+        nf="$(find_network "$netid")" || die "network $netid not found"
+        ref="$netid"; netid="$(rec_get "$nf" id)"
         f="$STATE/containers/$c"; [ -e "$f" ] || die "no such container: $c"
+        # And a container that is not attached is an ERROR, not a no-op: "everything is detached" and
+        # "this was never attached" are the same answer only to a fake.
+        case ";$(rec_get "$f" nets)" in
+          *";${netid}="*) : ;;
+          *) die "container $c is not connected to network $ref" ;;
+        esac
         # FAKE_DOCKER_DISCONNECT_SILENT reproduces §10a's "one detach silently fails in phase 4":
-        # the command reports success and the attachment survives.
+        # the command reports success and the attachment survives. It is answered AFTER the checks
+        # above, so it fabricates a failed detach of a real attachment and nothing else.
         if [ -z "${FAKE_DOCKER_DISCONNECT_SILENT:-}" ]; then
           rec_set "$f" nets "$(printf '%s' "$(rec_get "$f" nets)" | tr ';' '\n' | grep -av "^${netid}=" | tr '\n' ';' | sed 's/;*$/;/;s/^;$//')"
           rec_set "$f" aliases "$(printf '%s' "$(rec_get "$f" aliases)" | tr ';' '\n' | grep -av "^${netid}:" | tr '\n' ';' | sed 's/;*$/;/;s/^;$//')"
@@ -514,15 +776,29 @@ case "${1:-}" in
             --network-alias) alias="$2"; shift 2 ;;
             --env-file) envfile="$2"; shift 2 ;;
             --label) parse_label "$2"; shift 2 ;;
+            --label=*) parse_label "${1#--label=}"; shift ;;
             --mount) mounts="${mounts}${2};"; shift 2 ;;
-            -p) ports="${ports}${2};"; shift 2 ;;
-            --) shift; image="$1"; shift ;;
-            *) image="$1"; shift ;;
+            -p|--publish) ports="${ports}${2};"; shift 2 ;;
+            --) shift ;;
+            -*) bad_flag "container create" "$1" ;;
+            # The word after the image is docker's COMMAND override. This fake let it overwrite the
+            # image — `create … -- img sleep infinity` tried to resolve an image called `infinity` —
+            # so a fixture passing a command got an error about the wrong thing entirely.
+            *) [ -z "$image" ] || die "fake docker: container create with a command is not implemented (got '$1')"
+               image="$1"; shift ;;
           esac
         done
         [ -n "$name" ] || die "container create: no name"
         check_name "$name" container
         [ -n "$netid" ] || die "container create: no network"
+        # The env file is read by the CLI, before the daemon is contacted, so a missing one is
+        # refused FIRST and in the CLI's words. It was not checked at all here, which made
+        # lib/runtime.sh's own `[ -f "$envfile" ]` guard the only thing refusing it — and a guard
+        # whose absence changes nothing observable is a guard that can be deleted with the suite
+        # green. §4.3 puts bootstrap secrets in that file; launching without it is not a detail.
+        if [ -n "$envfile" ]; then
+          [ -f "$envfile" ] || die "open $envfile: no such file or directory"
+        fi
         # In real Docker's order: the image is resolved first, then the name conflict, then the mount
         # config. Every one of these must refuse BEFORE the record is written, or a refused create
         # still leaves a container behind for the next assertion to find.
@@ -534,6 +810,7 @@ case "${1:-}" in
         # daemon and is not a contract — what is, is that all of them precede the record write.)
         netid="$(resolve_netid "$netid")" || exit 1
         check_mounts "$mounts"
+        create_missing_volumes "$mounts"
         f="$STATE/containers/$name"; : > "$f"
         rec_set "$f" id "$(next_id)"
         rec_set "$f" image "$image"
@@ -541,13 +818,26 @@ case "${1:-}" in
         rec_set "$f" labels "$labels"
         # A created (never started) container has NO address — this is the fidelity D48 needs.
         rec_set "$f" nets "${netid}=;"
-        rec_set "$f" aliases "${netid}:${alias},;"
+        rec_set "$f" aliases "${netid}:$(alias_list "$alias" "$name");"
         rec_set "$f" gw "${netid}=0;"
         rec_set "$f" envfile "$envfile"
         # Ports are recorded in the inspect shape: <cport>/tcp=<hostip>:<hostport>;
+        #
+        # BOTH publish shapes are parsed, because they mean different things. `<ip>:<host>:<cport>`
+        # binds that address; `<host>:<cport>` binds ALL of them, which the daemon reports as
+        # 0.0.0.0 — the very address D26/§4b.1 exists to prevent. This arm assumed the three-field
+        # form and read the host port as the IP, so a two-field `-p 7480:7480` was recorded as the
+        # nonsense `7480/tcp=7480:7480` instead of the 0.0.0.0 binding it actually is, and a test
+        # asking "is anything published off-loopback?" would have been answered with gibberish rather
+        # than with the address it was looking for.
         pspec=""
         for p in $(printf '%s' "$ports" | tr ';' ' '); do
-          hip="${p%%:*}"; rest="${p#*:}"; hp="${rest%%:*}"; cp="${rest#*:}"
+          case "$p" in
+            *:*:*) hip="${p%%:*}"; rest="${p#*:}"; hp="${rest%%:*}"; cp="${rest##*:}" ;;
+            *:*)   hip="0.0.0.0"; hp="${p%%:*}"; cp="${p##*:}" ;;
+            *)     die "fake docker: a container-port-only publish is not implemented (got '$p')" ;;
+          esac
+          case "${hp}${cp}" in ''|*[!0-9]*) die "invalid published port: $p" ;; esac
           pspec="${pspec}${cp}/tcp=${hip}:${hp};"
         done
         rec_set "$f" ports "$pspec"
@@ -556,7 +846,13 @@ case "${1:-}" in
         ;;
       start)
         shift; name=""
-        while [ "$#" -gt 0 ]; do case "$1" in --) shift ;; *) name="$1"; shift ;; esac; done
+        while [ "$#" -gt 0 ]; do
+          case "$1" in
+            --) shift ;;
+            -*) bad_flag "container start" "$1" ;;
+            *) one_only "$name" "container start" container "$1"; name="$1"; shift ;;
+          esac
+        done
         check_name "$name" container
         f="$STATE/containers/$name"; [ -e "$f" ] || die "no such container: $name"
         rec_set "$f" state running
@@ -569,7 +865,13 @@ case "${1:-}" in
         ;;
       stop)
         shift; name=""
-        while [ "$#" -gt 0 ]; do case "$1" in --) shift ;; *) name="$1"; shift ;; esac; done
+        while [ "$#" -gt 0 ]; do
+          case "$1" in
+            --) shift ;;
+            -*) bad_flag "container stop" "$1" ;;
+            *) one_only "$name" "container stop" container "$1"; name="$1"; shift ;;
+          esac
+        done
         check_name "$name" container
         f="$STATE/containers/$name"; [ -e "$f" ] || die "no such container: $name"
         rec_set "$f" state exited
@@ -583,19 +885,38 @@ case "${1:-}" in
         printf '%s\n' "$name"
         ;;
       rm)
-        shift; name=""
-        while [ "$#" -gt 0 ]; do case "$1" in -f|--force) shift ;; --) shift ;; *) name="$1"; shift ;; esac; done
+        shift; name=""; force=""
+        while [ "$#" -gt 0 ]; do
+          case "$1" in
+            -f|--force) force=1; shift ;;
+            --) shift ;;
+            -*) bad_flag "container rm" "$1" ;;
+            *) one_only "$name" "container rm" container "$1"; name="$1"; shift ;;
+          esac
+        done
         check_name "$name" container
         f="$STATE/containers/$name"; [ -e "$f" ] || die "no such container: $name"
+        # `-f` was PARSED AND DISCARDED, so a RUNNING container was removed either way — and the
+        # adapter's `container rm -f` could be reduced to `container rm` with the whole suite green,
+        # which is the one thing that makes reconciliation able to clear a live container at all.
+        if [ -z "$force" ] && [ "$(rec_get "$f" state)" = running ]; then
+          die "You cannot remove a running container $(rec_get "$f" id). Stop the container before attempting removal or force remove"
+        fi
         rm -f "$f"; printf '%s\n' "$name"
         ;;
       inspect)
         shift; tmpl=""; name=""
         while [ "$#" -gt 0 ]; do
-          case "$1" in --format) tmpl="$2"; shift 2 ;; --) shift ;; *) name="$1"; shift ;; esac
+          case "$1" in
+            --format) tmpl="$2"; shift 2 ;;
+            --) shift ;;
+            -*) bad_flag "container inspect" "$1" ;;
+            *) one_only "$name" "container inspect" container "$1"; name="$1"; shift ;;
+          esac
         done
         check_name "$name" container
         [ -e "$STATE/containers/$name" ] || die "No such object: $name"
+        [ -n "$tmpl" ] || die "fake docker: container inspect without --format is not implemented"
         render "$tmpl" "$STATE/containers/$name" container
         ;;
       ls)
@@ -604,10 +925,17 @@ case "${1:-}" in
         # recovery from missing a stopped container, reissuing, and colliding with what it could not
         # see — could be DELETED with the whole suite still green. A fake that is permissive where
         # the real runtime is strict turns a load-bearing flag into decoration.
-        shift; filt=""; all=""
+        shift; filt=""; all=""; tmpl=""
         while [ "$#" -gt 0 ]; do
-          case "$1" in --filter) filt="$2"; shift 2 ;; --format) shift 2 ;; -a|--all) all=1; shift ;; *) shift ;; esac
+          case "$1" in
+            --filter) set_filter "$filt" "container ls" "$2"; filt="$2"; shift 2 ;;
+            --format) tmpl="$2"; shift 2 ;;
+            -a|--all) all=1; shift ;;
+            -*) bad_flag "container ls" "$1" ;;
+            *) die "fake docker: container ls accepts no arguments (got '$1')" ;;
+          esac
         done
+        check_ls_format container "$tmpl"
         for c in "$STATE"/containers/*; do
           [ -e "$c" ] || continue
           if [ -z "$all" ] && [ "$(rec_get "$c" state)" != running ]; then continue; fi
@@ -619,15 +947,23 @@ case "${1:-}" in
         # The pinned helper (D49/D54). Its result comes from the fixture image script so a test can
         # make the probe answer, fail, or be unobtainable.
         shift
-        img=""; cmd=""; rest=""; mounts=""; netid=""
+        img=""; cmd=""; rest=""; mounts=""; netid=""; autorm=""; name=""
         while [ "$#" -gt 0 ]; do
           case "$1" in
-            --rm) shift ;;
+            --rm) autorm=1; shift ;;
             --network) netid="$2"; shift 2 ;;
-            --user|--label) shift 2 ;;
+            --name) name="$2"; shift 2 ;;
+            --user) shift 2 ;;
+            --label) parse_label "$2"; shift 2 ;;
             --mount) mounts="${mounts}${2};"; shift 2 ;;
-            --) shift; img="$1"; shift; cmd="${1:-}"; shift || true; rest="$*"; break ;;
-            *) shift ;;
+            --) shift ;;
+            # `-v /:/hostroot` was SWALLOWED here — a whole-host bind mount that this fake reported
+            # as a clean run. Of every silently-ignored flag, that is the one that decides the
+            # question: an unimplemented flag has to be fatal.
+            -*) bad_flag "container run" "$1" ;;
+            # The first positional is the image; everything after it belongs to the container, so the
+            # loop STOPS here and never flag-parses a helper argument that happens to start with `-`.
+            *) img="$1"; shift; cmd="${1:-}"; shift || true; rest="$*"; break ;;
           esac
         done
         # The image gate applies to `run` exactly as it does to `create`: a helper whose pinned image
@@ -643,8 +979,28 @@ case "${1:-}" in
         # pre-defined mode and needs no lookup.
         # (The resolved id is discarded: `run --rm` records no attachment for anyone to inspect, so
         # the refusal is the whole of what this call is for.)
-        if [ -n "$netid" ]; then resolve_netid "$netid" >/dev/null || exit 1; fi
+        rnet=""
+        if [ -n "$netid" ]; then rnet="$(resolve_netid "$netid")" || exit 1; fi
         check_mounts "$mounts"
+        create_missing_volumes "$mounts"
+        # WITHOUT `--rm`, a real daemon LEAVES THE CONTAINER BEHIND when the command exits. This fake
+        # left nothing either way, so `--rm` — which is half of what makes the pinned helpers safe to
+        # run at all (D49/D54: no helper may outlive its own invocation) — could be dropped from the
+        # adapter with the whole suite green and no orphan anywhere for a test to find.
+        # The container is recorded BEFORE the entrypoint runs, because a helper that fails leaves
+        # one behind too; docker's own generated name is random, so `run-<id>` stands in for it.
+        if [ -z "$autorm" ]; then
+          [ -n "$name" ] || name="run-$(next_id)"
+          check_name "$name" container
+          [ ! -e "$STATE/containers/$name" ] || die "Conflict. The container name \"/$name\" is already in use"
+          rf="$STATE/containers/$name"; : > "$rf"
+          rec_set "$rf" id "$(next_id)"
+          rec_set "$rf" image "$img"
+          rec_set "$rf" state exited
+          rec_set "$rf" labels "$labels"
+          rec_set "$rf" nets "${rnet}=;"
+          rec_set "$rf" aliases "${rnet}:$(alias_list "" "$name");"
+        fi
         [ -z "${FAKE_DOCKER_HELPER_FAIL:-}" ] || die "helper: ${FAKE_DOCKER_HELPER_FAIL}"
         [ -x "${FAKE_HELPER_BIN:-}" ] || die "fake docker: FAKE_HELPER_BIN is not set to an executable fixture entrypoint"
         # shellcheck disable=SC2086   # deliberate split: $rest carries the helper's own arguments
@@ -659,12 +1015,23 @@ case "${1:-}" in
     case "${1:-}" in
       pull)
         shift; ref=""
-        while [ "$#" -gt 0 ]; do case "$1" in --) shift ;; *) ref="$1"; shift ;; esac; done
+        while [ "$#" -gt 0 ]; do
+          case "$1" in
+            --) shift ;;
+            -*) bad_flag "image pull" "$1" ;;
+            *) one_only "$ref" "image pull" reference "$1"; ref="$1"; shift ;;
+          esac
+        done
         [ -n "$ref" ] || die "image pull: no reference"
         case "${FAKE_DOCKER_PULL:-ok}" in
           ok)       k="$(image_key "$ref")"
                     : > "$k"
                     rec_set "$k" ref "$ref"
+                    # The image ID is minted ONCE, at pull, and stored. It used to be minted per
+                    # inspect, so two inspects of the same image reported different ids — an image
+                    # that appeared to change identity between two reads, which is the opposite of
+                    # what a digest-pinned reference means.
+                    rec_set "$k" imgid "sha256:$(next_id)"
                     printf 'Status: Downloaded newer image for %s\n' "$ref" ;;
           notfound) die "manifest for $ref not found: manifest unknown" ;;
           auth)     die "denied: requested access to the resource is denied" ;;
@@ -675,12 +1042,18 @@ case "${1:-}" in
       inspect)
         shift; tmpl=""; ref=""
         while [ "$#" -gt 0 ]; do
-          case "$1" in --format) tmpl="$2"; shift 2 ;; --) shift ;; *) ref="$1"; shift ;; esac
+          case "$1" in
+            --format) tmpl="$2"; shift 2 ;;
+            --) shift ;;
+            -*) bad_flag "image inspect" "$1" ;;
+            *) one_only "$ref" "image inspect" reference "$1"; ref="$1"; shift ;;
+          esac
         done
         [ -n "$ref" ] || die "image inspect: no reference"
         k="$(image_key "$ref")"
         [ -e "$k" ] || die "No such image: $ref"
-        if [ "$tmpl" = '{{.Id}}' ]; then printf 'sha256:%s\n' "$(next_id)"; else render "$tmpl" "$k" image; fi
+        [ -n "$tmpl" ] || die "fake docker: image inspect without --format is not implemented"
+        if [ "$tmpl" = '{{.Id}}' ]; then printf '%s\n' "$(rec_get "$k" imgid)"; else render "$tmpl" "$k" image; fi
         ;;
       *) die "fake docker: unsupported image subcommand: ${1:-}" ;;
     esac

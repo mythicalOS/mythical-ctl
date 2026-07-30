@@ -340,6 +340,328 @@ relocate_fake_state() {
     || { echo "FAKE_DOCKER_NET_DRIVER no longer wins: got '$output'" >&2; return 1; }
 }
 
+# --- the closed surface: flags, positionals and templates -------------------------------------------
+# Three review rounds each found the same defect one arm at a time — the fake accepting what a real
+# daemon refuses. The rounds below sweep the whole surface instead: every arm was asked whether it
+# takes an input Docker rejects. These four tests cover the argument layer, which was uniformly
+# permissive: unknown flags swallowed, extra positionals discarded, templates answered regardless.
+
+@test "an unimplemented flag is refused by every arm, never silently ignored" {
+  # The one that decides the question is `container run -v /:/hostroot`: MEASURED against the pre-fix
+  # fake it exited 0 with the flag DROPPED, so a whole-host bind mount was reported as a clean run.
+  # A fake that ignores a flag is worse than one that lacks it — the ignored case is a container
+  # escape a test calls green.
+  local net
+  docker image pull demo/img:tag >/dev/null
+  net="$(docker network create n1)"
+  fake_helper 'exit 0'
+
+  run docker container run --rm --network none -v /:/hostroot -- demo/img:tag selfcheck
+  [ "$status" -ne 0 ] || { echo "container run ignored -v /:/hostroot" >&2; return 1; }
+  assert_contains "does not implement the flag -v"
+  run docker container create --name c1 --network "$net" --user 1000 -- demo/img:tag
+  [ "$status" -ne 0 ] || { echo "container create ignored --user" >&2; return 1; }
+  assert_contains "does not implement the flag --user"
+  [ ! -e "$FAKE_DOCKER_STATE/containers/c1" ] \
+    || { echo "the refused create still recorded a container" >&2; return 1; }
+  run docker volume create --driver local v1
+  [ "$status" -ne 0 ] || { echo "volume create ignored --driver" >&2; return 1; }
+  [ ! -e "$FAKE_DOCKER_STATE/volumes/v1" ] \
+    || { echo "the refused create still recorded a volume" >&2; return 1; }
+  run docker network create --subnet 10.0.0.0/24 n2
+  [ "$status" -ne 0 ] || { echo "network create ignored --subnet" >&2; return 1; }
+  run docker container ls -q
+  [ "$status" -ne 0 ] || { echo "container ls ignored -q" >&2; return 1; }
+  run docker image pull -q other/img:tag
+  [ "$status" -ne 0 ] || { echo "image pull ignored -q" >&2; return 1; }
+  # And the flags the adapter really does emit still work, so the rule refuses the unimplemented
+  # rather than the unfamiliar.
+  run docker container create --name c2 --network "$net" --network-alias p1 --label mythicalos.nonce=n \
+      -p 127.0.0.1:7480:7480 -- demo/img:tag
+  assert_ok
+}
+
+@test "a subcommand that acts on one object refuses a second one" {
+  # Docker's CLI errors on the extra argument; this fake kept the LAST and discarded the rest, so
+  # `volume create v2 v3` created v3 alone and reported success, and a container create with a
+  # COMMAND resolved the command word as the image ("Unable to find image 'infinity' locally").
+  local net
+  docker image pull demo/img:tag >/dev/null
+  net="$(docker network create n1)"
+
+  run docker volume create v2 v3
+  [ "$status" -ne 0 ] || { echo "volume create accepted two names" >&2; return 1; }
+  [ ! -e "$FAKE_DOCKER_STATE/volumes/v3" ] && [ ! -e "$FAKE_DOCKER_STATE/volumes/v2" ] \
+    || { echo "a refused two-name create still recorded a volume" >&2; return 1; }
+  run docker volume inspect --format '{{.Driver}}' va vb
+  [ "$status" -ne 0 ] || { echo "volume inspect accepted two names" >&2; return 1; }
+  run docker network rm n1 n2
+  [ "$status" -ne 0 ] || { echo "network rm accepted two names" >&2; return 1; }
+  [ -e "$FAKE_DOCKER_STATE/networks/n1" ] \
+    || { echo "the refused rm removed the network anyway" >&2; return 1; }
+  run docker image pull demo/img:tag other/img:tag
+  [ "$status" -ne 0 ] || { echo "image pull accepted two references" >&2; return 1; }
+  run docker container create --name c1 --network "$net" -- demo/img:tag sleep infinity
+  [ "$status" -ne 0 ] || { echo "container create accepted a command" >&2; return 1; }
+  assert_contains "command is not implemented"
+  [ ! -e "$FAKE_DOCKER_STATE/containers/c1" ] \
+    || { echo "the refused create still recorded a container" >&2; return 1; }
+}
+
+@test "version, info and context answer only the templates they implement" {
+  # Every one of these arms printed ONE answer for ANY template. `version --format
+  # '{{.Client.Version}}'` returned the SERVER version, so the preflight engine gate (D29, engine
+  # 28+) could have been comparing the CLI's own version with the suite green; `info --format
+  # '{{.OSType}}'` returned the SecurityOptions string, so the rootless gate could have been reading
+  # any field at all. The two versions differ here precisely so the fields are distinguishable.
+  run docker version --format '{{.Server.Version}}'
+  [ "$output" = "28.0.0" ] || { echo "server version is '$output'" >&2; return 1; }
+  run docker version --format '{{.Client.Version}}'
+  [ "$output" = "99.0.0" ] || { echo "client version is '$output', not a distinct field" >&2; return 1; }
+  run docker version --format '{{.Nope}}'
+  [ "$status" -ne 0 ] || { echo "version answered an unimplemented template: $output" >&2; return 1; }
+  assert_contains "unsupported version template"
+
+  run docker info --format '{{range .SecurityOptions}}{{.}} {{end}}'
+  assert_contains "seccomp"
+  run docker info --format '{{.OSType}}'
+  [ "$status" -ne 0 ] || { echo "info answered an unimplemented template: $output" >&2; return 1; }
+  assert_contains "unsupported info template"
+
+  run docker context inspect --format '{{.Endpoints.docker.Host}}'
+  [ "$output" = "unix:///var/run/docker.sock" ] || { echo "context host is '$output'" >&2; return 1; }
+  run docker context inspect --format '{{.Name}}'
+  [ "$status" -ne 0 ] || { echo "context answered an unimplemented template: $output" >&2; return 1; }
+  # A NAMED context is not the active one, and answering as if it were is how a test about the wrong
+  # daemon passes.
+  run docker context inspect --format '{{.Endpoints.docker.Host}}' some-other-context
+  [ "$status" -ne 0 ] || { echo "context inspect answered for a named context: $output" >&2; return 1; }
+}
+
+@test "ls answers only the templates and filters it implements" {
+  # `--format` was parsed off and thrown away, so every template printed the NAME: an adapter asking
+  # for the driver, the id or the image would have been handed names and its lookup would have
+  # "worked". A non-label `--filter` matched nothing and reported success — the emptiest possible
+  # wrong answer — and a second `--filter` silently replaced the first, where a real daemon ANDs them.
+  docker volume create --label mythicalos.nonce=n1 v1 >/dev/null
+  run docker volume ls --format '{{.Name}}'
+  [ "$output" = "v1" ] || { echo "volume ls --format '{{.Name}}' gave '$output'" >&2; return 1; }
+  run docker volume ls --format '{{.Driver}}'
+  [ "$status" -ne 0 ] || { echo "volume ls answered an unimplemented template: $output" >&2; return 1; }
+  assert_contains "unsupported volume ls template"
+  run docker container ls -a --format '{{.ID}}'
+  [ "$status" -ne 0 ] || { echo "container ls answered an unimplemented template: $output" >&2; return 1; }
+  run docker volume ls --filter dangling=true
+  [ "$status" -ne 0 ] || { echo "volume ls accepted a filter it cannot apply: '$output'" >&2; return 1; }
+  assert_contains "only label= filters"
+  run docker volume ls --filter label=mythicalos.nonce=n1 --filter label=mythicalos.nonce=n2
+  [ "$status" -ne 0 ] || { echo "volume ls accepted two filters and applied one: '$output'" >&2; return 1; }
+  run docker network ls n1
+  [ "$status" -ne 0 ] || { echo "network ls accepted a positional argument" >&2; return 1; }
+}
+
+# --- referenced resources, conflicting state, and arguments that were accepted but ignored ---------
+
+@test "a resource that is still referenced cannot be removed" {
+  # §6b's teardown ordering is detach-then-remove, and the daemon is what enforces it. This fake
+  # removed a network with a container attached, a volume a container mounts, and a RUNNING container
+  # without `-f` — so the ordering was a convention no test could fail on, and `container rm -f`
+  # could have been reduced to `container rm` with the suite green.
+  local net
+  docker image pull demo/img:tag >/dev/null
+  net="$(docker network create n1)"
+  docker volume create vv >/dev/null
+  docker container create --name c1 --network "$net" --mount type=volume,source=vv,target=/d -- demo/img:tag >/dev/null
+
+  run docker network rm n1
+  [ "$status" -ne 0 ] || { echo "removed a network with an attached container" >&2; return 1; }
+  assert_contains "has active endpoints"
+  run docker volume rm vv
+  [ "$status" -ne 0 ] || { echo "removed a volume a container mounts" >&2; return 1; }
+  assert_contains "volume is in use"
+
+  docker container start c1 >/dev/null
+  run docker container rm c1
+  [ "$status" -ne 0 ] || { echo "removed a RUNNING container without -f" >&2; return 1; }
+  assert_contains "You cannot remove a running container"
+  [ -e "$FAKE_DOCKER_STATE/containers/c1" ] \
+    || { echo "the refused rm removed the container anyway" >&2; return 1; }
+  # -f is what makes it possible, and once the container is gone both removals are allowed.
+  run docker container rm -f c1
+  assert_ok
+  run docker volume rm vv
+  assert_ok
+  run docker network rm n1
+  assert_ok
+}
+
+@test "network connect refuses a duplicate endpoint and a private-mode container, and the container name is always an alias" {
+  # Three gaps in one arm. Connecting the SAME network twice appended a second attachment (a real
+  # daemon: "endpoint with name … already exists"), a container in `none` mode was attached happily
+  # (the daemon refusal lib/runtime.sh's D26/D42 comment CITES as its reason), and an omitted
+  # `--alias` recorded an EMPTY alias list — so §6b.2's explicit alias was unobservable.
+  local net net2 nets
+  docker image pull demo/img:tag >/dev/null
+  net="$(docker network create n1)"
+  net2="$(docker network create n2)"
+  docker container create --name c1 --network "$net" -- demo/img:tag >/dev/null
+
+  run docker network connect --alias a --gw-priority 0 -- n1 c1
+  [ "$status" -ne 0 ] || { echo "connected the same network twice" >&2; return 1; }
+  assert_contains "already exists in network"
+  run docker container inspect \
+    --format '{{range $k,$v := .NetworkSettings.Networks}}{{$v.NetworkID}}={{$v.IPAddress}};{{end}}' -- c1
+  [ "$output" = "${net}=;" ] \
+    || { echo "the refused connect changed the attachments: $output" >&2; return 1; }
+
+  docker container create --name c2 --network none -- demo/img:tag >/dev/null
+  run docker network connect --alias a --gw-priority 0 -- n2 c2
+  [ "$status" -ne 0 ] || { echo "connected a container in private (none) mode" >&2; return 1; }
+  assert_contains "private (none) mode"
+
+  # The automatic alias: a real daemon makes the container reachable under its own NAME, so an
+  # attachment made WITHOUT --alias is not aliasless — it carries the name and nothing else, which is
+  # exactly §9's "no sibling can guess it" failure and is now visible in the record.
+  run docker network connect -- n2 c1
+  assert_ok
+  run docker container inspect \
+    --format '{{range $k,$v := .NetworkSettings.Networks}}{{$v.NetworkID}}:{{range $v.Aliases}}{{.}},{{end}};{{end}}' -- c1
+  nets="$output"
+  case "$nets" in *"${net2}:c1,"*) : ;; *) echo "no automatic name alias: $nets" >&2; return 1 ;; esac
+  # And an EXPLICIT alias is recorded alongside it, so the two cases are distinguishable.
+  docker container create --name c3 --network "$net" --network-alias p1 -- demo/img:tag >/dev/null
+  run docker container inspect \
+    --format '{{range $k,$v := .NetworkSettings.Networks}}{{$v.NetworkID}}:{{range $v.Aliases}}{{.}},{{end}};{{end}}' -- c3
+  [ "$output" = "${net}:p1,c3,;" ] \
+    || { echo "explicit + automatic alias came out as '$output'" >&2; return 1; }
+}
+
+@test "network disconnect resolves its network and refuses a container that is not attached" {
+  # The arm took its argument as a literal id and filtered attachments by prefix, so: a detach from a
+  # network that does not exist reported SUCCESS, a detach naming the network by NAME matched nothing
+  # and reported success, and a detach of a container that was never attached reported success. Three
+  # different "it worked" answers for three calls that detached nothing.
+  local net net2
+  docker image pull demo/img:tag >/dev/null
+  net="$(docker network create n1)"
+  net2="$(docker network create n2)"
+  docker container create --name c1 --network "$net" -- demo/img:tag >/dev/null
+
+  run docker network disconnect -- nonexistent c1
+  [ "$status" -ne 0 ] || { echo "disconnect accepted a network that does not exist" >&2; return 1; }
+  assert_contains "network nonexistent not found"
+  run docker network disconnect -- n2 c1
+  [ "$status" -ne 0 ] || { echo "disconnect accepted a network the container is not on" >&2; return 1; }
+  assert_contains "is not connected to network"
+
+  # By NAME, the attachment is found and removed — the pre-fix arm silently matched nothing here.
+  run docker network disconnect -- n1 c1
+  assert_ok
+  run docker container inspect \
+    --format '{{range $k,$v := .NetworkSettings.Networks}}{{$v.NetworkID}}={{$v.IPAddress}};{{end}}' -- c1
+  [ -z "$output" ] || { echo "the attachment survived a detach by name: $output" >&2; return 1; }
+
+  # FAKE_DOCKER_DISCONNECT_SILENT still fabricates §10a's silent detach failure, on a REAL
+  # attachment: success reported, attachment intact.
+  docker network connect --alias a --gw-priority 0 -- n1 c1
+  export FAKE_DOCKER_DISCONNECT_SILENT=1
+  run docker network disconnect -- n1 c1
+  unset FAKE_DOCKER_DISCONNECT_SILENT
+  assert_ok
+  run docker container inspect \
+    --format '{{range $k,$v := .NetworkSettings.Networks}}{{$v.NetworkID}}={{$v.IPAddress}};{{end}}' -- c1
+  [ "$output" = "${net}=;" ] \
+    || { echo "the silent-detach knob no longer keeps the attachment: '$output'" >&2; return 1; }
+}
+
+@test "a missing --env-file is refused, and a two-field publish records the address the daemon binds" {
+  # `--env-file` was accepted and IGNORED, which left lib/runtime.sh's own existence check as the
+  # only thing refusing it — a guard whose deletion changes nothing observable. §4.3 puts bootstrap
+  # secrets in that file.
+  #
+  # `-p` assumed the three-field form and read the HOST PORT as the host IP, so `-p 7480:7480` was
+  # recorded as the nonsense `7480/tcp=7480:7480`. Its real meaning is a bind on ALL addresses, which
+  # the daemon reports as 0.0.0.0 — the very thing D26/§4b.1 exists to prevent, and the fake could
+  # not have shown it.
+  local net
+  docker image pull demo/img:tag >/dev/null
+  net="$(docker network create n1)"
+
+  run docker container create --name c1 --network "$net" --env-file "$BATS_TEST_TMPDIR/absent.env" -- demo/img:tag
+  [ "$status" -ne 0 ] || { echo "create accepted an env file that does not exist" >&2; return 1; }
+  assert_contains "no such file or directory"
+  [ ! -e "$FAKE_DOCKER_STATE/containers/c1" ] \
+    || { echo "the refused create still recorded a container" >&2; return 1; }
+  : > "$BATS_TEST_TMPDIR/present.env"
+  run docker container create --name c1 --network "$net" --env-file "$BATS_TEST_TMPDIR/present.env" -- demo/img:tag
+  assert_ok
+
+  docker container create --name c2 --network "$net" -p 7480:7480 -- demo/img:tag >/dev/null
+  run docker container inspect \
+    --format '{{range $p,$bs := .NetworkSettings.Ports}}{{range $bs}}{{$p}}={{.HostIp}}:{{.HostPort}};{{end}}{{end}}' -- c2
+  [ "$output" = "7480/tcp=0.0.0.0:7480;" ] \
+    || { echo "a two-field publish recorded '$output', not the 0.0.0.0 bind it is" >&2; return 1; }
+  docker container create --name c3 --network "$net" -p 127.0.0.1:7480:7480 -- demo/img:tag >/dev/null
+  run docker container inspect \
+    --format '{{range $p,$bs := .NetworkSettings.Ports}}{{range $bs}}{{$p}}={{.HostIp}}:{{.HostPort}};{{end}}{{end}}' -- c3
+  [ "$output" = "7480/tcp=127.0.0.1:7480;" ] \
+    || { echo "a three-field publish recorded '$output'" >&2; return 1; }
+}
+
+@test "container run without --rm leaves the container behind, as a real daemon does" {
+  # `--rm` was parsed and discarded, and no container was ever recorded for a `run` — so the flag
+  # that guarantees no pinned helper outlives its own invocation (D49/D54) could be deleted from the
+  # adapter with nothing anywhere for a test to find.
+  docker image pull demo/img:tag >/dev/null
+  fake_helper 'exit 0'
+
+  docker container run --rm --network none -- demo/img:tag selfcheck
+  run docker container ls -a --format '{{.Names}}'
+  [ -z "$output" ] || { echo "--rm left a container behind: $output" >&2; return 1; }
+
+  docker container run --network none -- demo/img:tag selfcheck
+  run docker container ls -a --format '{{.Names}}'
+  [ -n "$output" ] || { echo "a run WITHOUT --rm left nothing behind" >&2; return 1; }
+  run docker container inspect --format '{{.State.Status}}' -- "$output"
+  [ "$output" = "exited" ] || { echo "the leftover container is '$output', not exited" >&2; return 1; }
+}
+
+@test "a named volume a container mounts is auto-created, as the daemon does" {
+  # The permissiveness question read from the other side: not "what does the fake accept that Docker
+  # refuses" but "what does the fake FAIL TO CREATE that Docker creates". A missing named volume is
+  # auto-created by the daemon (the deliberate asymmetry with bind mounts, which are refused). This
+  # fake recorded the mount and created nothing, so the runtime world it showed had fewer objects in
+  # it than a real one — and a §10a "nothing partial survives" assertion would have passed over an
+  # orphan volume that really would be left behind. It carries no labels, exactly as the daemon's
+  # does, which is what makes it invisible to every find-by-label sweep in §6a.
+  local net
+  docker image pull demo/img:tag >/dev/null
+  net="$(docker network create n1)"
+  [ ! -e "$FAKE_DOCKER_STATE/volumes/orphan" ] || { echo "fixture is not clean" >&2; return 1; }
+  docker container create --name c1 --network "$net" \
+    --mount type=volume,source=orphan,target=/d -- demo/img:tag >/dev/null
+  run docker volume ls
+  case "$output" in *orphan*) : ;; *) echo "the mounted volume was not created: '$output'" >&2; return 1 ;; esac
+  run docker volume inspect --format '{{index .Labels "mythicalos.nonce"}}' -- orphan
+  assert_ok
+  [ -z "$output" ] || { echo "an auto-created volume must carry no labels, got '$output'" >&2; return 1; }
+}
+
+@test "an image id is stable across inspects" {
+  # The id was minted per inspect, so two reads of the SAME image reported different ids — an image
+  # that appears to change identity between two calls, which is the opposite of what a digest-pinned
+  # reference means.
+  local first second other
+  docker image pull demo/img:tag >/dev/null
+  docker image pull other/img:tag >/dev/null
+  first="$(docker image inspect --format '{{.Id}}' -- demo/img:tag)"
+  second="$(docker image inspect --format '{{.Id}}' -- demo/img:tag)"
+  [ "$first" = "$second" ] \
+    || { echo "the same image reported two ids: '$first' then '$second'" >&2; return 1; }
+  other="$(docker image inspect --format '{{.Id}}' -- other/img:tag)"
+  [ "$other" != "$first" ] || { echo "two different images share an id" >&2; return 1; }
+}
+
 @test "the lock file and its temps (incl. the recovery gate) are excluded from the fs snapshot" {
   load_mctl; mi_ensure_layout; mi_lock_acquire
   # A normal acquire creates no recovery/temp files, so plant the transient artifacts a stale-break

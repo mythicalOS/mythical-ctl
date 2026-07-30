@@ -32,6 +32,43 @@ pulled_image() {
   [ "$output" = "27.5.1" ]
 }
 
+@test "the engine version is read from the SERVER, not from the client" {
+  # `docker version` reports BOTH, and the fake used to answer any template with the server's number
+  # — so `{{.Client.Version}}` would have looked correct and D29's engine-28 floor would have been
+  # comparing the CLI's own version, which says nothing about the daemon. The two are deliberately
+  # far apart here: a client that would pass the floor in front of a daemon that would not.
+  FAKE_DOCKER_CLIENT_VERSION=99.9.9 FAKE_DOCKER_SERVER_VERSION=24.0.9 run mi_rt_engine_version
+  [ "$status" -eq 0 ]
+  [ "$output" = "24.0.9" ] \
+    || { echo "engine version reported as '$output' — that is not the SERVER's" >&2; return 1; }
+}
+
+@test "rootless is read from the daemon's SecurityOptions, and 'cannot ask' is not 'rootful'" {
+  # §4b.2 refuses a rootless daemon, and the three answers are three different postures: 0 rootless,
+  # 1 rootful, 2 the daemon could not be asked. A caller writing `if mi_rt_rootless; then refuse; fi`
+  # gets the right answer for 1 and silently the WRONG posture for 2, so 2 has to stay distinct.
+  run mi_rt_rootless
+  [ "$status" -eq 1 ] || { echo "an ordinary daemon reported rootless status $status" >&2; return 1; }
+  FAKE_DOCKER_ROOTLESS=1 run mi_rt_rootless
+  [ "$status" -eq 0 ] || { echo "a rootless daemon reported status $status" >&2; return 1; }
+  FAKE_DOCKER_DOWN=1 run mi_rt_rootless
+  [ "$status" -eq 2 ] \
+    || { echo "an unreachable daemon reported status $status, not the distinct 2" >&2; return 1; }
+}
+
+@test "the daemon endpoint is read from the active context (D30)" {
+  # D30 refuses a REMOTE daemon: bind sources resolve on the daemon's host, so a remote one validates
+  # the wrong filesystem. The fake used to print the endpoint for every template, so this could have
+  # been reading any field of the context document at all.
+  run mi_rt_context_host
+  [ "$status" -eq 0 ]
+  [ "$output" = "unix:///var/run/docker.sock" ] \
+    || { echo "local endpoint reported as '$output'" >&2; return 1; }
+  FAKE_DOCKER_CONTEXT_HOST=ssh://user@elsewhere run mi_rt_context_host
+  [ "$output" = "ssh://user@elsewhere" ] \
+    || { echo "remote endpoint reported as '$output'" >&2; return 1; }
+}
+
 @test "ping FAILS when the daemon is unreachable" {
   # The positive control is load-bearing, not decoration. With only the negative assertion this test
   # PASSED against a repository that had no lib/runtime.sh at all: `run` on an undefined function
@@ -345,10 +382,79 @@ pulled_image() {
   [ "$status" -eq 0 ]
 }
 
+@test "the helper container is always --rm — no helper outlives its own invocation" {
+  # D49/D54: a pinned helper runs and is gone. The fake recorded no container for a `run` at all, so
+  # `--rm` could be deleted from the adapter with nothing left behind for any test to find. Now a run
+  # without it leaves one, exactly as a real daemon does — which is what makes the flag observable.
+  local img
+  img="$(pulled_image)"
+  fake_helper 'exit 0'
+  run mi_rt_run_helper "$img" none - n1 selfcheck
+  [ "$status" -eq 0 ]
+  run docker container ls -a --format '{{.Names}}'
+  [ -z "$output" ] \
+    || { echo "the helper left a container behind: $output" >&2; return 1; }
+}
+
+@test "container rm force-removes a RUNNING container" {
+  # `-f` was parsed and discarded by the fake, so `container rm -f` and `container rm` were the same
+  # call and the flag could have been dropped with the suite green. Reconciliation cannot clear a
+  # live container without it.
+  local net
+  net="$(mi_rt_network_create mythical-i1-net i1 n-nonce)"
+  mi_rt_container_create mythical-i1-p1 "$(pulled_image)" "$net" p1 - label=nonce=c
+  mi_rt_container_start mythical-i1-p1
+  run mi_rt_inspect container c.running mythical-i1-p1
+  [ "$output" = "true" ] || { echo "the container is not running: $output" >&2; return 1; }
+  run mi_rt_container_rm mythical-i1-p1
+  [ "$status" -eq 0 ] \
+    || { echo "a running container could not be removed — is -f still passed? $output" >&2; return 1; }
+  run mi_rt_inspect container c.running mythical-i1-p1
+  [ "$status" -eq 3 ] || { echo "the container survived removal (rc $status)" >&2; return 1; }
+}
+
+@test "connect passes the alias EXPLICITLY, so a sibling can reach the peer (§6b.2)" {
+  # `docker network connect` infers no alias of its own; without one the container is reachable only
+  # under its installation-scoped NAME, which no sibling can guess — family DNS then fails silently,
+  # indistinguishable from an absent peer (§9). The fake recorded an empty alias list either way, so
+  # the flag was invisible; it now always records the automatic name alias, and the explicit one
+  # beside it when there is one.
+  local net net2
+  net="$(mi_rt_network_create mythical-i1-net i1 n-nonce)"
+  net2="$(mi_rt_network_create mythical-i1-net2 i1 n-nonce)"
+  mi_rt_container_create mythical-i1-p1 "$(pulled_image)" "$net" p1 - label=nonce=c
+  run mi_rt_network_connect "$net2" mythical-i1-p1 p1 0
+  [ "$status" -eq 0 ]
+  run mi_rt_inspect container c.aliases mythical-i1-p1
+  case "$output" in
+    *"${net2}:p1,"*) : ;;
+    *) echo "the peer alias 'p1' is not on the attachment: $output" >&2; return 1 ;;
+  esac
+}
+
+@test "an env file that does not exist is refused by the ADAPTER, before the runtime" {
+  # §4.3: bootstrap secrets go in a per-container 0600 env file, never in argv. Launching without the
+  # file the caller named is not a detail, and the refusal must come from the adapter — the message
+  # is pinned, because the fake now refuses a missing env file too (in the CLI's words) and a
+  # status-only assertion would pass on that instead.
+  local net
+  net="$(mi_rt_network_create mythical-i1-net i1 n-nonce)"
+  run mi_rt_container_create c1 "$(pulled_image)" "$net" p1 "${BATS_TEST_TMPDIR}/absent.env" label=nonce=c
+  [ "$status" -ne 0 ]
+  assert_contains "does not exist"
+  # Nothing reached the runtime at all.
+  run grep -aF -- "absent.env" "$FAKE_DOCKER_STATE/calls.log"
+  [ "$status" -ne 0 ] || { echo "the missing env file reached the runtime" >&2; return 1; }
+  # A file that exists is accepted, so the refusal is about existence and nothing else.
+  : > "${BATS_TEST_TMPDIR}/present.env"
+  run mi_rt_container_create c1 "$(pulled_image)" "$net" p1 "${BATS_TEST_TMPDIR}/present.env" label=nonce=c
+  [ "$status" -eq 0 ]
+}
+
 @test "gateway priority must be an integer, not merely made of integer characters" {
   # `case "$gw" in ''|*[!0-9-]*)` constrains the character SET only, so every value below passed it
   # and reached `docker network connect --gw-priority`.
-  local bad
+  local bad net2 net3
   net="$(mi_rt_network_create mythical-i1-net i1 n-nonce)"
   mi_rt_container_create mythical-i1-p1 "$(pulled_image)" "$net" p1 - label=nonce=c
   for bad in '1-2' '-' '--' '5-' '1-2-3'; do
@@ -358,8 +464,16 @@ pulled_image() {
     assert_contains "is not an integer"
   done
   # The two legitimate shapes still work: D45 phase 2 needs a NEGATIVE priority to be expressible.
-  run mi_rt_network_connect "$net" mythical-i1-p1 p1 10
+  #
+  # Each positive control uses a network the container is NOT already on. The original fixture
+  # connected it twice to the network it was CREATED on, which a real daemon refuses ("endpoint with
+  # name … already exists in network …") — the fake accepted it and grew a duplicate attachment. The
+  # assertions are unchanged; only the fixture is, because the old one could not have run against a
+  # real daemon at all.
+  net2="$(mi_rt_network_create mythical-i1-net2 i1 n-nonce)"
+  net3="$(mi_rt_network_create mythical-i1-net3 i1 n-nonce)"
+  run mi_rt_network_connect "$net2" mythical-i1-p1 p1 10
   [ "$status" -eq 0 ]
-  run mi_rt_network_connect "$net" mythical-i1-p1 p1 -20
+  run mi_rt_network_connect "$net3" mythical-i1-p1 p1 -20
   [ "$status" -eq 0 ]
 }
