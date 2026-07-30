@@ -134,7 +134,13 @@ mi_ledger_write() {
 
 # Convenience: print records of <kind>, or the value of <key> within them.
 mi_ledger_get() {
-  local kind="$1" key="${2:-}" records line f tok
+  # `fields`, not `f`: this is the only ARRAY-typed local in the shipped libraries, and the release
+  # bundler concatenates every module into one file in MODULES order — after which shellcheck's
+  # array tracking is no longer per-function. A later module's ordinary `local f="$1"` for a file
+  # path then draws SC2178 ("used as an array but is now assigned a string") plus an SC2128 on every
+  # use, so the repo tree lints clean while `shellcheck dist/mythical-ctl` fails. `f` for a filename
+  # is the obvious name in five of the modules here; the array is the one that gives way.
+  local kind="$1" key="${2:-}" records line fields tok
   # Capture and PROPAGATE first. A bare `mi_ledger_read | while` returns the while's status, so
   # without ambient pipefail a corrupt/torn ledger exits only the pipeline subshell and the while
   # reports success with no records — silently defeating fail-closed for this PUBLIC reader (and
@@ -147,8 +153,8 @@ mi_ledger_get() {
     esac
     if [ -z "$key" ]; then printf '%s\n' "$line"; continue; fi
     # emit the value of key= within the tab fields
-    IFS=$'\t' read -r -a f <<<"$line"
-    for tok in "${f[@]}"; do
+    IFS=$'\t' read -r -a fields <<<"$line"
+    for tok in "${fields[@]}"; do
       case "$tok" in "$key"=*) printf '%s\n' "${tok#*=}" ;; esac
     done
   done <<< "$records"

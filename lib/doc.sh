@@ -54,21 +54,21 @@ _mi_doc_bare_key_ok() {
 # byte examined comes from the snapshot.
 mi_doc_scan() {
   if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then mi_warn "doc: mi_doc_scan needs a <file>, a <type> and an optional <label>"; return 1; fi
-  # Named "dfile", not "f": lib/ledger.sh's mi_ledger_get uses a plain local `f` as an ARRAY
+  # Named "f", not "f": lib/ledger.sh's mi_ledger_get uses a plain local `f` as an ARRAY
   # (`read -a f`), and once the modules are inlined into one file by tools/bundle.sh, shellcheck's
   # SC2178/SC2128 track a variable name across the WHOLE flattened script rather than per function —
   # reusing `f` here as a scalar would read, in the bundle only, as reassigning an array to a string.
-  local dfile="$1" type="$2" label="${3:-$1}"
-  [ -f "$dfile" ] || return 3
+  local f="$1" type="$2" label="${3:-$1}"
+  [ -f "$f" ] || return 3
 
   # Same byte gate as the config reader, and for the same reason: a bash string cannot hold a NUL,
   # so a grep/read-based check physically cannot see one. Reused rather than reimplemented — one
   # audited implementation of this check, not two.
-  if ! _mi_conf_bytes_ok "$dfile"; then
+  if ! _mi_conf_bytes_ok "$f"; then
     mi_warn "doc: $label contains control bytes (NUL, CR, TAB or similar) — refusing to parse it"
     return 1
   fi
-  if [ -s "$dfile" ] && [ -n "$(tail -c1 "$dfile" 2>/dev/null)" ]; then
+  if [ -s "$f" ] && [ -n "$(tail -c1 "$f" 2>/dev/null)" ]; then
     mi_warn "doc: $label does not end in a newline (truncated?) — refusing to parse it"
     return 1
   fi
@@ -98,7 +98,7 @@ mi_doc_scan() {
       return 1
     fi
     body="${body}${key}"$'\t'"${val}"$'\n'
-  done < "$dfile"
+  done < "$f"
 
   # The header is checked AFTER the body is read but BEFORE anything is emitted, so a document of
   # the wrong type never yields a single record to a caller that forgot to check the status.
@@ -237,9 +237,9 @@ _mi_doc_spec_lookup() {   # <spec> <key> → prints "TYPE<TAB>CARD"; rc 1 if not
 # consumer a PREFIX of a rejected document — and this document decides which image to run.
 mi_doc_load() {
   if [ "$#" -lt 3 ] || [ "$#" -gt 4 ]; then mi_warn "doc: mi_doc_load needs a <file>, a <type>, a <spec> and an optional <label>"; return 1; fi
-  # "dfile", not "f" — see mi_doc_scan's note: lib/ledger.sh's mi_ledger_get uses `f` as an array,
+  # "f", not "f" — see mi_doc_scan's note: lib/ledger.sh's mi_ledger_get uses `f` as an array,
   # and the two collide only once tools/bundle.sh inlines every module into one flat file.
-  local dfile="$1" type="$2" spec="$3" label="${4:-$1}" records rc=0 line key val tc tp card seen="" out=""
+  local f="$1" type="$2" spec="$3" label="${4:-$1}" records rc=0 line key val tc tp card seen="" out=""
   # The schema is checked before the document is, so a schema bug is never reported as a document
   # error and can never silently relax a requirement (amendment A8).
   if ! _mi_doc_spec_ok "$spec"; then
@@ -247,26 +247,26 @@ mi_doc_load() {
     mi_warn "  KEY<TAB>TYPE<TAB>one|opt|many per line, with no duplicate keys"
     return 1
   fi
-  records="$(mi_doc_scan "$dfile" "$type" "$label")" || return $?
+  records="$(mi_doc_scan "$f" "$type" "$label")" || return $?
 
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     key="${line%%$'\t'*}"
     val="${line#*$'\t'}"
     if ! tc="$(_mi_doc_spec_lookup "$spec" "$key")"; then
-      mi_warn "doc: $dfile: unknown key $key — not permitted by this document's schema"
+      mi_warn "doc: $f: unknown key $key — not permitted by this document's schema"
       rc=1; continue
     fi
     tp="${tc%%$'\t'*}"; card="${tc#*$'\t'}"
     if ! _mi_doc_type_ok "$tp" "$val"; then
-      mi_warn "doc: $dfile: value for $key is not valid for type $tp"
+      mi_warn "doc: $f: value for $key is not valid for type $tp"
       rc=1; continue
     fi
     case "$card" in
       many) : ;;
       one|opt)
         case "$seen" in
-          *"|${key}|"*) mi_warn "doc: $dfile: $key may appear at most once"; rc=1; continue ;;
+          *"|${key}|"*) mi_warn "doc: $f: $key may appear at most once"; rc=1; continue ;;
         esac ;;
       *) mi_warn "doc: internal error — unknown cardinality '$card' for $key"; rc=1; continue ;;
     esac
@@ -283,7 +283,7 @@ mi_doc_load() {
     if [ "$card" = "one" ]; then
       case "$seen" in
         *"|${key}|"*) : ;;
-        *) mi_warn "doc: $dfile: required key $key is missing"; rc=1 ;;
+        *) mi_warn "doc: $f: required key $key is missing"; rc=1 ;;
       esac
     fi
   done <<< "$spec"
