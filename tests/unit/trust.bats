@@ -179,6 +179,37 @@ mkindex() {   # writes $MYTHICAL_HOME/{policy,mb,ms,index}; prints nothing
   [[ "$output" == *"more than once"* ]]
 }
 
+# A digest is not authentication (§8.1's load-bearing sentence): these two tests are the only place
+# mi_accept_index's own digest gate is exercised end to end. Without them, a mutation that skips
+# mi_trust_verify_digest entirely — forcing its result to success — passes every other test in this
+# file, because every other caller either never reaches mi_accept_index or supplies a matching digest
+# incidentally rather than as the thing under test.
+@test "an index whose real digest matches the recorded anchor is accepted, and its records come back" {
+  mkindex
+  local d="$MYTHICAL_HOME"
+  mi_trust_anchor_set "$(mi_digest "$d/index")"
+  run mi_accept_index "$d/index"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"policy_digest"* ]] || { echo "output missing a policy_digest record: $output" >&2; return 1; }
+  [[ "$output" == *"manifest"*"brokkr"* ]] || { echo "output missing a brokkr manifest record: $output" >&2; return 1; }
+}
+
+# The case that must never pass: an anchor IS recorded, so this is not "no anchor, no offline reuse"
+# (already covered above) — it is the authentication boundary itself. A recorded anchor that simply
+# does not match the file's real bytes must refuse, or a digest becomes trust rather than a check on
+# trust obtained elsewhere.
+@test "an index is refused when its real digest does not match the recorded anchor, and the message names the mismatch" {
+  mkindex
+  local d="$MYTHICAL_HOME" bogus real
+  bogus="$(printf 'a%.0s' {1..64})"
+  real="$(mi_digest "$d/index")"
+  mi_trust_anchor_set "$bogus"
+  run mi_accept_index "$d/index"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"$bogus"* ]] || { echo "output missing the recorded (expected) anchor $bogus: $output" >&2; return 1; }
+  [[ "$output" == *"$real"* ]] || { echo "output missing the file's real digest $real: $output" >&2; return 1; }
+}
+
 # --- the combined check ---
 
 # An expiry is mandatory, so the default is far future; a test wanting an expired document passes
@@ -314,4 +345,17 @@ mkdoc() {   # <version> [<expires>]
   [ "$status" -ne 0 ]
   printf '%s' "$output" | grep -aq 'is not a sha256 digest'
   [ "$(mi_trust_floor_get index)" = "1" ]
+}
+
+# mi_trust_check_only's freshness gate already refuses a lower version before mi_trust_commit is ever
+# reached, so every test above that exercises the anti-rollback rule does so through mi_trust_check
+# and never calls mi_trust_commit directly with a stale version. mi_trust_commit is PUBLIC and a later
+# plan's acquisition path is expected to call it directly, so its own floor guard has to hold with no
+# mi_trust_check_only in front of it — this is the only test that proves that independently.
+@test "mi_trust_commit called directly refuses a version below the floor, and the floor is unchanged" {
+  mi_trust_floor_set index 7
+  run mi_trust_commit index "$(mkdoc 3)"
+  [ "$status" -ne 0 ]
+  printf '%s' "$output" | grep -aq 'refusing to lower the recorded version floor'
+  [ "$(mi_trust_floor_get index)" = "7" ]
 }
