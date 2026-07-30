@@ -71,8 +71,32 @@ setup() {
   run mi_trust_floor_override manifest:brokkr 3 "emergency rollback of a bad release"
   [ "$status" -eq 0 ]
   [ "$(mi_trust_floor_get manifest:brokkr)" = "3" ]
-  [[ "$output" == *DOWNGRADING* ]] || { echo "output missing DOWNGRADING: $output" >&2; return 1; }
+  [[ "$output" == *DOWNGRADED* ]] || { echo "output missing DOWNGRADED: $output" >&2; return 1; }
   [[ "$output" == *"emergency rollback"* ]]
+}
+
+# The banner is emitted AFTER the ledger write, not before it, and this is what pins that.
+#
+# Written first, it announced the downgrade — in the past tense, ending "This is recorded in the
+# ledger" — on runs where the write then failed and nothing was recorded at all. Measured before the
+# fix: floor 7, write made to fail, the function printed "DOWNGRADING the version floor for
+# manifest:brokkr: 7 → 3 … This is recorded in the ledger", then returned 1 with the floor still 7
+# and no downgrade record. An operator reading the log of a FAILED emergency rollback was told it had
+# succeeded. Announcing an act before performing it announces it whether or not it happens.
+#
+# The state assertions alone do not catch this: the pre-fix code left the floor and the ledger
+# correct, and only the message lied. So this asserts on the OUTPUT, which is the thing that was wrong.
+@test "a failed override says so, and does not announce a downgrade that did not happen" {
+  mi_trust_floor_set manifest:brokkr 7
+  mi_ledger_write() { return 1; }
+  run mi_trust_floor_override manifest:brokkr 3 "emergency rollback"
+  [ "$status" -ne 0 ]
+  [[ "$output" != *DOWNGRADED* ]] \
+    || { echo "a failed override announced a downgrade: $output" >&2; return 1; }
+  [[ "$output" != *"recorded in the ledger"* ]] \
+    || { echo "a failed override claimed a ledger record: $output" >&2; return 1; }
+  [[ "$output" == *"NOT applied"* ]] \
+    || { echo "a failed override did not say it failed: $output" >&2; return 1; }
 }
 
 @test "a downgrade without a reason is refused, and the floor is untouched" {

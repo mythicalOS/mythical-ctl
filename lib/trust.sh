@@ -206,30 +206,43 @@ mi_trust_floor_override() {
     return 1
   fi
   [ "$rc" -eq 0 ] || return "$rc"
-  # The headline verb follows the ACTUAL direction of the change, compared via the ledger's
-  # overflow-safe decimal comparator (never `[ -gt ]`, for the same reason every other version
-  # comparison in this file uses it) — this override is not restricted to lowering a floor, so
-  # printing "DOWNGRADING" unconditionally would mislead an operator on a same-or-higher override.
-  if _mi_num_gt "$cur" "$version"; then
-    mi_warn "trust: DOWNGRADING the version floor for $docid: $cur → $version"
-    mi_warn "  reason: $reason"
-    mi_warn "  Every document between these versions becomes acceptable again, including any that were"
-    mi_warn "  withdrawn. This is recorded in the ledger."
-  elif _mi_num_gt "$version" "$cur"; then
-    mi_warn "trust: RAISING the version floor for $docid via override: $cur → $version"
-    mi_warn "  reason: $reason"
-  else
-    mi_warn "trust: RE-RECORDING the version floor for $docid at its current value ($version)"
-    mi_warn "  reason: $reason"
-  fi
   # ONE ledger write, not two. _mi_trust_put_many exists precisely so a pair lands together —
   # mi_trust_commit uses it for the floor+anchor pair for the same reason. Two separate
   # _mi_trust_put calls here would be two atomic writes with a window between them: if the second
   # (the audit record) failed, the floor would already be lowered with no reason recorded beside
   # it, while the operator is told the command failed — the exact opposite of surviving in the
   # audit trail rather than living in someone's shell history.
-  _mi_trust_put_many "$MI_TRUST_FLOOR_KIND" "$docid" "$version" \
-                     "$MI_TRUST_DOWNGRADE_KIND" "$docid" "from=${cur} to=${version} reason=${reason}"
+  #
+  # THE WRITE HAPPENS BEFORE THE ANNOUNCEMENT, and that ordering is the fix to a real defect rather
+  # than a preference. The banner below is written in the past tense and says "This is recorded in
+  # the ledger"; emitted first, it said exactly that on a run where the write then FAILED and
+  # nothing was recorded at all — the function returned 1, the floor was untouched, and the operator
+  # reading the log of a failed emergency rollback was told the downgrade had happened. Announcing
+  # an act before performing it means announcing it whether or not it happens. Nothing is lost by
+  # waiting: the banner exists to be loud in the record, not to be a progress indicator.
+  if ! _mi_trust_put_many "$MI_TRUST_FLOOR_KIND" "$docid" "$version" \
+                          "$MI_TRUST_DOWNGRADE_KIND" "$docid" "from=${cur} to=${version} reason=${reason}"; then
+    mi_warn "trust: the override of $docid's version floor was NOT applied — the ledger write failed."
+    mi_warn "  The floor is unchanged at $cur and no downgrade record was written."
+    return 1
+  fi
+  # The headline verb follows the ACTUAL direction of the change, compared via the ledger's
+  # overflow-safe decimal comparator (never `[ -gt ]`, for the same reason every other version
+  # comparison in this file uses it) — this override is not restricted to lowering a floor, so
+  # printing "DOWNGRADING" unconditionally would mislead an operator on a same-or-higher override.
+  if _mi_num_gt "$cur" "$version"; then
+    mi_warn "trust: DOWNGRADED the version floor for $docid: $cur → $version"
+    mi_warn "  reason: $reason"
+    mi_warn "  Every document between these versions becomes acceptable again, including any that were"
+    mi_warn "  withdrawn. This is recorded in the ledger."
+  elif _mi_num_gt "$version" "$cur"; then
+    mi_warn "trust: RAISED the version floor for $docid via override: $cur → $version"
+    mi_warn "  reason: $reason"
+  else
+    mi_warn "trust: RE-RECORDED the version floor for $docid at its current value ($version)"
+    mi_warn "  reason: $reason"
+  fi
+  return 0
 }
 
 mi_trust_anchor_set() {
