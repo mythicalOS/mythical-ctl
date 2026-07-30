@@ -25,49 +25,59 @@ setup() { setup_test_env; }
 #
 #   [[ "$output" == *needle* ]] || { echo "no needle in: $output" >&2; return 1; }
 #
-# So the rule enforced below is: any statement containing a `[[ … ]]` in COMMAND position — at the
-# start, or after a `;` — must carry a `||` fallback, unless it is the last statement of its body. A
-# `[[ ]]` opening an `if`/`while`/`until`/`elif` is a condition, not an assertion, and is exempt.
+# THE RULE enforced below: a `[[ … ]]` in COMMAND position — at the start of a statement, or after a
+# `;` — must carry a `||` fallback, UNLESS it is the last command the body executes. A `[[ ]]` opening
+# an `if`/`while`/`until`/`elif` is a condition rather than an assertion and is exempt.
 #
-# It is a heuristic, deliberately: it accepts `[[ … ]] || echo`, which would also not fail. What it is
-# NOT allowed to be is silently narrower than it looks, which it was twice — an earlier version matched
-# only a line ENDING in `]]`, so `[[ f ]]; true` and `[[ f ]] && true` sailed through, and it joined
-# comment-tailed backslashes as continuations, importing a `||` from the next statement. Hence the first
-# test: the detector is run against a fixture with known answers, so it has to prove it catches the
-# shapes rather than merely reporting clean.
+# "Last command the body executes" is deliberately not "last line": a body ending in
+# `true; [[ f ]]; true` ends with `true`, so the assertion decides nothing.
+#
+# It is a heuristic, and its boundary is stated rather than hidden: it accepts `[[ a ]] && [[ b ]] || c`,
+# which would also not fail. What it must not be is silently narrower than it reads, and it was — three
+# times. An early version matched only a line ENDING in `]]`, so `[[ f ]]; true` and `[[ f ]] && true`
+# sailed through. Then it joined comment-tailed backslashes as continuations, importing a `||` from the
+# following statement. Then it exempted a whole final LINE rather than the final command. Each of those
+# reported a clean suite while missing a real decorative assertion.
+#
+# Which is why the first test exists: the detector is run against a fixture with known answers, so it
+# cannot report clean on the real suites without first proving it catches all seven shapes.
 
 # Emit "file:line: statement" for every unguarded `[[ … ]]` assertion in the given .bats files.
 # Continuation lines are joined first: `[[ … ]] \` + `|| { … }` is CORRECT, and a scanner that judged
 # the first physical line alone would report it as a defect.
 _scan_bats() {
   awk '
-    function flush_stmt() {
+    # A body is flattened into an ordered list of SEGMENTS — `;`-separated commands — rather than a
+    # list of lines. Two reasons, both from real false negatives:
+    #
+    #   `true; [[ f ]]; true`  is one line and does not START with `[[`, so a line-level test misses
+    #                          the assertion buried in the middle of it.
+    #   the "last one is exempt" rule has to mean the last SEGMENT EXECUTED IN THE BODY, not the last
+    #                          line. A body whose final line is `true; [[ f ]]; true` ends with
+    #                          `true`, so the assertion is not the deciding command and is decorative.
+    #                          Exempting it because its LINE was last is exactly the miss that got
+    #                          through round 5.
+    function flush_stmt(   k, m, parts, seg) {
       if (pending == "") return
-      n++; stmt[n] = pending; ln[n] = pending_ln; pending = ""
-    }
-    # Is this statement an unguarded assertion? A `||` anywhere in it means a fallback exists, so the
-    # statement fails properly. Otherwise: split on `;` and look for a SEGMENT that begins with `[[`,
-    # because `true; [[ f ]]; true` is just as decorative as a bare one and does not begin with `[[`.
-    # A segment opening a compound condition (`if`, `while`, `until`, `elif`, `!`) is a condition and
-    # not an assertion, so it is skipped.
-    function unguarded(s,   k, m, parts, seg) {
-      if (s ~ /\|\|/) return 0
-      if (s !~ /\[\[/) return 0
-      m = split(s, parts, ";")
+      m = split(pending, parts, ";")
       for (k = 1; k <= m; k++) {
         seg = parts[k]
         sub(/^[ \t]+/, "", seg); sub(/[ \t]+$/, "", seg)
-        if (seg ~ /^(if|while|until|elif|!)[ \t]/) continue
-        if (seg ~ /^\[\[/) return 1
+        if (seg == "") continue
+        sn++; sseg[sn] = seg; sln[sn] = pending_ln; sfull[sn] = pending
       }
-      return 0
+      pending = ""
     }
-    /^@test /     { inb = 1; n = 0; pending = ""; bodies++; next }
+    /^@test /     { inb = 1; sn = 0; pending = ""; bodies++; next }
     inb && /^\}/  {
                     flush_stmt()
-                    for (i = 1; i < n; i++)
-                      if (unguarded(stmt[i]))
-                        printf "%s:%d: %s\n", FILENAME, ln[i], stmt[i]
+                    # `i < sn`: only the FINAL segment of the whole body is exempt, because that is the
+                    # one whose status bats takes as the result.
+                    for (i = 1; i < sn; i++) {
+                      if (sseg[i] ~ /\|\|/) continue                       # has a fallback: it fails
+                      if (sseg[i] ~ /^(if|while|until|elif|!)[ \t]/) continue  # a condition, not an assertion
+                      if (sseg[i] ~ /^\[\[/) printf "%s:%d: %s\n", FILENAME, sln[i], sfull[i]
+                    }
                     inb = 0; next
                   }
     inb           {
@@ -76,12 +86,14 @@ _scan_bats() {
                     if (line == "" || line ~ /^#/) next
                     if (pending == "") pending_ln = FNR
                     # A trailing backslash continues the statement — UNLESS it is inside a trailing
-                    # comment, where bash ignores it. `[[ f ]] # note \` does NOT continue, so joining
-                    # it with the next line could import a `||` from a statement that is not part of
-                    # this one and wave a decorative assertion through. Detecting the comment by
-                    # ` #` is a heuristic (a `#` inside quotes could trip it), but it errs toward a
-                    # FALSE POSITIVE — a visible, fixable complaint — rather than a silent miss.
-                    if (line ~ /\\$/ && line !~ /[ \t]#/) {
+                    # comment, where bash ignores it. `[[ f ]] # note \` and `[[ f ]];# note \` do NOT
+                    # continue, so joining either with the next line would import a `||` from a
+                    # statement that is not part of this one and wave a decorative assertion through.
+                    # A `#` starts a comment at line start or after whitespace or an operator, which is
+                    # what the class below approximates. It is a heuristic — a `#` inside quotes could
+                    # trip it — but it errs toward a FALSE POSITIVE, a visible and fixable complaint,
+                    # rather than a silent miss.
+                    if (line ~ /\\$/ && line !~ /[ \t;&|(]#/) {
                       sub(/\\$/, "", line); pending = pending line " "; next
                     }
                     pending = pending line
@@ -118,6 +130,10 @@ _bodies_seen() { sed -n 's/^BODIES=//p' "$MYTHICAL_HOME/bodies"; }
     printf '%s\n' '@test "bad 4: embedded after a semicolon" {' "  true; $A; true" '  true' '}'
     printf '%s\n' '@test "bad 5: comment-tailed pseudo-continuation" {' "  $A # explanation \\" \
                   '  true || :' '  true' '}'
+    printf '%s\n' '@test "bad 6: compound LAST line, assertion is not the deciding command" {' \
+                  "  true; $A; true" '}'
+    printf '%s\n' '@test "bad 7: semicolon-hash pseudo-continuation" {' "  $A;# explanation \\" \
+                  '  true || :' '  true' '}'
     printf '%s\n' '@test "good 1: guarded" {' "  $A || { echo boom >&2; return 1; }" '  true' '}'
     printf '%s\n' '@test "good 2: guarded across a continuation" {' "  $A \\" \
                   '    || { echo boom >&2; return 1; }' '  true' '}'
@@ -128,8 +144,8 @@ _bodies_seen() { sed -n 's/^BODIES=//p' "$MYTHICAL_HOME/bodies"; }
   out="$(_scan_bats "$fx")"
 
   found="$(printf '%s\n' "$out" | grep -c . )"
-  [ "$found" -eq 5 ] \
-    || { echo "expected exactly 5 findings, got $found:" >&2; echo "$out" >&2; return 1; }
+  [ "$found" -eq 7 ] \
+    || { echo "expected exactly 7 findings, got $found:" >&2; echo "$out" >&2; return 1; }
   case "$out" in
     *'== "b" ]]'*) : ;;
     *) echo "findings do not name the offending statement: $out" >&2; return 1 ;;
@@ -140,8 +156,8 @@ _bodies_seen() { sed -n 's/^BODIES=//p' "$MYTHICAL_HOME/bodies"; }
   case "$out" in
     *'if [['*) echo "the scanner flagged a condition, not an assertion: $out" >&2; return 1 ;;
   esac
-  [ "$(_bodies_seen)" -eq 9 ] \
-    || { echo "the scanner saw $(_bodies_seen) bodies in a 9-test fixture" >&2; return 1; }
+  [ "$(_bodies_seen)" -eq 11 ] \
+    || { echo "the scanner saw $(_bodies_seen) bodies in an 11-test fixture" >&2; return 1; }
 }
 
 @test "no test asserts with a bare [[ ]] that bash 3.2 cannot fail on" {

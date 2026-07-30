@@ -450,7 +450,7 @@ mi_conf_family_add() {
   fi
   local key="$1" val="$2" f dir tmp type existing rc
   mi_lock_assert_held "write mythical.conf"
-  f="$(mi_conf_family_path)"; dir="$(dirname "$f")"
+  f="$(mi_conf_family_path)"; dir="${f%/*}"   # builtin, no fork, no dependency on dirname
 
   # Validate the key and value BEFORE touching the file. A newline in a value would forge a second
   # key on the next read — the D19 "serialize safely on write" requirement — and _mi_conf_value_ok
