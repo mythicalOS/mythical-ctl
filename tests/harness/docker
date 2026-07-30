@@ -947,7 +947,7 @@ case "${1:-}" in
         # The pinned helper (D49/D54). Its result comes from the fixture image script so a test can
         # make the probe answer, fail, or be unobtainable.
         shift
-        img=""; cmd=""; rest=""; mounts=""; netid=""; autorm=""; name=""
+        img=""; cmd=""; mounts=""; netid=""; autorm=""; name=""
         while [ "$#" -gt 0 ]; do
           case "$1" in
             --rm) autorm=1; shift ;;
@@ -963,7 +963,13 @@ case "${1:-}" in
             -*) bad_flag "container run" "$1" ;;
             # The first positional is the image; everything after it belongs to the container, so the
             # loop STOPS here and never flag-parses a helper argument that happens to start with `-`.
-            *) img="$1"; shift; cmd="${1:-}"; shift || true; rest="$*"; break ;;
+            #
+            # The remaining arguments are LEFT IN "$@" rather than flattened into a string. Docker
+            # preserves each post-image argument exactly; collapsing them with `rest="$*"` and
+            # re-splitting on IFS turned `arg='two words'` into two arguments and glob-expanded
+            # `arg='*'` against the fake's working directory — inventing helper behaviour in the one
+            # path whose whole purpose is to reproduce it faithfully.
+            *) img="$1"; shift; cmd="${1:-}"; shift || true; break ;;
           esac
         done
         # The image gate applies to `run` exactly as it does to `create`: a helper whose pinned image
@@ -1003,8 +1009,9 @@ case "${1:-}" in
         fi
         [ -z "${FAKE_DOCKER_HELPER_FAIL:-}" ] || die "helper: ${FAKE_DOCKER_HELPER_FAIL}"
         [ -x "${FAKE_HELPER_BIN:-}" ] || die "fake docker: FAKE_HELPER_BIN is not set to an executable fixture entrypoint"
-        # shellcheck disable=SC2086   # deliberate split: $rest carries the helper's own arguments
-        "$FAKE_HELPER_BIN" "$cmd" $rest
+        # `${1+"$@"}` rather than a bare "$@": under `set -u`, bash 3.2 errors on "$@" when there are
+        # no positional parameters left, which is the ordinary case for a no-argument helper command.
+        "$FAKE_HELPER_BIN" "$cmd" ${1+"$@"}
         ;;
       *) die "fake docker: unsupported container subcommand: ${1:-}" ;;
     esac

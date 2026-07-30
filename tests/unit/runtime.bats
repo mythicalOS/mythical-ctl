@@ -477,3 +477,20 @@ pulled_image() {
   run mi_rt_network_connect "$net3" mythical-i1-p1 p1 -20
   [ "$status" -eq 0 ]
 }
+
+@test "helper arguments keep their exact argv boundaries — no splitting, no globbing" {
+  # Docker preserves each post-image argument verbatim. An earlier fake flattened them into one
+  # string and re-split it on IFS, so `arg='two words'` arrived as TWO arguments and `arg='*'` was
+  # expanded against the working directory — the fake inventing behaviour in the one path whose
+  # purpose is to reproduce docker's faithfully. Task 6 passes an alias this way and Task 11 passes
+  # a host path, so a path containing a space would have been silently torn in half.
+  mi_rt_image_pull "$(a_digestref helper)" >/dev/null
+  fake_helper 'printf "count=%s\n" "$#"; for a in "$@"; do printf "arg=[%s]\n" "$a"; done'
+  cd "$BATS_TEST_TMPDIR" || return 1
+  : > star-should-not-match
+  run mi_rt_run_helper "$(a_digestref helper)" none - n1 resolve "arg=two words" 'arg=*'
+  [ "$status" -eq 0 ]
+  assert_contains "count=3"
+  assert_contains "arg=[two words]"
+  assert_contains "arg=[*]"
+}
