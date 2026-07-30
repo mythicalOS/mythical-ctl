@@ -189,3 +189,23 @@ teardown() { teardown_test_env; }
   [ "$status" -eq 0 ]
   assert_contains "not detectable"
 }
+
+@test "a version with a numeric major but no minor is refused, not accepted on the major alone" {
+  # `28.` parses to major 28 and was ACCEPTED, contradicting this module's stated rule that an
+  # unparseable version is a refusal. Measured scope when it was found: every malformed value that
+  # got through had a major >= the floor and `27.` was already refused, so nothing older than the
+  # floor was ever admitted — this pins the rule, it does not close a bypass.
+  FAKE_DOCKER_SERVER_VERSION=28. run mi_preflight_daemon
+  [ "$status" -ne 0 ]
+  FAKE_DOCKER_SERVER_VERSION=28.. run mi_preflight_daemon
+  [ "$status" -ne 0 ]
+}
+
+@test "a real pre-release version is still accepted — the fix must not refuse legitimate versions" {
+  # The counterpart to the test above, and the reason the suffix grammar is deliberately NOT
+  # validated: a false refusal here strands every install on a supported daemon.
+  FAKE_DOCKER_SERVER_VERSION=28.0.0-beta.1 run mi_preflight_daemon
+  [ "$status" -eq 0 ]
+  FAKE_DOCKER_SERVER_VERSION=28.1.4 run mi_preflight_daemon
+  [ "$status" -eq 0 ]
+}

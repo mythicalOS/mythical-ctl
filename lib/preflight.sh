@@ -29,12 +29,35 @@
 # other variables are locals.
 # shellcheck disable=SC2154
 _mi_pf_engine_major_ok() {
-  local v="$1" major="${1%%.*}"
+  local v="$1" major="${1%%.*}" rest
   case "$v" in
     ''|*[!0-9.a-zA-Z+_-]*) return 1 ;;
   esac
   case "$major" in ''|*[!0-9]*) return 1 ;; esac
   [ "${#major}" -le 9 ] || return 1
+
+  # The MINOR must exist and start with a digit when there is a dot at all. Without this, the
+  # charset check above accepts `28.`, `28..` and `28.0.0-`, whose major parses to 28 and which are
+  # therefore ACCEPTED while not being version strings.
+  #
+  # Scope, stated honestly: this is a contract-consistency fix, NOT a security fix. Measured across
+  # the malformed inputs — `28.`, `28..`, `28.0.0-`, `.28`, `-28.0`, `+28`, `27.`, `28x`, `1e9`,
+  # `0028.0`, `9999999999999.0` — **every one that was accepted had a major of 28 or greater**, and
+  # `27.` was already refused. No malformed value admitted an engine older than the floor. What was
+  # actually wrong is that the file states "an UNPARSEABLE version is a REFUSAL" and then accepted
+  # three unparseable ones, so a later reader could not trust the rule as written.
+  case "$v" in
+    *.*) rest="${v#*.}"
+         case "$rest" in ''|[!0-9]*) return 1 ;; esac ;;
+  esac
+
+  # What this deliberately still ACCEPTS, and why: `28.0.0-`. Its minor exists and is numeric, and a
+  # trailing suffix after the patch is exactly the shape of a real pre-release version — Docker ships
+  # `28.0.0-beta.1`, which must keep working. Validating the suffix grammar would risk REFUSING a
+  # legitimate future Docker version, and a false refusal here strands every install on a supported
+  # daemon. Since only the major decides the gate and this major is unambiguous, accepting it is the
+  # cheaper error. Refusing malformed values whose major cannot be trusted is the point; refusing
+  # unusual-but-unambiguous ones is not.
   [ "$major" -ge "$MI_RT_MIN_ENGINE" ]
 }
 
