@@ -20,6 +20,20 @@ MI_CONF_MAXLEN=4096
 MI_CONF_MAXBYTES=1048576
 MI_CONF_SNAP_LIMIT=1048577
 MI_CONF_MARKER_PREFIX='#mythical-conf-sha256='
+# Per-file KEY COUNT cap, enforced by _mi_conf_scan_stream on both files.
+#
+# The whole-file ceiling above bounds the BYTES copied, not the WORK done. The duplicate-key check in
+# the scanner is quadratic — it scans a `seen` string that grows by one entry per key — so a file that
+# is entirely inside the accepted ceiling can cost minutes of CPU: measured on one machine, 4000 keys
+# took 2s, 8000 took 7s and 14000 took 22s (240 KB, well under the ceiling), so a 1 MiB file of short
+# valid keys is ~60000 keys and several minutes. mi_conf_product_add runs that scan AFTER
+# mi_lock_assert_held, so without a cap one compromised container could wedge every other product's
+# mutating operation for as long as it liked.
+#
+# 1024 is generous and still cheap: 1 MiB divided by the 4096-byte value cap is ~256 maximal settings,
+# so no legitimate file comes near it, while the quadratic stays bounded at ~10^6 comparisons — 1000
+# keys measured sub-second.
+MI_CONF_MAXKEYS=1024
 
 # --- byte-class gate -----------------------------------------------------------------------------
 # Refuse a file containing ANY control byte other than the line separator (\n): NUL, CR, TAB,
@@ -33,9 +47,19 @@ MI_CONF_MARKER_PREFIX='#mythical-conf-sha256='
 # Deleting the class and comparing to the original is the portable test: identical ⇒ none present.
 # Octal ranges are understood by both GNU and BSD tr. \012 (newline) is deliberately absent from the
 # ranges below, so it survives; \011 (tab) is inside \000-\011 and is therefore refused.
+#
+# rc: 0 clean · 1 a control byte is present · 2 the file cannot be READ.
+# The 2 matters because the comparison cannot tell those last two apart on its own: if the file exists
+# but cannot be opened, the `tr` redirect fails, tr contributes nothing, and `cmp` reports a
+# difference — which the caller then reported as "contains control bytes (NUL, CR, TAB or similar)",
+# sending an operator after a hostile-content problem when what they have is a permission problem.
+# Stated limitation: this catches the unopenable file, not an I/O error part-way through a read, which
+# still reports as a byte failure.
 _mi_conf_bytes_ok() {
+  [ -r "$1" ] || return 2
   # shellcheck disable=SC2094   # both sides only READ $1; nothing in this pipeline writes it
-  LC_ALL=C tr -d '\000-\011\013-\037\177' < "$1" 2>/dev/null | cmp -s - "$1"
+  LC_ALL=C tr -d '\000-\011\013-\037\177' < "$1" 2>/dev/null | cmp -s - "$1" || return 1
+  return 0
 }
 
 # rc 0 iff the value contains only permitted characters.
@@ -95,7 +119,7 @@ _mi_conf_key_ok() {
 # keeps any later '='. No eval, no expansion, no substitution: the value is inert data from the byte
 # it is read to the byte it is emitted.
 _mi_conf_scan_stream() {
-  local label="$1" line key val n=0 seen=""
+  local label="$1" line key val n=0 keys=0 seen=""
   while IFS= read -r line; do
     n=$((n + 1))
     case "$line" in
@@ -119,6 +143,13 @@ _mi_conf_scan_stream() {
       mi_warn "config: $label line $n: value for $key contains a forbidden character or is too long"
       return 1
     fi
+    # The key-count cap, checked BEFORE the duplicate scan below — which is the quadratic step it
+    # exists to bound, so checking it afterwards would bound nothing. See MI_CONF_MAXKEYS.
+    keys=$(( keys + 1 ))
+    if [ "$keys" -gt "$MI_CONF_MAXKEYS" ]; then
+      mi_warn "config: $label line $n: more than $MI_CONF_MAXKEYS keys — refusing to parse it"
+      return 1
+    fi
     # A duplicate key is ambiguous, and is exactly what a newline-forging write would produce.
     # Refuse rather than pick a winner. The delimiters make the match whole-key, so MYTHICAL_A
     # does not appear to collide with MYTHICAL_AB.
@@ -135,10 +166,18 @@ _mi_conf_scan_stream() {
 # rc: 0 ok · 1 malformed (already reported) · 3 file missing.
 mi_conf_scan() {
   if [ "$#" -ne 1 ]; then mi_warn "config: mi_conf_scan needs a <file>"; return 1; fi
-  local f="$1"
+  local f="$1" brc
   [ -f "$f" ] || return 3
 
-  if ! _mi_conf_bytes_ok "$f"; then
+  # `if cmd; then rc=0; else rc=$?; fi`, not `if ! cmd; then rc=$?; fi`: inside the then-branch of a
+  # NEGATED condition `$?` is the status of the `!`, which is 0 — so the negated form would read every
+  # failure as rc 0 and never reach either message.
+  if _mi_conf_bytes_ok "$f"; then brc=0; else brc=$?; fi
+  if [ "$brc" -eq 2 ]; then
+    mi_warn "config: cannot read $f — refusing to parse it"
+    return 1
+  fi
+  if [ "$brc" -ne 0 ]; then
     mi_warn "config: $f contains control bytes (NUL, CR, TAB or similar) — refusing to parse it"
     return 1
   fi
@@ -176,8 +215,18 @@ _mi_conf_int_ok() {
 }
 
 # Validate one value against one type. rc 0 ok, 1 reject.
+#
+# `local LC_ALL=C` for the reason spelled out at _mi_conf_key_ok, and it belongs here just as much:
+# this function has three length caps and two bracket ranges, and every one of them changes meaning
+# with the operator's locale. `${#v}` counts CHARACTERS in a UTF-8 locale and BYTES under C, and
+# bracket ranges are locale-collated unless forced to byte order. Measured before this line existed,
+# with spec `MYTHICAL_A<TAB>str:8` and the 8-character, 16-byte value `éééééééé`: rc 0 under
+# LC_ALL=en_US.UTF-8 and rc 1 under LC_ALL=C — the same bytes validating differently per locale, in
+# the one function that decides whether attacker-controlled input is acceptable. `netname` diverged
+# the same way, accepting `aéb` under UTF-8 and refusing it under C. The published caps are BYTES.
 _mi_conf_type_ok() {
   local type="$1" v="$2" p
+  local LC_ALL=C
   case "$type" in
     str:*)
       p="${type#str:}"
@@ -290,12 +339,12 @@ mi_conf_load() {
   _mi_conf_validate "$records" "$f" "$spec"
 }
 
-# Print one raw (scanned, not spec-validated) value. rc: 0 ok · 1 parse failure · 3 absent.
+# Print one value out of ALREADY-SCANNED KEY<TAB>VALUE records held in $1. rc: 0 ok · 3 absent.
 #
-# For MARKER-LESS files — mythical.conf, or a body already separated from its marker. A
-# <product>.conf still carrying its trailing marker is REJECTED here, by design: the scanner refuses
-# marker lines outright, and the way to read a product config is mi_conf_product_load, which strips
-# and validates the marker first. Reading one through this function would skip the integrity gate.
+# Records in, not a path: this opens no file, parses nothing, and never sees a marker — which is why
+# it has neither a parse-failure status nor anything to say about file formats. mi_conf_product_add
+# uses it to look a current value up in the records its snapshot already yielded, because the live
+# file still carries its trailing marker and the scanner refuses that by design.
 _mi_conf_record_value() {
   local records="$1" key="$2" line
   while IFS= read -r line; do
@@ -304,6 +353,13 @@ _mi_conf_record_value() {
   return 3
 }
 
+# Print one raw (scanned, not spec-validated) value from a FILE. rc: 0 ok · 1 parse failure · 3 absent.
+#
+# For MARKER-LESS files — mythical.conf, or a body already separated from its marker. A
+# <product>.conf still carrying its trailing marker is REJECTED here, by design: the scanner refuses
+# marker lines outright, and the way to read a product config is mi_conf_product_load, which strips
+# and validates the marker first. Reading one through this function would skip the integrity gate.
+#
 # Used where the caller wants a single key without a full spec — e.g. reading back a value this
 # process wrote. Propagates a parse failure rather than reporting the key absent: "the file is
 # hostile" and "the key is not set" must never look the same to a caller deciding whether to write.
@@ -351,6 +407,9 @@ _mi_conf_unchanged() {
 
 # ADD one key, preserving the rest of the file byte-for-byte (D9).
 #
+# rc: 0 written, or already exactly this value (a no-op success) · 1 refused, and the file is left
+#     untouched. There is no other status: this writer either lands the whole line or changes nothing.
+#
 # ADDITIVE ONLY. Absent ⇒ written; already present with the SAME value ⇒ no-op success; present with
 # a DIFFERENT value ⇒ REFUSED. §10a requires a re-install to leave user-owned files byte-identical
 # "including an operator's hand edit", and a second product's install to make mythical.conf "gain
@@ -383,6 +442,21 @@ mi_conf_family_add() {
   if ! _mi_conf_value_ok "$val" || ! _mi_conf_type_ok "$type" "$val"; then
     mi_warn "config: refusing to write an invalid value for $key"; return 1
   fi
+
+  # IDENTITY, before the first read. Deliberately BEYOND what the plan asked for: it scoped the §4.1a
+  # identity checks to the container-writable <product>.conf, on the reasoning that mythical.conf is
+  # host-only and not attacker-controlled. That is true of the threat and still leaves a bad failure
+  # mode here, reproduced before this call existed: with mythical.conf planted as a SYMLINK to a file
+  # holding MYTHICAL_NET=planted, this function returned 0, replaced the symlink with a real 0600
+  # file, left the link target untouched — and ADOPTED the target's content into mythical.conf, while
+  # the value the installer was asked to write went into a file nobody reads. The operator is told the
+  # write succeeded.
+  #
+  # No privilege is gained (the attacker must already create files in ~/.mythical/ as the operator,
+  # who could simply write mythical.conf directly), so this is hardening, not a hole being closed. But
+  # "silently adopts foreign content and reports success" is not a failure mode to ship, and the same
+  # check that refuses it also refuses a hardlinked or foreign-owned mythical.conf for free.
+  _mi_conf_identity_ok "$f" || return 1
 
   # Never overwrite a file we cannot read. A config that does not parse may be an operator's
   # half-finished edit or a hostile write; either way, silently rewriting it destroys evidence and
@@ -499,6 +573,11 @@ mi_conf_product_path() {
 
 # Refuse a config file whose identity is not its own (§4.1a). rc 0 ok, 1 refused (reported).
 #
+# Defined HERE, in the <product>.conf section, because that is the file the plan scoped it to — but
+# mi_conf_family_add ABOVE also calls it now (see the note at that call). Bash resolves a function
+# name when the call runs, not when the caller is defined, and every module is sourced before any
+# function is invoked, so the ordering is a reading convenience only.
+#
 # The symlink check alone is NOT sufficient: a hardlink is a second name for the same inode, not a
 # link at the path level, so every symlink test passes it. brokkr.conf hardlinked to mythical.conf
 # turns a product write into a write to the host-only file; hardlinked to bin/mythical-ctl it
@@ -542,7 +621,11 @@ _mi_conf_identity_ok() {
   # 1 and shift nothing. A `stat` format string is not portable and `find -printf` is GNU-only.
   # shellcheck disable=SC2012   # parsing ls is deliberate here; see the link-count note above
   owner="$(ls -ldn "$f" | awk 'NR==1{print $3}')"
-  me="$(id -u)"
+  # `$EUID`, not `id -u`. The EFFECTIVE uid is the identity the kernel actually enforces writes
+  # against, which is what this comparison is about; the real uid is a different question that only
+  # happens to have the same answer in an ordinary invocation. It is also a bash builtin, so it costs
+  # no fork. The file's own owner still comes from `ls -ldn` field 3 — no portable `stat` spells it.
+  me="$EUID"
   # Guarded exactly like the link count: an unreadable identity is a refusal, never an assumption
   # that the file is ours.
   case "$owner" in ''|*[!0-9]*) mi_warn "config: cannot read the owner of $f — refusing"; return 1 ;; esac
@@ -617,9 +700,15 @@ _mi_conf_snap() {
 # perfectly valid marker. That is a CONTENT race, distinct from residual 8's pathname race, and
 # unlike that one it is closable: read the bytes once and never look at the file again.
 _mi_conf_snap_load() {
-  local snap="$1" label="$2" spec="$3" records rc
-  # Control bytes first: binary or CR-laden content is hostile input, not a torn write.
-  if ! _mi_conf_bytes_ok "$snap"; then
+  local snap="$1" label="$2" spec="$3" records rc brc
+  # Control bytes first: binary or CR-laden content is hostile input, not a torn write. An UNREADABLE
+  # buffer (rc 2) gets its own message — see _mi_conf_bytes_ok. Same `if cmd; then rc=0; else rc=$?;
+  # fi` shape as everywhere else in this module, and for the same reason.
+  if _mi_conf_bytes_ok "$snap"; then brc=0; else brc=$?; fi
+  if [ "$brc" -eq 2 ]; then
+    mi_warn "config: cannot read $label — refusing to parse it"; return 1
+  fi
+  if [ "$brc" -ne 0 ]; then
     mi_warn "config: $label contains control bytes — refusing to parse it"; return 1
   fi
   # A file not ending in a newline was cut mid-line: torn, like a bad marker.
@@ -708,6 +797,27 @@ mi_conf_product_load() {
 }
 
 # Merge KEY/VALUE pairs into a product's config. Requires the family lock.
+#
+# rc: 0 written, or already exactly these values (a no-op success)
+#     1 refused, and the file is left untouched — bad arity, a bad product name, a key or value the
+#       spec refuses, the same key twice, a failed identity check, or a concurrent change
+#     4 an EXISTING file did not load: torn, or valid bytes that are not valid config. Refused rather
+#       than merged into, because merging would re-bless damaged content with a fresh, valid marker
+#     5 WRITTEN, BUT NOT TO THE DOCUMENTED OWNERSHIP SPEC (see below)
+#
+# rc 5's THREE states. The bytes are committed and the marker is valid in all three — which is what
+# separates 5 from 1 — but the file does not carry the mode and group the format publishes:
+#
+#   (a) the family group could not be set; the mode was forced to 0600. The product's own settings
+#       screen cannot write the file at all.
+#   (b) the family group WAS set, but mode 0660 could not be applied. The group is correct; only the
+#       mode is wrong.
+#   (c) neither the family group NOR the 0600 fallback could be applied. The mode is neither 0660 nor
+#       0600 and has to be inspected by hand.
+#
+# Each branch's message names its own state, because a caller keying on rc 5 to tell an operator "the
+# family group could not be set" would be printing a false diagnosis in case (b), where the group is
+# exactly right. docs/CONFIG-FORMAT.md enumerates the same three.
 #
 # Pairs are ARGUMENTS, not records on stdin. A newline-delimited record stream cannot tell a newline
 # INSIDE a caller's value from a deliberate second record, so `printf '%s\t%s\n' "$k" "$v"` with a
@@ -907,9 +1017,10 @@ mi_conf_product_add() {
 
   # D60: owner=operator, 0660, group = the canonical family gid, applied NUMERICALLY.
   #
-  # When chgrp FAILS this returns rc 5 — "written, but NOT to D60's spec" — never 0. The file is left
-  # at 0600, because 0660 owned by the operator's PRIMARY group would grant unrelated local users
-  # access while granting the container none: strictly worse than 0600 on both counts.
+  # Every failure below returns rc 5 — "written, but not to the documented ownership spec" — never 0
+  # and never 1. Where chgrp fails the file is left at 0600, because 0660 owned by the operator's
+  # PRIMARY group would grant unrelated local users access while granting the container none: strictly
+  # worse than 0600 on both counts.
   #
   # rc 5 exists because reporting success here would be a lie with consequences: D3 makes the
   # product's UI the editor of its own settings, and without the group that UI cannot write the file
@@ -917,22 +1028,33 @@ mi_conf_product_add() {
   # is the calling verb's decision (Plan 4), not a library default. See "Decisions" item 5 for the
   # gap in D60 this exposes.
   #
-  # Both chmod failures below return 5, NOT 1, and the reason is the rc contract rather than taste. By
-  # this point the bytes are COMMITTED — the content write has landed and the marker is valid — whereas
-  # every other rc 1 in this module means "refused, and the file was left untouched". rc 5 is precisely
-  # "written, but not to D60's spec", which is exactly what an unset mode is. Returning 1 here told a
-  # Plan 4 caller keying on that documented distinction the opposite of the truth.
+  # NOT rc 1, and the reason is the rc contract rather than taste. By this point the bytes are
+  # COMMITTED — the content write has landed and the marker is valid — whereas every other rc 1 in this
+  # module means "refused, and the file was left untouched". Returning 1 here told a Plan 4 caller
+  # keying on that documented distinction the opposite of the truth.
+  #
+  # The three states are ENUMERATED in this function's header, and each message below names ITS OWN.
+  # What was stale was the PUBLISHED contract, not the returns: the interface and docs/CONFIG-FORMAT.md
+  # described rc 5 as the single state "the family group could not be set (0600)", so a caller keying on
+  # rc 5 and relaying that sentence printed a false diagnosis in case (b) — where the group is correct
+  # and the mode is the only thing wrong. The behaviour was already right; the contract now says so, and
+  # the messages below are explicit enough that an operator can tell which state they are in.
   if chgrp "$gid" "$f" 2>/dev/null; then
     if ! chmod 660 "$f"; then
+      # (b) group correct, mode not applied.
       mi_warn "config: wrote $f and set the family group $gid, but could not set mode 0660 on it."
+      mi_warn "  The group IS set; only the mode is not, so the file is at whatever mode it already had."
       return 5
     fi
     return 0
   fi
   if ! chmod 600 "$f"; then
+    # (c) neither the group nor the fallback mode was applied.
     mi_warn "config: wrote $f, but could not set the family group $gid OR mode 0600 on it."
+    mi_warn "  Its mode is therefore neither 0660 nor 0600 — check it by hand before relying on it."
     return 5
   fi
+  # (a) group not set, mode forced to 0600.
   mi_warn "config: wrote $f, but could not set the family group $gid on it."
   mi_warn "  It is mode 0600. The product's own settings screen will be READ-ONLY until the group is set."
   return 5

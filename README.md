@@ -68,9 +68,15 @@ not, because nothing here mounts anything yet:
 
 Both files are `KEY=value` text. They are **never** executed — `mythical-ctl` parses them with a
 strict non-executing reader that allowlists keys and validates values by type, so a line like
-`KEY=$(...)` is refused rather than run. `mythical.conf` is host-only and never mounted into any
-container; `<product>.conf` is the only file a product can see or write, and no value in it reaches
-a container-launch argument. The format is specified in [`docs/CONFIG-FORMAT.md`](docs/CONFIG-FORMAT.md).
+`KEY=$(...)` is refused rather than run. That reader is built and tested today.
+
+The **split between the two files** is the design, not shipped behaviour, for the same reason as
+everything else above: `mythical.conf` is to stay host-only and never be mounted into any container;
+`<product>.conf` is to be the only file a product can see or write; and the code that eventually
+launches a container is to build its arguments without reading any value out of it. None of that is
+enforced here yet, because nothing in this repository mounts a file or launches a container — those
+obligations belong to the code that does, and this repository does not yet contain it. The format
+itself is specified in [`docs/CONFIG-FORMAT.md`](docs/CONFIG-FORMAT.md).
 
 Nothing is scattered across your home directory: every file you are expected to read or edit is
 in there.
@@ -93,7 +99,8 @@ helper creates missing directories and touches nothing else, and the config laye
 construction — it appends a key that is absent, refuses to change one that is already set to
 something else, and leaves every other byte, comment and blank line exactly as it found them.
 **Do not read it as a guarantee over your data yet** — nothing here touches a transcript or a log at
-all, and the only files it writes are the two configuration files.
+all. The only files it writes are the two configuration files and its own bookkeeping under `.state/`
+(the operation lock and the state ledger), which is the installer's, not an editing surface.
 
 ## Siblings
 

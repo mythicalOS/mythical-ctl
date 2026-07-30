@@ -29,15 +29,20 @@ doc_hash_finished() { # recipe 2: hash a finished conf minus its last line
 }
 
 # The marker prefix as the DOCUMENT spells it, not as the code exports it. Every fixture below builds
-# its marker line from this literal, so a fixture cannot be "right" merely because it agrees with the
-# constant it is supposed to be checking. One test compares the two on purpose.
+# — and strips — its marker line using THIS literal and nothing else, so a fixture cannot be "right"
+# merely because it agrees with the constant it is supposed to be checking. One test compares the two
+# on purpose; it is the only place in this file where the code's constant appears.
+#
+# The claim used to be false: one fixture built its marker from $MI_CONF_MARKER_PREFIX and two more
+# spelled the prefix inline a third time. A suite whose entire value is being written from the
+# published document cannot borrow the code's constant to build the input it feeds the code.
 DOC_MARKER='#mythical-conf-sha256='
 
 @test "both documented recipes agree with the CLI, on a multi-line body" {
   mi_conf_product_add brokkr "$SPEC" "$TEST_GID" MYTHICAL_BROKKR_RETENTION 30 MYTHICAL_BROKKR_THEME dark
   local f written
   f="$(mi_conf_product_path brokkr)"
-  written="$(tail -n1 "$f")"; written="${written#\#mythical-conf-sha256=}"
+  written="$(tail -n1 "$f")"; written="${written#"$DOC_MARKER"}"
   [ "$written" = "$(doc_hash_finished "$f")" ]
   sed '$d' "$f" > "$MYTHICAL_HOME/body.txt"
   [ "$written" = "$(doc_hash_stream "$MYTHICAL_HOME/body.txt")" ]
@@ -49,7 +54,7 @@ DOC_MARKER='#mythical-conf-sha256='
   printf 'MYTHICAL_BROKKR_RETENTION=7\nMYTHICAL_BROKKR_THEME=light\n' > "$MYTHICAL_HOME/body.txt"
   sum="$(doc_hash_stream "$MYTHICAL_HOME/body.txt")"
   cp "$MYTHICAL_HOME/body.txt" "$f"
-  printf '#mythical-conf-sha256=%s\n' "$sum" >> "$f"
+  printf '%s%s\n' "$DOC_MARKER" "$sum" >> "$f"
   run mi_conf_product_load brokkr "$SPEC"
   [ "$status" -eq 0 ]
   [[ "$output" == *"MYTHICAL_BROKKR_RETENTION"$'\t'"7"* ]]
@@ -72,10 +77,10 @@ DOC_MARKER='#mythical-conf-sha256='
 }
 
 # The document and the code must not drift apart on the one string every other implementation
-# has to hard-code.
+# has to hard-code. This is the ONE test that may name both sides — it exists to compare them.
 @test "the marker prefix in the document matches the constant in the code" {
-  [ "$MI_CONF_MARKER_PREFIX" = '#mythical-conf-sha256=' ]
-  grep -Fq "$MI_CONF_MARKER_PREFIX" "${_MCTL_ROOT}/docs/CONFIG-FORMAT.md"
+  [ "$MI_CONF_MARKER_PREFIX" = "$DOC_MARKER" ]
+  grep -Fq "$DOC_MARKER" "${_MCTL_ROOT}/docs/CONFIG-FORMAT.md"
 }
 
 # The document says quotes are NOT stripped — prove it, because it is the single most likely thing
@@ -87,7 +92,7 @@ DOC_MARKER='#mythical-conf-sha256='
   body='MYTHICAL_BROKKR_THEME="dark"'
   printf '%s\n' "$body" > "$MYTHICAL_HOME/body.txt"
   sum="$(doc_hash_stream "$MYTHICAL_HOME/body.txt")"
-  printf '%s\n%s%s\n' "$body" "$MI_CONF_MARKER_PREFIX" "$sum" > "$f"
+  printf '%s\n%s%s\n' "$body" "$DOC_MARKER" "$sum" > "$f"
   run mi_conf_product_load brokkr "$SPEC"
   [ "$status" -eq 1 ]          # rejected by the enum, not by the marker gate
 }

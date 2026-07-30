@@ -10,13 +10,70 @@ follow it is rejected, and rejection is not a bug.
 |---|---|---|
 | Who writes it | the operator, or `mythical-ctl` | the operator, `mythical-ctl`, or the product's UI |
 | Mounted into a container | **never** | yes — as a single file, read-write |
-| Mode | 0600 | 0660 (0600 if the family group cannot be set) |
+| Owner | the user running `mythical-ctl` | the user running `mythical-ctl` |
+| Mode | 0600 | 0660 — see [When the mode and group cannot be set](#when-the-mode-and-group-cannot-be-set) |
+| Group | not constrained — 0600 makes it irrelevant | the family group |
 | Integrity marker | no | **yes**, required |
 | Whole-file size ceiling | none | **1048576 bytes** |
+| Key-count ceiling | **1024 keys** | **1024 keys** |
 | Holds | host secrets and the launch spec | that product's own settings |
 
 A product's UI writes **only** `<product>.conf`. `mythical.conf` is not mounted into any container,
 and no value in `<product>.conf` ever reaches a container-launch argument.
+
+## Ownership and identity
+
+`mythical-ctl` checks **what the path is**, not only what it contains, and refuses it outright if any
+of the requirements below is not true. These are as normative as the syntax: a file that fails one is
+rejected with the file left untouched — no partial write, and no fallback to defaults either, because
+this is a refusal and not a torn-file report.
+
+Where the check runs, exactly, because it is not symmetrical:
+
+- **`<product>.conf` — on every read and every write.** It is the bind-mounted, container-writable
+  file, so its path is the one an attacker can reshape.
+- **`mythical.conf` — before every write.** It is host-only and never mounted, so the check is
+  hardening rather than a boundary; reading it goes through the generic reader, which does not repeat
+  it.
+
+| Requirement | Why |
+|---|---|
+| **Owned by the user running `mythical-ctl`** | The owner is the only identity that can reliably set the mode and group afterwards. A file owned by someone else can still be *writable* by us — on a rootful container runtime with no userid remapping, a compromised container can `chown 0:0 <product>.conf; chmod 0666` — so without this check the content write succeeds and only the `chgrp`/`chmod` fail, leaving a rewritten file that is root-owned and world-writable. |
+| **A regular file** | A fifo or device node is not a configuration file, and reading one can block forever. |
+| **Not a symlink** | Following one writes to a path of whoever planted the link's choosing, and *reads* the link target's content as though it were this product's configuration. |
+| **Link count exactly 1** | A hardlink is a second name for the **same inode**, not a link at the path level, so every symlink test passes it. `brokkr.conf` hardlinked to `mythical.conf` turns a product write into a write to the host-only file; hardlinked to the CLI it rewrites the CLI. This installer created the file, so nothing legitimately shares its inode. |
+
+**This is the rule most likely to surprise an implementer**, because none of it is visible in the
+file's bytes. Any path that produces the file as a *different* user yields a permanent rejection that
+nothing in the content explains — a UI that creates the file as a service account, a recovery
+procedure run under `sudo`, a restore from a tarball unpacked by another user, or a `cp` performed as
+root.
+
+**The remedy is to fix the ownership, not the content**: `chown <operator> ~/.mythical/<product>.conf`
+(and remove any extra hardlink to it, or replace the symlink with a real file), then re-read. If the
+file's content is intact it will load unchanged. A UI creating the file for the first time should
+create it **in place, as the operator**, rather than writing it elsewhere and moving it in.
+
+### When the mode and group cannot be set
+
+`<product>.conf` is meant to end up **owned by the operator, mode 0660, group = the family group** —
+that combination is what lets the product's own settings screen write the file while nobody else can.
+Setting the group requires the operator to be *in* that group, and that is not always true on the
+machine where the write happens.
+
+When it is not, the write still lands — the bytes and the marker are committed — but the file does
+**not** carry the ownership above, and `mythical-ctl` reports that as a distinct outcome:
+**written, but not to the documented ownership spec.** It is not a success, and it is not a refusal.
+There are exactly three shapes of it, and the message says which:
+
+| State | What is true | What the operator has to do |
+|---|---|---|
+| The group could not be set | Mode was forced to **0600** — deliberately, because 0660 owned by the operator's *primary* group would grant unrelated local users access while granting the container none. | Add the operator to the family group and run the same command again; a repeat write with the same values changes no bytes and re-applies the mode and group. |
+| The group **was** set, mode 0660 was not | The group is correct. Only the mode is wrong, and the file is at whatever mode it already had. | `chmod 660` the file. Nothing is wrong with the group. |
+| Neither the group nor the 0600 fallback could be applied | The mode is **neither** 0660 nor 0600 and has to be inspected. | Check the mode and ownership by hand before relying on the file. |
+
+A caller must not collapse these into one message. "The family group could not be set" is a false
+diagnosis in the second row, where the group is exactly right.
 
 ## Syntax
 
@@ -43,6 +100,31 @@ and no value in `<product>.conf` ever reaches a container-launch argument.
 
 The file is never `source`d, `eval`d or shell-expanded by anything that reads it, so `$(…)` and
 `` `…` `` are inert. They are refused anyway, so that a reader never has to reason about it.
+
+## Values are additionally validated against a type
+
+Obeying every rule above is **necessary and not sufficient.** After the syntax passes, each key's
+value is checked against a **type**, declared for that key by the schema the product ships. A file
+that is syntactically perfect is still rejected wholesale if any value does not fit its type — an
+over-long `str:`, an `int:` with a leading zero, an `enum` value containing `|`.
+
+The types, and the rules an implementer would not guess:
+
+| Type | Accepts | The non-obvious part |
+|---|---|---|
+| `str:<maxlen>` | any permitted value, up to `<maxlen>` | `<maxlen>` is **bytes**, like the 4096-byte value cap: a 5-character accented value is 10 bytes. |
+| `int:<min>:<max>` | decimal digits, within the inclusive range | **Non-negative only.** No sign, no leading `+`, no surrounding space — and **no leading zero**, because a leading zero would be re-read as *octal* and `010` would compare as 8, letting a textually out-of-range value validate. `0` on its own is fine. Signed values are not supported at all; a schema writing `int:-10:10` is a schema bug, not a value that should validate. |
+| `enum:<a>\|<b>\|<c>` | exactly one listed member | A member **cannot contain `\|`**: it is the separator and the format has no escaping. A value containing one is refused rather than matched. Comparison is exact — not a prefix, not a substring, and the empty value is never a member. |
+| `bool` | exactly `true` or `false` | Nothing else. Not `1`, `0`, `yes`, `on`, or `True` — the comparison is case-sensitive. |
+| `path:<maxlen>` | an absolute path, up to `<maxlen>` bytes | Must start with `/`, and must contain **no `..` component**. A `..` inside a *name* is fine: `/srv/..hidden` is a legitimate path, `/srv/../etc` is not. |
+| `netname` | a container-network name: `[A-Za-z0-9]` then `[A-Za-z0-9_.-]*` | Additionally refuses `host`, `none` and `container:<name>` — those are network *modes*, not networks this installer may own. |
+
+Every one of these is evaluated in byte order, so the same file validates identically whatever locale
+the reader is running under.
+
+**The schema itself is not part of this document.** Which keys exist for a product, and which type
+each one carries, is declared by that product and can change with it; this section fixes only what
+each type *means*. `mythical.conf`'s own keys are core-owned.
 
 ## The integrity marker
 
@@ -176,6 +258,23 @@ the only writers are the operator and this CLI.
 
 1 MiB is far beyond any legitimate configuration — at the 4096-byte value cap it is hundreds of
 settings.
+
+## The key-count ceiling
+
+A file containing **more than 1024 assignments is refused**, before any of them is used, with a
+message naming the cap. The boundary is inclusive: 1024 keys is accepted, 1025 is refused. Unlike the
+size ceiling, this applies to **both** files.
+
+It is a separate limit because the size ceiling bounds the *bytes* a reader copies, not the *work* it
+does. The duplicate-key check is quadratic in the number of keys, so a file well inside 1 MiB can cost
+minutes of CPU: measured, 14000 short valid keys is 240 KB and took 22 seconds, and 20000 keys is
+349 KB and took 46. Since a mutating write holds the family operation lock while it reads, an
+oversized-by-key-count file would block every other product's install or reconfigure for as long as
+it took to parse.
+
+1024 is far above anything legitimate for the same reason 1 MiB is: 1 MiB divided by the 4096-byte
+value cap is about 256 maximal settings. If a product genuinely needs more than a thousand keys in one
+file, it needs a different storage mechanism, not a larger config file.
 
 ## Writing safely
 

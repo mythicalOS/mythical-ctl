@@ -150,6 +150,50 @@ EOF
   diff -u "$MYTHICAL_HOME/before" "$f"
 }
 
+# --- identity (hardening, beyond what the plan scoped) --------------------------------------------
+# The plan put the §4.1a identity checks on the container-writable <product>.conf only, reasoning that
+# mythical.conf is host-only and not attacker-controlled. True of the threat, and it still left a bad
+# failure mode. Reproduced before the check was added here: with mythical.conf planted as a SYMLINK to
+# a file holding MYTHICAL_NET=planted, mi_conf_family_add returned 0, replaced the symlink with a real
+# 0600 file, left the link target untouched — and ADOPTED the target's content into mythical.conf,
+# while the value the installer was asked to write ended up in a file nothing reads. It reported
+# success. Bounded (the attacker must already be able to create files in ~/.mythical/ as the operator,
+# who could write mythical.conf directly), so no privilege is gained — but "silently adopts foreign
+# content and reports success" is not a failure mode to ship.
+@test "a symlinked mythical.conf is refused, not followed and adopted" {
+  local f target
+  f="$(mi_conf_family_path)"
+  target="$MYTHICAL_HOME/planted-target"
+  printf 'MYTHICAL_NET=planted\n' > "$target"; chmod 600 "$target"
+  ln -s "$target" "$f"
+
+  run mi_conf_family_add MYTHICAL_TELEMETRY_KEY tok
+  [ "$status" -ne 0 ]
+  # Explicit form, not a bare `[[ … ]]`: bash 3.2 does not apply errexit to a failing `[[ ]]`, so a
+  # bare one continues and only the test's last command decides pass/fail. Verified on 3.2.57.
+  [[ "$output" == *symlink* ]] || { echo "the refusal does not name the symlink: $output" >&2; return 1; }
+  # still a symlink: nothing was created through it, and nothing replaced it with a real file
+  [ -L "$f" ]
+  # the target is byte-identical — neither written to nor adopted from
+  [ "$(cat "$target")" = "MYTHICAL_NET=planted" ]
+  [ "$(wc -l < "$target" | tr -d ' ')" -eq 1 ]
+}
+
+# The same gate refuses the other identity the symlink test cannot catch: a hardlink is a second name
+# for the same inode, not a link at the path level, so `[ -L ]` passes it.
+@test "a hardlinked mythical.conf is refused, leaving the other name untouched" {
+  local f other
+  f="$(mi_conf_family_path)"; other="$MYTHICAL_HOME/other-name"
+  printf 'MYTHICAL_NET=n\n' > "$other"; chmod 600 "$other"
+  ln "$other" "$f"
+
+  run mi_conf_family_add MYTHICAL_TELEMETRY_KEY tok
+  [ "$status" -ne 0 ]
+  [[ "$output" == *hardlinked* ]] \
+    || { echo "the refusal does not name the hardlink: $output" >&2; return 1; }
+  [ "$(cat "$other")" = "MYTHICAL_NET=n" ]
+}
+
 @test "an existing file that does not parse is never overwritten" {
   local f; f="$(mi_conf_family_path)"
   printf 'MYTHICAL_NET=`id`\n' > "$f"; chmod 600 "$f"

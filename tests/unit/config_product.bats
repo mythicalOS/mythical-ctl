@@ -84,6 +84,14 @@ plant_conf() {
   [ "$(ls -l "$f" | awk 'NR==1{print substr($1,1,10)}')" = "-rw-------" ]
   [ "$(ls -ldn "$f" | awk 'NR==1{print $4}')" != "4294967000" ]
   [[ "$output" == *"READ-ONLY"* ]]
+  # rc 5 has THREE states and this is state (a). Each message must name its own, so that a caller
+  # keying on rc 5 to explain it to an operator cannot print a diagnosis belonging to another state.
+  #
+  # `|| { …; return 1; }` rather than a bare `[[ … ]]`: bash 3.2 does not apply errexit to a failing
+  # `[[ ]]`, so on macOS a bare one continues and only the test's LAST command decides pass/fail —
+  # verified on 3.2.57, where a bare assertion for a message that had been deleted still passed.
+  [[ "$output" == *"could not set the family group"* ]] \
+    || { echo "state (a) does not name the group failure: $output" >&2; return 1; }
 }
 
 # The critical property: a bind-mounted file must keep its inode across a rewrite.
@@ -192,6 +200,11 @@ EOF
 
 # rc 1 in this module means "refused, file untouched" everywhere else, so a chmod failure — which
 # happens AFTER the bytes have landed — must not borrow it. That state is exactly what rc 5 names.
+#
+# rc 5 is reached from THREE states, and the interface publishes only one of them ("the family group
+# could not be set (0600)") — so a caller keying on rc 5 to tell an operator that would print a false
+# diagnosis in state (b) below, where the group is exactly right and only the mode is wrong. The
+# behaviour is correct; the messages have to be distinguishable. Both halves below assert that.
 @test "a chmod failure after the bytes have landed reports rc 5, not rc 1" {
   local shim="$BATS_TEST_TMPDIR/chmodshim" f
   mkdir -p "$shim"
@@ -203,19 +216,36 @@ EOF
   chmod +x "$shim/chmod"                          # real chmod: the shim is not on PATH yet
   f="$(mi_conf_product_path brokkr)"
 
-  # chgrp SUCCEEDS, chmod 660 fails.
+  # STATE (b): chgrp SUCCEEDS, chmod 660 fails. The group is correct.
+  #
+  # Every message assertion below uses `|| { …; return 1; }` rather than a bare `[[ … ]]`: bash 3.2
+  # does not apply errexit to a failing `[[ ]]`, so on macOS a bare one continues and only the test's
+  # LAST command decides pass/fail. Verified on 3.2.57 by deleting the message these assert and
+  # watching the bare form still pass.
   PATH="$shim:$PATH" run write_conf
   [ "$status" -eq 5 ]
-  [[ "$output" == *"0660"* ]]
+  [[ "$output" == *"0660"* ]] || { echo "state (b) does not name mode 0660: $output" >&2; return 1; }
+  # …and the message says the group IS set, rather than blaming it. This is the false diagnosis the
+  # single-message version invited: "the family group could not be set" is simply untrue here.
+  [[ "$output" == *"The group IS set"* ]] \
+    || { echo "state (b) does not say the group is set: $output" >&2; return 1; }
+  [[ "$output" != *"could not set the family group"* ]] \
+    || { echo "state (b) falsely blames the family group: $output" >&2; return 1; }
+  [ "$(ls -ldn "$f" | awk 'NR==1{print $4}')" = "$TEST_GID" ]     # the group really is the family gid
   # The distinction rc 5 carries and rc 1 would deny: the content is committed and readable.
   [ -f "$f" ]
   [ "$(pget MYTHICAL_BROKKR_RETENTION)" = "30" ]
 
-  # chgrp FAILS and so does the 0600 fallback — still rc 5, with its own message, and NOT the
-  # "It is mode 0600" claim, which would now be false.
+  # STATE (c): chgrp FAILS and so does the 0600 fallback — still rc 5, with its own message, and NOT
+  # the "It is mode 0600" claim, which would now be false.
   PATH="$shim:$PATH" run write_records_gid 4294967000 MYTHICAL_BROKKR_RETENTION 30
   [ "$status" -eq 5 ]
-  [[ "$output" == *"OR mode 0600"* ]]
+  [[ "$output" == *"OR mode 0600"* ]] \
+    || { echo "state (c) does not name both failures: $output" >&2; return 1; }
+  [[ "$output" == *"neither 0660 nor 0600"* ]] \
+    || { echo "state (c) does not say the mode is unknown: $output" >&2; return 1; }
+  [[ "$output" != *"It is mode 0600"* ]] \
+    || { echo "state (c) claims mode 0600, which it could not set: $output" >&2; return 1; }
   [ "$(pget MYTHICAL_BROKKR_RETENTION)" = "30" ]
 }
 
