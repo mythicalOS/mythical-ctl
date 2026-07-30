@@ -80,7 +80,10 @@ main() {
                 mi_trust_anchor_get mi_trust_anchor_set mi_index_spec mi_index_load mi_accept_index \
                 mi_trust_check_only mi_trust_commit mi_trust_check \
                 mi_policy_doc_spec mi_policy_entitlement_spec mi_policy_load mi_policy_permits \
-                mi_policy_family_gid mi_accept_policy mi_policy_bindable; do
+                mi_policy_family_gid mi_accept_policy mi_policy_bindable \
+                mi_manifest_spec mi_manifest_load mi_manifest_image mi_manifest_launched \
+                mi_manifest_check mi_manifest_core_ok mi_accept_manifest \
+                mi_name_volume mi_name_container mi_name_network mi_name_alias; do
         if ! declare -F "$_f" >/dev/null 2>&1; then
           printf 'mythical-ctl: missing library function: %s\n' "$_f" >&2
           exit 1
