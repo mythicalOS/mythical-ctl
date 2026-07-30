@@ -45,6 +45,54 @@ _mi_led_field_ok() {
   [ "${#f}" -le 1024 ]
 }
 
+# THE SAME RULE, ON EVERY INPUT THAT REACHES THE SERIALIZER — which was the defect, not the rule.
+# A record is `<kind>` TAB `<field>` TAB `<field>`…, so the KIND is written to the same line by the
+# same function, and a TAB or newline in it forges precisely what a TAB or newline in a field forges:
+#
+#   mi_led_put $'identity\tid=forged\nobject' … 'x=y'
+#
+# wrote an `identity` record carrying `id=forged` followed by a second record, and the identity
+# reader then answered `forged`. Validating one of the three arguments is not validating the rule.
+#
+# A kind is a CLOSED vocabulary (the five constants at the top of this file), so it is held to the
+# grammar those already use rather than merely scrubbed of the two dangerous bytes: a kind outside
+# the grammar is a caller bug whatever it contains.
+_mi_led_kind_ok() {
+  case "$1" in ''|*[!a-z_]*) return 1 ;; esac
+  [ "${#1}" -le 64 ]
+}
+
+# <kind> [<key-field> <key-value>] — the arguments every entry point of the editor takes (mi_led_all
+# has no selector; the other three do). The selector IS a field split in two: it has to equal a
+# serialized field byte for byte to match one, so it is judged by the FIELD rule rather than by a
+# second rule that would drift from it. A selector no field could ever equal supersedes nothing and
+# deletes nothing, silently.
+_mi_led_args_ok() {
+  if ! _mi_led_kind_ok "$1"; then
+    mi_warn "prov: refusing ledger record kind '$1' — a kind is lowercase letters and underscore"
+    return 1
+  fi
+  if [ "$#" -eq 3 ] && ! _mi_led_field_ok "${2}=${3}"; then
+    mi_warn "prov: refusing ledger key selector '${2}=${3}' — a selector is one key=value field"
+    return 1
+  fi
+  return 0
+}
+
+# Judge a whole field list. It lives beside the rule rather than inside mi_led_put because
+# mi_prov_tombstone serializes a record itself and must reach the identical check — two copies of a
+# serialization rule drift, and this one is the difference between a record and a forged record.
+_mi_led_fields_ok() {
+  local f
+  for f in "$@"; do
+    if ! _mi_led_field_ok "$f"; then
+      mi_warn "prov: refusing to write ledger field '$f' — fields are key=value, with no tab or newline"
+      return 1
+    fi
+  done
+  return 0
+}
+
 # Does <record> carry <field>=<value>? Used to key an edit.
 _mi_led_record_matches() {
   local record="$1" field="$2" value="$3" tok
@@ -65,12 +113,10 @@ mi_led_put() {
   if [ "$#" -lt 4 ]; then mi_warn "prov: mi_led_put needs <kind> <key-field> <key-value> <field>..."; return 1; fi
   local kind="$1" kf="$2" kv="$3"; shift 3
   mi_lock_assert_held "record installer state"
+  _mi_led_args_ok "$kind" "$kf" "$kv" || return 1
   local f rec="" records line out=""
+  _mi_led_fields_ok "$@" || return 1
   for f in "$@"; do
-    if ! _mi_led_field_ok "$f"; then
-      mi_warn "prov: refusing to write ledger field '$f' — fields are key=value, with no tab or newline"
-      return 1
-    fi
     rec="${rec}"$'\t'"${f}"
   done
   if records="$(mi_ledger_read)"; then :; else
@@ -98,6 +144,7 @@ mi_led_del() {
   if [ "$#" -ne 3 ]; then mi_warn "prov: mi_led_del needs <kind> <key-field> <key-value>"; return 1; fi
   local kind="$1" kf="$2" kv="$3" records line out=""
   mi_lock_assert_held "remove installer state"
+  _mi_led_args_ok "$kind" "$kf" "$kv" || return 1
   if records="$(mi_ledger_read)"; then :; else
     local rc=$?
     [ "$rc" -eq 3 ] && return 0
@@ -119,6 +166,7 @@ mi_led_del() {
 mi_led_find() {
   if [ "$#" -ne 3 ]; then mi_warn "prov: mi_led_find needs <kind> <key-field> <key-value>"; return 1; fi
   local kind="$1" kf="$2" kv="$3" records line
+  _mi_led_args_ok "$kind" "$kf" "$kv" || return 1
   records="$(mi_ledger_read)" || return $?
   while IFS= read -r line; do
     [ -n "$line" ] || continue
@@ -136,6 +184,7 @@ mi_led_find() {
 mi_led_all() {
   if [ "$#" -ne 1 ]; then mi_warn "prov: mi_led_all needs <kind>"; return 1; fi
   local kind="$1" records line
+  _mi_led_args_ok "$kind" || return 1
   records="$(mi_ledger_read)" || return $?
   while IFS= read -r line; do
     [ -n "$line" ] || continue
@@ -314,13 +363,28 @@ mi_prov_find() {
 # removed and keeps the rest.
 mi_prov_tombstone() {
   if [ "$#" -ne 2 ]; then mi_warn "prov: mi_prov_tombstone needs <class> <name>"; return 1; fi
-  local class="$1" name="$2" rec nonce="" gen="0" records line out=""
+  local class="$1" name="$2" rec nonce="" gen="0" records line out="" key trec
   _mi_prov_class_ok "$class" || return 1
   mi_lock_assert_held "tombstone an object"
+  key="$(_mi_prov_key "$class" "$name")"
+
+  # THIS FUNCTION IS THE THIRD WRITER, and it is the one that does NOT go through mi_led_put — it
+  # serializes its own record below. So the field rule has to be applied here too, or <name> reaches
+  # the serializer unchecked and a newline in it forges a whole record exactly as it would through
+  # mi_led_put. `key=` is judged in its FIELD form because that is also its SELECTOR form: the two
+  # are the same string, and a selector no record could ever equal supersedes nothing, silently.
+  #
+  # `class` is already closed by _mi_prov_class_ok. `nonce` and `gen` are NOT re-checked, and that is
+  # a statement about the format rather than an omission: both come back out of mi_led_field, which
+  # splits a single line on TAB, so neither can contain a TAB or a newline however the ledger got
+  # written. The kind is this module's own constant. What remains variable is what is checked.
+  _mi_led_fields_ok "key=${key}" "name=${name}" || return 1
+
   if rec="$(mi_prov_find "$class" "$name")"; then
     nonce="$(mi_led_field "$rec" nonce)" || nonce=""
     gen="$(mi_led_field "$rec" gen)" || gen=0
   fi
+  trec=$'\t'"key=${key}"$'\t'"class=${class}"$'\t'"name=${name}"$'\t'"nonce=${nonce}"$'\t'"gen=${gen}"
   records="$(mi_ledger_read)" || {
     local rc=$?; [ "$rc" -eq 3 ] || return "$rc"; records="";
   }
@@ -330,15 +394,15 @@ mi_prov_tombstone() {
       "$MI_PROV_KIND"$'\t'*)
         # CLASS AND NAME, not name alone: a container and a volume can derive the same name (see
         # _mi_prov_key), and tombstoning one must not silently erase the other's provenance.
-        if _mi_led_record_matches "${line#*$'\t'}" key "$(_mi_prov_key "$class" "$name")"; then continue; fi ;;
+        if _mi_led_record_matches "${line#*$'\t'}" key "$key"; then continue; fi ;;
       "$MI_PROV_TOMB"$'\t'*)
         # A second removal of the same object supersedes the earlier tombstone rather than appending
         # beside it — otherwise a reinstall/uninstall cycle accumulates one tombstone per generation.
-        if _mi_led_record_matches "${line#*$'\t'}" key "$(_mi_prov_key "$class" "$name")"; then continue; fi ;;
+        if _mi_led_record_matches "${line#*$'\t'}" key "$key"; then continue; fi ;;
     esac
     out="${out}${line}"$'\n'
   done <<< "$records"
-  out="${out}${MI_PROV_TOMB}"$'\t'"key=$(_mi_prov_key "$class" "$name")"$'\t'"class=${class}"$'\t'"name=${name}"$'\t'"nonce=${nonce}"$'\t'"gen=${gen}"$'\n'
+  out="${out}${MI_PROV_TOMB}${trec}"$'\n'
   printf '%s' "$out" | mi_ledger_write
 }
 
@@ -421,12 +485,30 @@ mi_prov_authority() {
 # rc 0 genuinely first use · 3 a ledger exists (not first use) · 1 INCONSISTENT (reported).
 mi_first_use() {
   local h; h="$(mi_home)"
-  if [ -f "$h/.state/ledger" ]; then return 3; fi
+  local led="$h/.state/ledger"
+
+  # PRESENCE IS THE EVIDENCE, NOT READABILITY — and `-f` asks the wrong question. A failed or partial
+  # restore leaves `.state/ledger` as a DIRECTORY, or as a dangling symlink; `-f` is false for both,
+  # so with no other trace beside it the machine was declared fresh, and a fresh machine is one this
+  # installer initialises over. `-e` alone does not close it either: `-e` follows the link, so a
+  # dangling symlink is invisible to it too. `-L` is what sees the link itself.
+  if [ -f "$led" ]; then return 3; fi
+  if [ -e "$led" ] || [ -L "$led" ]; then
+    mi_warn "prov: the installer state ledger is present but is not a regular file — a directory, a"
+    mi_warn "  dangling symlink or a device node, which is what a failed restore leaves behind."
+    mi_warn "  Something is there, so this is not a first install; it is inconsistent, and it is"
+    mi_warn "  reported rather than initialised over."
+    mi_warn "  Run 'mythical-ctl state repair'."
+    return 1
+  fi
 
   local found=""
   local p
   for p in "$h"/*.conf; do
-    [ -e "$p" ] || continue
+    # Presence, again: a DANGLING symlink named <product>.conf is as much a trace of a previous
+    # installation as a readable file is, and `-e` alone cannot see one. (An unmatched glob is
+    # neither, so the literal `*.conf` is still skipped here.)
+    [ -e "$p" ] || [ -L "$p" ] || continue
     case "$(basename "$p")" in mythical.conf) continue ;; esac   # the family file alone is not product state
     found="${found} $(basename "$p")"
   done
@@ -438,7 +520,9 @@ mi_first_use() {
 
   # A STAGING ledger is its own third state (§6c/D59): an in-progress restore is not first use and not
   # inconsistent. Reported here so ordinary commands refuse and name it rather than proceeding.
-  if [ -f "$h/.state/ledger.staging" ]; then
+  # Any presence at the path is the marker, for the same reason as the active ledger above — a
+  # restore that failed while creating it is exactly the case this branch exists to catch.
+  if [ -e "$h/.state/ledger.staging" ] || [ -L "$h/.state/ledger.staging" ]; then
     mi_warn "prov: there is no active ledger, but a restore is in progress (.state/ledger.staging)."
     mi_warn "  Resume it with 'mythical-ctl restore --resume', or abandon it with 'restore --abandon'."
     return 1
@@ -460,14 +544,32 @@ mi_first_use() {
   # previous install or a collision — both of which make "fresh machine" false. A find-by-label sweep
   # cannot stand in for this: every label filter needs the installation identity as its value, and the
   # identity is precisely what is missing.
-  local anyobj="" kind
+  #
+  # AND AN EMPTY ANSWER IS NOT THE SAME FACT AS NO ANSWER. The listings used to swallow every
+  # failure, so a daemon that was down, absent from PATH, or refusing to answer produced three empty
+  # listings and this function returned 0 — genuinely first use — off the strength of a question it
+  # never got to ask. That is a fail-open on the single thing this function decides, and it inverts
+  # the rule the whole module is built on: every other function here refuses when it cannot
+  # establish a fact. Refuse here too, and say which listing failed.
+  local anyobj="" unasked="" kind names n
   for kind in container volume network; do
-    local n
-    while IFS= read -r n; do
-      [ -n "$n" ] || continue
-      case "$n" in "${MI_NAME_PREFIX}-"*) anyobj="${anyobj} ${kind}:${n}" ;; esac
-    done <<< "$(_mi_prov_list_all "$kind")"
+    if names="$(_mi_prov_list_all "$kind")"; then
+      while IFS= read -r n; do
+        [ -n "$n" ] || continue
+        case "$n" in "${MI_NAME_PREFIX}-"*) anyobj="${anyobj} ${kind}:${n}" ;; esac
+      done <<< "$names"
+    else
+      unasked="${unasked} ${kind}"
+    fi
   done
+  if [ -n "$unasked" ]; then
+    mi_warn "prov: there is no installer state ledger, and the container runtime could not be asked"
+    mi_warn "  what it holds (${unasked# })."
+    mi_warn "  Labelled objects survive removing the home directory entirely, so 'no ledger' is only"
+    mi_warn "  a first install once the runtime has ANSWERED that it holds none of ours."
+    mi_warn "  Start the container runtime and run this again."
+    return 1
+  fi
   if [ -n "$anyobj" ]; then
     mi_warn "prov: there is no installer state ledger, but the container runtime already holds"
     mi_warn "  labelled or family-named objects:${anyobj}"
@@ -480,10 +582,17 @@ mi_first_use() {
 
 # List every object of <kind>, unfiltered. Only mi_first_use needs this — everything else works from
 # labels, because §6a rejects names as reassignable. Kept private for that reason.
+#
+# rc 0 the runtime ANSWERED and this is its listing, empty or not · non-zero it could not be asked.
+# The `|| true` these arms used to carry reported "there is nothing there" for "I could not look",
+# which is the one conclusion the caller must never reach by default. And the case statement had no
+# default arm, so an unknown kind fell through to rc 0 with no output — the same fail-open one level
+# down, from a typo rather than from a down daemon.
 _mi_prov_list_all() {
   case "$1" in
-    container) _mi_rt container ls -a --format '{{.Names}}' 2>/dev/null || true ;;
-    network)   _mi_rt network   ls    --format '{{.Name}}'  2>/dev/null || true ;;
-    volume)    _mi_rt volume    ls    --format '{{.Name}}'  2>/dev/null || true ;;
+    container) _mi_rt container ls -a --format '{{.Names}}' 2>/dev/null ;;
+    network)   _mi_rt network   ls    --format '{{.Name}}'  2>/dev/null ;;
+    volume)    _mi_rt volume    ls    --format '{{.Name}}'  2>/dev/null ;;
+    *)         mi_warn "prov: '$1' is not a listable object kind"; return 1 ;;
   esac
 }

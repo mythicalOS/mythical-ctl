@@ -251,3 +251,86 @@ teardown() { mi_lock_release; teardown_test_env; }
   run mi_first_use
   [ "$status" -eq 3 ]
 }
+
+# --- the module's rules applied to EVERY input, not to one of them --------------------------------
+# Each test below is a case where a rule this file states in prose was enforced on one of the inputs
+# it reaches and not on the others. They are grouped because they are one defect repeated, not three.
+
+@test "a runtime that CANNOT BE ASKED is not evidence of a fresh machine" {
+  # Labelled objects outlive `rm -rf` of the home entirely, which is the only reason they are swept
+  # at all. An empty listing because the daemon refused to answer is not the same fact as an empty
+  # listing, and only the second is first-use evidence.
+  FAKE_DOCKER_DOWN=1 run mi_first_use
+  [ "$status" -eq 1 ]
+  assert_contains "could not be asked"
+}
+
+@test "an unlistable object kind is a listing FAILURE, not an empty listing" {
+  # The same fail-open one level down: the lister's case statement had no default arm, so an
+  # unknown kind returned 0 with no output — indistinguishable from "asked, and there are none".
+  run _mi_prov_list_all zebra
+  [ "$status" -ne 0 ]
+  assert_contains "not a listable"
+}
+
+@test "the record KIND is validated too — it is serialized exactly like a field is" {
+  id="$(mi_ident_ensure)"
+  # A TAB forges a field boundary and a newline forges a whole record. That rule was applied to the
+  # appended fields and not to the kind, which is written to the same line by the same function.
+  run mi_led_put "$(printf 'identity\tid=forged\nobject')" ignored ignored "x=y"
+  [ "$status" -ne 0 ]
+  run mi_ident_get
+  [ "$status" -eq 0 ]
+  [ "$output" = "$id" ] || { echo "identity forged through the record kind: '$output'" >&2; return 1; }
+}
+
+@test "the key SELECTOR is validated too — it is one field split in two" {
+  mi_ident_ensure >/dev/null
+  run mi_led_put object "$(printf 'na\tme')" x "class=container"
+  [ "$status" -ne 0 ]
+  run mi_led_put object name "$(printf 'a\nb')" "class=container"
+  [ "$status" -ne 0 ]
+  # And the key half obeys the key grammar, because the selector has to match a serialized field
+  # byte for byte — a selector no field can ever equal silently supersedes nothing.
+  run mi_led_put object Name x "class=container"
+  [ "$status" -ne 0 ]
+}
+
+@test "a tombstone cannot forge a record through the object NAME it serializes" {
+  id="$(mi_ident_ensure)"
+  # mi_prov_tombstone builds its own record rather than going through mi_led_put, so it reaches the
+  # serializer without passing the field rule — the third input, and the one nobody had checked.
+  run mi_prov_tombstone volume "$(printf 'v1\nidentity\tid=forged')"
+  [ "$status" -ne 0 ]
+  run mi_ident_get
+  [ "$status" -eq 0 ]
+  [ "$output" = "$id" ] || { echo "identity forged through a tombstone name: '$output'" >&2; return 1; }
+}
+
+@test "a ledger path that is a DIRECTORY is inconsistent, not a fresh machine" {
+  mkdir -p "$MYTHICAL_HOME/.state/ledger"
+  run mi_first_use
+  [ "$status" -eq 1 ]
+  assert_contains "not a regular file"
+}
+
+@test "a DANGLING SYMLINK at the ledger path is inconsistent, not a fresh machine" {
+  ln -s "$MYTHICAL_HOME/.state/gone" "$MYTHICAL_HOME/.state/ledger"
+  run mi_first_use
+  [ "$status" -eq 1 ]
+  assert_contains "not a regular file"
+}
+
+@test "a STAGING ledger that is not a regular file still blocks first use" {
+  mkdir -p "$MYTHICAL_HOME/.state/ledger.staging"
+  run mi_first_use
+  [ "$status" -eq 1 ]
+  assert_contains "restore is in progress"
+}
+
+@test "a DANGLING SYMLINK product conf is a trace too — presence is the test, not readability" {
+  ln -s "$MYTHICAL_HOME/gone.conf" "$MYTHICAL_HOME/brokkr.conf"
+  run mi_first_use
+  [ "$status" -eq 1 ]
+  assert_contains "brokkr.conf"
+}
