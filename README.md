@@ -47,9 +47,11 @@ product carried its own install script with its own conventions — different vo
 environment variables, different ideas about where configuration lives. A user who installed two of
 them met two different models, and the shared parts drifted apart with every change.
 
-`mythical-ctl` is the common half, written once: container-runtime preflight, the `~/.mythical/`
+`mythical-ctl` is that common half, written once: container-runtime preflight, the `~/.mythical/`
 layout, reading and validating configuration, volume and bind lifecycle, and the lifecycle verbs.
-Products contribute a manifest describing themselves, and nothing more.
+Products contribute a manifest describing themselves, and nothing more. That is the **design** — of
+it, the layout and the configuration layer are built and tested today; the preflight, the volume and
+bind lifecycle and the verbs are not (see the status note at the top).
 
 ## One place for everything you edit
 
@@ -110,8 +112,12 @@ small enough to read.
 
 ## Requirements
 
-**To run the CLI:** bash and a container runtime. No language runtime is required to install a
-product, which is why this is written in shell.
+**To run the CLI as it stands:** bash, and nothing else. It answers `--version` and `--help`, and its
+library layer needs only bash builtins, the usual POSIX text tools, and `sha256sum` or `shasum -a 256`.
+
+**A container runtime** is required by the lifecycle verbs, which are not implemented yet — so it is a
+requirement of the design, not of this release. It is listed here because it is the reason this is
+written in shell at all: no language runtime is required to install a product.
 
 **To install**, you additionally need **`curl`** and **`mktemp`** — the sequence above downloads the
 bootstrap to a temp file and checks its HTTP status before executing anything, rather than piping a
