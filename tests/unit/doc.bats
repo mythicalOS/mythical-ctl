@@ -66,6 +66,29 @@ doc() { printf 'mythical-manifest 1\n%s\n' "$1" > "$F"; }
   [ "$status" -eq 1 ]
 }
 
+# Every byte-gate failure used to be reported as "contains control bytes (NUL, CR, TAB or similar)",
+# including a file that exists and simply cannot be OPENED — see lib/config.sh's mi_conf_scan, which
+# fixed the same conflation. _mi_conf_bytes_ok returns 2 for unreadable and 1 for a control byte
+# precisely so the caller can tell them apart; mi_doc_scan must branch on that instead of collapsing
+# both into one message.
+@test "an unreadable document is reported as unreadable, not as containing control bytes" {
+  # Not staged as root: root reads a mode-000 file regardless, so there the fixture would simply be
+  # readable and the test would assert the wrong thing rather than fail honestly.
+  if [ "$EUID" -eq 0 ]; then skip "root bypasses mode 000, so an unreadable file cannot be staged"; fi
+  doc 'product=brokkr'
+  chmod 000 "$F"
+  run mi_doc_scan "$F" manifest
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"cannot read"* ]] \
+    || { echo "an unreadable document was not reported as unreadable: $output" >&2; return 1; }
+  [[ "$output" != *"control bytes"* ]] \
+    || { echo "an unreadable document was blamed on control bytes: $output" >&2; return 1; }
+  # …and the same file, readable, parses fine — so the message above is about the mode and nothing else.
+  chmod 600 "$F"
+  run mi_doc_scan "$F" manifest
+  [ "$status" -eq 0 ]
+}
+
 @test "keys are lowercase with an optional single dotted prefix" {
   local k
   for k in 'Product' 'PRODUCT' 'pro duct' 'pro-duct' '.product' 'product.' 'a.b.c' ''; do
@@ -95,6 +118,36 @@ doc() { printf 'mythical-manifest 1\n%s\n' "$1" > "$F"; }
   run mi_doc_scan "$F" manifest
   [ "$status" -eq 0 ]
   [ "${#lines[@]}" -eq 2 ]
+}
+
+# --- the key-count cap ---
+#
+# mi_doc_scan builds its `body` string one key at a time, and every `body+=...` append copies the
+# whole string accumulated so far — the same class of superlinear cost lib/config.sh's MI_CONF_MAXKEYS
+# bounds, just without that scanner's separate quadratic duplicate check (mi_doc_scan allows repeats;
+# cardinality is mi_doc_load's job). Measured on this code path with no cap: 1000 keys 1.23s, 2000
+# keys 2.72s, 4000 keys 6.66s — and mi_doc_scan sits on the path this plan calls host-launch authority.
+#
+# awk builds the fixture: an append loop of this length costs seconds under bats' per-command DEBUG
+# trap, for no benefit.
+many_doc_keys() {   # <n> <file> — N "volume=state:/data" lines under a valid manifest header
+  { printf 'mythical-manifest 1\n'; awk -v n="$1" 'BEGIN{for(i=0;i<n;i++)print "volume=state:/data"}'; } > "$2"
+}
+
+@test "the key-count cap is exact: 1024 keys accepted, 1025 refused, and names the cap" {
+  local f="$MYTHICAL_HOME/many.txt"
+  [ "$MI_DOC_MAXKEYS" -eq 1024 ]
+  many_doc_keys 1024 "$f"
+  run mi_doc_scan "$f" manifest
+  [ "$status" -eq 0 ]
+  [ "${#lines[@]}" -eq 1024 ]
+  many_doc_keys 1025 "$f"
+  run mi_doc_scan "$f" manifest
+  [ "$status" -eq 1 ]
+  # `|| { …; return 1; }`, not a bare `[[ ]]`: bash 3.2 does not apply errexit to a failing `[[ ]]`
+  # unless it is the body's final command.
+  [[ "$output" == *"more than 1024 keys"* ]] \
+    || { echo "the refusal does not name the cap: $output" >&2; return 1; }
 }
 
 @test "a missing file reports rc 3" {
@@ -139,6 +192,38 @@ doc() { printf 'mythical-manifest 1\n%s\n' "$1" > "$F"; }
   run mi_doc_load "$F" manifest "$SPEC"
   [ "$status" -eq 1 ]
   [[ "$output" == *bindable_role* ]]
+}
+
+# <label> exists so a caller validating a private SNAPSHOT (Task 2 closes a TOCTOU this way) can
+# still report the operator's real pathname while every byte examined comes from the snapshot.
+# mi_doc_load forwards $label into mi_doc_scan correctly, but its own four diagnostics (unknown key,
+# bad type, cardinality violation, missing required key) printed the raw path instead.
+@test "mi_doc_load's diagnostics report the label, not the raw file path" {
+  local label="/home/operator/real-manifest.mf"
+
+  doc "$(printf 'product=brokkr\nversion=1\nbindable_role=secrets')"   # unknown key
+  run mi_doc_load "$F" manifest "$SPEC" "$label"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"$label"* ]] || { echo "label missing (unknown key): $output" >&2; return 1; }
+  [[ "$output" != *"$F"* ]] || { echo "raw path leaked (unknown key): $output" >&2; return 1; }
+
+  doc "$(printf 'product=brokkr\nversion=x')"                          # bad type
+  run mi_doc_load "$F" manifest "$SPEC" "$label"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"$label"* ]] || { echo "label missing (bad type): $output" >&2; return 1; }
+  [[ "$output" != *"$F"* ]] || { echo "raw path leaked (bad type): $output" >&2; return 1; }
+
+  doc "$(printf 'product=brokkr\nversion=1\nport=1\nport=2')"          # cardinality violation
+  run mi_doc_load "$F" manifest "$SPEC" "$label"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"$label"* ]] || { echo "label missing (cardinality): $output" >&2; return 1; }
+  [[ "$output" != *"$F"* ]] || { echo "raw path leaked (cardinality): $output" >&2; return 1; }
+
+  doc 'version=1'                                                      # missing required key
+  run mi_doc_load "$F" manifest "$SPEC" "$label"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"$label"* ]] || { echo "label missing (missing key): $output" >&2; return 1; }
+  [[ "$output" != *"$F"* ]] || { echo "raw path leaked (missing key): $output" >&2; return 1; }
 }
 
 # --- the spec itself (amendment A8) ---
@@ -192,6 +277,84 @@ doc() { printf 'mythical-manifest 1\n%s\n' "$1" > "$F"; }
     doc "$(printf 'product=brokkr\nversion=%s' "$v")"
     run mi_doc_load "$F" manifest "$SPEC"
     [ "$status" -eq 1 ] || { echo "accepted bad docver '$v'" >&2; return 1; }
+  done
+}
+
+# digestref, productdigest and coreversion had zero test coverage — three of the nine new types in
+# the most privileged input layer, and each is exactly the kind of %/%%/#/## parameter-expansion
+# boundary logic that fails silently. A dedicated spec is used because $SPEC (above) declares none
+# of them.
+HEXA='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+HEXB='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+
+@test "digestref requires <repository>@sha256:<64 hex>, exactly one @" {
+  local spec; spec="$(printf 'ref\tdigestref\topt')"
+  doc "ref=brokkr@sha256:${HEXA}"
+  run mi_doc_load "$F" manifest "$spec"
+  [ "$status" -eq 0 ] || { echo "rejected a valid digestref: $output" >&2; return 1; }
+
+  # Two "@sha256:" occurrences: `%` strips the SHORTEST trailing match, which is the LAST occurrence,
+  # leaving an '@' inside what mi_doc_load treats as the repository — caught by the "exactly one @"
+  # check. Worth a test rather than a sentence: this is the kind of boundary that silently drifts.
+  doc "ref=repo@sha256:${HEXA}@sha256:${HEXB}"
+  run mi_doc_load "$F" manifest "$spec"
+  [ "$status" -eq 1 ] || { echo "accepted a digestref with two @sha256: occurrences" >&2; return 1; }
+
+  local v
+  for v in 'brokkr' 'brokkr@sha256:tooshort' "brokkr@sha256:${HEXA}x" '@sha256:'"$HEXA"; do
+    doc "ref=${v}"
+    run mi_doc_load "$F" manifest "$spec"
+    [ "$status" -eq 1 ] || { echo "accepted invalid digestref '$v'" >&2; return 1; }
+  done
+}
+
+@test "digestref's repository component is constrained: lowercase, digits, . _ - / : only" {
+  local spec; spec="$(printf 'ref\tdigestref\topt')"
+  local v
+  for v in 'Brokkr' 'BROKKR' 'brokkr;pwned' '/brokkr' 'brokkr/' 'brokkr:' ':brokkr'; do
+    doc "ref=${v}@sha256:${HEXA}"
+    run mi_doc_load "$F" manifest "$spec"
+    [ "$status" -eq 1 ] || { echo "accepted invalid repository '$v'" >&2; return 1; }
+  done
+  # A legitimate registry-host-with-port, multi-segment repository is still accepted — the digest
+  # half carries the security property; this is only a sanity bound on the half that does not.
+  doc "ref=registry.example.com:5000/team/brokkr@sha256:${HEXA}"
+  run mi_doc_load "$F" manifest "$spec"
+  [ "$status" -eq 0 ] || { echo "rejected a legitimate registry:port repository: $output" >&2; return 1; }
+}
+
+@test "productdigest requires <product>:<64 hex>, exactly one colon" {
+  local spec; spec="$(printf 'pd\tproductdigest\topt')"
+  doc "pd=brokkr:${HEXA}"
+  run mi_doc_load "$F" manifest "$spec"
+  [ "$status" -eq 0 ] || { echo "rejected a valid productdigest: $output" >&2; return 1; }
+
+  # Two colons: must be refused rather than resolving to the first, exactly like the spec-duplicate-key
+  # rule above — a second delimiter is ambiguity, not data.
+  doc "pd=brokkr:extra:${HEXA}"
+  run mi_doc_load "$F" manifest "$spec"
+  [ "$status" -eq 1 ] || { echo "accepted a productdigest with two colons" >&2; return 1; }
+
+  local v
+  for v in 'brokkr' "BROKKR:${HEXA}" 'brokkr:tooshort'; do
+    doc "pd=${v}"
+    run mi_doc_load "$F" manifest "$spec"
+    [ "$status" -eq 1 ] || { echo "accepted invalid productdigest '$v'" >&2; return 1; }
+  done
+}
+
+@test "coreversion is MAJOR[.MINOR[.PATCH]], bounded numeric components" {
+  local spec; spec="$(printf 'cv\tcoreversion\topt')"
+  local v
+  for v in '1' '1.2' '1.2.3' '0.0.1'; do
+    doc "cv=${v}"
+    run mi_doc_load "$F" manifest "$spec"
+    [ "$status" -eq 0 ] || { echo "rejected valid coreversion '$v'" >&2; return 1; }
+  done
+  for v in '' '1.' '.1' '1..2' '1.2.3.4' '1.x'; do
+    doc "cv=${v}"
+    run mi_doc_load "$F" manifest "$spec"
+    [ "$status" -eq 1 ] || { echo "accepted invalid coreversion '$v'" >&2; return 1; }
   done
 }
 

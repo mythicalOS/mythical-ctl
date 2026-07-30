@@ -17,6 +17,19 @@
 
 MI_DOC_FORMAT=1
 
+# Per-document KEY COUNT cap, enforced by mi_doc_scan INSIDE its read loop — for the same reason
+# lib/config.sh's MI_CONF_MAXKEYS is: the cost this bounds is incurred WHILE accumulating, so checking
+# it afterwards would bound nothing. mi_doc_scan does not scan for duplicates (repeats are meaningful
+# here — cardinality is mi_doc_load's job), but it does build a `body` string one key at a time, and
+# every `body="${body}..."` append copies the whole string accumulated so far, so the total work is
+# superlinear in the number of keys. Measured on this code path with no cap: 1000 keys 1.23s, 2000
+# keys 2.72s, 4000 keys 6.66s — and mi_doc_scan sits on the path this plan calls host-launch authority,
+# so an attacker able to grow a manifest could grow the cost of merely reading it.
+#
+# 1024 matches lib/config.sh's MI_CONF_MAXKEYS for the same reason: generous for any real document,
+# cheap to reject once exceeded.
+MI_DOC_MAXKEYS=1024
+
 # A key is lowercase, and may carry ONE dotted prefix (`brokkr.permitted_role`) so the policy index
 # can scope entries by product without needing nesting. Exactly one dot: `a.b.c` would imply a
 # hierarchy this format does not have, and silently accepting it invites one.
@@ -54,17 +67,27 @@ _mi_doc_bare_key_ok() {
 # byte examined comes from the snapshot.
 mi_doc_scan() {
   if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then mi_warn "doc: mi_doc_scan needs a <file>, a <type> and an optional <label>"; return 1; fi
-  # Named "f", not "f": lib/ledger.sh's mi_ledger_get uses a plain local `f` as an ARRAY
-  # (`read -a f`), and once the modules are inlined into one file by tools/bundle.sh, shellcheck's
-  # SC2178/SC2128 track a variable name across the WHOLE flattened script rather than per function —
-  # reusing `f` here as a scalar would read, in the bundle only, as reassigning an array to a string.
-  local f="$1" type="$2" label="${3:-$1}"
+  # `f` is a safe scalar name here: lib/ledger.sh's mi_ledger_get is the one function in this
+  # repository that needs an array-typed local, and it names that local `fields` for exactly this
+  # reason — see the note there.
+  local f="$1" type="$2" label="${3:-$1}" brc
   [ -f "$f" ] || return 3
 
   # Same byte gate as the config reader, and for the same reason: a bash string cannot hold a NUL,
   # so a grep/read-based check physically cannot see one. Reused rather than reimplemented — one
   # audited implementation of this check, not two.
-  if ! _mi_conf_bytes_ok "$f"; then
+  #
+  # `if cmd; then rc=0; else rc=$?; fi`, not `if ! cmd; then rc=$?; fi`: inside the then-branch of a
+  # NEGATED condition `$?` is the status of the `!`, which is 0 — see lib/config.sh's mi_conf_scan,
+  # which has the same shape for the same reason. _mi_conf_bytes_ok returns 2 for an unreadable file
+  # and 1 for a control byte so the two can be told apart; collapsing both into one message sends an
+  # operator with a permission problem after a hostile-content problem instead.
+  if _mi_conf_bytes_ok "$f"; then brc=0; else brc=$?; fi
+  if [ "$brc" -eq 2 ]; then
+    mi_warn "doc: cannot read $label — refusing to parse it"
+    return 1
+  fi
+  if [ "$brc" -ne 0 ]; then
     mi_warn "doc: $label contains control bytes (NUL, CR, TAB or similar) — refusing to parse it"
     return 1
   fi
@@ -73,7 +96,7 @@ mi_doc_scan() {
     return 1
   fi
 
-  local first line key val n=0 body=""
+  local first line key val n=0 keys=0 body=""
   while IFS= read -r line; do
     n=$((n + 1))
     if [ "$n" -eq 1 ]; then
@@ -95,6 +118,14 @@ mi_doc_scan() {
     # record), no $ ` \, bounded length, no leading or trailing space.
     if ! _mi_conf_value_ok "$val"; then
       mi_warn "doc: $label line $n: value for $key contains a forbidden character or is too long"
+      return 1
+    fi
+    # The key-count cap, checked BEFORE the body accumulation below — which is the step it exists to
+    # bound: every `body="${body}..."` append copies the whole string accumulated so far, so the cost
+    # is incurred WHILE accumulating. Checking it afterwards would bound nothing. See MI_DOC_MAXKEYS.
+    keys=$(( keys + 1 ))
+    if [ "$keys" -gt "$MI_DOC_MAXKEYS" ]; then
+      mi_warn "doc: $label line $n: more than $MI_DOC_MAXKEYS keys — refusing to parse it"
       return 1
     fi
     body="${body}${key}"$'\t'"${val}"$'\n'
@@ -145,6 +176,15 @@ _mi_doc_type_ok() {
       local repo="${v%@sha256:*}" hex="${v##*@sha256:}"
       [ -n "$repo" ] || return 1
       case "$repo" in *@*) return 1 ;; esac      # exactly one @
+      # The digest half is what carries the security property here — it pins the image to one exact
+      # content hash, so a floating reference is structurally impossible. This is only a SANITY bound
+      # on the half that does NOT carry that property: lowercase letters, digits, and `. _ - / :` (a
+      # registry host may need a port), non-empty, capped at 255, and not starting or ending on a
+      # separator. OCI repository names are already required to be lowercase, so this rejects nothing
+      # a real registry would ever hand back.
+      if [ "${#repo}" -gt 255 ]; then return 1; fi     # an `if`, not A && B || C (A6)
+      case "$repo" in *[!a-z0-9._/:-]*) return 1 ;; esac
+      case "$repo" in /*|:*|*/|*:) return 1 ;; esac
       _mi_doc_type_ok sha256 "$hex" ;;
     productdigest)
       # <product>:<64 hex> — the family index's flat encoding of "this product's manifest must
@@ -237,8 +277,8 @@ _mi_doc_spec_lookup() {   # <spec> <key> → prints "TYPE<TAB>CARD"; rc 1 if not
 # consumer a PREFIX of a rejected document — and this document decides which image to run.
 mi_doc_load() {
   if [ "$#" -lt 3 ] || [ "$#" -gt 4 ]; then mi_warn "doc: mi_doc_load needs a <file>, a <type>, a <spec> and an optional <label>"; return 1; fi
-  # "f", not "f" — see mi_doc_scan's note: lib/ledger.sh's mi_ledger_get uses `f` as an array,
-  # and the two collide only once tools/bundle.sh inlines every module into one flat file.
+  # `f` is safe as a scalar here too — see mi_doc_scan's note: the array-typed local in
+  # lib/ledger.sh's mi_ledger_get is named `fields`, not `f`.
   local f="$1" type="$2" spec="$3" label="${4:-$1}" records rc=0 line key val tc tp card seen="" out=""
   # The schema is checked before the document is, so a schema bug is never reported as a document
   # error and can never silently relax a requirement (amendment A8).
@@ -254,19 +294,19 @@ mi_doc_load() {
     key="${line%%$'\t'*}"
     val="${line#*$'\t'}"
     if ! tc="$(_mi_doc_spec_lookup "$spec" "$key")"; then
-      mi_warn "doc: $f: unknown key $key — not permitted by this document's schema"
+      mi_warn "doc: $label: unknown key $key — not permitted by this document's schema"
       rc=1; continue
     fi
     tp="${tc%%$'\t'*}"; card="${tc#*$'\t'}"
     if ! _mi_doc_type_ok "$tp" "$val"; then
-      mi_warn "doc: $f: value for $key is not valid for type $tp"
+      mi_warn "doc: $label: value for $key is not valid for type $tp"
       rc=1; continue
     fi
     case "$card" in
       many) : ;;
       one|opt)
         case "$seen" in
-          *"|${key}|"*) mi_warn "doc: $f: $key may appear at most once"; rc=1; continue ;;
+          *"|${key}|"*) mi_warn "doc: $label: $key may appear at most once"; rc=1; continue ;;
         esac ;;
       *) mi_warn "doc: internal error — unknown cardinality '$card' for $key"; rc=1; continue ;;
     esac
@@ -283,7 +323,7 @@ mi_doc_load() {
     if [ "$card" = "one" ]; then
       case "$seen" in
         *"|${key}|"*) : ;;
-        *) mi_warn "doc: $f: required key $key is missing"; rc=1 ;;
+        *) mi_warn "doc: $label: required key $key is missing"; rc=1 ;;
       esac
     fi
   done <<< "$spec"
