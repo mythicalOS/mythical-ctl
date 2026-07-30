@@ -6,9 +6,11 @@ The installer and lifecycle CLI for the **mythicalOS** family of local-first con
 > answers `--version` and `--help` and nothing else. What is built and tested is the foundation the
 > verbs will stand on: the `~/.mythical/` layout and its ownership rules, a single atomic
 > fail-closed state ledger, a family operation lock, the two-config-file layer with its
-> non-executing parser, and a hermetic test harness. Everything below describing
-> `install`/`start`/`stop` is the **design**, not shipped behaviour — read it as what this is for,
-> not what it does today. The products themselves are not published yet either.
+> non-executing parser, the authenticated-document trust chain (family index, family policy index,
+> per-product manifests, and the `/detect` version contract), and a hermetic test harness.
+> Everything below describing `install`/`start`/`stop` is the **design**, not shipped behaviour —
+> read it as what this is for, not what it does today. The products themselves are not published
+> yet either.
 >
 > The install command below **does** work — but it is served by
 > [get.mythicalos.ai](https://get.mythicalos.ai), which installs product containers directly; it
@@ -82,6 +84,14 @@ itself is specified in [`docs/CONFIG-FORMAT.md`](docs/CONFIG-FORMAT.md).
 
 Nothing is scattered across your home directory: every file you are expected to read or edit is
 in there.
+
+Beyond those two files, this project also builds and tests a separate, more privileged
+authenticated-document layer that the lifecycle commands will call on once they land: a family
+index, a family policy index, and each product's manifest, chained back to a single authenticated
+root, plus a small bounded reader for a product's own version out of its `/detect` response. That
+contract — the grammar, the trust model, and exactly which keys a manifest may and may not declare
+— is published in [`docs/DOCUMENT-FORMAT.md`](docs/DOCUMENT-FORMAT.md) for product authors and
+index publishers who need it without reading this repository's source.
 
 **It is not the whole install, though.** Product state — and each product's own secrets store —
 lives in named container volumes, and the containers, images and shared network live in your

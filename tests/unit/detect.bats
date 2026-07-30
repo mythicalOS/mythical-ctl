@@ -1,0 +1,132 @@
+#!/usr/bin/env bats
+load '../lib/test_helper'
+
+setup() { setup_test_env; load_mctl; }
+
+J='{"product":"brokkr","version":"0.1.13","ui_url":"http://localhost:7480/","components":{"ui":"0.1.12","daemon":"0.1.13"},"image_version":"0.1.13"}'
+
+@test "the three required flat fields are extracted" {
+  [ "$(mi_detect_field "$J" product)" = "brokkr" ]
+  [ "$(mi_detect_field "$J" version)" = "0.1.13" ]
+  [ "$(mi_detect_field "$J" ui_url)"  = "http://localhost:7480/" ]
+}
+
+@test "whitespace around the colon is tolerated" {
+  [ "$(mi_detect_field '{ "product" : "brokkr" }' product)" = "brokkr" ]
+}
+
+@test "an absent field reports rc 3, distinct from unreadable" {
+  run mi_detect_field "$J" nothing
+  [ "$status" -eq 3 ]
+}
+
+# The nested object must not be mistaken for a flat field.
+@test "a nested field is reported unreadable, never guessed at" {
+  run mi_detect_field "$J" components
+  [ "$status" -eq 1 ]
+}
+
+@test "a value containing an escape is refused rather than mis-decoded" {
+  local j
+  for j in '{"product":"a\"b"}' '{"product":"a\\b"}' '{"product":"a\nb"}'; do
+    run mi_detect_field "$j" product
+    [ "$status" -eq 1 ] || { echo "accepted escaped value: $j" >&2; return 1; }
+  done
+}
+
+@test "a non-string value is refused" {
+  run mi_detect_field '{"product":123}' product
+  [ "$status" -eq 1 ]
+  run mi_detect_field '{"product":null}' product
+  [ "$status" -eq 1 ]
+}
+
+@test "a field name is matched whole, not as a substring" {
+  [ "$(mi_detect_field '{"ui_url":"u","url":"v"}' url)" = "v" ]
+}
+
+@test "a repeated field is refused as ambiguous" {
+  run mi_detect_field '{"product":"a","product":"b"}' product
+  [ "$status" -eq 1 ]
+}
+
+# Malformed SEQUENCING is refused too, not only malformed values. An earlier version reacted to the
+# tokens it recognised and ignored the rest, so {"a":"1" "b":"2"} — no comma — parsed happily.
+@test "malformed JSON is refused, including bad member sequencing" {
+  local j
+  for j in '{"product":"brokkr" "ignored":"v"}' \
+           '{"product""brokkr"}' \
+           '{,"product":"a"}' \
+           '{"product":"a",}' \
+           '{"product":"a":"b"}' \
+           '{"product":}' \
+           '{:"a"}' \
+           '{"a":123 "product":"x"}' \
+           '{"a":{"b":"c"} "product":"x"}' \
+           '["product","a"]' \
+           '{"product":"a"} {"product":"b"}' \
+           '{"product":"a"' \
+           'product' \
+           ''; do
+    run mi_detect_field "$j" product
+    [ "$status" -eq 1 ] || { echo "accepted malformed JSON: $j" >&2; return 1; }
+  done
+}
+
+# Grammar, not just character sets. Delimiters are MATCHED (an `[` closed by `}` would
+# desynchronise the depth counter and let a nested key be reported as top-level — the one way
+# malformed input elsewhere can make this function return a WRONG answer, as opposed to no answer);
+# bare literals must be exactly true/false/null or a JSON number; escapes must be valid.
+@test "malformed literals, delimiters and escapes are refused" {
+  local j
+  for j in '{"product":"ok","x":tru}' \
+           '{"product":"ok","x":TRUE}' \
+           '{"product":"ok","x":01}' \
+           '{"product":"ok","x":1.}' \
+           '{"product":"ok","x":+1}' \
+           '{"product":"ok","x":[}}' \
+           '{"product":"ok","x":[1,2}' \
+           '{"product":"ok","x":{"a":1]}' \
+           '{"product":"ok"}}'; do
+    run mi_detect_field "$j" product
+    [ "$status" -eq 1 ] || { echo "accepted malformed: $j" >&2; return 1; }
+  done
+  # invalid escapes, written through printf so the bytes are exact
+  local f="$BATS_TEST_TMPDIR/j"
+  printf '{"product":"ok","x":"\\q"}'      > "$f"; run mi_detect_field "$(cat "$f")" product; [ "$status" -eq 1 ]
+  printf '{"product":"ok","x":"\\u12"}'    > "$f"; run mi_detect_field "$(cat "$f")" product; [ "$status" -eq 1 ]
+  printf '{"product":"ok","x":"\\uZZZZ"}'  > "$f"; run mi_detect_field "$(cat "$f")" product; [ "$status" -eq 1 ]
+}
+
+@test "valid literals, numbers and escapes still read" {
+  [ "$(mi_detect_field '{"product":"ok","x":true}'      product)" = "ok" ]
+  [ "$(mi_detect_field '{"product":"ok","x":null}'      product)" = "ok" ]
+  [ "$(mi_detect_field '{"product":"ok","x":-12.5e-3}'  product)" = "ok" ]
+  [ "$(mi_detect_field '{"a":{},"b":[],"product":"ok"}' product)" = "ok" ]
+  local f="$BATS_TEST_TMPDIR/j"
+  printf '{"a":"\\u0041\\n\\t","product":"ok"}' > "$f"
+  [ "$(mi_detect_field "$(cat "$f")" product)" = "ok" ]
+}
+
+@test "well-formed responses with every value kind still read" {
+  [ "$(mi_detect_field '{"product":"a","n":123,"o":{"k":"v"},"arr":[1,2],"b":true,"z":null}' product)" = "a" ]
+  [ "$(mi_detect_field '{"a":{"product":"nested"},"product":"top"}' product)" = "top" ]
+  [ "$(mi_detect_field '{"a":[{"product":"in-array"}],"product":"top"}' product)" = "top" ]
+  [ "$(mi_detect_field "$(printf '{\n  "product" : "a" ,\n  "n" : 1\n}')" product)" = "a" ]
+}
+
+# --- D10: the deprecated alias ---
+
+@test "version is preferred, and image_version is the fallback" {
+  [ "$(mi_detect_version "$J")" = "0.1.13" ]
+  [ "$(mi_detect_version '{"product":"x","image_version":"9.9"}')" = "9.9" ]
+}
+
+@test "a response with neither version field reports the unknown marker, never a fabricated value" {
+  [ "$(mi_detect_version '{"product":"x"}')" = "unknown" ]
+}
+
+@test "a version is never inherited from a sibling field" {
+  run mi_detect_version '{"product":"x","components":{"ui":"1.2.3"}}'
+  [ "$output" = "unknown" ]
+}
