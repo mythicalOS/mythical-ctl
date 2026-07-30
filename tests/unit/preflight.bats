@@ -63,10 +63,47 @@ teardown() { teardown_test_env; }
   [ "$status" -ne 0 ]
 }
 
+@test "a REMOTE named pipe is refused — the scheme alone is not the locality" {
+  # A Windows named pipe is `\\<server>\pipe\<name>`, spelled `//<server>/pipe/<name>` in the endpoint
+  # URL, and the server component `.` means THIS machine. `npipe:////remote-host/pipe/docker_engine`
+  # is therefore a perfectly valid REMOTE daemon. Accepting every `npipe://*` failed open on exactly
+  # the invariant this check exists to enforce, and it failed open silently: the accept-test above
+  # passes either way, because the local form is a member of both sets.
+  FAKE_DOCKER_CONTEXT_HOST='npipe:////remote-host/pipe/docker_engine' run mi_preflight_daemon
+  [ "$status" -ne 0 ]
+  assert_contains "not local"
+
+  # Only the exact `.` component is the local machine. Anything else is refused rather than reasoned
+  # about — this is a locality gate, and a server component we have to interpret is one we cannot
+  # place on either side of it.
+  FAKE_DOCKER_CONTEXT_HOST='npipe:////../pipe/docker_engine' run mi_preflight_daemon
+  [ "$status" -ne 0 ]
+  assert_contains "not local"
+
+  DOCKER_HOST='npipe:////remote-host/pipe/docker_engine' run mi_preflight_daemon
+  [ "$status" -ne 0 ]
+  assert_contains "not local"
+}
+
 @test "an absent daemon is refused, distinctly from a policy refusal" {
   FAKE_DOCKER_DOWN=1 run mi_preflight_daemon
   [ "$status" -ne 0 ]
   assert_contains "did not answer"
+}
+
+@test "a daemon we cannot ask about rootlessness is refused, not assumed rootful" {
+  # mi_rt_rootless returns 2 for "could not ask", which is neither 0 (rootless) nor 1 (rootful), and
+  # the refusal for it was UNREACHABLE until the harness grew a knob narrow enough to produce it: the
+  # only other way to make `info` fail was FAKE_DOCKER_DOWN, which fails `version` too and therefore
+  # trips the ping refusal several lines earlier. So the arm could be replaced by `*) : ;;` with the
+  # whole suite green — an unknown daemon silently treated as rootful, which is the same error as
+  # treating an unmeasured thing as measured-clean.
+  #
+  # The assertion names the rootless message specifically: refusing for the WRONG reason (a ping
+  # failure, an unreadable context) would satisfy a bare non-zero check.
+  FAKE_DOCKER_INFO_FAIL=1 run mi_preflight_daemon
+  [ "$status" -ne 0 ]
+  assert_contains "cannot determine whether the daemon is rootless"
 }
 
 @test "a bridge network with no trusted_host_interfaces passes" {

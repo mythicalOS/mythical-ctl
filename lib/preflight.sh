@@ -41,9 +41,19 @@ _mi_pf_engine_major_ok() {
 # Is this daemon endpoint LOCAL (D30)? Bind sources resolve on the DAEMON's host, so a remote daemon
 # makes every path check in §4.1a and §5.1 validate the wrong filesystem.
 #
-# Accepted: a unix socket (including Docker Desktop's per-user socket under $HOME) and a Windows named
-# pipe — Docker Desktop's managed VM is explicitly fine, because the daemon shares the host's view of
-# the paths we bind.
+# Accepted: a unix socket (including Docker Desktop's per-user socket under $HOME) and the LOCAL form
+# of a Windows named pipe — Docker Desktop's managed VM is explicitly fine, because the daemon shares
+# the host's view of the paths we bind.
+#
+# THE PIPE SCHEME IS NOT THE LOCALITY. A named pipe is `\\<server>\pipe\<name>`, spelled
+# `//<server>/pipe/<name>` in the endpoint URL, and the server component names a MACHINE: `.` is this
+# one, anything else is another. So `npipe:////./pipe/dockerDesktopLinuxEngine` is local while
+# `npipe:////remote-host/pipe/docker_engine` is a remote daemon reached over SMB. Accepting the whole
+# scheme failed open on the single invariant this function exists to enforce, and did it invisibly —
+# the local form is a member of both sets, so an accept-test for it passes either way.
+#
+# Only the exact `.` component is accepted. A server component this code would have to interpret is
+# one it cannot place on either side of the guarantee, so it is refused rather than reasoned about.
 #
 # Refused: everything else, INCLUDING `tcp://127.0.0.1`. A loopback TCP daemon looks local and is not
 # necessarily so — it can be an SSH-forwarded port or a socket-activated proxy to another machine, and
@@ -51,7 +61,8 @@ _mi_pf_engine_major_ok() {
 # than validating paths against a filesystem that is not the one the container will see.
 _mi_pf_endpoint_local() {
   case "${1:-}" in
-    unix://*|npipe://*) return 0 ;;
+    unix://*) return 0 ;;
+    npipe:////./*) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -71,6 +82,23 @@ mi_preflight_daemon() {
 
   # Locality (D30/§4b.3). DOCKER_HOST overrides the context when set, so check it FIRST and check the
   # context only when it is unset — otherwise a remote DOCKER_HOST beside a local context passes.
+  #
+  # This precedence has been read the other way round from the documentation, so it is MEASURED here
+  # rather than argued: Docker CLI 28.3.3, against a throwaway context whose endpoint was an
+  # unreachable tcp://192.0.2.99:2376.
+  #
+  #   DOCKER_HOST=unix://… with DOCKER_CONTEXT=<that remote context>  the LOCAL daemon answered, rc 0
+  #   DOCKER_CONTEXT=<that remote context> alone — the CONTROL          timed out, so the context
+  #                                                                     really was remote and the row
+  #                                                                     above is not a false positive
+  #   DOCKER_HOST unset, DOCKER_CONTEXT=<that remote context>          `context inspect` reported the
+  #                                                                     remote endpoint
+  #
+  # So DOCKER_HOST wins, and when it is unset mi_rt_context_host already resolves whatever
+  # DOCKER_CONTEXT selected — both branches read the endpoint the CLI would actually dial, and there
+  # is no third source to consult. The `-c` / `--context` FLAG does outrank DOCKER_HOST, which is what
+  # the documentation sentence is about; this code never passes it, and a flag we do not pass is not a
+  # bypass. Do not reorder these two branches without repeating the measurement above.
   local ep
   if [ -n "${DOCKER_HOST:-}" ]; then
     ep="$DOCKER_HOST"

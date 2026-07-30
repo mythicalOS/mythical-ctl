@@ -37,6 +37,23 @@ load '../lib/test_helper'
   assert_contains "27.1.0"
 }
 
+@test "the info-failure knob breaks info ONLY, and version keeps answering" {
+  # Narrowness is the whole point, and it is asserted rather than assumed. FAKE_DOCKER_DOWN already
+  # fails every command including version; a second knob that did the same would be a duplicate, and
+  # a caller reaching for it to reproduce "the daemon answers but info does not" would silently get
+  # "the daemon is gone" instead — the condition it needs masked by a louder one that fires first.
+  FAKE_DOCKER_INFO_FAIL=1 run docker info --format '{{range .SecurityOptions}}{{.}} {{end}}'
+  [ "$status" -ne 0 ] || { echo "info still answered under the knob: $output" >&2; return 1; }
+
+  FAKE_DOCKER_INFO_FAIL=1 run docker version --format '{{.Server.Version}}'
+  [ "$status" -eq 0 ] || { echo "version must keep answering under the knob: $output" >&2; return 1; }
+  assert_contains "28.0.0"
+
+  # And it is off by default — a knob that fires unset would break every other info caller.
+  run docker info --format '{{range .SecurityOptions}}{{.}} {{end}}'
+  assert_ok
+}
+
 @test "fs snapshot is stable across a no-op and detects a new file" {
   load_mctl; mi_ensure_layout
   source "$_MCTL_ROOT/tests/harness/snapshot.sh"

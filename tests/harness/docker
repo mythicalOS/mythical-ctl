@@ -45,10 +45,18 @@
 # real daemon's mouth. The `--flag=value` spelling is implemented only where a caller uses it
 # (`--label=`, `--driver=`); elsewhere it is refused rather than accepted and ignored.
 #
-# Knobs: FAKE_DOCKER_DOWN, FAKE_DOCKER_SERVER_VERSION, FAKE_DOCKER_CLIENT_VERSION, FAKE_DOCKER_ROOTLESS,
+# Knobs: FAKE_DOCKER_DOWN, FAKE_DOCKER_INFO_FAIL, FAKE_DOCKER_SERVER_VERSION,
+#        FAKE_DOCKER_CLIENT_VERSION, FAKE_DOCKER_ROOTLESS,
 #        FAKE_DOCKER_CONTEXT_HOST, FAKE_DOCKER_PULL, FAKE_DOCKER_NET_DUPLICATE,
 #        FAKE_DOCKER_NET_DRIVER, FAKE_DOCKER_NET_DEFAULT_DRIVER, FAKE_DOCKER_NET_THI,
 #        FAKE_DOCKER_HELPER_FAIL, FAKE_DOCKER_CONNECT_FAIL, FAKE_DOCKER_DISCONNECT_SILENT
+#
+# FAKE_DOCKER_DOWN and FAKE_DOCKER_INFO_FAIL are NOT two settings of one thing. The first fails EVERY
+# command, `version` included, which is what makes the adapter's absent-vs-unreachable split
+# observable. The second fails `info` ALONE, leaving `version` answering, so a probe that reads `info`
+# can be made to report "could not ask" without the caller's earlier ping refusing first. Broadening
+# either to cover the other's case would mask a refusal the suite is meant to pin — see the `info`
+# arm below.
 #
 # The two driver knobs are NOT the same thing, and the difference is load-bearing:
 #
@@ -460,6 +468,21 @@ case "${1:-}" in
         *) die "fake docker: info accepts no arguments (got '$1')" ;;
       esac
     done
+    # FAKE_DOCKER_INFO_FAIL fabricates a daemon that ANSWERS `version` and fails `info`, and its
+    # narrowness is the entire reason it exists rather than being folded into FAKE_DOCKER_DOWN.
+    # `mi_rt_rootless` reports "could not ask" (rc 2) when this call fails, and the preflight arm that
+    # refuses on it is reached only AFTER a successful ping — which reads `version`. So the only
+    # pre-existing way to break `info`, taking the whole daemon down, trips the ping refusal several
+    # lines earlier and leaves the rootless-unknown arm unreachable: it could be replaced by a no-op
+    # with the entire suite green. A knob is what makes that refusal assertable, and a knob that also
+    # broke `version` would recreate the same masking it was added to remove.
+    #
+    # Answered AFTER the flag parse: an unimplemented flag is a CLI-side error and stays one, in this
+    # arm as in every other. The message is this fake's own wording, not a quotation of Docker's — the
+    # condition is real (a daemon whose info call errors, an API-version mismatch, a proxy forwarding
+    # /version but not /info) but the exact string a real daemon would print is not measured here, and
+    # the adapter discards it anyway.
+    [ -z "${FAKE_DOCKER_INFO_FAIL:-}" ] || die "Error response from daemon: system info is unavailable"
     if [ -n "${FAKE_DOCKER_ROOTLESS:-}" ]; then secopt='name=rootless name=seccomp '
     else secopt='name=seccomp name=apparmor '; fi
     case "$tmpl" in
