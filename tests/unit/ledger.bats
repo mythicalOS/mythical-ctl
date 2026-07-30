@@ -226,3 +226,38 @@ EOF
     || { echo "the valid ledger was replaced — it now holds: $(cat "$f")" >&2; return 1; }
   mi_ledger_read >/dev/null
 }
+
+@test "a ledger path that is a DIRECTORY is refused by both the reader and the writer" {
+  # `[ -f ]` is false for a directory, so both the reader and the writer read it as "no ledger".
+  # Measured consequence before the fix: the writer's `mv -f "$tmp" "$f"` moved the temp file INTO
+  # the directory and returned 0 — writing nothing, reporting success, and leaving a stray
+  # .ledger.XXXXXX behind on every call. Every read still said "absent", so nothing noticed; the
+  # visible symptom was a NEW installation identity minted on each invocation.
+  setup_ledger
+  rm -f "$MYTHICAL_HOME/.state/ledger"
+  mkdir -p "$MYTHICAL_HOME/.state/ledger"
+
+  run mi_ledger_read
+  [ "$status" -ne 3 ]
+  assert_contains "not a regular file"
+
+  run bash -c 'source '"$_MCTL_ROOT"'/lib/common.sh; source '"$_MCTL_ROOT"'/lib/layout.sh; source '"$_MCTL_ROOT"'/lib/lock.sh; source '"$_MCTL_ROOT"'/lib/ledger.sh; printf "kind\tk=v\n" | mi_ledger_write'
+  [ "$status" -ne 0 ]
+  [ -z "$(ls -A "$MYTHICAL_HOME/.state/ledger")" ] || { echo "the writer wrote INTO the directory" >&2; return 1; }
+}
+
+@test "a ledger path that is a DANGLING SYMLINK is refused, not treated as absent" {
+  # The other half of the same rule. Here `mv -f` would have replaced the link itself, destroying
+  # the only trace of where it pointed.
+  setup_ledger
+  rm -f "$MYTHICAL_HOME/.state/ledger"
+  ln -s "$MYTHICAL_HOME/.state/nowhere" "$MYTHICAL_HOME/.state/ledger"
+
+  run mi_ledger_read
+  [ "$status" -ne 3 ]
+  assert_contains "not a regular file"
+
+  run bash -c 'source '"$_MCTL_ROOT"'/lib/common.sh; source '"$_MCTL_ROOT"'/lib/layout.sh; source '"$_MCTL_ROOT"'/lib/lock.sh; source '"$_MCTL_ROOT"'/lib/ledger.sh; printf "kind\tk=v\n" | mi_ledger_write'
+  [ "$status" -ne 0 ]
+  [ -L "$MYTHICAL_HOME/.state/ledger" ] || { echo "the writer replaced the symlink" >&2; return 1; }
+}
