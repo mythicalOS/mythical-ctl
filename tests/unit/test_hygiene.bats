@@ -40,7 +40,7 @@ setup() { setup_test_env; }
 # reported a clean suite while missing a real decorative assertion.
 #
 # Which is why the first test exists: the detector is run against a fixture with known answers, so it
-# cannot report clean on the real suites without first proving it catches all seven shapes.
+# cannot report clean on the real suites without first proving it catches all eight shapes.
 
 # Emit "file:line: statement" for every unguarded `[[ … ]]` assertion in the given .bats files.
 # Continuation lines are joined first: `[[ … ]] \` + `|| { … }` is CORRECT, and a scanner that judged
@@ -57,14 +57,26 @@ _scan_bats() {
     #                          `true`, so the assertion is not the deciding command and is decorative.
     #                          Exempting it because its LINE was last is exactly the miss that got
     #                          through round 5.
-    function flush_stmt(   k, m, parts, seg) {
+    function flush_stmt(   j, m, semis, seg, k, q, parts, part, cond) {
       if (pending == "") return
-      m = split(pending, parts, ";")
-      for (k = 1; k <= m; k++) {
-        seg = parts[k]
+      m = split(pending, semis, ";")
+      for (j = 1; j <= m; j++) {
+        seg = semis[j]
         sub(/^[ \t]+/, "", seg); sub(/[ \t]+$/, "", seg)
         if (seg == "") continue
-        sn++; sseg[sn] = seg; sln[sn] = pending_ln; sfull[sn] = pending
+        # Does this `;`-segment OPEN a compound condition? If so, every `&&` part of it is condition
+        # context, not an assertion — `if [[ a ]] && [[ b ]]; then` must not report `[[ b ]]`.
+        cond = (seg ~ /^(if|while|until|elif|!)[ \t]/)
+        # Split on `&&` too: in `true && [[ f ]] && true` the assertion is an INTERMEDIATE command of
+        # an and-list, so errexit does not stop the body and the trailing `true` carries the status.
+        # A `;`-level split alone sees one segment beginning with `true` and never looks inside it.
+        q = split(seg, parts, "&&")
+        for (k = 1; k <= q; k++) {
+          part = parts[k]
+          sub(/^[ \t]+/, "", part); sub(/[ \t]+$/, "", part)
+          if (part == "") continue
+          sn++; sseg[sn] = part; sln[sn] = pending_ln; sfull[sn] = pending; scond[sn] = cond
+        }
       }
       pending = ""
     }
@@ -74,7 +86,8 @@ _scan_bats() {
                     # `i < sn`: only the FINAL segment of the whole body is exempt, because that is the
                     # one whose status bats takes as the result.
                     for (i = 1; i < sn; i++) {
-                      if (sseg[i] ~ /\|\|/) continue                       # has a fallback: it fails
+                      if (scond[i]) continue                                # inside an if/while condition
+                      if (sseg[i] ~ /\|\|/) continue                         # has a fallback: it fails
                       if (sseg[i] ~ /^(if|while|until|elif|!)[ \t]/) continue  # a condition, not an assertion
                       if (sseg[i] ~ /^\[\[/) printf "%s:%d: %s\n", FILENAME, sln[i], sfull[i]
                     }
@@ -134,6 +147,9 @@ _bodies_seen() { sed -n 's/^BODIES=//p' "$MYTHICAL_HOME/bodies"; }
                   "  true; $A; true" '}'
     printf '%s\n' '@test "bad 7: semicolon-hash pseudo-continuation" {' "  $A;# explanation \\" \
                   '  true || :' '  true' '}'
+    printf '%s\n' '@test "bad 8: intermediate command of an and-list" {' "  true && $A && true" '  true' '}'
+    printf '%s\n' '@test "good 5: and-list whose condition really is a condition" {' \
+                  "  if $A && $A; then true; fi" '  true' '}'
     printf '%s\n' '@test "good 1: guarded" {' "  $A || { echo boom >&2; return 1; }" '  true' '}'
     printf '%s\n' '@test "good 2: guarded across a continuation" {' "  $A \\" \
                   '    || { echo boom >&2; return 1; }' '  true' '}'
@@ -144,8 +160,8 @@ _bodies_seen() { sed -n 's/^BODIES=//p' "$MYTHICAL_HOME/bodies"; }
   out="$(_scan_bats "$fx")"
 
   found="$(printf '%s\n' "$out" | grep -c . )"
-  [ "$found" -eq 7 ] \
-    || { echo "expected exactly 7 findings, got $found:" >&2; echo "$out" >&2; return 1; }
+  [ "$found" -eq 8 ] \
+    || { echo "expected exactly 8 findings, got $found:" >&2; echo "$out" >&2; return 1; }
   case "$out" in
     *'== "b" ]]'*) : ;;
     *) echo "findings do not name the offending statement: $out" >&2; return 1 ;;
@@ -156,8 +172,8 @@ _bodies_seen() { sed -n 's/^BODIES=//p' "$MYTHICAL_HOME/bodies"; }
   case "$out" in
     *'if [['*) echo "the scanner flagged a condition, not an assertion: $out" >&2; return 1 ;;
   esac
-  [ "$(_bodies_seen)" -eq 11 ] \
-    || { echo "the scanner saw $(_bodies_seen) bodies in an 11-test fixture" >&2; return 1; }
+  [ "$(_bodies_seen)" -eq 13 ] \
+    || { echo "the scanner saw $(_bodies_seen) bodies in a 13-test fixture" >&2; return 1; }
 }
 
 @test "no test asserts with a bare [[ ]] that bash 3.2 cannot fail on" {
