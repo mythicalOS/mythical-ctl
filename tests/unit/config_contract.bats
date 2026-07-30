@@ -222,3 +222,77 @@ doc_conf_of_size() {
   # …and the document says the reference exists, so a future rename has somewhere to have been warned.
   grep -Fq 'shipped runtime output' "${_MCTL_ROOT}/docs/CONFIG-FORMAT.md"
 }
+
+# The document publishes an ORDERED precedence for classification, and the order is the substance: it
+# is what stops a NUL-bearing markerless file being reported as "torn, using defaults" when it is
+# actually hostile content that must be refused. A cross-repo implementer reads this table to decide
+# what to tell their user, so every row is verified against the CLI rather than asserted.
+#
+# Each fixture builds its marker from DOC_MARKER — the document's literal — and each row names the rc
+# the document publishes for it. rc 0 accepted · 1 rejected/malformed · 3 absent · 4 torn.
+@test "every row of the document's marker-precedence table matches the CLI" {
+  local f sum body rc row
+  f="$(mi_conf_product_path brokkr)"
+
+  # Build a conforming file from the document's own recipe.
+  doc_write() {
+    body="$1"
+    printf '%s\n' "$body" > "$MYTHICAL_HOME/body.txt"
+    sum="$(doc_hash_stream "$MYTHICAL_HOME/body.txt")"
+    printf '%s\n%s%s\n' "$body" "$DOC_MARKER" "$sum" > "$f"
+  }
+  # `if cmd; then rc=0; else rc=$?; fi`, not a bare call followed by `rc=$?`: bats runs test bodies
+  # under errexit, so the bare form aborts the test at the first non-zero rc — and every row here but
+  # the last expects one.
+  check() {                      # check <expected-rc> <row name>
+    if mi_conf_product_load brokkr "$SPEC" >/dev/null 2>&1; then rc=0; else rc=$?; fi
+    [ "$rc" -eq "$1" ] || { echo "row '$2': document says rc $1, CLI gave rc $rc" >&2; return 1; }
+  }
+
+  rm -f "$f"
+  check 3 'file absent'
+
+  printf 'MYTHICAL_BROKKR_RETENTION=30\000\n' > "$f"
+  check 1 'control byte, no marker — malformed BEFORE any marker classification'
+
+  printf 'MYTHICAL_BROKKR_RETENTION=30\n%sdead' "$DOC_MARKER" > "$f"
+  check 4 'does not end in a newline'
+
+  printf 'MYTHICAL_BROKKR_RETENTION=99\n%sdeadbeef\n' "$DOC_MARKER" > "$f"
+  check 4 'marker absent or mismatched'
+
+  doc_write 'MYTHICAL_BROKKR_RETENTION=30'
+  row="$(tail -n1 "$f" | tr 'a-f' 'A-F')"
+  printf 'MYTHICAL_BROKKR_RETENTION=30\n%s\n' "$row" > "$f"
+  check 4 'marker correct but UPPERCASE — the compare is literal'
+
+  : > "$f"
+  check 4 'present but zero bytes'
+
+  doc_write 'MYTHICAL_NOT_IN_SPEC=1'
+  check 1 'marker matches, body off-schema — intact bytes are not damage'
+
+  doc_write 'MYTHICAL_BROKKR_RETENTION=999'
+  check 1 'marker matches, value fails its type'
+
+  doc_write 'MYTHICAL_BROKKR_RETENTION=30'
+  check 0 'marker matches and the body is valid'
+}
+
+# `<product>` becomes part of a pathname, so the document publishes its grammar — and the reservation
+# of `mythical`, which is the HOST-ONLY file's name. An implementation that missed either would aim a
+# product write at the file the host/container split depends on being unreachable, while looking
+# correct. Both lists are transcribed from the document's own "Names that are refused" sentence.
+@test "the product-name grammar the document publishes is the grammar the CLI enforces" {
+  local n
+  for n in mythical Brokkr 'a b' -lead a.b .. . ../outside bin/x x/../y '' \
+           aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; do
+    if mi_conf_product_path "$n" >/dev/null 2>&1; then
+      echo "the document forbids '$n' but the CLI accepted it" >&2; return 1
+    fi
+  done
+  for n in brokkr skuld saga my-product a a1; do
+    mi_conf_product_path "$n" >/dev/null 2>&1 \
+      || { echo "the document allows '$n' but the CLI refused it" >&2; return 1; }
+  done
+}

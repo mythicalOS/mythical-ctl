@@ -873,8 +873,12 @@ mi_conf_product_load() {
 # rc: 0 written, or already exactly these values (a no-op success)
 #     1 refused, and the file is left untouched — bad arity, a bad product name, a key or value the
 #       spec refuses, the same key twice, a failed identity check, or a concurrent change
-#     4 an EXISTING file did not load: torn, or valid bytes that are not valid config. Refused rather
-#       than merged into, because merging would re-bless damaged content with a fresh, valid marker
+#     4 an EXISTING file is TORN — its marker is absent or does not match its body, or it does not end
+#       in a newline. Refused rather than merged into, because merging would re-bless damaged content
+#       with a fresh, valid marker. Bytes that are INTACT but are not valid config (a body that does
+#       not parse, an off-schema key, a value the type refuses) return 1, not 4: the file is not
+#       damaged, it is simply wrong, and telling an operator to repair a file that is byte-for-byte
+#       what was written sends them after the wrong problem. Verified by running both cases.
 #     5 WRITTEN, BUT NOT TO THE DOCUMENTED OWNERSHIP SPEC (see below)
 #
 # rc 5's THREE states. The bytes are committed and the marker is valid in all three — which is what

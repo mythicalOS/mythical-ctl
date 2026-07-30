@@ -18,6 +18,28 @@ follow it is rejected, and rejection is not a bug.
 | Key-count ceiling | **1024 keys** | **1024 keys** |
 | Holds | host secrets and the launch spec | that product's own settings |
 
+### What `<product>` may be
+
+`<product>` becomes part of a pathname, so it is validated before it becomes one. It must match
+
+```
+[a-z][a-z0-9-]{0,63}
+```
+
+— a lowercase letter, then lowercase letters, digits and hyphens, at most 64 characters — and the name
+**`mythical` is RESERVED** and always refused.
+
+Both halves matter to anyone implementing this contract. The grammar contains no path separator, no
+dot, and no way to spell `..`, so a name can never escape `~/.mythical/`. The reservation exists
+because `~/.mythical/mythical.conf` is the **host-only** file: treating `mythical` as an ordinary
+product name would aim a product write at the file the whole host/container split depends on being
+unreachable from the product side. `mythical-ctl` refuses that name, prints no path for it, and creates
+nothing — an implementation that did not would corrupt the family configuration while looking correct.
+
+Names that are refused, and are worth testing against: `mythical`, `Brokkr` (uppercase), `a b` (space),
+`-lead` (leading hyphen), `a.b` (dot), the empty string, `..`, `.`, `../outside`, `bin/x`, `x/../y`, and
+anything over 64 characters. `brokkr`, `skuld`, `saga`, `my-product`, `a` and `a1` are all valid.
+
 A product's UI writes **only** `<product>.conf`.
 
 **What is shipped, and what is design.** Everything this document says about the *file format* is
@@ -33,10 +55,19 @@ treated as attacker-controlled. Nothing here should be read as a delivered secur
 
 ## Ownership and identity
 
-`mythical-ctl` checks **what the path is**, not only what it contains, and refuses it outright if any
-of the requirements below is not true. These are as normative as the syntax: a file that fails one is
-rejected with the file left untouched — no partial write, and no fallback to defaults either, because
-this is a refusal and not a torn-file report.
+`mythical-ctl` checks **what the path is**, not only what it contains, and refuses it if any of the
+requirements below is not true. These are as normative as the syntax: a file that fails one is rejected
+with the file left untouched — no partial write, and no fallback to defaults either, because this is a
+refusal and not a torn-file report.
+
+**What the check does and does not promise.** It describes the pathname *at the moment it runs*. That
+is a real limit, not a hedge: a shell tool cannot hold a path open and operate on the held object, so
+between the last check and the operation the pathname can in principle be replaced. `mythical-ctl`
+re-checks immediately before every mutation to make that window as small as the language allows, and a
+family operation lock excludes every other `mythical-ctl` process — but the window is not zero, and
+closing it would need file-descriptor- or mount-namespace-based I/O that portable shell does not have.
+Read these requirements as "this path is refused when it is seen to fail", not as an unconditional
+guarantee about the object finally written. Nothing else in this document depends on the difference.
 
 Where the check runs, exactly, because it is not symmetrical:
 
@@ -232,14 +263,37 @@ sed '$d' <product>.conf | sha256sum | cut -d' ' -f1
 
 ### How a mismatched marker is treated
 
+**Order matters, so read this before the table.** The checks do not all have equal standing; they run in
+a fixed order, and the first one to fail decides the outcome:
+
+1. **Is the file there at all?** An absent `<product>.conf` is **absent**, not torn. It is the ordinary
+   state before anything has been configured — no defaults-with-a-warning, no damage report.
+2. **Does it obey the byte policy?** A file containing a control byte (NUL, CR, TAB, DEL) is **rejected
+   as malformed**, whatever its marker says. This is checked *before* the marker, so a NUL-bearing file
+   with no marker is malformed — not torn. Hostile or binary content is not a damaged config.
+3. **Does it end in a newline?** If not, the last write was cut mid-line: **torn**.
+4. **Does the marker match?** Only now. Absent or mismatched ⇒ **torn**.
+5. **Does the body parse and satisfy the schema?** If not, **rejected as malformed** — the bytes are
+   intact, so this is not damage.
+
+So "torn" means specifically *byte-clean content whose marker does not vouch for it*. Anything that
+fails an earlier gate is a refusal instead, and the two must not be conflated: a refusal means fix or
+remove the file, while torn means the settings fall back to defaults and the file wants its marker
+recomputed.
+
 | Situation | Result |
 |---|---|
+| File absent | **absent** — the normal unconfigured state, not torn and not an error |
+| Contains a control byte (NUL, CR, TAB, DEL) | **rejected as malformed**, regardless of the marker |
+| Does not end in a newline | **torn** — the last write was cut mid-line |
 | Marker matches | accepted |
-| Marker **absent or mismatched** | treated as **torn**: defaults are used, and the operator is told both what to do if they edited the file by hand and what it means if they did not |
+| Marker **absent or mismatched** | **torn**: defaults are used, and the operator is told both what to do if they edited the file by hand and what it means if they did not |
 | Marker correct but **UPPERCASE** | mismatched, therefore **torn** — the comparison is a literal string compare |
 | Marker line has trailing text (a space, a second field) | mismatched, therefore **torn** |
+| Present but zero bytes | **torn** — a file with no marker at all |
 | A marker-prefix line anywhere but the final line | rejected as malformed |
 | Marker matches but the body is not valid config | rejected as malformed — the bytes are intact, so this is not damage |
+| Marker matches but a value fails its type | rejected as malformed — same reason |
 
 A write torn at a line boundary produces a file that parses perfectly and is missing every setting
 after the cut. That is why a mismatch is not forgiven just because the remaining text is well
