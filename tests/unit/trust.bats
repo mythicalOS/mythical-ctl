@@ -507,3 +507,55 @@ mkdoc() {   # <version> [<expires>]
   printf '%s' "$output" | grep -aq 'refusing to lower the recorded version floor'
   [ "$(mi_trust_floor_get index)" = "7" ]
 }
+
+@test "a version floor recorded twice is REFUSED, not silently compared as one string" {
+  # `mi_ledger_get` prints every matching field, so a record carrying its key twice — which a
+  # restored ledger can — came back as two lines and the numeric comparison ran on a string
+  # containing a newline.
+  #
+  # Direction matters and was measured: this did NOT fail open. `_mi_num_gt` compares by digit count
+  # first, and a two-line value is always longer than any single value below the real floor, so every
+  # rollback attempt was still refused. What it did instead was refuse LEGITIMATE upgrades — with a
+  # duplicated floor of 99999, moving to 100000 was rejected as a downgrade. Availability, not
+  # authenticity, with a refusal message that named a rollback which was not happening.
+  :   # setup() already ran: env, modules, layout, lock, empty ledger
+  printf 'trust-floor\tindex=99999\tindex=1000\n' | mi_ledger_write
+  run mi_trust_floor_get index
+  [ "$status" -ne 0 ]
+  assert_contains "more than once"
+  # and the record is preserved, not rewritten to whichever value we liked
+  run grep -ac 'index=99999' "$MYTHICAL_HOME/.state/ledger"
+  [ "$output" = "1" ]
+}
+
+@test "a floor that is RECORDED but unreadable is refused, never read as never-seen" {
+  # rc 3 from this getter means "no floor has ever been recorded", which is the first-use branch
+  # that accepts any version on trust. A floor that exists but carries no value used to take that
+  # branch, so anti-rollback silently stopped applying to the one document whose record was damaged.
+  # Both spellings are covered: an empty value, and a record with no fields at all.
+  :   # setup() already ran: env, modules, layout, lock, empty ledger
+  printf 'trust-floor\tindex=\n' | mi_ledger_write
+  run mi_trust_floor_get index
+  [ "$status" -eq 1 ]
+  assert_contains "carries no value"
+}
+
+@test "a trust record with no fields at all is refused, not read as absent" {
+  :
+  printf 'trust-floor\n' | mi_ledger_write
+  run mi_trust_floor_get index
+  [ "$status" -eq 1 ]
+  assert_contains "no fields at all"
+}
+
+@test "a genuinely absent floor is still rc 3, and a good floor still reads back" {
+  # The counterpart: the refusals above must not swallow the legitimate first-use branch, which is
+  # what makes trust-on-first-use possible at all.
+  :
+  run mi_trust_floor_get index
+  [ "$status" -eq 3 ]
+  printf 'trust-floor\tindex=42\n' | mi_ledger_write
+  run mi_trust_floor_get index
+  [ "$status" -eq 0 ]
+  [ "$output" = "42" ]
+}

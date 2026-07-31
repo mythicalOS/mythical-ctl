@@ -80,9 +80,104 @@ mi_trust_floor_get() {
   _mi_trust_docid_ok "$docid" || { mi_warn "trust: invalid document id '$docid'"; return 1; }
   # mi_ledger_get propagates a corrupt ledger as a failure rather than reporting "no records", which
   # is what keeps "the ledger is damaged" from looking like "this is a first install".
+  _mi_trust_kind_wellformed "$MI_TRUST_FLOOR_KIND" || return 1
   v="$(mi_ledger_get "$MI_TRUST_FLOOR_KIND" "$docid")" || return $?
-  [ -n "$v" ] || return 3
+  if [ -z "$v" ]; then
+    # EMPTY IS NOT ABSENT. rc 3 here means "no floor has ever been recorded", which is the first-use
+    # branch that accepts any version on trust. A floor that IS recorded but carries no value must
+    # not take that branch: it is a floor we cannot read, and reading it as "never seen" turns the
+    # anti-rollback guarantee off for the one document whose record was damaged.
+    if _mi_trust_key_present "$MI_TRUST_FLOOR_KIND" "$docid"; then
+      mi_warn "trust: a version floor for '$docid' is recorded but carries no value."
+      mi_warn "  Refusing rather than treating it as never-seen — that branch accepts any version."
+      mi_warn "  Run 'mythical-ctl state repair'."
+      return 1
+    fi
+    return 3
+  fi
+  _mi_trust_single_value "$v" "version floor for '$docid'" || return 1
   printf '%s\n' "$v"
+}
+
+# Is a key recorded at all under <kind>, whatever its value? This is the "present but unreadable"
+# versus "absent" question, and it cannot be answered from `mi_ledger_get`'s output alone, because
+# both cases print nothing.
+#
+# The walk consumes one separator at a time rather than using `IFS=$'\t'; set -- $record`, which
+# would both drop empty fields (TAB is IFS whitespace, so adjacent separators collapse) and
+# glob-expand each token against the working directory.
+_mi_trust_key_present() {
+  local kind="$1" key="$2" records line rest tok
+  records="$(mi_ledger_read)" || return $?
+  while IFS= read -r line; do
+    case "$line" in "$kind"$'\t'*) : ;; *) continue ;; esac
+    rest="${line#*$'\t'}"
+    while [ -n "$rest" ]; do
+      tok="${rest%%$'\t'*}"
+      case "$tok" in "${key}="*) return 0 ;; esac
+      if [ "$rest" = "$tok" ]; then rest=""; else rest="${rest#*$'\t'}"; fi
+    done
+  done <<< "$records"
+  return 1
+}
+
+# Every record of <kind> must be well formed: at least one field, and every field `name=value`.
+# A bare `trust-floor` row with no fields at all is the other half of the same defect — it carries
+# no key, so the presence check above cannot see it, and the getter would report "never recorded".
+# Trust records are the one place where "I could not read this" must never resolve to "there is
+# nothing here", so a malformed record of a trust kind refuses the whole read.
+_mi_trust_kind_wellformed() {
+  local kind="$1" records line rest tok
+  records="$(mi_ledger_read)" || return 0        # unreadable ledger is the caller's rc to propagate
+  while IFS= read -r line; do
+    case "$line" in "$kind"$'\t'*) : ;; "$kind") : ;; *) continue ;; esac
+    if [ "$line" = "$kind" ]; then
+      mi_warn "trust: a '$kind' record in the ledger has no fields at all."
+      mi_warn "  Refusing rather than reading it as absent. Run 'mythical-ctl state repair'."
+      return 1
+    fi
+    rest="${line#*$'\t'}"
+    while [ -n "$rest" ]; do
+      tok="${rest%%$'\t'*}"
+      case "$tok" in
+        *=*) : ;;
+        *) mi_warn "trust: a '$kind' record contains '$tok', which is not a name=value field."
+           mi_warn "  Refusing rather than reading around it. Run 'mythical-ctl state repair'."
+           return 1 ;;
+      esac
+      if [ "$rest" = "$tok" ]; then rest=""; else rest="${rest#*$'\t'}"; fi
+    done
+  done <<< "$records"
+  return 0
+}
+
+# A floor or anchor must be ONE value. `mi_ledger_get` prints every matching field, so a record
+# carrying its key twice — which a restored ledger can — comes back as several lines, and the
+# comparison below then runs on a string containing a newline.
+#
+# Measured impact, stated precisely because the direction matters: this does NOT fail open.
+# `_mi_num_gt` compares by digit count first, and a two-line value is always longer than any single
+# value below the real floor, so every rollback attempt is still refused — exhaustively checked over
+# a matrix of floors and lower versions, with no accepting case. What it does instead is refuse
+# LEGITIMATE upgrades: with a duplicated floor of 99999, moving to 100000 is rejected as a downgrade.
+# So the failure is availability, not authenticity — a wedged installation whose refusal message is
+# actively misleading, because it names a rollback that is not happening.
+#
+# Refuse and report, rather than picking the first line or the largest: an ambiguous floor is exactly
+# the case where guessing is how a rollback floor silently becomes the wrong number.
+_mi_trust_single_value() {
+  local v="$1" what="$2"
+  # `$'\n'`, NOT `"$(printf '\n')"`. Command substitution strips trailing newlines, so the latter is
+  # the EMPTY string and the pattern degrades to `*` — matching every value and refusing every read.
+  # Caught by running the suite: it broke 25 trust tests at once.
+  case "$v" in
+    *$'\n'*)
+      mi_warn "trust: the $what is recorded more than once in the ledger, with differing values."
+      mi_warn "  Refusing rather than choosing one — an ambiguous floor is how a rollback floor"
+      mi_warn "  silently becomes the wrong number. Run 'mythical-ctl state repair'."
+      return 1 ;;
+  esac
+  return 0
 }
 
 # No arity guard: this takes no arguments, so there is nothing to expand and nothing that could
@@ -90,8 +185,20 @@ mi_trust_floor_get() {
 # (SC2120) and then flag every call site (SC2119).
 mi_trust_anchor_get() {
   local v
+  _mi_trust_kind_wellformed "$MI_TRUST_ANCHOR_KIND" || return 1
   v="$(mi_ledger_get "$MI_TRUST_ANCHOR_KIND" digest)" || return $?
-  [ -n "$v" ] || return 3
+  if [ -z "$v" ]; then
+    # Same rule as the floor: an anchor that is recorded but unreadable must not take the
+    # no-anchor branch, which is where trust-on-first-use accepts a root it has never seen.
+    if _mi_trust_key_present "$MI_TRUST_ANCHOR_KIND" digest; then
+      mi_warn "trust: a trust anchor is recorded but carries no value."
+      mi_warn "  Refusing rather than treating it as never-seen — that branch accepts a new root."
+      mi_warn "  Run 'mythical-ctl state repair'."
+      return 1
+    fi
+    return 3
+  fi
+  _mi_trust_single_value "$v" "trust anchor digest" || return 1
   printf '%s\n' "$v"
 }
 

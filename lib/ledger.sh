@@ -21,7 +21,20 @@ _mi_num_gt() {
 # Exit: 0 ok · 3 missing · 1 corrupt/newer-schema (fail closed).
 mi_ledger_read() {
   local f; f="$(_mi_ledger_path)"
-  [ -f "$f" ] || return 3
+  # ABSENT is rc 3 — a legitimate first write. PRESENT-BUT-NOT-A-REGULAR-FILE is not absent, and
+  # conflating the two was silent data loss. `[ -f ]` alone is false for a directory and for a
+  # dangling symlink, so both reported "no ledger", the writer's never-destroy-evidence check below
+  # was skipped as a result, and `mv -f "$tmp" "$f"` then either moved the temp file INTO the
+  # directory (returning 0, writing nothing, leaving a stray .ledger.XXXXXX behind on every call) or
+  # replaced the dangling symlink and destroyed the trace it pointed at. Measured consequence:
+  # mi_ident_ensure minted a DIFFERENT installation identity on every invocation, because each write
+  # reported success and each read still said "absent".
+  if [ ! -f "$f" ]; then
+    if [ -e "$f" ] || [ -L "$f" ]; then
+      mi_die "ledger: '$f' exists but is not a regular file — refusing (fail closed). Run 'state repair'."
+    fi
+    return 3
+  fi
 
   # Snapshot the ledger to a PRIVATE inode, then validate AND parse the SAME bytes. Reopening $f for
   # each step (tail/head/sed) is a TOCTOU: reads do not hold the lock, so a concurrent atomic replace
@@ -88,6 +101,12 @@ mi_ledger_write() {
   # Run the validation read in a SUBSHELL: on corruption mi_ledger_read calls mi_die (exit), which
   # would otherwise terminate this writer before it could report. Containing it keeps the writer's
   # own diagnostic reachable.
+  # Anything present that is not a regular file is refused before the validation read, for the same
+  # reason the reader refuses it: `[ -f ]` is false for a directory and for a dangling symlink, so
+  # this guard used to be skipped on exactly the inputs that make the `mv -f` below destructive.
+  if [ ! -f "$f" ] && { [ -e "$f" ] || [ -L "$f" ]; }; then
+    mi_die "ledger: '$f' exists but is not a regular file — refusing to write over it; run 'state repair'"
+  fi
   if [ -f "$f" ] && ! ( mi_ledger_read >/dev/null 2>&1 ); then
     mi_die "existing ledger does not validate — refusing to overwrite it; run 'state repair'"
   fi
