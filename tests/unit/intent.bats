@@ -773,3 +773,48 @@ put_raw() { { mi_ledger_read; printf '%s\n' "$1"; } | mi_ledger_write; }
   [ "$status" -ne 0 ]
   assert_contains "cannot read the clock"
 }
+
+# --- class container is refused here, and the refusal IS the boundary -------------------------------
+#
+# A container intent is opened WRITE-AHEAD by the bring-up sequence and carries the desired state and
+# the check that bring-up owes, because a recovering process cannot re-derive what the dead one
+# decided. This function confirms a match directly and writes neither, so finishing one here consumes
+# the only record of what was being built: the container is accounted for, no desired row exists, the
+# state plan answers `none`, and nothing ever starts or verifies it.
+#
+# It was previously a comment in the module that opens these intents. A comment is not a boundary
+# while this function still accepts the call, so it is a refusal.
+@test "reconcile REFUSES a container intent and keeps it" {
+  n="$(mi_nonce_new)"
+  mi_intent_open container "mythical-${IDENT}-p1" "$n"
+  run mi_intent_reconcile container "mythical-${IDENT}-p1"
+  [ "$status" -eq 1 ]
+  assert_contains "not reconciled here"
+  assert_contains "state repair"
+  # Refused, not consumed: the intent is still the record a recovery can act on, and nothing was
+  # written as provenance for it.
+  run mi_intent_find container "mythical-${IDENT}-p1"
+  [ "$status" -eq 0 ]
+  run mi_prov_find container "mythical-${IDENT}-p1"
+  [ "$status" -eq 3 ]
+}
+
+# The refusal is SCOPED. A blanket stop would be indistinguishable from it on the test above, and
+# would break the two classes this function is right for — a volume, whose existence is its whole
+# state, and a network, which is recorded by id and holds no lifecycle.
+@test "the container refusal does not stop the classes reconcile is right for" {
+  nv="$(mi_nonce_new)"
+  mi_intent_open volume v1 "$nv"
+  mi_rt_volume_create v1 "$nv" "$IDENT"
+  run mi_intent_reconcile volume v1
+  [ "$status" -eq 0 ]
+  run mi_prov_find volume v1
+  [ "$status" -eq 0 ]
+  nn="$(mi_nonce_new)"
+  mi_rt_network_create mythical-i1-net "$IDENT" "$nn" >/dev/null
+  mi_intent_open network mythical-i1-net "$nn"
+  run mi_intent_reconcile network mythical-i1-net
+  [ "$status" -eq 0 ]
+  run mi_prov_find network mythical-i1-net
+  [ "$status" -eq 0 ]
+}

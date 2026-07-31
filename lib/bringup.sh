@@ -24,8 +24,9 @@
 # CONSEQUENCE FOR CALLERS: a container intent opened here is finished by mi_bringup_recover and by
 # nothing else. lib/intent.sh's generic mi_intent_reconcile confirms a matched object directly — right
 # for a volume, whose existence is its whole state, and wrong for a container, which also owes a
-# desired state and a live verification. Reconciling one of these intents through the generic path
-# reintroduces exactly the defect this sequence's own recovery was fixed for.
+# desired state and a live verification. That is no longer left to callers to observe: the generic
+# reconciler REFUSES class container outright, because a comment here is not a boundary while the
+# function over there still accepts the call.
 #
 # PURE library — no side effects at source time; no `set -euo pipefail`.
 #
@@ -765,10 +766,17 @@ _mi_bringup_attach_ok() {
     if [ -n "$src" ] && [ -n "$tgt" ]; then permitted=("$src" "$tgt"); fi
   fi
 
-  # Every attachment must be permitted, AND the expected one must be present. Both directions: the
-  # first catches a stray bridge, the second catches a container that is on the migration's source
-  # only.
-  local i ok
+  # EXACTLY THE PERMITTED SET, WHICH IS "EVERY PERMITTED ID EXACTLY ONCE" — not "every attachment is
+  # permitted, and the wanted one is among them". That weaker pair accepts a strict SUBSET, and the
+  # subset it accepts is the mid-migration one. With a recorded migration the permitted set is
+  # {source,target}, so a container attached to the TARGET alone satisfies both halves when it is
+  # verified for the target (nothing unexpected is attached; the wanted network is), and a container
+  # on the SOURCE alone satisfies them both when the wanted network is the source. Neither is
+  # attached to the set the migration record documents, and success here is what makes every caller
+  # of mi_bringup_verify_live retire the outstanding check — so a container standing half-way through
+  # a migration would be recorded as verified and never looked at again.
+  local i ok n
+  # Direction 1 — nothing beyond the permitted set. This is what catches a stray default bridge.
   for id in ${ids[@]+"${ids[@]}"}; do
     ok=0
     for i in ${permitted[@]+"${permitted[@]}"}; do [ "$id" = "$i" ] && ok=1; done
@@ -779,12 +787,38 @@ _mi_bringup_attach_ok() {
       return 1
     fi
   done
+  # Direction 2 — the network THIS call is about. Asked separately, and before direction 3, because
+  # direction 3 does not imply it: a migration recorded between two OTHER networks bounds `permitted`
+  # to a pair the wanted network is not in, and a container attached to exactly that pair would
+  # satisfy direction 3 while having no attachment to the network being verified at all.
   ok=0
   for id in ${ids[@]+"${ids[@]}"}; do [ "$id" = "$want" ] && ok=1; done
   if [ "$ok" -eq 0 ]; then
     mi_warn "bringup: '$c' is not attached to the expected network '$want'."
     return 1
   fi
+  # Direction 3 — every permitted ID present, exactly once. Zero is the subset above. More than one
+  # is a second endpoint on a single network: a real daemon refuses the duplicate connect outright,
+  # so seeing it means something other than this CLI built the attachment, and a comparison that
+  # counted only distinct ids would call that set equal to one it does not match.
+  for i in ${permitted[@]+"${permitted[@]}"}; do
+    n=0
+    for id in ${ids[@]+"${ids[@]}"}; do
+      if [ "$id" = "$i" ]; then n=$((n + 1)); fi
+    done
+    if [ "$n" -eq 1 ]; then continue; fi
+    if [ "$n" -eq 0 ]; then
+      mi_warn "bringup: '$c' is NOT attached to network '$i'."
+      mi_warn "  Its network set must be exactly {${permitted[*]}}; it is attached to {${ids[*]}}."
+      mi_warn "  A subset is not the set: during a recorded migration a container standing on only one"
+      mi_warn "  of the two is mid-move, not reconciled, and this is the check whose success retires"
+      mi_warn "  the outstanding verification."
+    else
+      mi_warn "bringup: '$c' is attached to network '$i' $n times."
+      mi_warn "  Its network set must be exactly {${permitted[*]}} — one endpoint per network."
+    fi
+    return 1
+  done
 
   # The alias, on the expected network. `docker network connect` infers none, and without it the
   # container joins under its own installation-scoped name — which no sibling can guess, so family DNS

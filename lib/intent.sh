@@ -441,11 +441,41 @@ mi_intent_confirm() {
 # and, before any of them, COULD NOT ASK ⇒ retain. That is not a fourth row of the table; it is the
 # precondition the other three rest on, and it is asked by _mi_intent_matches.
 #
-# rc 0 reconciled · 1 stopped (reported) · 3 no such intent · 4 retained for a later run.
+# CLASS `container` IS REFUSED HERE — see the guard, which is the boundary itself and not a note
+# about one.
+#
+# rc 0 reconciled · 1 stopped (reported), and the answer for class container · 3 no such intent ·
+# 4 retained for a later run.
 mi_intent_reconcile() {
   if [ "$#" -ne 2 ]; then mi_warn "intent: mi_intent_reconcile needs <class> <name>"; return 1; fi
   local class="$1" name="$2" rec nonce ident matches count rc
   _mi_prov_class_ok "$class" || return 1
+
+  # A CONTAINER IS NOT RECONCILED HERE, AND THE REFUSAL IS THE ENFORCEMENT. This function's adopt
+  # path confirms a single label match directly — right for a volume, whose existence is its whole
+  # state, and for a network, which is recorded by id and holds no lifecycle. A container holds a
+  # lifecycle: its intent is opened WRITE-AHEAD, before the object exists, and carries the desired
+  # state and the check the bring-up owes precisely because a recovering process cannot re-derive
+  # what the dead one decided.
+  #
+  # Confirming one here consumes that record without acting on it. Nothing writes a desired row, so
+  # the state plan answers `none`; nothing sets an outstanding check, so no verification is ever
+  # scheduled; and the intent — the only durable statement of what was being built — is gone. The
+  # container is left accounted for, never started and never live-verified, and the ledger says the
+  # installation is converged. That state is unrecoverable, because the record recovery needed is the
+  # one this call dropped.
+  #
+  # It was previously stated as a comment in the module that opens these intents. A comment is not a
+  # boundary while the function still accepts the call, so it is a refusal now.
+  if [ "$class" = container ]; then
+    mi_warn "intent: a container intent is not reconciled here. It is opened write-ahead and records"
+    mi_warn "  the desired state and the check its bring-up owes; finishing it means committing both"
+    mi_warn "  BEFORE confirming, and then verifying the container live. This function does none of"
+    mi_warn "  that — it would confirm the object and drop the intent, leaving '$name' accounted for,"
+    mi_warn "  with no desired state, never started and never verified."
+    mi_warn "  Finish it through the bring-up recovery path, or run 'mythical-ctl state repair'."
+    return 1
+  fi
 
   if rec="$(mi_intent_find "$class" "$name")"; then rc=0; else rc=$?; fi
   [ "$rc" -eq 0 ] || return "$rc"
@@ -515,9 +545,12 @@ mi_intent_reconcile() {
       # D56: a volume has no ID at all — `docker volume inspect` returns Name, Driver, Labels,
       # Mountpoint and CreatedAt and nothing else — so name + nonce IS its identity.
       volume)           : ;;
-      # A container's ID is read and recorded by the verb that launched it (Task 7), which holds the
-      # rest of the launch facts worth recording alongside it.
-      container|probe)  : ;;
+      # A probe container is temporary and holds no state to record; its ID is of no interest to
+      # anything, and mi_probe_cleanup settles probe intents by dropping them rather than through
+      # this path at all. `container` is NOT listed: it is refused at the top of this function, and
+      # naming it here would read as though it still flows through. If that guard is ever removed,
+      # a container falls to the arm below and is retained rather than silently adopted.
+      probe)  : ;;
       # Not reachable through the vocabulary above, and here for the same reason the reissue `case`
       # below has one: without it a class added to _mi_prov_class_ok later would be adopted with no
       # id and no thought, which is the silent half of the defect this arm's neighbour just fixed.
@@ -551,10 +584,10 @@ mi_intent_reconcile() {
         mi_warn "intent: reissuing volume '$name' failed — retaining the intent for the next run"
         return 4; }
       ;;
-    container|probe)
-      # A container cannot be reissued from the intent alone: its image, mounts, ports and env are the
-      # caller's to supply. The bring-up sequence owns that (Task 7); here we only report, so the
-      # intent survives for the verb that knows how to rebuild it.
+    probe)
+      # A probe cannot be reissued from the intent alone: its image, mounts, ports and env are the
+      # caller's to supply. Here we only report, so the intent survives for the verb that knows how
+      # to rebuild it. `container` is refused at the top of this function and never arrives.
       mi_warn "intent: no $class carries nonce '$nonce'; rebuilding it needs the launch spec, so the"
       mi_warn "  intent is retained and the verb that opened it will re-create it."
       return 4

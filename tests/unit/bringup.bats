@@ -447,3 +447,88 @@ learn_addr() {
   run grep -a -- '--privileged' "$FAKE_DOCKER_STATE/calls.log"
   [ "$status" -ne 0 ]
 }
+
+# --- the exact set, in the two directions the earlier pair did not pin -----------------------------
+#
+# "Every attachment is permitted, AND the wanted one is present" is satisfied by a strict SUBSET of
+# the permitted set, and the subset it accepts is the mid-migration one. With {source,target}
+# permitted, a container on the target alone passes when it is verified for the target, and one on
+# the source alone passes when it is verified for the source: nothing unexpected is attached, and the
+# network being asked about is. The set the migration record documents is {source,target}, and
+# success here is what makes every caller of mi_bringup_verify_live retire the outstanding check.
+#
+# The earlier test rejects the source only when the TARGET is wanted, which is the `want` half of the
+# old check doing the work — neither of these two goes anywhere near it.
+@test "a container attached only to the migration's TARGET fails verification against the TARGET" {
+  OTHER="$(mi_rt_network_create other "$IDENT" nn2)"
+  mi_bringup_create "$C" "$IMG" "$OTHER" p1 running - >/dev/null
+  mi_led_put netmig key family "key=family" "phase=2" "source=$NET" "target=$OTHER" "containers=$C"
+  run mi_bringup_verify_attach "$C" "$OTHER" p1
+  [ "$status" -ne 0 ]
+  assert_contains "is NOT attached to network '$NET'"
+  # The refusal is REPORTED, not a silent failure that happens to satisfy an absence: the container
+  # is still there and still attached to the network it does have.
+  run mi_rt_inspect container c.nets "$C"
+  [ "$status" -eq 0 ]
+  assert_contains "${OTHER}="
+}
+
+@test "a container attached only to the migration's SOURCE fails verification against the SOURCE" {
+  mi_bringup_create "$C" "$IMG" "$NET" p1 running - >/dev/null
+  OTHER="$(mi_rt_network_create other "$IDENT" nn2)"
+  mi_led_put netmig key family "key=family" "phase=2" "source=$NET" "target=$OTHER" "containers=$C"
+  run mi_bringup_verify_attach "$C" "$NET" p1
+  [ "$status" -ne 0 ]
+  assert_contains "is NOT attached to network '$OTHER'"
+  run mi_rt_inspect container c.nets "$C"
+  [ "$status" -eq 0 ]
+  assert_contains "${NET}="
+}
+
+# EXACTLY ONCE, not merely present. A duplicate connect is an endpoint conflict a real daemon
+# refuses, and the fake models that refusal — so a set carrying one id twice cannot be built through
+# the adapter and is handed to the predicate directly. It is still worth pinning: a comparison over
+# DISTINCT ids alone would call such a set equal to one it does not match, and an attachment set this
+# CLI did not build is exactly what these checks exist to notice.
+@test "the same network attached twice is not the same as attached once" {
+  mi_bringup_create "$C" "$IMG" "$NET" p1 running - >/dev/null
+  nets="$(mi_rt_inspect container c.nets "$C")"
+  aliases="$(mi_rt_inspect container c.aliases "$C")"
+  # The REAL singular set first, so the refusal below is about the duplication and not about the
+  # shape of a hand-built fixture. Both sets come from the runtime rather than from a second copy of
+  # its encoding here, which is the same reason setup() asks it for the address.
+  run _mi_bringup_attach_ok "$C" "$NET" p1 "$nets" "$aliases"
+  [ "$status" -eq 0 ]
+  run _mi_bringup_attach_ok "$C" "$NET" p1 "${nets}${nets}" "$aliases"
+  [ "$status" -ne 0 ]
+  assert_contains "2 times"
+}
+
+# --- the generic reconciler is not a second door to a confirmed container --------------------------
+#
+# Crash after mi_bringup_create and before step 3: the container is built and the write-ahead intent
+# is open, which is the state mi_bringup_recover exists for. lib/intent.sh's generic reconciler finds
+# one label match and confirms it directly, writing no desired state and no outstanding check — so
+# the container would be accounted for, mi_state_plan would answer `none`, and it would never be
+# started, never live-verified and never scheduled. The record a later run needed is the intent that
+# confirming just dropped.
+@test "the generic intent reconciler REFUSES a container intent instead of finishing it" {
+  mi_bringup_create "$C" "$IMG" "$NET" p1 running - >/dev/null
+  run mi_intent_reconcile container "$C"
+  [ "$status" -eq 1 ]
+  assert_contains "not reconciled here"
+  # Refused, not half-done: the intent survives as the record recovery acts on, and nothing was
+  # written as provenance.
+  run mi_intent_find container "$C"
+  [ "$status" -eq 0 ]
+  run mi_prov_find container "$C"
+  [ "$status" -eq 3 ]
+  # And the path that IS allowed to finish it still finishes it, from exactly this state — the
+  # refusal closes a door without stranding the object behind it.
+  run mi_bringup_recover "$IDX" "$C" "$NET" p1
+  [ "$status" -eq 0 ]
+  run mi_state_desired_get "$C"
+  [ "$output" = running ]
+  run mi_state_plan "$C"
+  [ "$output" = "start verify" ]
+}
