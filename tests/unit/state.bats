@@ -33,16 +33,16 @@ teardown() { mi_lock_release; teardown_test_env; }
 
 @test "clearing an outstanding kind clears ONLY that kind" {
   mi_state_commit "$C" running alias "$NET"
-  mi_state_outstanding_clear "$C" alias
+  mi_state_outstanding_clear "$C" alias "$NET"
   run mi_state_outstanding "$C"
   [ -z "$output" ]
   run mi_state_desired_get "$C"
   [ "$output" = running ]
 }
 
-@test "clearing a kind that was never outstanding is a no-op success" {
+@test "clearing a kind this core does not define is REFUSED, not a silent no-op" {
   mi_state_commit "$C" running alias "$NET"
-  run mi_state_outstanding_clear "$C" storage
+  run mi_state_outstanding_clear "$C" storage "$NET"
   [ "$status" -ne 0 ]
   assert_contains "not a check kind"
 }
@@ -66,7 +66,7 @@ teardown() { mi_lock_release; teardown_test_env; }
   mi_rt_container_start "$C"
   run mi_state_reconciled "$C"
   [ "$status" -ne 0 ]
-  mi_state_outstanding_clear "$C" alias
+  mi_state_outstanding_clear "$C" alias "$NET"
   run mi_state_reconciled "$C"
   [ "$status" -eq 0 ]
 }
@@ -274,6 +274,130 @@ put_raw() { { mi_ledger_read; printf '%s\n' "$1"; } | mi_ledger_write; }
   [ "$(mi_ledger_read | grep -ac '^$' || true)" -eq 1 ]
   mi_state_commit "$C" stopped alias "$NET"
   [ "$(mi_ledger_read | grep -ac '^$' || true)" -eq 1 ]
-  mi_state_outstanding_clear "$C" alias
+  mi_state_outstanding_clear "$C" alias "$NET"
   [ "$(mi_ledger_read | grep -ac '^$' || true)" -eq 1 ]
+}
+
+# --- fix wave 1: AN OUTSTANDING CHECK MAY ONLY DISAPPEAR WHEN THE THING IT NAMES WAS VERIFIED -------
+#
+# Four faces of one rule, so four ways an owed verification could stop being owed with nobody having
+# performed it. Each test names the shape it replaces, as the block above does.
+
+@test "an outstanding check SURVIVES a commit that does not mention it" {
+  # A desired-state write is not a verification of anything. `mi_state_commit "$C" stopped` used to
+  # rewrite this container's whole state and drop the alias entry with it — nothing was checked, and
+  # the check simply vanished, leaving the container reconciled on an unanswered question.
+  mi_state_commit "$C" running alias "$NET"
+  mi_state_commit "$C" stopped
+  run mi_state_desired_get "$C"
+  [ "$output" = stopped ]
+  run mi_state_outstanding "$C"
+  [ "$status" -eq 0 ]
+  assert_contains "alias"
+  assert_contains "$NET"
+  run mi_state_plan "$C"
+  [ "$output" = "defer" ]
+}
+
+@test "a later commit ADDS to the outstanding set rather than replacing it" {
+  mi_state_commit "$C" running alias "$NET"
+  mi_state_commit "$C" running alias "${NET}x"
+  run mi_state_outstanding "$C"
+  [ "$status" -eq 0 ]
+  case $'\n'"$output"$'\n' in
+    *$'\n'"alias"$'\t'"${NET}"$'\n'*) : ;;
+    *) echo "the first check was replaced rather than added to: $output" >&2; return 1 ;;
+  esac
+  case $'\n'"$output"$'\n' in
+    *$'\n'"alias"$'\t'"${NET}x"$'\n'*) : ;;
+    *) echo "the second check was not recorded: $output" >&2; return 1 ;;
+  esac
+}
+
+@test "clearing names the PARAMETER — a same-kind check nobody verified survives" {
+  # `mi_state_outstanding_clear "$C" alias` filtered on the KIND alone, while mi_state_commit accepts
+  # several entries of one kind with different parameters — so verifying the alias on ONE network
+  # retired the check owed on every other. Test 28 builds two same-kind entries but exercises
+  # `forget`; this one exercises the clear, which is the function the defect is in.
+  mi_state_commit "$C" running alias "$NET" alias "${NET}x"
+  mi_state_outstanding_clear "$C" alias "$NET"
+  run mi_state_outstanding "$C"
+  [ "$status" -eq 0 ]
+  case $'\n'"$output"$'\n' in
+    *$'\n'"alias"$'\t'"${NET}x"$'\n'*) : ;;
+    *) echo "a check nobody verified was cleared too: $output" >&2; return 1 ;;
+  esac
+  case $'\n'"$output"$'\n' in
+    *$'\n'"alias"$'\t'"${NET}"$'\n'*) echo "the verified check survived its own clear: $output" >&2; return 1 ;;
+  esac
+  # and one unverified entry still keeps the container off the reconciled list
+  mi_rt_container_start "$C"
+  run mi_state_reconciled "$C"
+  [ "$status" -ne 0 ]
+}
+
+@test "a clear that does not name WHICH check was verified is refused" {
+  # The clear is the only place an owed check disappears, so it has to name the exact thing that was
+  # verified. A parameterless clear names a kind and nothing else — the by-kind clear this replaced,
+  # one call earlier.
+  mi_state_commit "$C" running alias "$NET"
+  run mi_state_outstanding_clear "$C" alias
+  [ "$status" -ne 0 ]
+  run mi_state_outstanding_clear "$C" alias ""
+  [ "$status" -ne 0 ]
+  run mi_state_outstanding "$C"
+  assert_contains "$NET"
+}
+
+@test "an outstanding entry that does not say WHAT to verify refuses the whole set" {
+  # A missing `param` became `p=""`, so a restored `container=C kind=alias` row was listed as an
+  # ordinary entry: it schedules a `verify` that names nothing to verify, and the by-kind clear then
+  # deleted it. Fail closed, exactly as the missing-`kind` case already does.
+  mi_state_commit "$C" running alias "$NET"
+  put_raw "outstanding"$'\t'"container=${C}"$'\t'"kind=alias"
+  run mi_state_outstanding "$C"
+  [ "$status" -ne 0 ]
+  run mi_state_reconciled "$C"
+  [ "$status" -ne 0 ]
+}
+
+@test "an outstanding entry whose parameter is EMPTY refuses the set too" {
+  # `param=` is a legal field carrying no value, so it reaches the listing as `p=""` — the same entry
+  # naming nothing, one byte later, and the same reason to refuse it.
+  mi_state_commit "$C" running alias "$NET"
+  put_raw "outstanding"$'\t'"container=${C}"$'\t'"kind=alias"$'\t'"param="
+  run mi_state_outstanding "$C"
+  [ "$status" -ne 0 ]
+}
+
+@test "the desired row has exactly ONE writer, and it is the atomic one" {
+  # mi_state_desired_set wrote `desired` alone: it neither preserved the recorded value nor wrote an
+  # outstanding check atomically with it. A caller that recorded `running`, started the container and
+  # crashed left observed = desired = running with nothing outstanding — plan `none`, and the live
+  # verification lost. It is REMOVED rather than documented against; with the set now preserved,
+  # `mi_state_commit <container> <state>` is the intent-preserving write it existed for, obtained
+  # through the atomic path.
+  run type mi_state_desired_set
+  [ "$status" -ne 0 ]
+  mi_state_commit "$C" running alias "$NET"
+  want="$(mi_state_desired_get "$C")"
+  mi_state_commit "$C" "$want"
+  run mi_state_outstanding "$C"
+  assert_contains "$NET"
+}
+
+@test "recording the same check twice records it once, and ONE clear retires it" {
+  # commit ADDS to the set now, so a check already owed must not be written a second time: two rows
+  # naming one verification are not two obligations, and the second would outlive the clear that
+  # performed it if the clear dropped only one row.
+  mi_state_commit "$C" running alias "$NET"
+  mi_state_commit "$C" running alias "$NET" alias "$NET"
+  run mi_state_outstanding "$C"
+  [ "$status" -eq 0 ]
+  n=0
+  while IFS= read -r l; do if [ -n "$l" ]; then n=$((n + 1)); fi; done <<< "$output"
+  [ "$n" -eq 1 ] || { echo "expected one entry, got ${n}: $output" >&2; return 1; }
+  mi_state_outstanding_clear "$C" alias "$NET"
+  run mi_state_outstanding "$C"
+  [ -z "$output" ]
 }

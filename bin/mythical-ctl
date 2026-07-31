@@ -93,7 +93,7 @@ main() {
                 mi_prov_image_record mi_prov_authority mi_first_use \
                 mi_nonce_new mi_intent_open mi_intent_confirm mi_intent_reconcile \
                 mi_intent_abandonable mi_intent_abandon mi_unaccounted_scan mi_unaccounted_gate \
-                mi_state_desired_get mi_state_desired_set mi_state_commit mi_state_outstanding \
+                mi_state_desired_get mi_state_commit mi_state_outstanding \
                 mi_state_outstanding_clear mi_state_observed mi_state_reconciled mi_state_plan \
                 mi_state_forget; do
         if ! declare -F "$_f" >/dev/null 2>&1; then

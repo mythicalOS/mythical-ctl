@@ -24,8 +24,39 @@
 #     _mi_led_select — the one place that cardinality question is asked — and only that row is
 #     dropped. Replacing two contradicting rows with one destroys the evidence that the ledger needs
 #     repairing, which is the one thing these modules may never do. The OUTSTANDING set is different
-#     by design: it is legitimately several rows per container, so "replace the set" is the operation,
-#     and the cardinality question does not arise for it.
+#     by design: it is legitimately several rows per container, so the cardinality question does not
+#     arise for it — which is exactly why the rule below has to be stated separately for it.
+#
+# AND THE RULE THIS MODULE OWNS: AN OUTSTANDING CHECK MAY ONLY DISAPPEAR WHEN THE THING IT NAMES WAS
+# ACTUALLY VERIFIED. It has ONE home — _mi_state_filter, the single walk that rewrites a container's
+# rows — and each entry point declares which of its three modes it uses:
+#
+#   +keep   mi_state_commit. A desired-state write is not a verification, so it drops NO outstanding
+#           row: an entry already recorded survives a commit that does not mention it, and the pairs
+#           the commit IS given are ADDED to the set. Replacing the set made a bare
+#           `mi_state_commit <container> stopped` retire every check the container owed, with nothing
+#           checked and nothing said.
+#   +match  mi_state_outstanding_clear — the only path an entry disappears down. It names the KIND
+#           AND THE PARAMETER, because the set holds several entries of one kind with different
+#           parameters: verifying the alias on one network must not retire the check owed on another.
+#           A clear that named only the kind could not express which check it had performed, so the
+#           API accepted a state its own clear could not handle.
+#   +all    mi_state_forget — a family uninstall, or `state repair` dropping a container's whole
+#           recorded state. That is not a claim that anything was verified, and it is the only caller
+#           allowed to say it.
+#
+# The same rule closes the READ side: an entry naming no parameter is refused rather than listed,
+# because it schedules a verification of nothing and no clear can ever name it (mi_state_outstanding).
+#
+# And it is why there is exactly ONE writer of the `desired` row — mi_state_commit, which writes that
+# row and the outstanding set in a single ledger write. A second writer that set `desired` alone
+# existed for "intent-preserving" recreates, and it reopened precisely the window D50 closes: record
+# `running`, start the container, crash before the alias check is written, and the container is
+# observed = desired = running with nothing outstanding, so mi_state_plan answers `none` and the live
+# verification is simply lost. Its public signature accepted either state and nothing enforced the
+# narrow use its comment claimed. It is REMOVED rather than documented against — with the set
+# preserved, `mi_state_commit <container> <state>` IS that intent-preserving write, taken through the
+# atomic path.
 #
 # And one rule this module shares with lib/intent.sh: ZERO IS ONLY EVIDENCE WHEN THE QUESTION WAS
 # ANSWERED. `mi_rt_inspect` splits rc 3 (the object is gone) from rc 1 (the runtime could not answer),
@@ -146,7 +177,26 @@ mi_state_outstanding() {
       mi_warn "  Run 'mythical-ctl state repair'."
       return 1
     fi
-    p="$(mi_led_field "$line" param)" || p=""
+    # AN ENTRY THAT DOES NOT SAY WHAT IT MUST VERIFY is refused for exactly the reason one that does
+    # not say what KIND of check it is is refused, and it was the one case left open: `|| p=""` turned
+    # a restored `container=C kind=alias` row with no parameter into an ordinary-looking entry. An
+    # `alias` entry carries the network the alias must resolve on, so one carrying nothing schedules a
+    # `verify` that names nothing to verify — and since the clear names the parameter, nothing could
+    # ever match it either. Fail closed, as the missing-kind case does.
+    if p="$(mi_led_field "$line" param)"; then :; else
+      mi_warn "state: an outstanding '${k}' check recorded for '$c' does not say WHAT it must verify."
+      mi_warn "  An 'alias' entry carries the network the alias must resolve on; one carrying nothing"
+      mi_warn "  schedules a check of nothing, and no clear can ever name it. It is PRESERVED and"
+      mi_warn "  reported. Run 'mythical-ctl state repair'."
+      return 1
+    fi
+    if [ -z "$p" ]; then
+      mi_warn "state: an outstanding '${k}' check recorded for '$c' carries an EMPTY parameter — it"
+      mi_warn "  names nothing to verify and no clear can match it, so it would keep this container"
+      mi_warn "  unreconciled forever. It is PRESERVED and reported."
+      mi_warn "  Run 'mythical-ctl state repair'."
+      return 1
+    fi
     # Buffered rather than printed as the loop goes: a partial listing followed by a failure status is
     # the shape a caller reads as success with data. Same reason mi_led_all buffers.
     out="${out}${k}"$'\t'"${p}"$'\n'
@@ -158,9 +208,23 @@ mi_state_outstanding() {
 # byte, and hand back what remains (no trailing newline, as `$( )` would strip one anyway).
 #
 #   <drop-desired>  the fields of the ONE `desired` row _mi_led_select resolved to, or empty for none.
-#   <out-kinds>     `+all` — commit and forget replace the whole outstanding set — or one check kind,
-#                   which is a clear. Both sentinels start with `+`, which _mi_led_field_ok's name
-#                   grammar excludes, so neither can ever collide with a real check kind.
+#   <mode>          WHICH OUTSTANDING ROWS MAY DISAPPEAR — the whole of this module's own rule, asked
+#                   in this one place so no caller can answer it a second way:
+#                     +keep   none of them (mi_state_commit)
+#                     +match  the ones naming <kind> AND <param> (mi_state_outstanding_clear)
+#                     +all    the container's whole set (mi_state_forget)
+#                   All three start with `+`, which _mi_led_field_ok's name grammar excludes, so no
+#                   mode can ever be confused with a real check kind. An unknown mode drops nothing:
+#                   the safe direction is to keep an owed check, never to retire one.
+#
+# +keep does not reach the drop decision and fall through it — it never looks at an outstanding row at
+# all. A mode that walks into the decision and is expected to decline is one edit away from accepting.
+#
+# +match matches BOTH halves. Matching the kind alone is what let a verified alias on one network
+# retire the check owed on another, and it matched every row of the kind, not one — which is correct
+# here and only here: several rows naming the same (kind, param) name the SAME verification, and that
+# verification happened. This is the one place in these modules where "every row that matches" is the
+# contract rather than the defect, so it is stated rather than left to be inferred.
 #
 # It performs _mi_led_without's single-row drop inline rather than calling it, because this edit
 # touches TWO record sets in one write and the body must be walked ONCE: a second pass reports the
@@ -178,7 +242,7 @@ mi_state_outstanding() {
 # reads as harmless and is not: the row is silently absent from the output, so a foreign or restored
 # ledger quietly loses a row at the first operation that touches this container.
 _mi_state_filter() {
-  local records="$1" c="$2" want="$3" kinds="$4" line rec out="" blank=0
+  local records="$1" c="$2" want="$3" mode="$4" kind="${5:-}" param="${6:-}" line rec out="" blank=0
   # AN EMPTY BODY IS NOT A BLANK ROW. The here-string below supplies a newline of its own, so `""`
   # would arrive as one empty line and be reported as a blank row on the first write of every install.
   [ -n "$records" ] || return 0
@@ -188,11 +252,14 @@ _mi_state_filter() {
     # row removed is the row that was judged. `want` is cleared on the first hit, so a ledger holding
     # those bytes twice cannot lose both rows here.
     if [ -n "$want" ] && [ "$line" = "$want" ]; then want=""; continue; fi
-    if _mi_led_row_of "$line" "$MI_OUT_KIND"; then
+    if [ "$mode" != '+keep' ] && _mi_led_row_of "$line" "$MI_OUT_KIND"; then
       rec="$MI_LED_ROW"          # copied out before anything else runs; the global is valid until the next call
+      # The container gates first, so a row this module cannot read is refused ONCE, by the matcher
+      # that owns the message, rather than three times over.
       if _mi_led_record_matches "$rec" container "$c"; then
-        if [ "$kinds" = '+all' ]; then continue; fi
-        if _mi_led_record_matches "$rec" kind "$kinds"; then continue; fi
+        if [ "$mode" = '+all' ]; then continue; fi
+        if [ "$mode" = '+match' ] && _mi_led_record_matches "$rec" kind "$kind" &&
+           _mi_led_record_matches "$rec" param "$param"; then continue; fi
       fi
     fi
     if [ -z "$line" ]; then blank=$((blank + 1)); fi   # a loop counter, not a value out of a file
@@ -207,14 +274,38 @@ _mi_state_filter() {
 }
 
 # The read-modify-write mi_state_commit and mi_state_forget share: resolve this container's ONE
-# `desired` row, then hand back the body with that row and the container's whole outstanding set
-# removed. rc 0 the remainder is printed · 1 refused, reported.
+# `desired` row, then hand back the body with that row removed and its outstanding set treated
+# according to <mode>. rc 0 the remainder is printed · 1 refused, reported.
+#
+# The mode is the CALLER's to state and is passed straight through: commit and forget differ in
+# exactly that one answer, and a shared helper that chose for them would be the second place the
+# question is settled.
 _mi_state_take() {
-  local records="$1" c="$2" old="" rc
+  local records="$1" c="$2" mode="$3" old="" rc
   if old="$(_mi_led_select "$records" "$MI_STATE_KIND" container "$c")"; then :; else
     rc=$?; [ "$rc" -eq 3 ] || return 1; old=""
   fi
-  _mi_state_filter "$records" "$c" "$old" '+all'
+  _mi_state_filter "$records" "$c" "$old" "$mode"
+}
+
+# Is this container's <kind>/<param> check ALREADY in <records>? An obligation already recorded is the
+# same obligation: writing it twice puts two rows in the ledger naming ONE verification, which is not
+# two things to check — it is one thing written down twice, and it makes the listing report a set that
+# has a member it does not have. rc 0 present · 1 not, or the rows could not be read as records (in
+# which case nothing here matches, and the caller adds its entry rather than assuming it is covered).
+_mi_state_out_has() {
+  local records="$1" c="$2" kind="$3" param="$4" line rec
+  [ -n "$records" ] || return 1
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    _mi_led_row_of "$line" "$MI_OUT_KIND" || continue
+    rec="$MI_LED_ROW"
+    _mi_led_record_matches "$rec" container "$c" || continue
+    if _mi_led_record_matches "$rec" kind "$kind" && _mi_led_record_matches "$rec" param "$param"; then
+      return 0
+    fi
+  done <<< "$records"
+  return 1
 }
 
 # D50's ordering, made unavoidable: desired state AND the outstanding set commit in ONE atomic ledger
@@ -267,13 +358,15 @@ mi_state_commit() {
     shift 2
   done
 
-  local records rest rc out="" i
+  local records rest rc out="" i k p
   if records="$(mi_ledger_read)"; then :; else
     # rc 3 is "no ledger yet", a legitimate first write. Anything else is corruption, already reported
     # by the reader — never overwrite a ledger we could not read.
     rc=$?; [ "$rc" -eq 3 ] || return "$rc"; records=""
   fi
-  rest="$(_mi_state_take "$records" "$c")" || return 1
+  # +keep: THE OUTSTANDING SET IS PRESERVED. This write records an intent; it verifies nothing, so it
+  # may not retire a check. The entries below are ADDED to what survives.
+  rest="$(_mi_state_take "$records" "$c" '+keep')" || return 1
   [ -z "$rest" ] || out="${rest}"$'\n'
   out="${out}${MI_STATE_KIND}"$'\t'"container=${c}"$'\t'"state=${want}"$'\n'
   i=0
@@ -282,32 +375,59 @@ mi_state_commit() {
   # command substitution inside an arithmetic array subscript, so a subscript derived from ledger
   # content would be an execution surface. No value read from the ledger reaches arithmetic here.
   while [ "$i" -lt "${#pairs[@]}" ]; do
-    out="${out}${MI_OUT_KIND}"$'\t'"container=${c}"$'\t'"kind=${pairs[$i]}"$'\t'"param=${pairs[$((i + 1))]}"$'\n'
+    k="${pairs[$i]}"; p="${pairs[$((i + 1))]}"
     i=$((i + 2))
+    # Already owed? Then it is already recorded. Asked of `$out`, which is what this write will
+    # actually contain — the rows it kept AND the ones this loop has already appended — so a check
+    # carried over from an earlier commit and a pair repeated within ONE call are the same question,
+    # answered once.
+    if _mi_state_out_has "$out" "$c" "$k" "$p"; then continue; fi
+    out="${out}${MI_OUT_KIND}"$'\t'"container=${c}"$'\t'"kind=${k}"$'\t'"param=${p}"$'\n'
   done
   printf '%s' "$out" | mi_ledger_write
 }
 
-# Set desired state WITHOUT touching the outstanding set. For the verbs that preserve intent rather
-# than express it — a `recreate` of a stopped product must stay stopped (§6b.3's verb table).
-#
-# It goes through mi_led_put, which applies the field rule, the selector rule and the cardinality
-# question itself. There is deliberately no second copy of any of them here: a guard whose removal
-# changes nothing observable is a guard that gets removed.
-mi_state_desired_set() {
-  if [ "$#" -ne 2 ]; then mi_warn "state: mi_state_desired_set needs <container> <desired>"; return 1; fi
-  _mi_state_desired_ok "$2" || return 1
-  mi_led_put "$MI_STATE_KIND" container "$1" "container=${1}" "state=${2}"
-}
+# There is no mi_state_desired_set, deliberately — see the rule at the top of this file. The verbs
+# that preserve intent rather than express it (a `recreate` of a stopped product must stay stopped,
+# §6b.3's verb table) read the recorded state with mi_state_desired_get and write it back through
+# mi_state_commit, which preserves the outstanding set. That is the same operation, taken through the
+# one writer that cannot leave desired state and the checks it owes in separate ledger writes.
 
-# Clear ONE kind. A `start` clears only the kinds it actually performed — one kind of check must not be
+# Clear ONE outstanding check: the entry naming <kind> AND <param>. THIS IS THE ONLY PLACE AN
+# OUTSTANDING ENTRY DISAPPEARS, and it names the exact thing that was verified.
+#
+# The parameter is not decoration. mi_state_commit accepts several entries of one kind with different
+# parameters — an `alias` check per network — so a clear keyed on the kind alone said "some alias was
+# verified" and retired every alias check the container owed, including ones nothing had looked at.
+# A `start` likewise clears only the kinds it actually performed: one kind of check must not be
 # retired by another that happened to succeed (D52). Anything left outstanding keeps the container
 # NOT RECONCILED.
+#
+# Clearing a check that is not recorded is a no-op success, exactly as mi_led_del is: the caller
+# verified something and the ledger already owes nothing for it.
 mi_state_outstanding_clear() {
-  if [ "$#" -ne 2 ]; then mi_warn "state: mi_state_outstanding_clear needs <container> <kind>"; return 1; fi
-  local c="$1" kind="$2" records rest rc
+  if [ "$#" -ne 3 ]; then mi_warn "state: mi_state_outstanding_clear needs <container> <kind> <param>"; return 1; fi
+  local c="$1" kind="$2" param="$3" records rest rc
   _mi_state_kind_ok "$kind" || return 1
-  _mi_led_args_ok "$MI_OUT_KIND" container "$c" || return 1
+  # AN EMPTY PARAMETER IS THE BY-KIND CLEAR THIS REPLACED, one argument later. It names no check, and
+  # a match on it would either retire everything of the kind or nothing at all depending on how the
+  # matcher happened to treat the empty string — neither of which is "this is what I verified".
+  if [ -z "$param" ]; then
+    mi_warn "state: refusing to clear the outstanding '${kind}' check for '${c}' without saying WHICH"
+    mi_warn "  one was verified. This set holds several entries of one kind with different parameters"
+    mi_warn "  — an 'alias' check per network — so a clear that names only the kind retires checks"
+    mi_warn "  nobody performed. Nothing was written."
+    return 1
+  fi
+  # THE WRITER'S OWN LIST RULE, ON THE SELECTOR. The entry was serialized from exactly these three
+  # fields, so judging them with the same function is what makes a clear able to name only something a
+  # commit could have recorded — and a selector no field could ever equal matches nothing and clears
+  # nothing, silently. It subsumes the container check the other selector paths make with
+  # _mi_led_args_ok; a second copy of it here would be a guard whose removal changes nothing.
+  if ! _mi_led_fields_ok "container=${c}" "kind=${kind}" "param=${param}"; then
+    mi_warn "state: refusing to clear the outstanding '${kind}' check for '${c}'. Nothing was written."
+    return 1
+  fi
   mi_lock_assert_held "clear an outstanding check"
   if records="$(mi_ledger_read)"; then :; else
     rc=$?
@@ -317,7 +437,7 @@ mi_state_outstanding_clear() {
     [ "$rc" -eq 3 ] && return 0
     return "$rc"
   fi
-  rest="$(_mi_state_filter "$records" "$c" "" "$kind")" || return 1
+  rest="$(_mi_state_filter "$records" "$c" "" '+match' "$kind" "$param")" || return 1
   printf '%s' "$rest" | mi_ledger_write
 }
 
@@ -330,6 +450,10 @@ mi_state_outstanding_clear() {
 # desired state — and mi_led_del removes the ONE row a selector resolves to, so on a container with
 # two outstanding kinds it would refuse the second call outright and leave the set half-forgotten
 # behind a deleted desired row.
+#
+# `+all` — the ONE caller permitted to make an unverified check disappear, and it is not claiming
+# verification: it is dropping the container from this installation's records entirely, after which
+# there is nothing left to be outstanding for. Every other path preserves.
 mi_state_forget() {
   if [ "$#" -ne 1 ]; then mi_warn "state: mi_state_forget needs <container>"; return 1; fi
   local c="$1" records rest rc
@@ -340,7 +464,7 @@ mi_state_forget() {
     [ "$rc" -eq 3 ] && return 0
     return "$rc"
   fi
-  rest="$(_mi_state_take "$records" "$c")" || return 1
+  rest="$(_mi_state_take "$records" "$c" '+all')" || return 1
   printf '%s' "$rest" | mi_ledger_write
 }
 
