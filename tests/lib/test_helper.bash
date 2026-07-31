@@ -35,7 +35,7 @@ run_mctl() { run "${_MCTL_ROOT}/bin/mythical-ctl" "$@"; }
 # tests run before later tasks have created their modules (e.g. Task 2 has no lock.sh yet).
 load_mctl() {
   local m f
-  for m in common layout config lock ledger doc trust policy manifest detect runtime preflight exit prov intent; do
+  for m in common layout config lock ledger doc trust policy manifest detect runtime preflight exit prov intent probe; do
     f="${_MCTL_ROOT}/lib/${m}.sh"
     # shellcheck disable=SC1090
     [ -f "$f" ] && source "$f"
@@ -59,6 +59,64 @@ fake_helper() {
 
 # A digest-pinned image reference, for fixtures that need a valid `digestref`.
 a_digestref() { printf 'ghcr.io/mythicalos/%s@sha256:%s\n' "${1:-fixture}" "$(printf 'a%.0s' $(seq 1 64))"; }
+
+# The two pinned helper images every family index MUST name (mi_index_spec: `probe_image` and
+# `copy_image`, both `digestref`, both cardinality `one`). Emitted from ONE place, and called by every
+# index fixture in this suite, so that adding or renaming a required index key is a single edit rather
+# than twenty — and so no fixture can drift into spelling one of them differently from the rest.
+index_helper_images() {
+  printf 'probe_image=%s\n' "$(a_digestref probe)"
+  printf 'copy_image=%s\n' "$(a_digestref copy)"
+}
+
+# Install the fixture helper image's entrypoint as the thing the fake `docker container run` executes.
+#
+# THE FIXTURE ENTRYPOINT IS THE SPECIFICATION for the real pinned helper images (D49's probe and D54's
+# copy container), which are built outside this repository: it defines the command grammar those images
+# must answer. See tests/harness/helperimg for the grammar itself.
+install_helper_img() {
+  FAKE_HELPER_BIN="${_MCTL_ROOT}/tests/harness/helperimg"
+  # Loud here rather than as "fake docker: FAKE_HELPER_BIN is not set to an executable fixture
+  # entrypoint" ten frames down inside the runtime adapter: a fixture that lost its executable bit is
+  # a harness problem and must not read as a probe failure.
+  [ -x "$FAKE_HELPER_BIN" ] \
+    || { echo "install_helper_img: $FAKE_HELPER_BIN is missing or not executable" >&2; return 1; }
+  export FAKE_HELPER_BIN
+}
+
+# A VERIFIED family index at <file>: a complete `mythical-index 1` document plus the trust anchor
+# recorded for it, so `mi_accept_index <file>` returns 0.
+#
+# Defaults emitted, in this order: version=1, expires=<now+1 day>, policy_digest, probe_image,
+# copy_image. Any extra `key=value` argument is emitted verbatim AFTER them — and an argument whose KEY
+# names one of those defaults REPLACES that default rather than being appended beside it.
+#
+# THE REPLACEMENT IS NOT A CONVENIENCE. Every default above is cardinality `one`, and mi_doc_load
+# refuses a `one` key that appears twice — so a naive append would make `write_index_fixture … \
+# "expires=1"` fail as a MALFORMED document rather than as the expired document the caller meant to
+# build, and the test would pass or fail for the wrong reason. Keys that are not defaults (notably
+# `manifest=<product>:<digest>`, cardinality `many`) are simply appended, repeats included.
+#
+# It writes the ledger (the anchor), so the family lock must already be held.
+write_index_fixture() {
+  local f="$1"; shift
+  local kv key over=""
+  for kv in "$@"; do over="${over}|${kv%%=*}|"; done
+  {
+    printf 'mythical-index 1\n'
+    for kv in "version=1" \
+              "expires=$(( $(date +%s) + 86400 ))" \
+              "policy_digest=$(printf 'b%.0s' $(seq 1 64))" \
+              "probe_image=$(a_digestref probe)" \
+              "copy_image=$(a_digestref copy)"; do
+      key="${kv%%=*}"
+      case "$over" in *"|${key}|"*) continue ;; esac
+      printf '%s\n' "$kv"
+    done
+    for kv in "$@"; do printf '%s\n' "$kv"; done
+  } > "$f"
+  mi_trust_anchor_set "$(mi_digest "$f")"
+}
 
 # A guaranteed-dead PID for stale-lock fixtures. A literal like 999999 is NOT reliably dead — Linux
 # pid_max can exceed it — so spawn a child, reap it, and reuse its PID: reaped, and not reallocatable

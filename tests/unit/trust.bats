@@ -242,6 +242,7 @@ mkindex() {   # writes $MYTHICAL_HOME/{policy,mb,ms,index}; prints nothing
   printf 'mythical-manifest 1\nversion=1\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nmin_core=0.1.0\nimage=r@%s\nvolume=state:/data\n' "$dig" > "$d/mb"
   printf 'mythical-manifest 1\nversion=1\nexpires=4102444800\nproduct=skuld\nlaunched=true\nmin_core=0.1.0\nimage=r@%s\nvolume=state:/data\n' "$dig" > "$d/ms"
   { printf 'mythical-index 1\nversion=1\nexpires=4102444800\npolicy_digest=%s\n' "$(mi_digest "$d/policy")"
+    index_helper_images
     printf 'manifest=brokkr:%s\nmanifest=skuld:%s\n' "$(mi_digest "$d/mb")" "$(mi_digest "$d/ms")"; } > "$d/index"
 }
 
@@ -265,6 +266,7 @@ mkindex() {   # writes $MYTHICAL_HOME/{policy,mb,ms,index}; prints nothing
   mkindex
   local d="$MYTHICAL_HOME"
   { printf 'mythical-index 1\nversion=1\nexpires=4102444800\npolicy_digest=%s\n' "$(mi_digest "$d/policy")"
+    index_helper_images
     printf 'manifest=brokkr:%s\nmanifest=brokkr:%s\n' "$(mi_digest "$d/mb")" "$(mi_digest "$d/ms")"; } > "$d/index"
   mi_trust_anchor_set "$(mi_digest "$d/index")"
   # refused at LOAD, not merely at lookup: an ambiguous index that parses could still be used to
@@ -336,6 +338,7 @@ mkindex() {   # writes $MYTHICAL_HOME/{policy,mb,ms,index}; prints nothing
   mkindex
   local d="$MYTHICAL_HOME"
   { printf 'mythical-index 1\nversion=1\nexpires=1\npolicy_digest=%s\n' "$(mi_digest "$d/policy")"
+    index_helper_images
     printf 'manifest=brokkr:%s\nmanifest=skuld:%s\n' "$(mi_digest "$d/mb")" "$(mi_digest "$d/ms")"; } > "$d/index"
   mi_trust_anchor_set "$(mi_digest "$d/index")"
   run mi_accept_index "$d/index"

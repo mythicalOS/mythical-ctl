@@ -437,6 +437,13 @@ mi_rt_container_rm() {
 # <netspec> is either `none` (the copy container — D54 requires it, and this is the one legitimate
 # use of `none` in the design, since the copy never joins a network) or a network ID (the probe).
 # <runas> is `-` or a numeric uid (D58's effective-access check runs AS the product's runtime uid).
+#
+# `--rm` IS THE HALF OF THE CONTRACT THAT SAYS NO HELPER OUTLIVES ITS OWN INVOCATION. The other half is
+# that while it DOES live it is an object like any other (§6a/§6b): named, and labelled with both the
+# nonce and the installation, through the `name=` and `install=` specs below. A helper carrying only a
+# nonce is anonymous — a nonce says WHICH object, never WHOSE — so a leaked one could never be shown to
+# be ours, nothing would be authorized to remove it, and §6b.2's classifier would read a
+# daemon-assigned name as a stranger's object and ignore it entirely.
 mi_rt_run_helper() {
   if [ "$#" -lt 5 ]; then
     mi_warn "runtime: mi_rt_run_helper needs <image> <netspec> <runas> <label-nonce> <cmd> [args...]"
@@ -488,6 +495,12 @@ mi_rt_run_helper() {
                  rtargv+=(--mount "type=bind,source=${s#staging=},target=/dst") ;;
       dstro=*)   _mi_rt_bind_path_ok "${s#dstro=}" "helper read-only source" || return 1
                  rtargv+=(--mount "type=bind,source=${s#dstro=},target=/dst,readonly") ;;
+      # The name the caller's own record names it by, and the installation it belongs to — the same
+      # two facts every other create in this module records. See the note above the function.
+      name=*)    _mi_rt_arg_ok "${s#name=}" || { mi_warn "runtime: invalid helper container name"; return 1; }
+                 rtargv+=(--name "${s#name=}") ;;
+      install=*) _mi_rt_arg_ok "${s#install=}" || { mi_warn "runtime: invalid installation identity"; return 1; }
+                 rtargv+=(--label "${MI_RT_NS}.installation=${s#install=}") ;;
       # An argument to the CLOSED command word, INSIDE the container — never a docker flag. Every
       # value passed this way is a container-internal path or an alias this code computed.
       arg=*)     rtpost+=("${s#arg=}") ;;

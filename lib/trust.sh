@@ -365,6 +365,15 @@ mi_index_spec() {
   printf 'expires\tepoch\tone\n'
   printf 'policy_digest\tsha256\tone\n'
   printf 'manifest\tproductdigest\tmany\n'
+  # D49/D54: the two pinned helper images the core runs on the operator's daemon. Named HERE, in the
+  # one document that is verified against the persisted anchor, so they ride the same trust chain as
+  # everything else — never "whatever busybox is around".
+  #
+  # REQUIRED, not optional. D49's answer to an unobtainable probe is to STOP rather than proceed
+  # unverified; an absent key would make that stop unreachable, because the code would never get as
+  # far as trying. And `digestref` refuses a tag by construction (D22), so `latest` cannot appear.
+  printf 'probe_image\tdigestref\tone\n'
+  printf 'copy_image\tdigestref\tone\n'
 }
 
 # Parse an index file. NOT an authentication step — mi_accept_index is. Kept separate so the

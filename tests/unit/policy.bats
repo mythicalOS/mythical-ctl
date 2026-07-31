@@ -220,8 +220,9 @@ mkchain() {   # writes $MYTHICAL_HOME/{policy,index}; does NOT set the anchor
   local d="$MYTHICAL_HOME"
   { printf 'mythical-policy 1\nversion=1\nexpires=4102444800\nfamily_gid=60748\n'
     printf 'brokkr.permitted_role=state\nbrokkr.bindable_role=state\n'; } > "$d/policy"
-  printf 'mythical-index 1\nversion=1\nexpires=4102444800\npolicy_digest=%s\n' \
-    "$(mi_digest "$d/policy")" > "$d/index"
+  { printf 'mythical-index 1\nversion=1\nexpires=4102444800\npolicy_digest=%s\n' \
+      "$(mi_digest "$d/policy")"
+    index_helper_images; } > "$d/index"
 }
 
 @test "mi_accept_policy end to end: a matching chain is accepted and its records come back" {
@@ -244,7 +245,8 @@ mkchain() {   # writes $MYTHICAL_HOME/{policy,index}; does NOT set the anchor
   mkchain
   local d="$MYTHICAL_HOME" bogus
   bogus="$(printf 'b%.0s' {1..64})"
-  printf 'mythical-index 1\nversion=1\nexpires=4102444800\npolicy_digest=%s\n' "$bogus" > "$d/index"
+  { printf 'mythical-index 1\nversion=1\nexpires=4102444800\npolicy_digest=%s\n' "$bogus"
+    index_helper_images; } > "$d/index"
   mi_trust_anchor_set "$(mi_digest "$d/index")"
   run mi_accept_policy "$d/index" "$d/policy"
   [ "$status" -eq 1 ]
@@ -283,8 +285,9 @@ mkchain() {   # writes $MYTHICAL_HOME/{policy,index}; does NOT set the anchor
     printf 'brokkr.permitted_role=secrets\n'; } > "$d/forged-policy"
   # An attacker who can write the cached index (but not the anchor) points it at the forged policy,
   # without ever touching the recorded anchor.
-  printf 'mythical-index 1\nversion=1\nexpires=4102444800\npolicy_digest=%s\n' \
-    "$(mi_digest "$d/forged-policy")" > "$d/index"
+  { printf 'mythical-index 1\nversion=1\nexpires=4102444800\npolicy_digest=%s\n' \
+      "$(mi_digest "$d/forged-policy")"
+    index_helper_images; } > "$d/index"
   run mi_accept_policy "$d/index" "$d/forged-policy"
   [ "$status" -eq 1 ] || { echo "a forged index was accepted, status=$status: $output" >&2; return 1; }
   [[ "$output" == *digest* ]] || { echo "output missing a digest-mismatch message: $output" >&2; return 1; }
@@ -299,8 +302,9 @@ mkchain() {   # writes $MYTHICAL_HOME/{policy,index}; does NOT set the anchor
   local d="$MYTHICAL_HOME"
   { printf 'mythical-policy 1\nversion=1\nexpires=1\nfamily_gid=60748\n'
     printf 'brokkr.permitted_role=state\nbrokkr.bindable_role=state\n'; } > "$d/policy"
-  printf 'mythical-index 1\nversion=1\nexpires=4102444800\npolicy_digest=%s\n' \
-    "$(mi_digest "$d/policy")" > "$d/index"
+  { printf 'mythical-index 1\nversion=1\nexpires=4102444800\npolicy_digest=%s\n' \
+      "$(mi_digest "$d/policy")"
+    index_helper_images; } > "$d/index"
   mi_trust_anchor_set "$(mi_digest "$d/index")"
   run mi_accept_policy "$d/index" "$d/policy"
   [ "$status" -eq 1 ] || { echo "an expired policy was accepted, status=$status: $output" >&2; return 1; }

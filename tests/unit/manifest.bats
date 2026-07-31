@@ -162,6 +162,7 @@ man() { { printf 'mythical-manifest 1\nversion=1\nexpires=4102444800\nproduct=br
   local d="$MYTHICAL_HOME" dig="sha256:$(printf 'a%.0s' {1..64})"
   printf 'mythical-manifest 1\nversion=1\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nmin_core=99.0.0\nimage=r@%s\nvolume=state:/data\n' "$dig" > "$d/mb"
   { printf 'mythical-index 1\nversion=1\nexpires=4102444800\npolicy_digest=%s\n' "$(mi_digest "$d/policy")"
+    index_helper_images
     printf 'manifest=brokkr:%s\n' "$(mi_digest "$d/mb")"; } > "$d/index"
   mi_trust_anchor_set "$(mi_digest "$d/index")"
   run mi_accept_manifest "$d/index" "$d/policy" "$d/mb" brokkr
@@ -246,6 +247,7 @@ mkindex() {   # writes $MYTHICAL_HOME/{policy,mb,ms,index}
   printf 'mythical-manifest 1\nversion=1\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nmin_core=0.1.0\nimage=r@%s\nvolume=state:/data\n' "$dig" > "$d/mb"
   printf 'mythical-manifest 1\nversion=1\nexpires=4102444800\nproduct=skuld\nlaunched=true\nmin_core=0.1.0\nimage=r@%s\nvolume=state:/data\n' "$dig" > "$d/ms"
   { printf 'mythical-index 1\nversion=1\nexpires=4102444800\npolicy_digest=%s\n' "$(mi_digest "$d/policy")"
+    index_helper_images
     printf 'manifest=brokkr:%s\nmanifest=skuld:%s\n' "$(mi_digest "$d/mb")" "$(mi_digest "$d/ms")"; } > "$d/index"
 }
 
@@ -314,6 +316,7 @@ mkindex() {   # writes $MYTHICAL_HOME/{policy,mb,ms,index}
 
   # The cached index is rewritten to vouch for it, without ever touching the recorded anchor.
   { printf 'mythical-index 1\nversion=1\nexpires=4102444800\npolicy_digest=%s\n' "$(mi_digest "$d/policy")"
+    index_helper_images
     printf 'manifest=brokkr:%s\n' "$(mi_digest "$d/forged-mb")"; } > "$d/index"
 
   # Grants exactly what the forged manifest asks for, so nothing downstream of step 1 can
@@ -351,6 +354,7 @@ mkindex() {   # writes $MYTHICAL_HOME/{policy,mb,ms,index}
   mkindex
   local d="$MYTHICAL_HOME"
   { printf 'mythical-index 1\nversion=1\nexpires=4102444800\npolicy_digest=%s\n' "$(mi_digest "$d/policy")"
+    index_helper_images
     printf 'manifest=brokkr:%s\n' "$(mi_digest "$d/ms")"; } > "$d/index"   # brokkr → the SKULD file
   mi_trust_anchor_set "$(mi_digest "$d/index")"
   run mi_accept_manifest "$d/index" "$d/policy" "$d/ms" brokkr
@@ -370,7 +374,8 @@ mkindex() {   # writes $MYTHICAL_HOME/{policy,mb,ms,index}
   run mi_accept_policy "$MYTHICAL_HOME/index" "$MYTHICAL_HOME/policy"
   [ "$status" -eq 1 ]
 
-  printf 'mythical-index 1\nversion=99\nexpires=4102444800\npolicy_digest=%s\n' "$(printf 'a%.0s' {1..64})" > "$MYTHICAL_HOME/index"
+  { printf 'mythical-index 1\nversion=99\nexpires=4102444800\npolicy_digest=%s\n' "$(printf 'a%.0s' {1..64})"
+    index_helper_images; } > "$MYTHICAL_HOME/index"
   run mi_accept_index "$MYTHICAL_HOME/index"
   [ "$status" -eq 1 ]
 }
@@ -392,6 +397,7 @@ mkindex() {   # writes $MYTHICAL_HOME/{policy,mb,ms,index}
   local d="$MYTHICAL_HOME" dig="sha256:$(printf 'a%.0s' {1..64})"
   printf 'mythical-manifest 1\nversion=1\nexpires=4102444800\nproduct=brokkr\nlaunched=false\nmin_core=0.1.0\nimage=r@%s\nvolume=state:/data\n' "$dig" > "$d/mb"
   { printf 'mythical-index 1\nversion=1\nexpires=4102444800\npolicy_digest=%s\n' "$(mi_digest "$d/policy")"
+    index_helper_images
     printf 'manifest=brokkr:%s\n' "$(mi_digest "$d/mb")"; } > "$d/index"
   mi_trust_anchor_set "$(mi_digest "$d/index")"
   run mi_accept_manifest "$d/index" "$d/policy" "$d/mb" brokkr
@@ -416,6 +422,7 @@ mkindex() {   # writes $MYTHICAL_HOME/{policy,mb,ms,index}
   # mkindex's policy grants brokkr only the 'state' role — 'secrets' is not among its entitlements.
   printf 'mythical-manifest 1\nversion=1\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nmin_core=0.1.0\nimage=r@%s\nvolume=secrets:/run/secrets\n' "$dig" > "$d/mb"
   { printf 'mythical-index 1\nversion=1\nexpires=4102444800\npolicy_digest=%s\n' "$(mi_digest "$d/policy")"
+    index_helper_images
     printf 'manifest=brokkr:%s\nmanifest=skuld:%s\n' "$(mi_digest "$d/mb")" "$(mi_digest "$d/ms")"; } > "$d/index"
   mi_trust_anchor_set "$(mi_digest "$d/index")"
   run mi_accept_manifest "$d/index" "$d/policy" "$d/mb" brokkr
@@ -440,6 +447,7 @@ mkindex() {   # writes $MYTHICAL_HOME/{policy,mb,ms,index}
   # this refusal.
   printf 'mythical-manifest 1\nversion=7\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nmin_core=0.1.0\nimage=r@%s\nvolume=secrets:/run/secrets\n' "$dig" > "$d/mb7"
   { printf 'mythical-index 1\nversion=1\nexpires=4102444800\npolicy_digest=%s\n' "$(mi_digest "$d/policy")"
+    index_helper_images
     printf 'manifest=brokkr:%s\nmanifest=skuld:%s\n' "$(mi_digest "$d/mb7")" "$(mi_digest "$d/ms")"; } > "$d/index"
   mi_trust_anchor_set "$(mi_digest "$d/index")"
   run mi_accept_manifest "$d/index" "$d/policy" "$d/mb7" brokkr
@@ -456,6 +464,7 @@ mkindex() {   # writes $MYTHICAL_HOME/{policy,mb,ms,index}
   local d="$MYTHICAL_HOME" dig="sha256:$(printf 'a%.0s' {1..64})"
   printf 'mythical-manifest 1\nversion=5\nexpires=4102444800\nproduct=brokkr\nlaunched=false\nmin_core=0.1.0\nimage=r@%s\nvolume=state:/data\n' "$dig" > "$d/mb5"
   { printf 'mythical-index 1\nversion=1\nexpires=4102444800\npolicy_digest=%s\n' "$(mi_digest "$d/policy")"
+    index_helper_images
     printf 'manifest=brokkr:%s\nmanifest=skuld:%s\n' "$(mi_digest "$d/mb5")" "$(mi_digest "$d/ms")"; } > "$d/index"
   mi_trust_anchor_set "$(mi_digest "$d/index")"
   run mi_accept_manifest "$d/index" "$d/policy" "$d/mb5" brokkr
@@ -472,6 +481,7 @@ mkindex() {   # writes $MYTHICAL_HOME/{policy,mb,ms,index}
   local d="$MYTHICAL_HOME" dig="sha256:$(printf 'a%.0s' {1..64})"
   printf 'mythical-manifest 1\nversion=1\nexpires=1\nproduct=brokkr\nlaunched=true\nmin_core=0.1.0\nimage=r@%s\nvolume=state:/data\n' "$dig" > "$d/mbx"
   { printf 'mythical-index 1\nversion=1\nexpires=4102444800\npolicy_digest=%s\n' "$(mi_digest "$d/policy")"
+    index_helper_images
     printf 'manifest=brokkr:%s\nmanifest=skuld:%s\n' "$(mi_digest "$d/mbx")" "$(mi_digest "$d/ms")"; } > "$d/index"
   mi_trust_anchor_set "$(mi_digest "$d/index")"
   run mi_accept_manifest "$d/index" "$d/policy" "$d/mbx" brokkr
@@ -488,6 +498,7 @@ mkindex() {   # writes $MYTHICAL_HOME/{policy,mb,ms,index}
 
   printf 'mythical-manifest 1\nversion=2\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nmin_core=0.1.0\nimage=r@%s\nvolume=state:/data\n' "$dig" > "$d/mb2"
   { printf 'mythical-index 1\nversion=1\nexpires=4102444800\npolicy_digest=%s\n' "$(mi_digest "$d/policy")"
+    index_helper_images
     printf 'manifest=brokkr:%s\nmanifest=skuld:%s\n' "$(mi_digest "$d/mb2")" "$(mi_digest "$d/ms")"; } > "$d/index"
   mi_trust_anchor_set "$(mi_digest "$d/index")"
   run mi_accept_manifest "$d/index" "$d/policy" "$d/mb2" brokkr   # floor advances to 2
@@ -496,6 +507,7 @@ mkindex() {   # writes $MYTHICAL_HOME/{policy,mb,ms,index}
   # Roll back to the original version=1 file/index — must be refused as a replay, and no floor
   # should ever have been written if freshness were skipped entirely.
   { printf 'mythical-index 1\nversion=1\nexpires=4102444800\npolicy_digest=%s\n' "$(mi_digest "$d/policy")"
+    index_helper_images
     printf 'manifest=brokkr:%s\nmanifest=skuld:%s\n' "$(mi_digest "$d/mb")" "$(mi_digest "$d/ms")"; } > "$d/index"
   mi_trust_anchor_set "$(mi_digest "$d/index")"
   run mi_accept_manifest "$d/index" "$d/policy" "$d/mb" brokkr
@@ -515,6 +527,7 @@ mkindex() {   # writes $MYTHICAL_HOME/{policy,mb,ms,index}
   # policy, where brokkr has only 'state'.
   printf 'mythical-manifest 1\nversion=1\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nmin_core=0.1.0\nimage=r@%s\nvolume=secrets:/run/secrets\n' "$dig" > "$d/mbs"
   { printf 'mythical-index 1\nversion=1\nexpires=4102444800\npolicy_digest=%s\n' "$(mi_digest "$d/policy")"
+    index_helper_images
     printf 'manifest=brokkr:%s\n' "$(mi_digest "$d/mbs")"; } > "$d/index"
   mi_trust_anchor_set "$(mi_digest "$d/index")"
 

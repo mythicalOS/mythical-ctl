@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Fixture for the pinned helper image (test-only; never shipped). Stands in for BOTH pinned helpers —
+# the probe (D49) and the copy container (D54) — because the real images share one entrypoint contract:
+# a closed command word, flat `key=value` lines on stdout, and a nonzero exit for a failed check.
+#
+# THIS FILE IS THE SPECIFICATION of that contract. The real images are built outside this repository,
+# and what they must implement is exactly what is below:
+#
+#   argv          <command> [<argument>...]      — the command word FIRST, then its own arguments.
+#                 The command comes from a closed vocabulary the core holds (lib/runtime.sh's
+#                 mi_rt_run_helper); an unsupported one exits 2 and answers nothing.
+#   stdout        flat `key=value` lines, one per line, no nesting and no quoting. §7.5's dependency
+#                 floor has no JSON parser and this is on the path that decides whether a network
+#                 verified, so the answer is in the format the reader already has.
+#   exit status   0 the check ran and passed · 1 the check ran and FAILED · 2 the command word is not
+#                 one this image implements. "The check failed" and "I could not run the check" are
+#                 never the same answer.
+#
+#   selfcheck                  → selfcheck=ok
+#   resolve <alias>            → alias=<alias>, address=<addr>. An EMPTY address is a legitimate
+#                                answer meaning "did not resolve", reported with exit 0; the caller
+#                                maps it to its own rc 3. `alias=` echoes the alias ASKED about, so
+#                                the caller can tell an answer to its question from an answer to
+#                                another one.
+#   egress                     → egress=ok
+#   preflight|copy|verify|acl|access  → Part B's commands (D54/D58), stubbed here.
+#
+# Its answers are driven by HELPER_* environment variables so a test can make the probe succeed, fail,
+# or report a non-resolving alias without a real daemon.
+set -euo pipefail
+
+cmd="${1:-}"; shift || true
+
+case "$cmd" in
+  selfcheck)
+    # The DNS-MECHANISM check: the probe resolves its OWN alias on the target network. This is what
+    # separates "DNS on this network is broken" from "that product is simply not running".
+    if [ "${HELPER_SELFCHECK:-ok}" = fail ]; then printf 'selfcheck=fail\n'; exit 1; fi
+    printf 'selfcheck=ok\n'
+    ;;
+  resolve)
+    # `${HELPER_RESOLVE_ADDR-…}`, NOT `:-`: an explicitly EMPTY value must stay empty, because
+    # "did not resolve" is the answer it exists to produce. With `:-` the default would win and the
+    # non-resolving case would be unreachable.
+    printf 'alias=%s\n' "${1:-}"
+    printf 'address=%s\n' "${HELPER_RESOLVE_ADDR-10.88.1.2}"
+    ;;
+  egress)
+    if [ "${HELPER_EGRESS:-ok}" = fail ]; then printf 'egress=fail\n'; exit 1; fi
+    printf 'egress=ok\n'
+    ;;
+  preflight|copy|verify|acl|access)
+    # Part B's commands. Implemented in Task 11; a stub here keeps the closed command set honest.
+    printf '%s=stub\n' "$cmd"
+    ;;
+  *) printf 'helperimg: unsupported command: %s\n' "$cmd" >&2; exit 2 ;;
+esac
