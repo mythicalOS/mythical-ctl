@@ -98,6 +98,23 @@ teardown() { rm -rf "$OUT"; mi_lock_release; teardown_test_env; }
   assert_contains "not a regular file"
 }
 
+# The core-fixed set could not be computed, so nothing about these mounts was checked — which must
+# not read as "there was nothing to check". Both checkers walk that set through a here-string, and a
+# here-string built from a failed command is empty: the loop runs zero times and the checker returns
+# success. A product name that is not an `ident` is the reachable way to make the set fail.
+@test "a product name that cannot make a path REFUSES, never checks nothing and passes" {
+  run mi_mount_check_fixed "../evil"
+  [ "$status" -ne 0 ]
+  assert_contains "not a usable product name"
+}
+
+@test "the overlap check refuses the same way rather than comparing against an empty set" {
+  mkdir -p "$OUT/work"
+  run mi_mount_check_overlap "../evil" "$OUT/work"
+  [ "$status" -ne 0 ]
+  assert_contains "not a usable product name"
+}
+
 @test "a bind naming the family home is rejected" {
   run mi_mount_check_overlap brokkr "$MYTHICAL_HOME"
   [ "$status" -ne 0 ]

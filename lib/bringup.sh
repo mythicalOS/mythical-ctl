@@ -12,7 +12,7 @@
 #
 # PURE library — no side effects at source time; no `set -euo pipefail`.
 #
-# ARRAY-TYPED LOCALS DECLARED HERE: `srcs`, `modes`, `bspecs`, `ids`, `permitted`. tools/bundle.sh
+# ARRAY-TYPED LOCALS DECLARED HERE: `srcs`, `modes`, `bspecs`, `broles`, `ids`, `permitted`. tools/bundle.sh
 # flattens every module into one file, after which shellcheck's array tracking is no longer
 # per-function — so a later module using one of these names for an ordinary scalar draws SC2178 plus
 # an SC2128 per use, with the tree clean and only `shellcheck dist/mythical-ctl` red. The names
@@ -420,8 +420,11 @@ mi_mount_binds() {
   local product="$1"; shift
   _mi_bringup_name_ok product "$product" || return 1
   local up role rup key val f rc
-  local -a bspecs
-  bspecs=()
+  # Two parallel arrays rather than one, and the role is CARRIED rather than parsed back out of the
+  # spec: recovering it with `${b%:*}`/`${b##*:}` would re-split a string on a `:` that a canonical
+  # host path is free to contain, so the annotation could name a fragment of the path instead.
+  local -a bspecs broles
+  bspecs=(); broles=()
   up="$(printf '%s' "$product" | tr 'a-z-' 'A-Z_')"
   f="$(mi_conf_family_path)"
   for role in "$@"; do
@@ -434,12 +437,15 @@ mi_mount_binds() {
     local canon
     canon="$(mi_canon "$val")" || return 1
     mi_mount_check_overlap "$product" "$canon" || return 1
-    bspecs+=("bind=${canon}:${role}:rw")
+    bspecs+=("bind=${canon}:${role}:rw"); broles+=("$role")
   done
   [ "${#bspecs[@]}" -gt 0 ] || return 0
   mi_mount_binds_check_pairwise ${bspecs[@]+"${bspecs[@]}"} || return 1
-  local b
-  for b in ${bspecs[@]+"${bspecs[@]}"}; do printf '%s\t%s\n' "$b" "${b%:*}"; done
+  local i=0
+  while [ "$i" -lt "${#bspecs[@]}" ]; do
+    printf '%s\t%s\n' "${bspecs[$i]}" "${broles[$i]}"
+    i=$((i + 1))
+  done
   return 0
 }
 
