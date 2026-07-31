@@ -759,12 +759,37 @@ _mi_bringup_attach_ok() {
   # The permitted set. Exactly one ID normally; exactly {source,target} during a recorded migration.
   local -a permitted
   permitted=("$want")
-  local mig src tgt
-  if mig="$(mi_led_find netmig key family 2>/dev/null)"; then
-    src="$(mi_led_field "$mig" source)" || src=""
-    tgt="$(mi_led_field "$mig" target)" || tgt=""
-    if [ -n "$src" ] && [ -n "$tgt" ]; then permitted=("$src" "$tgt"); fi
-  fi
+  local mig src tgt migrc
+  # THE MIGRATION LOOKUP FAILS CLOSED, in both of its failure directions.
+  #
+  # `mi_led_find` answers rc 0 found · 3 absent · 1 could not answer — the last covering an unreadable
+  # ledger and an AMBIGUOUS one (two `netmig key=family` rows). Only rc 3 means "there is no
+  # migration"; treating rc 1 as absent is the same fold this codebase has closed five times, and here
+  # it is a fail-open with a specific consequence: the permitted set silently narrows back to the
+  # singleton `{want}`, a container standing on the target alone then satisfies every direction below,
+  # live verification succeeds, and the caller RETIRES the outstanding check — leaving a half-migrated
+  # container recorded as verified and never looked at again.
+  #
+  # A record that IS present must yield both fields. A missing or empty `source`/`target` was coerced
+  # to empty and fell through to the same singleton, so a truncated record produced the identical
+  # wrong answer by a second route.
+  if mig="$(mi_led_find netmig key family 2>/dev/null)"; then migrc=0; else migrc=$?; fi
+  case "$migrc" in
+    3) : ;;                       # genuinely no migration recorded — the singleton is correct
+    0) src="$(mi_led_field "$mig" source)" || src=""
+       tgt="$(mi_led_field "$mig" target)" || tgt=""
+       if [ -z "$src" ] || [ -z "$tgt" ]; then
+         mi_warn "bringup: a network migration is recorded but does not name both networks."
+         mi_warn "  Refusing to verify '$c' against a narrower set than the record implies — that is"
+         mi_warn "  how a half-migrated container gets recorded as verified. Run 'mythical-ctl state repair'."
+         return 1
+       fi
+       permitted=("$src" "$tgt") ;;
+    *) mi_warn "bringup: cannot read whether a network migration is in progress."
+       mi_warn "  Refusing rather than assuming there is none — assuming would narrow the permitted"
+       mi_warn "  set and accept a container standing half-way through one."
+       return 1 ;;
+  esac
 
   # EXACTLY THE PERMITTED SET, WHICH IS "EVERY PERMITTED ID EXACTLY ONCE" — not "every attachment is
   # permitted, and the wanted one is among them". That weaker pair accepts a strict SUBSET, and the

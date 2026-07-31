@@ -532,3 +532,40 @@ learn_addr() {
   run mi_state_plan "$C"
   [ "$output" = "start verify" ]
 }
+
+# Append a row verbatim, keeping every row already there. The editors refuse to WRITE an ambiguous
+# or truncated record, so these states can only arrive from a restored or foreign ledger — which is
+# exactly what these two reads have to survive.
+put_raw_bu() { { mi_ledger_read; printf '%s\n' "$1"; } | mi_ledger_write; }
+
+@test "an AMBIGUOUS migration record refuses verification instead of narrowing the permitted set" {
+  # Two `netmig key=family` rows make the lookup answer rc 1 — "could not answer" — which used to be
+  # read as "there is no migration". The permitted set then narrowed back to the single wanted
+  # network, so a container standing on the target ALONE satisfied every direction, live verification
+  # succeeded, and the caller retired the outstanding check: a half-migrated container recorded as
+  # verified and never looked at again.
+  mi_bringup_create "$C" "$IMG" "$NET" p1 running - >/dev/null
+  OTHER="$(mi_rt_network_create other "$IDENT" nn2)"
+  mi_rt_network_connect "$OTHER" "$C" p1 0
+  mi_led_put netmig key family "key=family" "phase=2" "source=$NET" "target=$OTHER" "containers=$C"
+  put_raw_bu "netmig"$'\t'"key=family"$'\t'"phase=2"$'\t'"source=$NET"$'\t'"target=$OTHER"
+  run mi_bringup_verify_attach "$C" "$OTHER" p1
+  [ "$status" -ne 0 ]
+  assert_contains "cannot read whether a network migration"
+}
+
+@test "a migration record naming only ONE network refuses too — the same narrowing by another route" {
+  mi_bringup_create "$C" "$IMG" "$NET" p1 running - >/dev/null
+  put_raw_bu "netmig"$'\t'"key=family"$'\t'"phase=2"$'\t'"source=$NET"
+  run mi_bringup_verify_attach "$C" "$NET" p1
+  [ "$status" -ne 0 ]
+  assert_contains "does not name both networks"
+}
+
+@test "and a genuinely absent migration record still verifies a correctly attached container" {
+  # The control. Neither refusal above may swallow the ordinary case — the one every install that is
+  # not mid-migration depends on.
+  mi_bringup_create "$C" "$IMG" "$NET" p1 running - >/dev/null
+  run mi_bringup_verify_attach "$C" "$NET" p1
+  [ "$status" -eq 0 ]
+}
