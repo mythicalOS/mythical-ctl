@@ -321,14 +321,27 @@ mi_mount_check_overlap() {
 # combination did not.
 #
 # Two binds may not overlap when EITHER is writable. Two read-only binds may.
+#
+# IT SPLITS THE SPEC THE WAY THE RUNTIME DOES, field by field from the left, and that is not a style
+# choice. Taking the mode as "everything after the last colon" (`${body##*:}`) while lib/runtime.sh
+# takes it as "everything after the second" makes the two disagree about any spec with a fourth field:
+# `bind=/a:/b:x:rw` reads as mode `rw` here — accepted — and as mode `x:rw` there, where it is refused.
+# So this rule would have judged a combination on a mode the launch never saw. One split, both readers,
+# and a spec that is not exactly three fields is refused rather than silently re-cut.
 mi_mount_binds_check_pairwise() {
   local -a srcs modes
   srcs=(); modes=()
-  local s body p1 p3 c
+  local s body p1 p3 c rest
   for s in "$@"; do
     case "$s" in bind=*) : ;; *) continue ;; esac
     body="${s#bind=}"
-    p1="${body%%:*}"; p3="${body##*:}"
+    p1="${body%%:*}"; rest="${body#*:}"; p3="${rest#*:}"
+    if [ "$rest" = "$body" ] || [ "$p3" = "$rest" ]; then
+      mi_warn "bringup: bind spec '$s' is not <source>:<target>:<mode>. A spec this function has to"
+      mi_warn "  re-cut to read is one whose source it cannot be sure of, and the source is what the"
+      mi_warn "  overlap rule is about."
+      return 1
+    fi
     # A MODE OUTSIDE {ro,rw} IS REFUSED, never read as "not writable". The rule below turns on
     # `= rw`, so an unrecognised third field would make the pair read-only to this function and
     # permit exactly the overlap it exists to refuse — a fail-open reached by a typo.
@@ -401,9 +414,91 @@ mi_conf_spec_for() {
   mi_conf_product_keys "$@"
 }
 
-# Emit `bind=<canonical>:<container-path>:<rw>` for every role the operator has bound, having validated
-# it. Roles with no bind key fall through to a named volume (D6: storage defaults to named volumes, and
-# a fresh install requires the user to decide no paths).
+# WHERE THIS ROLE IS MOUNTED INSIDE THE CONTAINER, out of the AUTHENTICATED manifest — the only
+# document that says. A manifest declares `volume  <role>:<absolute path>` (lib/doc.sh's `rolemount`),
+# which is precisely the role→target mapping a launchable bind spec needs, and it is authenticated by
+# the same door that vouched for the product.
+#
+# rc 0 the target is printed · 1 refused (reported).
+#
+# A ROLE THE MANIFEST DOES NOT PLACE HAS NO TARGET, and that is a refusal rather than a guess. There is
+# nowhere else the container path could come from: the core derives NAMES (D32), never mount points,
+# and inventing one would mount an operator's directory somewhere the product does not read.
+#
+# AND A ROLE IT PLACES TWICE IS AMBIGUOUS. Two records for one role are two answers to a question that
+# has one, and picking the first would decide by file order which of an operator's directories is
+# exposed at which path. Same rule the ledger applies to a lookup that resolves to more than one thing.
+_mi_bringup_role_target() {
+  local mrec="$1" role="$2" v r p found="" n=0
+  while IFS= read -r v; do
+    [ -n "$v" ] || continue
+    case "$v" in *:*) : ;; *) continue ;; esac   # not a rolemount at all; it places nothing
+    r="${v%%:*}"; p="${v#*:}"
+    [ "$r" = "$role" ] || continue
+    n=$((n + 1))
+    found="$p"
+  done <<< "$(mi_doc_values "$mrec" volume)"
+  if [ "$n" -eq 0 ]; then
+    mi_warn "bringup: the manifest declares no mount point for the '$role' volume, so there is nowhere"
+    mi_warn "  inside the container to bind it to. A container path is never invented here — the core"
+    mi_warn "  derives names, not mount points. Refusing."
+    return 1
+  fi
+  if [ "$n" -gt 1 ]; then
+    mi_warn "bringup: the manifest places the '$role' volume at $n different paths. That is two answers"
+    mi_warn "  to a question with one, and taking the first would let record order decide where an"
+    mi_warn "  operator's directory is exposed. Refusing."
+    return 1
+  fi
+  printf '%s\n' "$found"
+}
+
+# A COMPONENT OF A `bind=<source>:<target>:<mode>` SPEC, judged by the rule the CONSUMER applies and by
+# the one the GRAMMAR needs — asked HERE, by the producer, so that no value this module emits can look
+# launchable without being launchable.
+#
+# _mi_rt_bind_path_ok is lib/runtime.sh's own rule (absolute, comma-free, no `..`, no control bytes),
+# called rather than copied: it is what mi_rt_container_create will apply, and a second implementation
+# of the same check is one that drifts until the producer accepts what the consumer refuses.
+#
+# THE COLON IS THIS FUNCTION'S OWN ADDITION, and it is the one the runtime's rule cannot make. The spec
+# is colon-separated, so a colon INSIDE a component moves every field boundary after it: the runtime
+# reads `bind=/x:/y:/t:rw` as source `/x`, target `/y`, mode `/t:rw` and refuses — but
+# `bind=/x:/y:rw`, where the source genuinely is `/x:/y`, is read as source `/x` mounted at `/y` and
+# LAUNCHES, mounting a path nobody named. Refusing at the producer is the only place that distinction
+# still exists; by the time the spec is a string, the information is gone.
+_mi_bringup_spec_field_ok() {
+  local v="$1" what="$2"
+  _mi_rt_bind_path_ok "$v" "$what" || return 1
+  case "$v" in
+    *:*)
+      mi_warn "bringup: $what '$v' contains a ':'. A bind spec is <source>:<target>:<mode>, so a colon"
+      mi_warn "  inside a component moves the field boundaries and the launch mounts a different pair"
+      mi_warn "  of paths from the one written down. Refusing rather than emitting a spec that cannot"
+      mi_warn "  mean what it says."
+      return 1 ;;
+  esac
+  return 0
+}
+
+# Emit `<role><TAB>bind=<canonical source>:<manifest target>:rw` for every role the operator has bound,
+# having validated it. Roles with no bind key fall through to a named volume (D6: storage defaults to
+# named volumes, and a fresh install requires the user to decide no paths).
+#
+# THE SECOND FIELD IS THE CONTAINER PATH THE MANIFEST DECLARES, and this is a correction. It used to be
+# the ROLE — so every spec this function emitted was refused by mi_rt_container_create, whose target
+# must be absolute, and the operator-bind feature could not work at all as emitted. It was defended as
+# a seam for a later task to convert; it is not one. The output is documented as a `bind=` runtime spec
+# and shaped exactly like one, so nothing stops a caller passing it straight to the runtime, which is
+# what a later task would naturally do. The manifest already holds the mapping, so the conversion has
+# an authenticated source and belongs here, at the one place that has both halves.
+#
+# THE LINE IS A RECORD, NOT AN ARGV FRAGMENT — TAB-separated, role first, exactly as mi_mount_core_fixed
+# emits its mounts. A caller needs the pairing (the roles that got no bind are the ones that fall
+# through to named volumes) and cannot recover it from the spec, where nothing distinguishes a target
+# from any other path. Role first so that a caller who splats the whole listing into the runtime fails
+# on the FIRST token, loudly, with "unknown container spec", before anything is created — rather than
+# accepting a spec and then failing on the annotation beside it.
 #
 # THE VALIDATED CANONICAL SOURCE is what is emitted — never the operator's original string. §4.1a:
 # "Validate and launch against the same resolved path. Canonicalize once, then pass the validated
@@ -416,34 +511,63 @@ mi_conf_spec_for() {
 # receives is the set that matters. Buffering also means a refused combination emits nothing at all,
 # rather than handing a caller a PREFIX of a launch spec it may act on.
 mi_mount_binds() {
-  if [ "$#" -lt 2 ]; then mi_warn "bringup: mi_mount_binds needs <product> <role>..."; return 1; fi
-  local product="$1"; shift
+  if [ "$#" -lt 4 ]; then
+    mi_warn "bringup: mi_mount_binds needs <product> <manifest-records> <policy-records> <role>..."
+    return 1
+  fi
+  local product="$1" mrec="$2" prec="$3"; shift 3
   _mi_bringup_name_ok product "$product" || return 1
-  local up role rup key val f rc
+  local up role rup key val f rc pspec
   # Two parallel arrays rather than one, and the role is CARRIED rather than parsed back out of the
-  # spec: recovering it with `${b%:*}`/`${b##*:}` would re-split a string on a `:` that a canonical
-  # host path is free to contain, so the annotation could name a fragment of the path instead.
+  # spec: neither of the spec's path components is distinguishable from the other once it is a string,
+  # and re-splitting one on `:` to recover an annotation is exactly the re-cut this module refuses to
+  # make anywhere else.
   local -a bspecs broles
   bspecs=(); broles=()
   up="$(printf '%s' "$product" | tr 'a-z-' 'A-Z_')"
   f="$(mi_conf_family_path)"
+  # D53's gate, ASKED WHERE THE MOUNT IS ACTUALLY PRODUCED. mi_conf_get reads a key straight out of the
+  # file with no spec, so reading MYTHICAL_<P>_<R>_BIND directly honoured whatever an operator had
+  # typed — the entitlement lived only in the spec a caller may or may not have validated the file
+  # against. `migrate-storage` would then have been a supported one-liner for moving every model
+  # credential onto an operator-chosen host path, which is the exact scenario D53 names. The spec is
+  # the SAME one mi_conf_product_keys builds, not a second reading of the policy index.
+  pspec="$(mi_conf_product_keys "$product" "$mrec" "$prec")" || return 1
   for role in "$@"; do
     _mi_bringup_name_ok role "$role" || return 1
     rup="$(printf '%s' "$role" | tr 'a-z-' 'A-Z_')"
     key="MYTHICAL_${up}_${rup}_BIND"
     if val="$(mi_conf_get "$f" "$key")"; then rc=0; else rc=$?; fi
+    if ! _mi_conf_spec_type "$pspec" "$key" >/dev/null; then
+      # Not bindable. Falling through to the named volume is right when the operator said nothing — but
+      # SILENTLY, while the file names the key, would leave them believing a bind is in effect when the
+      # role's whole protection is that it is not one.
+      if [ "$rc" -eq 0 ]; then
+        mi_warn "bringup: $f sets '$key', but the authenticated policy index does not make '$role'"
+        mi_warn "  bindable for '$product'. Recognising a role is not authorizing it: a role kept on a"
+        mi_warn "  named volume is kept there deliberately. Refusing rather than ignoring the setting."
+        return 1
+      fi
+      [ "$rc" -eq 3 ] || return "$rc"
+      continue
+    fi
     [ "$rc" -eq 3 ] && continue                        # not bound: the named volume is used instead
     [ "$rc" -eq 0 ] || return "$rc"
-    local canon
+    local canon target
     canon="$(mi_canon "$val")" || return 1
     mi_mount_check_overlap "$product" "$canon" || return 1
-    bspecs+=("bind=${canon}:${role}:rw"); broles+=("$role")
+    target="$(_mi_bringup_role_target "$mrec" "$role")" || return 1
+    # BOTH components, by the consumer's own rule plus the grammar's — so what is emitted is launchable
+    # or nothing is emitted at all.
+    _mi_bringup_spec_field_ok "$canon" "bind source for role '$role'" || return 1
+    _mi_bringup_spec_field_ok "$target" "container target for role '$role'" || return 1
+    bspecs+=("bind=${canon}:${target}:rw"); broles+=("$role")
   done
   [ "${#bspecs[@]}" -gt 0 ] || return 0
   mi_mount_binds_check_pairwise ${bspecs[@]+"${bspecs[@]}"} || return 1
   local i=0
   while [ "$i" -lt "${#bspecs[@]}" ]; do
-    printf '%s\t%s\n' "${bspecs[$i]}" "${broles[$i]}"
+    printf '%s\t%s\n' "${broles[$i]}" "${bspecs[$i]}"
     i=$((i + 1))
   done
   return 0
@@ -508,17 +632,38 @@ mi_secrets_envfile() {
 }
 
 # --- §6b.3 step 1: create ------------------------------------------------------------------------
+# THE INTENT RECORDS WHAT THIS RUN WAS IN THE MIDDLE OF *DOING*, not merely which object it was in the
+# middle of creating — and that is the whole of the fix for the window this sequence could not close.
+#
+# The window is BEFORE the first state write, and no ordering closes it. Create succeeds, step 2's
+# inspection succeeds, the process dies before mi_state_commit. Recovery re-inspects and confirms — but
+# with nothing to say what the desired state was or what check was owed, it wrote neither, and
+# mi_state_plan then answered `none` for ever: for an intended `running` container, never started,
+# never live-verified, and no outstanding entry for any later start to schedule a verification from.
+# Reordering the two writes does not help (the gap is earlier than both) and neither would a combined
+# writer: it cannot close a gap that opens before it is called. The durable record has to carry the
+# decision, because the process that made it is the one that died.
+#
+# So the write-ahead record carries the DESIRED STATE this bring-up resolved (`preserve` is resolved by
+# mi_bringup before this is called, so what lands here is always a concrete `running`/`stopped`) and
+# the CHECK the sequence owes. mi_bringup_recover reads all three back, establishes state through the
+# ordinary atomic writer, and only then confirms.
 mi_bringup_create() {
-  if [ "$#" -lt 5 ]; then
-    mi_warn "bringup: mi_bringup_create needs <container> <image> <netid> <alias> <envfile|-> [spec...]"
+  if [ "$#" -lt 6 ]; then
+    mi_warn "bringup: mi_bringup_create needs <container> <image> <netid> <alias> <running|stopped> <envfile|-> [spec...]"
     return 1
   fi
-  local c="$1" image="$2" netid="$3" alias="$4" envfile="$5"; shift 5
+  local c="$1" image="$2" netid="$3" alias="$4" desired="$5" envfile="$6"; shift 6
   local ident nonce
+  # Judged HERE, before the intent is written, by the vocabulary lib/state.sh owns — a value this
+  # module invented would be one mi_state_commit refuses at recovery time, which is the worst moment to
+  # discover it: the container exists, the intent names an unusable state, and nothing can act on it.
+  _mi_state_desired_ok "$desired" || return 1
   ident="$(mi_ident_get)" || return 1
   nonce="$(mi_nonce_new)" || return 1
-  # Write-ahead: the intent, with the nonce, BEFORE the object.
-  mi_intent_open container "$c" "$nonce" || return 1
+  # Write-ahead: the intent, with the nonce AND the decision, BEFORE the object.
+  mi_intent_open container "$c" "$nonce" \
+    "desired=${desired}" "check=alias" "check_param=${netid}" || return 1
   mi_rt_container_create "$c" "$image" "$netid" "$alias" "$envfile" \
     "$@" "label=installation=${ident}" "label=nonce=${nonce}" >/dev/null || return 1
   printf '%s\n' "$nonce"
@@ -553,11 +698,29 @@ _mi_bringup_attachments() {
 # The one exception is a recorded D45 migration, during which the permitted set is exactly {old, new} —
 # bounded, recorded, and resumed the moment it commits. A two-network container with NO migration
 # intent recorded is a DEFECT, and is caught here rather than tolerated.
-mi_bringup_verify_attach() {
-  if [ "$#" -ne 3 ]; then mi_warn "bringup: mi_bringup_verify_attach needs <container> <expected netid> <alias>"; return 1; fi
-  local c="$1" want="$2" alias="$3" nets aliases id line
-  nets="$(mi_rt_inspect container c.nets "$c")" || return 1
-  aliases="$(mi_rt_inspect container c.aliases "$c")" || return 1
+#
+# THE JUDGEMENT IS SEPARATED FROM THE INSPECTION, and it is separated because TWO steps make it. Step 2
+# asks it of a stopped container; step 5 asks it again of a running one — and step 5 is the step that
+# CLEARS the outstanding check, so it is the step at which getting this wrong is unrecoverable.
+#
+# Step 5 used to pull the target network's address out of the attachment set and never re-ask. A second
+# network attached AFTER step 2 — before or during running — therefore changed nothing it looked at:
+# DNS still resolved the alias to the target network's address, live verification returned success, and
+# the caller retired the only outstanding entry. The result is a container this CLI reports as verified
+# and reconciled while attached to an extra network, which is exactly the state step 2 exists to make
+# unreachable, arriving through the door step 5 left open. "Confirmed" means attached correctly AND TO
+# NOTHING ELSE, and that second half has to be true at the moment the check is retired, not only at the
+# moment it was written.
+#
+# It takes the inspection RESULTS rather than performing them, so step 5 can judge and measure ONE
+# observation. Inspecting twice would compare an address against a topology established a moment
+# earlier — a check that passes for the wrong reason, which is the same defect class one layer down.
+#
+# rc 0 the set is exactly what is permitted, and the alias is on the expected network · 1 refused
+# (reported).
+_mi_bringup_attach_ok() {
+  if [ "$#" -ne 5 ]; then mi_warn "bringup: _mi_bringup_attach_ok needs <container> <netid> <alias> <nets> <aliases>"; return 1; fi
+  local c="$1" want="$2" alias="$3" nets="$4" aliases="$5" id line
 
   local -a ids
   ids=()
@@ -627,6 +790,16 @@ mi_bringup_verify_attach() {
   return 0
 }
 
+# Step 2's entry point: inspect, then judge. The judgement itself is the predicate above, which step 5
+# calls on its own inspection.
+mi_bringup_verify_attach() {
+  if [ "$#" -ne 3 ]; then mi_warn "bringup: mi_bringup_verify_attach needs <container> <expected netid> <alias>"; return 1; fi
+  local c="$1" want="$2" alias="$3" nets aliases
+  nets="$(mi_rt_inspect container c.nets "$c")" || return 1
+  aliases="$(mi_rt_inspect container c.aliases "$c")" || return 1
+  _mi_bringup_attach_ok "$c" "$want" "$alias" "$nets" "$aliases"
+}
+
 # --- §6b.3 step 5: verify live -------------------------------------------------------------------
 # RE-INSPECT the container now that it is running to learn the endpoint address it actually has, then
 # have the probe resolve its alias and confirm the answer matches THAT address.
@@ -639,9 +812,19 @@ mi_bringup_verify_attach() {
 # the product running) · 4 the probe could not run at all.
 mi_bringup_verify_live() {
   if [ "$#" -ne 4 ]; then mi_warn "bringup: mi_bringup_verify_live needs <index> <container> <netid> <alias>"; return 1; fi
-  local idx="$1" c="$2" netid="$3" alias="$4" nets line expect="" resolved rc
+  local idx="$1" c="$2" netid="$3" alias="$4" nets aliases line expect="" resolved rc
 
   nets="$(mi_rt_inspect container c.nets "$c")" || return 1
+  aliases="$(mi_rt_inspect container c.aliases "$c")" || return 1
+  # THE COMPLETE-SET CHECK, AGAIN, BEFORE ANYTHING THIS FUNCTION SAYS CAN RETIRE A CHECK. Success here
+  # is what makes the caller clear the outstanding entry, so every property "confirmed" claims has to
+  # hold NOW — including the one about what the container is NOT attached to. The topology can change
+  # between step 2 and this moment, and a resolving alias is no evidence about it: aliases are
+  # network-scoped, so the target network answers correctly no matter what else the container joined.
+  #
+  # Judged on THIS inspection, and the address below is taken from the same one, so the address
+  # compared belongs to the topology just proved complete.
+  _mi_bringup_attach_ok "$c" "$netid" "$alias" "$nets" "$aliases" || return 1
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     if [ "${line%%$'\t'*}" = "$netid" ]; then expect="${line#*$'\t'}"; fi
@@ -706,7 +889,10 @@ mi_bringup() {
     *) mi_warn "bringup: '$desired' is not running, stopped or preserve"; return 1 ;;
   esac
 
-  nonce="$(mi_bringup_create "$c" "$image" "$netid" "$alias" "$envfile" "$@")" || return 1
+  # `$want`, never `$desired`: `preserve` is resolved above, and the intent must record the state this
+  # run actually decided on. Writing `preserve` into it would leave recovery re-deriving a decision
+  # from a ledger this run may already have changed.
+  nonce="$(mi_bringup_create "$c" "$image" "$netid" "$alias" "$want" "$envfile" "$@")" || return 1
 
   # Step 2. A container that does not verify is REMOVED and the intent retained — leaving it would be a
   # confirmed-but-detached container, the state §6b.3 exists to make unreachable.
@@ -787,6 +973,13 @@ mi_bringup() {
 # have changed: a network detached, a second one attached. So the unconfirmed states collapse into one
 # row and always re-inspect. Steps that leave no durable record are not steps recovery can reason about.
 #
+# AND IT ESTABLISHES STATE BEFORE IT CONFIRMS. Confirming alone was the defect: it consumed the intent
+# — the only durable record of what was being built — and wrote provenance in its place, leaving a
+# container with no desired state and no outstanding check. mi_state_plan then answered `none`, so the
+# container was never started, never live-verified, and nothing existed for a later start to schedule a
+# verification from. The order here mirrors mi_bringup's for the same reason: state first, confirmation
+# second, so a crash between them leaves the intent open and the next run repeats this function.
+#
 # rc 0 confirmed · 4 removed and the intent retained for the verb to rebuild · 1 stopped (reported).
 mi_bringup_recover() {
   if [ "$#" -ne 4 ]; then mi_warn "bringup: mi_bringup_recover needs <index> <container> <netid> <alias>"; return 1; fi
@@ -797,6 +990,57 @@ mi_bringup_recover() {
   if rec="$(mi_intent_find container "$c")"; then rc=0; else rc=$?; fi
   [ "$rc" -eq 0 ] || return "$rc"
   nonce="$(mi_led_field "$rec" nonce)" || return 1
+
+  # WHAT THE DYING RUN WAS IN THE MIDDLE OF DOING — read BEFORE anything is inspected, removed or
+  # written. An intent this function cannot fully read is one it cannot finish, and it must not remove
+  # a container on the strength of a record it could not act on either way.
+  #
+  # A MISSING FIELD IS A REFUSAL, NOT A DEFAULT. lib/state.sh has no default desired state for exactly
+  # this reason: `running` would start something nobody asked for and `stopped` would take a working
+  # install down. Confirming without one is the third wrong answer and the quietest — it produces a
+  # container that is accounted for, never started, and never checked. Every intent this module opens
+  # carries all three fields; one that does not came from a restored, foreign or older ledger, or from
+  # a caller that is not this sequence.
+  local want check param
+  if want="$(mi_led_field "$rec" desired)"; then :; else
+    mi_warn "bringup: the intent for '$c' does not say which desired state this bring-up was recording."
+    mi_warn "  Confirming it would consume the only record of what was being built and leave the"
+    mi_warn "  container accounted for, never started and never verified. It is PRESERVED and reported."
+    mi_warn "  Run 'mythical-ctl state repair'."
+    return 1
+  fi
+  if ! _mi_state_desired_ok "$want"; then
+    mi_warn "  — and that value is on DISK, in the intent, not in this call. The container and the"
+    mi_warn "  intent are both PRESERVED. Run 'mythical-ctl state repair'."
+    return 1
+  fi
+  if check="$(mi_led_field "$rec" check)"; then :; else
+    mi_warn "bringup: the intent for '$c' does not say what check this bring-up owed. An intent that"
+    mi_warn "  records a start without recording what proving it costs is the state D50 refuses to let"
+    mi_warn "  an empty outstanding set mean. It is PRESERVED and reported."
+    mi_warn "  Run 'mythical-ctl state repair'."
+    return 1
+  fi
+  _mi_state_kind_ok "$check" || return 1
+  if param="$(mi_led_field "$rec" check_param)"; then :; else param=""; fi
+  if [ -z "$param" ]; then
+    mi_warn "bringup: the intent for '$c' records a '${check}' check that names nothing to verify."
+    mi_warn "  An 'alias' check carries the network the alias must resolve on, and one carrying nothing"
+    mi_warn "  can never be matched and so can never be cleared. It is PRESERVED and reported."
+    mi_warn "  Run 'mythical-ctl state repair'."
+    return 1
+  fi
+  # THE INTENT AND THE CALLER MUST BE TALKING ABOUT THE SAME NETWORK. The topology is verified below
+  # against the caller's <netid>, and the check is recorded from the intent's — so a disagreement would
+  # commit a check for a network nothing here has looked at, on the evidence of a network nobody
+  # recorded. There is no safe way to pick one: the intent is the durable record and the argument is
+  # what was actually proved. Both are preserved and an operator decides.
+  if [ "$param" != "$netid" ]; then
+    mi_warn "bringup: the intent for '$c' was opened for network '$param', and this recovery was asked"
+    mi_warn "  about '$netid'. Those are two different bring-ups. Nothing is confirmed, nothing is"
+    mi_warn "  removed, and nothing is recorded."
+    return 1
+  fi
 
   local obs
   obs="$(mi_state_observed "$c")" || return 1
@@ -822,6 +1066,12 @@ mi_bringup_recover() {
     return 4
   fi
 
+  # STATE FIRST, CONFIRMATION SECOND — mi_bringup's step 3, performed here from the record rather than
+  # from a decision this process never made. mi_state_commit writes the desired row and the outstanding
+  # entry in ONE atomic ledger write, so the container can never be confirmed with one and not the
+  # other; and because the intent is still open until the line below, a crash in between simply brings
+  # the next run back to this function.
+  mi_state_commit "$c" "$want" "$check" "$param" || return 1
   local id
   id="$(mi_rt_inspect container c.image "$c" 2>/dev/null || true)"
   mi_intent_confirm container "$c" "$nonce" "id=${id}" || return 1

@@ -14,6 +14,11 @@ setup() {
   printf 'PEER=x\n#mythical-conf-sha256=deadbeef\n' > "$MYTHICAL_HOME/brokkr.conf"
   mkdir -p "$MYTHICAL_HOME/transcripts" "$MYTHICAL_HOME/logs"
   OUT="$(mktemp -d)"
+  # A product's authenticated declarations, as mi_accept_manifest / mi_accept_policy would yield them.
+  # `secrets` is DECLARED but not made bindable — the D53 case, kept in the shared fixture so every
+  # bind test runs against a policy that grants some roles and withholds one.
+  MREC="$(printf 'volume\twork:/work\nvolume\tproject:/srv/project\nvolume\tsecrets:/run/secrets\n')"
+  PREC="$(printf 'brokkr.bindable_role\twork\nbrokkr.bindable_role\tproject\n')"
 }
 teardown() { rm -rf "$OUT"; mi_lock_release; teardown_test_env; }
 
@@ -194,10 +199,41 @@ teardown() { rm -rf "$OUT"; mi_lock_release; teardown_test_env; }
   assert_contains ":ro or :rw"
 }
 
+# The mode must be read the way lib/runtime.sh reads it — everything after the SECOND colon, not after
+# the last. Taking the last field made this rule judge `bind=/a:/b:x:rw` as read-write and accept the
+# combination, while the launch would have seen mode `x:rw` and refused: a rule applied to a spec that
+# does not exist.
+@test "a bind spec with a fourth field is refused, never re-cut into a mode it does not have" {
+  mkdir -p "$OUT/work/project"
+  run mi_mount_binds_check_pairwise "bind=$OUT/work:/work:x:rw" "bind=$OUT/work/project:/project:rw"
+  [ "$status" -ne 0 ]
+  assert_contains ":ro or :rw"
+}
+
+@test "a bind spec with no mode field at all is refused rather than read as two fields" {
+  mkdir -p "$OUT/work"
+  run mi_mount_binds_check_pairwise "bind=$OUT/work:/work"
+  [ "$status" -ne 0 ]
+  assert_contains "not <source>:<target>:<mode>"
+}
+
+# A colon inside a component moves every field boundary after it, so the spec launches something other
+# than what it says. Only the producer still knows where the boundaries were meant to be.
+@test "a source path containing a colon is refused rather than emitted as an ambiguous spec" {
+  mkdir -p "$OUT/we:ird"
+  printf 'MYTHICAL_BROKKR_WORK_BIND=%s\n' "$OUT/we:ird" > "$MYTHICAL_HOME/mythical.conf"
+  run mi_mount_binds brokkr "$MREC" "$PREC" work
+  [ "$status" -ne 0 ]
+  assert_contains "contains a ':'"
+  case "$output" in
+    *bind=*) echo "an ambiguous spec was emitted: $output" >&2; return 1 ;;
+  esac
+}
+
 @test "the VALIDATED canonical path is what reaches the spec — never the operator's string" {
   mkdir -p "$OUT/real"; ln -s "$OUT/real" "$OUT/link"
   printf 'MYTHICAL_BROKKR_WORK_BIND=%s\n' "$OUT/link" > "$MYTHICAL_HOME/mythical.conf"
-  run mi_mount_binds brokkr work
+  run mi_mount_binds brokkr "$MREC" "$PREC" work
   [ "$status" -eq 0 ]
   assert_contains "$(cd "$OUT/real" && pwd -P)"
   run grep -a "$OUT/link" <<<"$output"
@@ -211,7 +247,7 @@ teardown() { rm -rf "$OUT"; mi_lock_release; teardown_test_env; }
   mkdir -p "$OUT/work/project"
   { printf 'MYTHICAL_BROKKR_WORK_BIND=%s\n' "$OUT/work"
     printf 'MYTHICAL_BROKKR_PROJECT_BIND=%s\n' "$OUT/work/project"; } > "$MYTHICAL_HOME/mythical.conf"
-  run mi_mount_binds brokkr work project
+  run mi_mount_binds brokkr "$MREC" "$PREC" work project
   [ "$status" -ne 0 ]
   assert_contains "overlap"
 
@@ -220,15 +256,69 @@ teardown() { rm -rf "$OUT"; mi_lock_release; teardown_test_env; }
   mkdir -p "$OUT/a" "$OUT/b"
   { printf 'MYTHICAL_BROKKR_WORK_BIND=%s\n' "$OUT/a"
     printf 'MYTHICAL_BROKKR_PROJECT_BIND=%s\n' "$OUT/b"; } > "$MYTHICAL_HOME/mythical.conf"
-  run mi_mount_binds brokkr work project
+  run mi_mount_binds brokkr "$MREC" "$PREC" work project
   [ "$status" -eq 0 ]
   assert_contains "$(cd "$OUT/a" && pwd -P)"
   assert_contains "$(cd "$OUT/b" && pwd -P)"
 }
 
+# THE PRODUCER'S OUTPUT, HANDED TO THE CONSUMER. Testing mi_mount_binds alone is why the two could be
+# incompatible without anything going red: the spec's second field was the ROLE, and
+# mi_rt_container_create requires an absolute container target, so every configured bind reached the
+# runtime and was refused — the feature could not work as emitted. Nothing that looks launchable may
+# fail to launch, and only a test that crosses the seam can say so.
+@test "the emitted bind spec is one the runtime adapter accepts, and mounts the declared path" {
+  mkdir -p "$OUT/work"
+  printf 'MYTHICAL_BROKKR_WORK_BIND=%s\n' "$OUT/work" > "$MYTHICAL_HOME/mythical.conf"
+  run mi_mount_binds brokkr "$MREC" "$PREC" work
+  [ "$status" -eq 0 ]
+  [ "$(printf '%s' "$output" | cut -f1)" = work ]
+  spec="$(printf '%s' "$output" | cut -f2)"
+
+  img="$(a_digestref p1)"
+  mi_rt_image_pull "$img" >/dev/null
+  net="$(mi_rt_network_create nettest "$(mi_ident_ensure)" nn)"
+  run mi_rt_container_create ctest "$img" "$net" al - "$spec"
+  [ "$status" -eq 0 ]
+  # And it mounted what the manifest declared, at the source that was validated — not merely "the
+  # runtime did not complain".
+  run mi_rt_inspect container c.mounts ctest
+  assert_contains "$(cd "$OUT/work" && pwd -P)|/work"
+}
+
+# The container path comes from the AUTHENTICATED manifest and nowhere else. A record that names a role
+# without PLACING it declares the volume — so the bind key exists — while saying nothing about where it
+# goes, and inventing a target there would mount an operator's directory where the product does not
+# read. Refusing is the only honest answer.
+@test "a bound role the manifest declares but does not PLACE is refused, never given a target" {
+  mkdir -p "$OUT/work"
+  printf 'MYTHICAL_BROKKR_WORK_BIND=%s\n' "$OUT/work" > "$MYTHICAL_HOME/mythical.conf"
+  run mi_mount_binds brokkr "$(printf 'volume\twork\n')" "$PREC" work
+  [ "$status" -ne 0 ]
+  assert_contains "no mount point"
+  case "$output" in
+    *bind=*) echo "a spec was emitted for a role with no declared target: $output" >&2; return 1 ;;
+  esac
+}
+
+# D53 at the place the mount is actually produced. mi_conf_get reads a key straight out of the file
+# with no spec, so without this gate the entitlement lived only in a validation the caller may never
+# have run — and the role whose whole protection is that it stays on a named volume would be bindable
+# by typing its key.
+@test "a role the policy index does not make bindable cannot be bound by naming its key" {
+  mkdir -p "$OUT/secrets"
+  printf 'MYTHICAL_BROKKR_SECRETS_BIND=%s\n' "$OUT/secrets" > "$MYTHICAL_HOME/mythical.conf"
+  run mi_mount_binds brokkr "$MREC" "$PREC" secrets
+  [ "$status" -ne 0 ]
+  assert_contains "does not make 'secrets'"
+  case "$output" in
+    *"$OUT/secrets"*bind=*) echo "an unentitled role produced a bind spec: $output" >&2; return 1 ;;
+  esac
+}
+
 @test "a role with no bind key falls through to a named volume rather than failing" {
   printf 'MYTHICAL_NET=n\n' > "$MYTHICAL_HOME/mythical.conf"
-  run mi_mount_binds brokkr work
+  run mi_mount_binds brokkr "$MREC" "$PREC" work
   [ "$status" -eq 0 ]
   [ -z "$output" ]
 }

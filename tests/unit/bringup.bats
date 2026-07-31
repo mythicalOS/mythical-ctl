@@ -39,7 +39,7 @@ learn_addr() {
 }
 
 @test "bring-up creates STOPPED, on exactly the target network, with the alias" {
-  mi_bringup_create "$C" "$IMG" "$NET" p1 - >/dev/null
+  mi_bringup_create "$C" "$IMG" "$NET" p1 running - >/dev/null
   run mi_rt_inspect container c.running "$C"
   [ "$output" = false ]
   run mi_bringup_verify_attach "$C" "$NET" p1
@@ -47,7 +47,7 @@ learn_addr() {
 }
 
 @test "attachment verification asserts the network set is EXACTLY the expected ID" {
-  mi_bringup_create "$C" "$IMG" "$NET" p1 - >/dev/null
+  mi_bringup_create "$C" "$IMG" "$NET" p1 running - >/dev/null
   OTHER="$(mi_rt_network_create other "$IDENT" nn2)"
   mi_rt_network_connect "$OTHER" "$C" p1 0
   run mi_bringup_verify_attach "$C" "$NET" p1
@@ -56,7 +56,7 @@ learn_addr() {
 }
 
 @test "a container attached to NOTHING fails verification, and says so" {
-  mi_bringup_create "$C" "$IMG" "$NET" p1 - >/dev/null
+  mi_bringup_create "$C" "$IMG" "$NET" p1 running - >/dev/null
   mi_rt_network_disconnect "$NET" "$C"
   run mi_bringup_verify_attach "$C" "$NET" p1
   [ "$status" -ne 0 ]
@@ -64,7 +64,7 @@ learn_addr() {
 }
 
 @test "a container on TWO networks WITH a recorded migration intent is permitted, bounded to {old,new}" {
-  mi_bringup_create "$C" "$IMG" "$NET" p1 - >/dev/null
+  mi_bringup_create "$C" "$IMG" "$NET" p1 running - >/dev/null
   OTHER="$(mi_rt_network_create other "$IDENT" nn2)"
   mi_rt_network_connect "$OTHER" "$C" p1 0
   mi_led_put netmig key family "key=family" "phase=2" "source=$NET" "target=$OTHER" "containers=$C"
@@ -73,7 +73,7 @@ learn_addr() {
 }
 
 @test "a container on a THIRD network is a failure even during a migration" {
-  mi_bringup_create "$C" "$IMG" "$NET" p1 - >/dev/null
+  mi_bringup_create "$C" "$IMG" "$NET" p1 running - >/dev/null
   O2="$(mi_rt_network_create other2 "$IDENT" nn2)"
   O3="$(mi_rt_network_create other3 "$IDENT" nn3)"
   mi_rt_network_connect "$O2" "$C" p1 0
@@ -87,7 +87,7 @@ learn_addr() {
 # container sitting on the migration's SOURCE only, which every "is anything unexpected here" test
 # passes.
 @test "a container attached only to the migration's SOURCE fails verification against the TARGET" {
-  mi_bringup_create "$C" "$IMG" "$NET" p1 - >/dev/null
+  mi_bringup_create "$C" "$IMG" "$NET" p1 running - >/dev/null
   OTHER="$(mi_rt_network_create other "$IDENT" nn2)"
   mi_led_put netmig key family "key=family" "phase=2" "source=$NET" "target=$OTHER" "containers=$C"
   run mi_bringup_verify_attach "$C" "$OTHER" p1
@@ -96,7 +96,7 @@ learn_addr() {
 }
 
 @test "a missing ALIAS fails verification even when the attachment is right" {
-  mi_bringup_create "$C" "$IMG" "$NET" wrongalias - >/dev/null
+  mi_bringup_create "$C" "$IMG" "$NET" wrongalias running - >/dev/null
   run mi_bringup_verify_attach "$C" "$NET" p1
   [ "$status" -ne 0 ]
   assert_contains "alias"
@@ -201,21 +201,81 @@ learn_addr() {
   [ "$status" -eq 3 ]
 }
 
-@test "recovery from a crash after CREATE re-inspects, then confirms" {
-  n="$(mi_nonce_new)"
-  mi_intent_open container "$C" "$n" "product=p1"
-  mi_rt_container_create "$C" "$IMG" "$NET" p1 - label=installation="$IDENT" label=nonce="$n" >/dev/null
+# A CONFIRMED CONTAINER MUST BE ONE THE RECONCILER CAN STILL ACT ON. Recovery used to confirm and stop
+# there: the intent — the only record of what was being built — was consumed, no desired state and no
+# outstanding check were ever written, and mi_state_plan then answered `none` for ever. The container
+# was never started and never live-verified, and no entry existed for a later start to schedule the
+# verification from. So the plan is asserted here, not just the provenance: `none` is precisely the
+# answer the defect produced, and it is indistinguishable from a healthy reconciled container.
+@test "recovery from a crash after CREATE establishes desired state and the check, then confirms" {
+  mi_bringup_create "$C" "$IMG" "$NET" p1 running - >/dev/null
   run mi_bringup_recover "$IDX" "$C" "$NET" p1
   [ "$status" -eq 0 ]
   run mi_prov_find container "$C"
   [ "$status" -eq 0 ]
+  run mi_intent_find container "$C"
+  [ "$status" -eq 3 ]
+  run mi_state_desired_get "$C"
+  [ "$output" = running ]
+  run mi_state_outstanding "$C"
+  assert_contains alias
+  run mi_state_plan "$C"
+  [ "$output" = "start verify" ]
+}
+
+# The desired state is the one thing the dying process knew and nothing else does, so it has to survive
+# in the intent rather than be re-derived. A bring-up the operator asked to leave STOPPED must not come
+# back as `running`.
+@test "recovery restores the desired state the bring-up recorded, not a default" {
+  mi_bringup_create "$C" "$IMG" "$NET" p1 stopped - >/dev/null
+  run mi_bringup_recover "$IDX" "$C" "$NET" p1
+  [ "$status" -eq 0 ]
+  run mi_state_desired_get "$C"
+  [ "$output" = stopped ]
+  run mi_state_plan "$C"
+  [ "$output" = defer ]
+  run mi_rt_inspect container c.running "$C"
+  [ "$output" = false ]
+}
+
+# An intent that does not say what it was in the middle of DOING cannot be finished, and confirming it
+# anyway is the quiet form of the defect above. Both the container and the intent survive.
+@test "recovery refuses an intent that does not record what the bring-up was doing" {
+  n="$(mi_nonce_new)"
+  mi_intent_open container "$C" "$n" "product=p1"
+  mi_rt_container_create "$C" "$IMG" "$NET" p1 - label=installation="$IDENT" label=nonce="$n" >/dev/null
+  run mi_bringup_recover "$IDX" "$C" "$NET" p1
+  [ "$status" -eq 1 ]
+  assert_contains "does not say which desired state"
+  run mi_prov_find container "$C"
+  [ "$status" -eq 3 ]
+  run mi_intent_find container "$C"
+  [ "$status" -eq 0 ]
+  run mi_rt_inspect container c.running "$C"
+  [ "$status" -eq 0 ]
+}
+
+# The topology is verified against the caller's network and the check is recorded from the intent's, so
+# a disagreement would record a check for a network nothing looked at. Neither is preferred over the
+# other; both are preserved.
+@test "recovery refuses when the intent names a different network from the one it is asked about" {
+  OTHER="$(mi_rt_network_create other "$IDENT" nn2)"
+  mi_bringup_create "$C" "$IMG" "$NET" p1 running - >/dev/null
+  run mi_bringup_recover "$IDX" "$C" "$OTHER" p1
+  [ "$status" -eq 1 ]
+  assert_contains "two different bring-ups"
+  run mi_prov_find container "$C"
+  [ "$status" -eq 3 ]
+  run mi_intent_find container "$C"
+  [ "$status" -eq 0 ]
+  run mi_rt_inspect container c.running "$C"
+  [ "$status" -eq 0 ]
 }
 
 @test "recovery from a crash after CREATE with a WRONG topology removes and reissues" {
-  n="$(mi_nonce_new)"
-  mi_intent_open container "$C" "$n" "product=p1"
+  mi_bringup_create "$C" "$IMG" "$NET" p1 running - >/dev/null
   BAD="$(mi_rt_network_create bad "$IDENT" nb)"
-  mi_rt_container_create "$C" "$IMG" "$BAD" p1 - label=installation="$IDENT" label=nonce="$n" >/dev/null
+  mi_rt_network_connect "$BAD" "$C" p1 0
   run mi_bringup_recover "$IDX" "$C" "$NET" p1
   [ "$status" -eq 4 ]
   assert_contains "removed"
@@ -226,17 +286,22 @@ learn_addr() {
   [ "$status" -eq 3 ]
   run mi_intent_find container "$C"
   [ "$status" -eq 0 ]
+  # And no desired state was recorded for a container that was just removed.
+  run mi_state_desired_get "$C"
+  [ "$status" -eq 3 ]
 }
 
 @test "recovery refuses a container standing at the name under a DIFFERENT nonce" {
-  n="$(mi_nonce_new)"
-  mi_intent_open container "$C" "$n" "product=p1"
+  mi_bringup_create "$C" "$IMG" "$NET" p1 running - >/dev/null
+  mi_rt_container_rm "$C" >/dev/null
   mi_rt_container_create "$C" "$IMG" "$NET" p1 - label=installation="$IDENT" label=nonce=someoneelse >/dev/null
   run mi_bringup_recover "$IDX" "$C" "$NET" p1
   [ "$status" -eq 1 ]
   assert_contains "NOT adopted"
   run mi_rt_inspect container c.running "$C"
   [ "$status" -eq 0 ]
+  run mi_state_desired_get "$C"
+  [ "$status" -eq 3 ]
 }
 
 # The cross-task obligation: a verb performing a `start verify` plan RECORDS the resume before it
@@ -267,6 +332,46 @@ learn_addr() {
   assert_contains "ALREADY resumed"
   run mi_rt_inspect container c.running "$C"
   [ "$output" = false ]
+}
+
+# STEP 5 IS THE STEP THAT CLEARS, so every property "confirmed" claims has to hold at that moment —
+# including the one about what the container is NOT attached to. The topology changes here BETWEEN the
+# attachment check and the clear, which nothing covered: the alias still resolves to the target
+# network's address, because aliases are network-scoped and that endpoint is untouched, so the live
+# check passed and retired the only outstanding entry on a container sitting on an extra network.
+#
+# The address is left correct on purpose. A test that also broke resolution would go red for the
+# ordinary reason and prove nothing about the set check.
+@test "the live check refuses to clear while the container has gained an EXTRA network" {
+  HELPER_RESOLVE_ADDR=1.2.3.4 mi_bringup "$IDX" "$C" "$IMG" "$NET" p1 running - || true
+  # The precondition: there IS a check to lose. Without this the assertions below hold just as well
+  # for a bring-up that never recorded one.
+  run mi_state_outstanding "$C"
+  assert_contains alias
+  OTHER="$(mi_rt_network_create other "$IDENT" nn2)"
+  mi_rt_network_connect "$OTHER" "$C" p1 0
+  # The alias now resolves correctly — the reconcile fails on the SET, not on the address.
+  HELPER_RESOLVE_ADDR="$ADDR" run mi_bringup_reconcile "$IDX" "$C" "$NET" p1
+  [ "$status" -ne 0 ]
+  assert_contains "not permitted"
+  run mi_state_outstanding "$C"
+  assert_contains alias
+  # And the product is LEFT RUNNING — a failed verification is a state, not a reason to stop it.
+  run mi_rt_inspect container c.running "$C"
+  [ "$output" = true ]
+}
+
+# The same rule, at the function itself, with the resolution provably working: `selfcheck` and the
+# address comparison both succeed, so the only thing that can refuse is the complete-set check.
+@test "live verification asks the COMPLETE set, not just the address on the target network" {
+  mi_bringup "$IDX" "$C" "$IMG" "$NET" p1 running - >/dev/null
+  run mi_bringup_verify_live "$IDX" "$C" "$NET" p1
+  [ "$status" -eq 0 ]
+  OTHER="$(mi_rt_network_create other "$IDENT" nn2)"
+  mi_rt_network_connect "$OTHER" "$C" p1 0
+  run mi_bringup_verify_live "$IDX" "$C" "$NET" p1
+  [ "$status" -eq 1 ]
+  assert_contains "not permitted"
 }
 
 @test "a running container with an outstanding check is verified NOW, and the entry then clears" {
