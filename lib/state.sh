@@ -1,0 +1,511 @@
+#!/usr/bin/env bash
+# D43 desired state, D50 its transitions, D52 the typed outstanding-check set, and the reconciler that
+# reads them.
+#
+# THE ORDERING RULE, and it is the whole point: every transition is INTENT-FIRST, then act, then
+# reconcile. An earlier revision specified the desired-state field without specifying the order, which
+# leaves two broken interleavings:
+#
+#   stop the container, THEN crash  ⇒ desired is still `running` while it is stopped, so recovery
+#                                     RESTARTS what the operator asked to stop.
+#   write `stopped`, THEN crash     ⇒ desired is `stopped` while it is still running — a state the
+#                                     recovery table did not contain at all.
+#
+# TWO RULES FROM lib/prov.sh RUN THROUGH EVERY FUNCTION HERE, because this module reads and writes the
+# same ledger, and a rule enforced at one module's inputs and not at the next module's is how each of
+# that file's defects got in:
+#
+#   * THE FIELD RULE APPLIES TO EVERY WRITER, INCLUDING THE ONES THAT DO NOT GO THROUGH mi_led_put.
+#     mi_state_commit is the fifth such writer (after mi_prov_tombstone and mi_intent_confirm), so it
+#     judges the field list it is about to serialize with _mi_led_fields_ok — the writer's own rule,
+#     not a second one — or a TAB in a container name forges a field and a newline forges a record.
+#   * A LOOKUP THAT DOES NOT RESOLVE TO EXACTLY ONE THING IS AMBIGUOUS, AND AMBIGUITY PRESERVES AND
+#     REPORTS. There is one `desired` row per container, so the row a commit supersedes is resolved by
+#     _mi_led_select — the one place that cardinality question is asked — and only that row is
+#     dropped. Replacing two contradicting rows with one destroys the evidence that the ledger needs
+#     repairing, which is the one thing these modules may never do. The OUTSTANDING set is different
+#     by design: it is legitimately several rows per container, so "replace the set" is the operation,
+#     and the cardinality question does not arise for it.
+#
+# And one rule this module shares with lib/intent.sh: ZERO IS ONLY EVIDENCE WHEN THE QUESTION WAS
+# ANSWERED. `mi_rt_inspect` splits rc 3 (the object is gone) from rc 1 (the runtime could not answer),
+# and the ledger readers split rc 3 (nothing recorded) from rc 1 (unreadable, or ambiguous). Every
+# decision below consumes both halves of both splits. Folding either into "there is nothing there"
+# makes the reconciler act on a fleet it could not read — which is exactly the direction that starts
+# a container the operator stopped.
+#
+# PURE library — no side effects at source time; no `set -euo pipefail`.
+
+MI_STATE_KIND=desired
+MI_OUT_KIND=outstanding
+# The storage-migration record's kind, declared HERE because this module loads before lib/migrate.sh
+# and needs it for the suspension check below. lib/migrate.sh REFERENCES it; it must not redefine it —
+# two spellings of one ledger kind is how a suspension check stops matching the records it guards.
+MI_MIG_KIND=storagemig
+
+# D52: the outstanding set is TYPED, not a boolean. A single flag records no kind and no parameters,
+# so a `start` would resolve an alias, clear the flag, and report success having never checked
+# migrated storage. Each entry carries what kind of check is owed and what it needs.
+#
+#   alias   carries the network ID the alias must resolve on; cleared by probe resolution matching the
+#           post-start endpoint (§6b.3 step 5).
+#
+# `alias` is the ONLY kind, deliberately. There is no `storage` kind: an earlier revision defined one
+# carrying "the destination path and the expectation", cleared by "the container observably reading
+# that path" — which is not implementable, because the entry holds a HOST path the container cannot
+# see, and reading from inside would require the shell and tooling D48 refuses to assume any product
+# image ships. What is verifiable is verified where it belongs: content host-side at D51 phase 4, and
+# the mount by inspection at D51 phase 8. The container-side read is not performed and is NOT CLAIMED.
+#
+# The shape exists anyway because a boolean already proved unable to carry a second kind.
+_mi_state_kind_ok() {
+  case "$1" in alias) return 0 ;; esac
+  mi_warn "state: '$1' is not a check kind this core defines (the only kind is 'alias')"
+  return 1
+}
+
+# ONE VOCABULARY, BOTH DIRECTIONS. It gates what mi_state_commit will write AND what
+# mi_state_desired_get will read back: a `state=paused` arriving in a restored ledger is a value the
+# reconciler's table has no row for, and without this it reached that table and fell through every
+# arm — printing nothing, returning success, and reading to a caller as "there is no work to do".
+# The wording is neutral about direction; each caller's own message says whether it was writing or
+# reading.
+_mi_state_desired_ok() {
+  case "$1" in running|stopped) return 0 ;; esac
+  mi_warn "state: desired state must be running or stopped, not '$1'"
+  return 1
+}
+
+# rc 0 prints running|stopped · 3 nothing recorded · 1 unreadable ledger, or a record that is there and
+# cannot be read as one.
+#
+# NO DEFAULT. A container with no recorded desired state is a container this installer has not been
+# told what to do with; defaulting to `running` would start things nobody asked for, and defaulting to
+# `stopped` would take a working install down. Callers handle 3 explicitly.
+mi_state_desired_get() {
+  if [ "$#" -ne 1 ]; then mi_warn "state: mi_state_desired_get needs <container>"; return 1; fi
+  local rec rc v
+  if rec="$(mi_led_find "$MI_STATE_KIND" container "$1")"; then rc=0; else rc=$?; fi
+  [ "$rc" -eq 0 ] || return "$rc"
+  # ONE RECORD, ZERO ANSWERS IS NOT ZERO RECORDS. `state=` with nothing after it is a legal field and
+  # a record carrying no `state=` at all is legal too, so "the record did not answer" is not "there is
+  # no record" — and reporting 3 here would mean "nothing recorded", which invites the next verb to
+  # record over the row rather than repair it. Same shape as lib/prov.sh's identity reader.
+  if v="$(mi_led_field "$rec" state)"; then :; else
+    mi_warn "state: the record of desired state for '$1' does not say which state is wanted. It says"
+    mi_warn "  this container was given an intent without saying what it was, so it can be neither"
+    mi_warn "  reconciled nor left alone. It is PRESERVED and reported."
+    mi_warn "  Run 'mythical-ctl state repair'."
+    return 1
+  fi
+  if ! _mi_state_desired_ok "$v"; then
+    mi_warn "  — and that value is on DISK, in the ledger, not in this call. The ledger is checksummed,"
+    mi_warn "  which proves the bytes were not altered after they were written, not that this"
+    mi_warn "  installation wrote them. It is PRESERVED and reported."
+    mi_warn "  Run 'mythical-ctl state repair'."
+    return 1
+  fi
+  printf '%s\n' "$v"
+}
+
+# The outstanding entries for <container>, one per line as `KIND<TAB>PARAM`.
+#
+# rc 0 the set is printed (empty means there is nothing outstanding) · 1 the question could not be
+# answered, REPORTED — never folded into an empty set. An empty set is what makes a container
+# reconciled and what makes the reconciler plan `none`, so a listing that reported "none" for a ledger
+# it could not read would declare a fleet settled on the strength of a question nobody answered.
+mi_state_outstanding() {
+  if [ "$#" -ne 1 ]; then mi_warn "state: mi_state_outstanding needs <container>"; return 1; fi
+  local c="$1" recs rc line k p out=""
+  # The container is a SELECTOR here, judged by the function every editor entry point judges one with:
+  # it must equal a serialized field byte for byte to match one, and a selector no field could ever
+  # equal answers "nothing is outstanding" for every container name it is given.
+  _mi_led_args_ok "$MI_OUT_KIND" container "$c" || return 1
+  if recs="$(mi_led_all "$MI_OUT_KIND")"; then rc=0; else rc=$?; fi
+  # 3 is "there is no ledger yet", which IS an answer, and the answer is that nothing is outstanding.
+  # Anything else is "could not read it", already reported by the reader, and it is propagated.
+  if [ "$rc" -eq 3 ]; then return 0; fi
+  [ "$rc" -eq 0 ] || return "$rc"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    _mi_led_record_matches "$line" container "$c" || continue
+    # AN ENTRY FOR THIS CONTAINER THAT DOES NOT SAY WHAT IT IS refuses the whole listing rather than
+    # being skipped. Skipping it removes an owed check from the set, and an empty set means
+    # reconciled — so the one record shape that cannot be interpreted would be the one that silently
+    # retires the verification it records.
+    if k="$(mi_led_field "$line" kind)"; then :; else
+      mi_warn "state: an outstanding check recorded for '$c' does not say what KIND of check is owed,"
+      mi_warn "  so it can never be performed and never cleared. Leaving it out of the set would make"
+      mi_warn "  this container look fully reconciled. It is PRESERVED and reported."
+      mi_warn "  Run 'mythical-ctl state repair'."
+      return 1
+    fi
+    if [ -z "$k" ]; then
+      mi_warn "state: an outstanding check recorded for '$c' carries an EMPTY kind — it says a check is"
+      mi_warn "  owed without saying which, which no clear can ever match. It is PRESERVED and reported."
+      mi_warn "  Run 'mythical-ctl state repair'."
+      return 1
+    fi
+    p="$(mi_led_field "$line" param)" || p=""
+    # Buffered rather than printed as the loop goes: a partial listing followed by a failure status is
+    # the shape a caller reads as success with data. Same reason mi_led_all buffers.
+    out="${out}${k}"$'\t'"${p}"$'\n'
+  done <<< "$recs"
+  printf '%s' "$out"
+}
+
+# ONE WALK OF THE LEDGER BODY: drop this container's state rows, preserve every other row byte for
+# byte, and hand back what remains (no trailing newline, as `$( )` would strip one anyway).
+#
+#   <drop-desired>  the fields of the ONE `desired` row _mi_led_select resolved to, or empty for none.
+#   <out-kinds>     `+all` — commit and forget replace the whole outstanding set — or one check kind,
+#                   which is a clear. Both sentinels start with `+`, which _mi_led_field_ok's name
+#                   grammar excludes, so neither can ever collide with a real check kind.
+#
+# It performs _mi_led_without's single-row drop inline rather than calling it, because this edit
+# touches TWO record sets in one write and the body must be walked ONCE: a second pass reports the
+# same blank rows a second time and rewrites what the first pass just rewrote. Every JUDGEMENT is
+# still delegated to the function that owns it, and that is not decoration:
+#
+#   _mi_led_row_of decides what is a record of a kind. A bare `outstanding` row with no TAB and no
+#   fields IS one — the `case "$kind"$'\t'*` pattern this function used to carry made it a record of
+#   no kind at all, so it was neither matched nor dropped nor reported, and the next ordinary edit
+#   lost it.
+#   _mi_led_record_matches decides whether a record answers, and it gates the record first, so a row
+#   this module cannot read matches nothing and stays exactly where it is.
+#
+# A BLANK ROW IS PRESERVED AND REPORTED, not skipped. `[ -n "$line" ] || continue` in a rewriting loop
+# reads as harmless and is not: the row is silently absent from the output, so a foreign or restored
+# ledger quietly loses a row at the first operation that touches this container.
+_mi_state_filter() {
+  local records="$1" c="$2" want="$3" kinds="$4" line rec out="" blank=0
+  # AN EMPTY BODY IS NOT A BLANK ROW. The here-string below supplies a newline of its own, so `""`
+  # would arrive as one empty line and be reported as a blank row on the first write of every install.
+  [ -n "$records" ] || return 0
+  if [ -n "$want" ]; then want="${MI_STATE_KIND}"$'\t'"${want}"; fi
+  while IFS= read -r line; do
+    # The one desired row the selector resolved to, matched as a WHOLE LINE, byte for byte — so the
+    # row removed is the row that was judged. `want` is cleared on the first hit, so a ledger holding
+    # those bytes twice cannot lose both rows here.
+    if [ -n "$want" ] && [ "$line" = "$want" ]; then want=""; continue; fi
+    if _mi_led_row_of "$line" "$MI_OUT_KIND"; then
+      rec="$MI_LED_ROW"          # copied out before anything else runs; the global is valid until the next call
+      if _mi_led_record_matches "$rec" container "$c"; then
+        if [ "$kinds" = '+all' ]; then continue; fi
+        if _mi_led_record_matches "$rec" kind "$kinds"; then continue; fi
+      fi
+    fi
+    if [ -z "$line" ]; then blank=$((blank + 1)); fi   # a loop counter, not a value out of a file
+    out="${out}${line}"$'\n'
+  done <<< "$records"
+  if [ "$blank" -gt 0 ]; then
+    mi_warn "state: the installer state ledger holds ${blank} blank row(s) — a row that is not a record"
+    mi_warn "  of any kind. It grants nothing and answers nothing, and it is kept exactly where it is"
+    mi_warn "  rather than dropped by this write. Run 'mythical-ctl state repair'."
+  fi
+  printf '%s' "$out"
+}
+
+# The read-modify-write mi_state_commit and mi_state_forget share: resolve this container's ONE
+# `desired` row, then hand back the body with that row and the container's whole outstanding set
+# removed. rc 0 the remainder is printed · 1 refused, reported.
+_mi_state_take() {
+  local records="$1" c="$2" old="" rc
+  if old="$(_mi_led_select "$records" "$MI_STATE_KIND" container "$c")"; then :; else
+    rc=$?; [ "$rc" -eq 3 ] || return 1; old=""
+  fi
+  _mi_state_filter "$records" "$c" "$old" '+all'
+}
+
+# D50's ordering, made unavoidable: desired state AND the outstanding set commit in ONE atomic ledger
+# write. Splitting them leaves a window where desired is `running` and the set is empty — and a crash
+# there produces a container that recovery starts and then considers fully reconciled, SKIPPING LIVE
+# VERIFICATION ENTIRELY. The ledger is one atomic document (§6b) precisely so related fields need not
+# be written separately; two updates to it in sequence is the same defect the consolidation removed.
+#
+# Usage: mi_state_commit <container> <running|stopped> [<kind> <param>]...
+mi_state_commit() {
+  if [ "$#" -lt 2 ]; then mi_warn "state: mi_state_commit needs <container> <desired> [<kind> <param>]..."; return 1; fi
+  local c="$1" want="$2"; shift 2
+  _mi_state_desired_ok "$want" || return 1
+  mi_lock_assert_held "record desired state"
+
+  # THE FIELD RULE, ON A WRITER THAT SERIALIZES ITS OWN RECORD. mi_led_put is not on this path — this
+  # function writes two kinds in one ledger write and mi_led_put writes one record — so `container`
+  # and `param` would otherwise reach the serializer unchecked, and a TAB in either forges a field
+  # boundary while a newline forges a whole record. It is the WRITER's own list rule, applied to the
+  # exact list about to be serialized, so what was validated is what gets written.
+  if ! _mi_led_fields_ok "container=${c}" "state=${want}"; then
+    mi_warn "state: refusing to record desired state for '${c}'. Nothing was written."
+    return 1
+  fi
+
+  # Validate every pair BEFORE building the record: a rejected kind or field halfway through would
+  # otherwise commit a partial set. `pairs` is the array name deliberately — the release bundler
+  # flattens every module into one file, after which shellcheck's array tracking is not per-function,
+  # so an array-typed local must not reuse a name another module uses for a scalar.
+  local -a pairs
+  pairs=()
+  while [ "$#" -gt 0 ]; do
+    _mi_state_kind_ok "$1" || return 1
+    # AN ENTRY WITH NO PARAMETER IS THE BOOLEAN D52 REPLACED. `alias` carries the network its alias
+    # must resolve on, and the clear matches on it — so an entry with nothing to match keeps its
+    # container unreconciled forever, with nothing that could ever retire it. A trailing kind with no
+    # argument at all lands here too: it is the same missing parameter, one position earlier.
+    if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
+      mi_warn "state: the outstanding '${1}' check carries no parameter. D52 made this set TYPED"
+      mi_warn "  because a flag records no kind and no parameters: an 'alias' entry carries the network"
+      mi_warn "  the alias must resolve on, and one carrying nothing can never be matched and so can"
+      mi_warn "  never be cleared. Nothing was written."
+      return 1
+    fi
+    if ! _mi_led_fields_ok "container=${c}" "kind=${1}" "param=${2}"; then
+      mi_warn "state: refusing to record the outstanding '${1}' check for '${c}'. Nothing was written."
+      return 1
+    fi
+    pairs+=("$1" "$2")
+    shift 2
+  done
+
+  local records rest rc out="" i
+  if records="$(mi_ledger_read)"; then :; else
+    # rc 3 is "no ledger yet", a legitimate first write. Anything else is corruption, already reported
+    # by the reader — never overwrite a ledger we could not read.
+    rc=$?; [ "$rc" -eq 3 ] || return "$rc"; records=""
+  fi
+  rest="$(_mi_state_take "$records" "$c")" || return 1
+  [ -z "$rest" ] || out="${rest}"$'\n'
+  out="${out}${MI_STATE_KIND}"$'\t'"container=${c}"$'\t'"state=${want}"$'\n'
+  i=0
+  # `i` is a loop counter this function set to 0 and advances by 2 — never a value parsed out of a
+  # file. That distinction is the whole of lib/prov.sh's _mi_prov_gen_ok note: bash EVALUATES a
+  # command substitution inside an arithmetic array subscript, so a subscript derived from ledger
+  # content would be an execution surface. No value read from the ledger reaches arithmetic here.
+  while [ "$i" -lt "${#pairs[@]}" ]; do
+    out="${out}${MI_OUT_KIND}"$'\t'"container=${c}"$'\t'"kind=${pairs[$i]}"$'\t'"param=${pairs[$((i + 1))]}"$'\n'
+    i=$((i + 2))
+  done
+  printf '%s' "$out" | mi_ledger_write
+}
+
+# Set desired state WITHOUT touching the outstanding set. For the verbs that preserve intent rather
+# than express it — a `recreate` of a stopped product must stay stopped (§6b.3's verb table).
+#
+# It goes through mi_led_put, which applies the field rule, the selector rule and the cardinality
+# question itself. There is deliberately no second copy of any of them here: a guard whose removal
+# changes nothing observable is a guard that gets removed.
+mi_state_desired_set() {
+  if [ "$#" -ne 2 ]; then mi_warn "state: mi_state_desired_set needs <container> <desired>"; return 1; fi
+  _mi_state_desired_ok "$2" || return 1
+  mi_led_put "$MI_STATE_KIND" container "$1" "container=${1}" "state=${2}"
+}
+
+# Clear ONE kind. A `start` clears only the kinds it actually performed — one kind of check must not be
+# retired by another that happened to succeed (D52). Anything left outstanding keeps the container
+# NOT RECONCILED.
+mi_state_outstanding_clear() {
+  if [ "$#" -ne 2 ]; then mi_warn "state: mi_state_outstanding_clear needs <container> <kind>"; return 1; fi
+  local c="$1" kind="$2" records rest rc
+  _mi_state_kind_ok "$kind" || return 1
+  _mi_led_args_ok "$MI_OUT_KIND" container "$c" || return 1
+  mi_lock_assert_held "clear an outstanding check"
+  if records="$(mi_ledger_read)"; then :; else
+    rc=$?
+    # No ledger at all: there is nothing recorded to clear, and this has achieved its purpose — the
+    # same answer mi_led_del gives. It does NOT create one: writing an empty ledger as a side effect
+    # of clearing nothing is a state change nobody asked for.
+    [ "$rc" -eq 3 ] && return 0
+    return "$rc"
+  fi
+  rest="$(_mi_state_filter "$records" "$c" "" "$kind")" || return 1
+  printf '%s' "$rest" | mi_ledger_write
+}
+
+# Drop every state record for a container. Only a family uninstall and `state repair` use this — a
+# product uninstall keeps trust state (§6c), and desired state for a container that no longer exists is
+# harmless where losing it is not.
+#
+# ONE ledger write, through the same read-modify-write mi_state_commit uses. Two calls to mi_led_del
+# would be two writes, with a window between them in which the container has an outstanding set and no
+# desired state — and mi_led_del removes the ONE row a selector resolves to, so on a container with
+# two outstanding kinds it would refuse the second call outright and leave the set half-forgotten
+# behind a deleted desired row.
+mi_state_forget() {
+  if [ "$#" -ne 1 ]; then mi_warn "state: mi_state_forget needs <container>"; return 1; fi
+  local c="$1" records rest rc
+  _mi_led_args_ok "$MI_STATE_KIND" container "$c" || return 1
+  mi_lock_assert_held "forget a container's recorded state"
+  if records="$(mi_ledger_read)"; then :; else
+    rc=$?
+    [ "$rc" -eq 3 ] && return 0
+    return "$rc"
+  fi
+  rest="$(_mi_state_take "$records" "$c")" || return 1
+  printf '%s' "$rest" | mi_ledger_write
+}
+
+# What the RUNTIME says: running | stopped | absent. Never the ledger — the whole point of a separate
+# desired field is that the two can disagree.
+#
+# rc 0 one of the three words · 1 the runtime could not be asked, or answered something this adapter
+# does not understand.
+mi_state_observed() {
+  if [ "$#" -ne 1 ]; then mi_warn "state: mi_state_observed needs <container>"; return 1; fi
+  local v rc
+  if v="$(mi_rt_inspect container c.running "$1")"; then rc=0; else rc=$?; fi
+  case "$rc" in
+    0) : ;;
+    3) printf 'absent\n'; return 0 ;;        # the object is genuinely gone — mi_rt_inspect proved the daemon answers
+    *) return 1 ;;                           # could not ask; already reported by the adapter
+  esac
+  # `{{.State.Running}}` renders `true` or `false` and nothing else. ANYTHING ELSE IS NOT `stopped`:
+  # treating an unrecognised answer as "not running" is the same fail-open as treating a down daemon
+  # as an absent object, one layer up — desired=running plus a manufactured `stopped` plans a start
+  # against a container that may well be running.
+  case "$v" in
+    true)  printf 'running\n' ;;
+    false) printf 'stopped\n' ;;
+    *) mi_warn "state: the runtime answered '${v}' when asked whether '$1' is running, which is neither"
+       mi_warn "  true nor false. Reading that as 'stopped' would plan a start against a container"
+       mi_warn "  whose state was never established."
+       return 1 ;;
+  esac
+}
+
+# rc 0 iff the container is FULLY reconciled. D50: an outstanding entry means NOT RECONCILED even when
+# actual and desired both say `running`. Without that, the reconciler sees a running container that
+# should be running, calls it settled, and the deferred verification is never performed — the entry
+# survives forever with nothing scheduled to clear it.
+#
+# Every failure to ANSWER also reports not-reconciled, which is the safe direction: an unreadable
+# ledger or an unreachable runtime leaves the container in the set the reconciler still has work for,
+# rather than in the set it has declared settled. Each of the three readers below has already reported
+# why on stderr.
+mi_state_reconciled() {
+  if [ "$#" -ne 1 ]; then mi_warn "state: mi_state_reconciled needs <container>"; return 1; fi
+  local want obs out
+  # rc 3 (nothing recorded) lands here as "not reconciled" too. There is no desired state to have
+  # converged to, so nothing can claim it has.
+  want="$(mi_state_desired_get "$1")" || return 1
+  obs="$(mi_state_observed "$1")" || return 1
+  out="$(mi_state_outstanding "$1")" || return 1
+  [ -z "$out" ] || return 1
+  [ "$want" = "$obs" ]
+}
+
+# A recorded STORAGE migration suspends reconciliation for its container. Its record is kind
+# `storagemig`, keyed <product>:<role> — NOT an `intent` record keyed by container — so it cannot be
+# found with mi_intent_find, and an earlier draft of this module tried exactly that: the lookup never
+# matched, the suspension was silently dead, and the reconciler would have restarted a container the
+# migration deliberately stopped. The container's product comes from its provenance record.
+#
+# rc 0 a migration governs this container · 1 none does · 2 THE QUESTION COULD NOT BE ANSWERED,
+# reported. The third value is the point of this function's shape: both lookups it makes can fail for
+# a reason that is not "there is none" — an unreadable ledger, an ambiguous record set, a listing that
+# refuses because one row cannot be read — and the caller must not act on any of them. A `|| return 1`
+# over both, which is what this had, made every one of those mean "no migration governs", i.e.
+# "proceed", i.e. start or stop a container a migration deliberately stopped.
+_mi_state_storagemig_for() {
+  local c="$1" rec product recs line rc
+  if rec="$(mi_prov_find container "$c")"; then rc=0; else rc=$?; fi
+  # No provenance record: nothing says which product this container belongs to, and a storage
+  # migration is keyed by product — so there is no migration this container could be under. That is an
+  # answer, not a failure. (§6b's "is this mine?" question is deletion authority's, and it is asked at
+  # the removal paths, not here.)
+  if [ "$rc" -eq 3 ]; then return 1; fi
+  [ "$rc" -eq 0 ] || return 2
+  if product="$(mi_led_field "$rec" product)"; then :; else
+    rc=$?
+    [ "$rc" -eq 3 ] && return 1      # the record names no product; nothing can be keyed on one
+    return 2
+  fi
+  # `product=` with an empty value would match a migration record carrying an equally empty one, so a
+  # container whose provenance names no product would be suspended by a migration for a different
+  # nothing. Empty is "no product", exactly as an absent field is.
+  [ -n "$product" ] || return 1
+  if recs="$(mi_led_all "$MI_MIG_KIND")"; then rc=0; else rc=$?; fi
+  if [ "$rc" -eq 3 ]; then return 1; fi
+  [ "$rc" -eq 0 ] || return 2
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    if _mi_led_record_matches "$line" product "$product"; then return 0; fi
+  done <<< "$recs"
+  return 1
+}
+
+# THE reconciler's decision, as one word. Callers act on it; the table lives here so §6b.3's recovery
+# rows are a lookup rather than a judgement at each call site.
+#
+#   suspended  a live intent for this container governs — the reconciler must not "fix" a container a
+#              migration deliberately stopped (§5.2), exactly as the exact-set invariant defers to a
+#              network-migration intent (§6b.2).
+#   rebuild    desired=running and the container is ABSENT. Never a bare `start`: there is nothing to
+#              start, and the launch spec is the verb's to supply.
+#   stop       desired=stopped, still running — a `stop` that crashed after writing intent.
+#   start verify  desired=running, stopped. EVERY path that leaves a container running walks the live
+#              verification, whether or not something was already outstanding. The tempting shape is
+#              `start` when the set is empty and `start verify` when it is not — and that is the D42
+#              defect: the outstanding entry was introduced for deferred migration checks and never
+#              wired into ordinary bring-up, so a fresh install or a `recreate` reported success
+#              having never resolved the container's alias even once. "It started" is not evidence
+#              that its alias resolves.
+#   verify     running, with something outstanding: verified NOW, not at a hypothetical next start. A
+#              container already running HAS an address, and D50 makes an outstanding entry mean
+#              not-reconciled — leaving it for a future `start` that may never come would let it sit
+#              indefinitely on a running product while every pass declares the fleet settled.
+#   defer      STOPPED with something outstanding: it has no address, so there is nothing to resolve.
+#              Deferred to its next explicit start. Deferring is not skipping — the entry stays.
+#   none       reconciled, or a completed `stop`.
+#
+# rc 0 the word is printed · 1 refused: something this decision rests on could not be read, and it is
+# reported rather than resolved into a plan.
+mi_state_plan() {
+  if [ "$#" -ne 1 ]; then mi_warn "state: mi_state_plan needs <container>"; return 1; fi
+  local c="$1" want obs out rc
+
+  # AN INTENT LOOKUP HAS THREE ANSWERS AND ONLY ONE OF THEM IS "NO INTENT". mi_led_find returns 1 for
+  # an unreadable ledger AND for a key more than one record answers for; a bare `if mi_intent_find …;
+  # then suspended; fi` folded both into "proceed", which is the direction that acts on a container
+  # whose half-built state nobody could read. stdout is discarded because only the status is wanted;
+  # stderr is NOT, or the reason for a refusal would be swallowed with it.
+  if mi_intent_find container "$c" >/dev/null; then rc=0; else rc=$?; fi
+  if [ "$rc" -eq 0 ]; then printf 'suspended\n'; return 0; fi
+  if [ "$rc" -ne 3 ]; then
+    mi_warn "state: cannot tell whether an unconfirmed intent governs '${c}', so this container gets no"
+    mi_warn "  plan. A half-built container is not reconcilable, and 'the question failed' is not"
+    mi_warn "  'there is no intent'."
+    return 1
+  fi
+
+  if _mi_state_storagemig_for "$c"; then rc=0; else rc=$?; fi
+  if [ "$rc" -eq 0 ]; then printf 'suspended\n'; return 0; fi
+  if [ "$rc" -ne 1 ]; then
+    mi_warn "state: cannot tell whether a storage migration governs '${c}', so this container gets no"
+    mi_warn "  plan. Acting here would be acting on a container a migration may have stopped on purpose."
+    return 1
+  fi
+
+  if want="$(mi_state_desired_get "$c")"; then rc=0; else rc=$?; fi
+  if [ "$rc" -eq 3 ]; then printf 'none\n'; return 0; fi     # nothing recorded: nothing to converge to
+  [ "$rc" -eq 0 ] || return 1
+
+  obs="$(mi_state_observed "$c")" || return 1
+  out="$(mi_state_outstanding "$c")" || return 1
+
+  case "${want}/${obs}" in
+    running/absent)   printf 'rebuild\n' ;;
+    running/stopped)  printf 'start verify\n' ;;
+    running/running)  if [ -n "$out" ]; then printf 'verify\n'; else printf 'none\n'; fi ;;
+    stopped/running)  printf 'stop\n' ;;
+    stopped/stopped)  if [ -n "$out" ]; then printf 'defer\n'; else printf 'none\n'; fi ;;
+    stopped/absent)   printf 'none\n' ;;
+    # Structurally unreachable today: both vocabularies are closed above this line, by
+    # _mi_state_desired_ok on the way out of the ledger and by mi_state_observed's own true/false
+    # gate. It is here because a `case` with no default RETURNS SUCCESS HAVING PRINTED NOTHING, and a
+    # caller reading a plan of "" as "no work" is the silent form of every failure this table exists
+    # to make explicit. Adding a state to either vocabulary should land here loudly.
+    *) mi_warn "state: '${c}' is desired '${want}' and observed '${obs}', which is not a row of the"
+       mi_warn "  reconciler's table. Refusing rather than printing an empty plan."
+       return 1 ;;
+  esac
+}
