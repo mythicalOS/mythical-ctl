@@ -263,6 +263,12 @@ teardown() { mi_lock_release; teardown_test_env; }
   FAKE_DOCKER_DOWN=1 run mi_first_use
   [ "$status" -eq 1 ]
   assert_contains "could not be asked"
+  # EVERY KIND IS ASKED, and the refusal has to name all three. MEASURED: with only the assertion
+  # above, restoring the swallowed failure on ONE of the three arms left the suite green — the other
+  # two still failed, the function still refused, and the message merely listed two kinds instead of
+  # three. That is a live fail-open for a runtime that can list containers and networks but not
+  # volumes, which is not the same fixture as a daemon that is down, and nothing here saw it.
+  assert_contains "(container volume network)"
 }
 
 @test "an unlistable object kind is a listing FAILURE, not an empty listing" {
@@ -540,6 +546,12 @@ put_raw() { { mi_ledger_read; printf '%s\n' "$1"; } | mi_ledger_write; }
   # merely absent, which is rc 3.
   run mi_led_field "" nonce
   [ "$status" -eq 1 ] || { echo "expected 1, got $status: $output" >&2; return 1; }
+  # THE MESSAGE IS PINNED, not decoration. Under the separator walk the empty record is one empty
+  # field, which the field rule refuses on its own — so without this assertion the branch that names
+  # the actual problem could be deleted with the status unchanged, and it would be, being a guard
+  # whose removal changes nothing observable. What it changes is what the operator is told about a
+  # ledger they now have to repair.
+  assert_contains "no fields at all"
   # The gate is in this function, not only in the ones that call it: it is public, it is the only
   # reader of a field out of a record, and the next caller may hold a record from a path that did not
   # check. A well-formed record still answers.
@@ -586,6 +598,109 @@ put_raw() { { mi_ledger_read; printf '%s\n' "$1"; } | mi_ledger_write; }
   run mi_ident_get
   [ "$status" -eq 1 ] || { echo "expected 1, got $status: $output" >&2; return 1; }
   assert_contains "identities"
+}
+
+# --- how a record is SPLIT is part of the format, and it was two rules, not one -------------------
+# `IFS=$'\t'; set -- $record` is not a TAB split. It is IFS word-splitting followed by pathname
+# expansion, and each half broke the gate in its own direction: what the walk below sees, that idiom
+# could not see, and what the ledger recorded, that idiom did not compare.
+
+@test "a record with an EMPTY field is ill-formed — the walk sees what IFS splitting collapsed" {
+  mi_ident_ensure >/dev/null
+  id="$(mi_ident_get)"
+  led="$MYTHICAL_HOME/.state/ledger"
+  for n in e1 e2 e3; do mi_rt_volume_create "$n" "nonce-$n" "$id"; done
+
+  # TAB IS IFS WHITESPACE, so adjacent separators COLLAPSE: an empty field is not merely tolerated,
+  # it is INVISIBLE. Measured: `IFS=$'\t'; set -- $'key=a\t\tclass=b'` yields TWO fields, not three,
+  # and a leading or trailing separator yields two as well. So each record below is checksum-valid on
+  # disk, reads back as though it were the well-formed record it is not, and authorises deletion of a
+  # LIVE volume — while no writer in this module could ever have produced it. A read rule that
+  # accepts what the write rule cannot emit is the drift the gate exists to prevent.
+  put_raw "$(printf 'object\tkey=volume:e1\t\tclass=volume\tname=e1\tnonce=nonce-e1\tgen=1')"
+  put_raw "$(printf 'object\t\tkey=volume:e2\tclass=volume\tname=e2\tnonce=nonce-e2\tgen=1')"
+  put_raw "$(printf 'object\tkey=volume:e3\tclass=volume\tname=e3\tnonce=nonce-e3\tgen=1\t')"
+
+  run mi_prov_authority volume e1
+  [ "$status" -ne 0 ] || { echo "an EMPTY field AUTHORIZED deletion" >&2; return 1; }
+  run mi_prov_authority volume e2
+  [ "$status" -ne 0 ] || { echo "a LEADING empty field AUTHORIZED deletion" >&2; return 1; }
+  run mi_prov_authority volume e3
+  [ "$status" -ne 0 ] || { echo "a TRAILING empty field AUTHORIZED deletion" >&2; return 1; }
+
+  # PRESERVED, which is the other half of the invariant. A test that asserts only the refusal proves
+  # only half the rule: refusing while quietly dropping the record destroys the very evidence that
+  # says this ledger needs repairing.
+  for n in e1 e2 e3; do
+    [ "$(grep -acF "nonce=nonce-$n" "$led")" = 1 ] \
+      || { echo "the record for $n was not preserved" >&2; return 1; }
+  done
+}
+
+@test "a field VALUE that is a glob is compared LITERALLY — the cwd cannot manufacture a nonce" {
+  mi_ident_ensure >/dev/null
+  id="$(mi_ident_get)"
+  led="$MYTHICAL_HOME/.state/ledger"
+  mi_rt_volume_create g1 live-nonce "$id"
+  # `*` carries neither a TAB nor a newline, so it is a LEGAL field value: this module's own public
+  # editor writes it verbatim, and a restored ledger can carry it too. But `set -- $record` is
+  # UNQUOTED, so every field is also a pathname PATTERN — `nonce=*` expands against whatever
+  # directory the CLI happens to be invoked from, and a file named `nonce=<the live nonce>` sitting
+  # there supplies a value the ledger never recorded.
+  mi_led_put object key volume:g1 "key=volume:g1" "class=volume" "name=g1" "nonce=*" "gen=1"
+  [ "$(grep -acF 'nonce=*' "$led")" = 1 ] \
+    || { echo "the ledger did not record a literal '*'" >&2; return 1; }
+
+  decoy="$BATS_TEST_TMPDIR/decoy"; mkdir -p "$decoy"; : > "${decoy}/nonce=live-nonce"
+  here="$PWD"
+  cd "$decoy" || return 1
+  run mi_prov_authority volume g1
+  cd "$here" || return 1
+  [ "$status" -ne 0 ] \
+    || { echo "the working directory manufactured the nonce: deletion AUTHORIZED" >&2; return 1; }
+  # And it is the LEDGER'S literal `*` that was compared, not whatever the directory offered. Without
+  # this the test would also pass against code that expanded the glob to something that merely failed
+  # to match — refused for the wrong reason, and still reading the directory.
+  assert_contains "recorded '*'"
+  [ "$(grep -acF 'nonce=*' "$led")" = 1 ] || { echo "the record was not preserved" >&2; return 1; }
+}
+
+@test "a tombstone consumes only a record that DESCRIBES the object it is tombstoning" {
+  mi_ident_ensure >/dev/null
+  led="$MYTHICAL_HOME/.state/ledger"
+  # `key`, `class` and `name` are three independent fields and nothing made them agree, and the
+  # tombstone path found its record by `key` ALONE. So a record that deletion authority refuses
+  # because it describes something else was silently consumed here instead: its nonce and generation
+  # were copied into a tombstone for the object that was ASKED about, and the record itself was
+  # dropped — replacing the conflicting evidence rather than preserving and reporting it.
+  mi_led_put object key volume:t1 "key=volume:t1" "class=container" "name=other" "nonce=n-t1" "gen=1"
+  run mi_prov_authority volume t1
+  [ "$status" -ne 0 ]
+  assert_contains "does not describe it"
+  run mi_prov_tombstone volume t1
+  [ "$status" -ne 0 ] \
+    || { echo "a tombstone consumed a record describing something else" >&2; return 1; }
+  assert_contains "does not describe it"
+  [ "$(grep -acF 'name=other' "$led")" = 1 ] \
+    || { echo "the mismatched record was not preserved" >&2; return 1; }
+
+  # A MISSING `nonce=` loses the same way: authority refuses such a record, and the tombstone that
+  # OUTLIVES the object must not quietly record an empty identity in its place.
+  mi_led_put object key volume:t2 "key=volume:t2" "class=volume" "name=t2" "gen=1"
+  run mi_prov_authority volume t2
+  [ "$status" -ne 0 ]
+  assert_contains "no nonce"
+  run mi_prov_tombstone volume t2
+  [ "$status" -ne 0 ] \
+    || { echo "a tombstone consumed a record carrying no nonce" >&2; return 1; }
+  assert_contains "no nonce"
+  run mi_prov_find volume t2
+  [ "$status" -eq 0 ] || { echo "the nonce-less record was not preserved: rc=$status" >&2; return 1; }
+
+  # Nothing was tombstoned at all: a refusal that still wrote the tombstone would have recorded an
+  # identity this module could not establish, which is the thing a tombstone exists not to do.
+  [ "$(grep -ac '^tombstone' "$led")" = 0 ] \
+    || { echo "a tombstone was written from a record that does not describe the object" >&2; return 1; }
 }
 
 @test "a REPEATED tombstone keeps the identity the tombstone exists to preserve" {

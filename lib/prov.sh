@@ -18,6 +18,9 @@
 # extraction, and listing. It is not restated at any of them, because a rule enforced at some of a
 # module's inputs and not at the rest is how each of this file's earlier defects got in.
 #
+# HOW a record is split is part of that rule, not a detail below it — see _mi_led_split. Every read
+# path takes its fields from that one walk, and there is no second way to obtain them.
+#
 # PUBLIC SURFACE: mi_led_put, mi_led_del, mi_led_find, mi_led_all, mi_led_field, mi_ident_get,
 # mi_ident_ensure, mi_member_add, mi_member_has, mi_member_del, mi_prov_record, mi_prov_find,
 # mi_prov_tombstone, mi_prov_authority, mi_prov_image_record, mi_prov_gen, mi_first_use.
@@ -128,6 +131,59 @@ _mi_led_fields_ok() {
   return 0
 }
 
+# THE ONLY SPLITTER — and splitting is a SECURITY RULE here, not plumbing.
+#
+# `IFS=$'\t'; set -- $record` is not a TAB split. It is IFS word-splitting followed by pathname
+# expansion, and each half was a defect in its own direction. Both are properties of the idiom, so
+# both existed at every site that used it, and neither is visible when reading such a line:
+#
+#   1. TAB IS IFS *WHITESPACE*, so ADJACENT SEPARATORS COLLAPSE and an empty field is INVISIBLE.
+#      Measured: `IFS=$'\t'; set -- $'key=a\t\tclass=b'` yields TWO fields, not three; a leading or a
+#      trailing separator likewise yields two. So a record with an empty field passed the
+#      well-formedness gate as though the empty field were not there, and a checksum-valid
+#
+#          object<TAB>key=volume:v1<TAB><TAB>class=volume<TAB>name=v1<TAB>nonce=live<TAB>gen=1
+#
+#      matched, read back, and AUTHORISED DELETION of a live volume. No writer here can emit that
+#      record — so the read rule accepted what the write rule cannot produce, which is precisely the
+#      drift between the two directions this gate was introduced to make impossible.
+#
+#   2. THE EXPANSION IS UNQUOTED, so every field is also a PATHNAME PATTERN. `*` contains neither a
+#      TAB nor a newline, so `nonce=*` is a LEGAL field: this module's own editor writes it verbatim
+#      and a restored ledger can carry it. It then expanded against whatever directory the CLI
+#      happened to be invoked from. Measured: with a file named `nonce=live-nonce` in that directory,
+#      the field became `nonce=live-nonce` and deletion of a volume labelled `live-nonce` was
+#      authorised while the ledger literally recorded `*`. THE WORKING DIRECTORY COULD MANUFACTURE
+#      THE NONCE THAT AUTHORISES A DELETION — from an unprivileged file, in a directory the operator
+#      need not own.
+#
+# The walk below has neither property: nothing is word-split, nothing is glob-expanded, and an empty
+# field is one token like any other. It consumes one separator at a time with parameter expansion,
+# which is the only string operation in bash that is neither.
+#
+# The tokens go into a module-global array because bash cannot return a list, and _mi_led_record_ok
+# is the only caller: a reader gets a record's fields by passing the gate, or it does not get them.
+# `local IFS` is deliberately absent — this function never depends on IFS, which is the point of it.
+MI_LED_TOK=()
+
+_mi_led_split() {
+  local s="$1"
+  MI_LED_TOK=()
+  while :; do
+    case "$s" in
+      *$'\t'*)
+        MI_LED_TOK+=( "${s%%$'\t'*}" )
+        s="${s#*$'\t'}" ;;
+      *)
+        # The remainder is the last field, empty or not. A walk always yields at least one token, so
+        # "${MI_LED_TOK[@]}" is never an empty-array expansion — which bash 3.2 reports as an unbound
+        # variable under `set -u`, and bin/mythical-ctl runs with `set -u`.
+        MI_LED_TOK+=( "$s" )
+        break ;;
+    esac
+  done
+}
+
 # ONE RECORD, ONE MEANING — THE SINGLE GATE EVERY PATH THAT READS A RECORD OFF DISK GOES THROUGH.
 #
 # The rule: a record read off disk is either WELL-FORMED, or it matches nothing and is preserved and
@@ -156,21 +212,22 @@ _mi_led_fields_ok() {
 #
 # rc 0 well-formed · 1 ill-formed, REPORTED. Every caller must treat 1 as "this matches nothing" and
 # must leave the record where it is.
+#
+# ON SUCCESS THE RECORD'S FIELDS ARE LEFT IN MI_LED_TOK, and that is deliberately the ONLY way to
+# obtain them: a reader cannot iterate a record it has not judged, because judging it is what
+# produces the tokens. They are valid until the next call to this function, which is the next line in
+# every caller here.
 _mi_led_record_ok() {
-  local IFS
-  IFS=$'\t'
-  # shellcheck disable=SC2086   # deliberate IFS split on TAB, which IS this format's field separator
-  set -- $1
-  # Restore word-splitting BEFORE reporting: mi_warn joins its arguments with the first character of
-  # IFS, so a message emitted while IFS is a TAB would come out tab-joined the day someone gives it a
-  # second argument. Cheap here, invisible to find later.
-  IFS=$' \t\n'
-  if [ "$#" -eq 0 ]; then
+  _mi_led_split "$1"
+  # The empty record is one empty field under the walk, and the field rule below refuses it — but it
+  # is refused HERE so the operator is told what is actually wrong with it. "This describes nothing"
+  # and "this token is not a field" are different facts about a ledger someone has to repair.
+  if [ -z "$1" ]; then
     mi_warn "prov: a ledger record carries no fields at all — it describes nothing, so it matches"
     mi_warn "  nothing and grants nothing. Run 'mythical-ctl state repair'."
     return 1
   fi
-  _mi_led_fields_ok "$@" || return 1
+  _mi_led_fields_ok "${MI_LED_TOK[@]}" || return 1
   return 0
 }
 
@@ -181,13 +238,11 @@ _mi_led_record_ok() {
 # deleted. Any mismatch preserves — the record stays on disk, is reported, and grants nothing.
 _mi_led_record_matches() {
   local record="$1" field="$2" value="$3" tok matched=1
+  # The gate splits; this reads what the gate split. It does NOT split again — a second walk beside
+  # the first is a second splitting rule, and the whole reason this function no longer contains one
+  # is that the two would drift the moment either was touched.
   _mi_led_record_ok "$record" || return 1
-  local IFS
-  IFS=$'\t'
-  # shellcheck disable=SC2086   # deliberate IFS split on TAB of a record the gate has just judged
-  set -- $record
-  IFS=$' \t\n'
-  for tok in "$@"; do
+  for tok in "${MI_LED_TOK[@]}"; do
     if [ "$tok" = "${field}=${value}" ]; then matched=0; fi
   done
   return "$matched"
@@ -312,15 +367,12 @@ mi_led_field() {
   # because it is public, it is the only reader of a field out of a record, and the next caller may
   # hold a record that came from a path which did not check.
   _mi_led_record_ok "$1" || return 1
-  # Save the field name BEFORE `set --`, which REPLACES the positional parameters: reading "$2"
-  # afterwards would compare against the record's second field instead of the name we were asked for.
-  # Found by executing this function, not by reading it.
+  # Reads the tokens the gate produced; it does not split again. (This function used to `set -- $1`,
+  # which REPLACES the positional parameters — so "$2" afterwards was the record's second field
+  # rather than the name asked for, and the name had to be saved into a local first. Taking the
+  # fields from the gate removes the trap rather than continuing to step around it.)
   local tok want="$2"
-  local IFS
-  IFS=$'\t'
-  # shellcheck disable=SC2086   # deliberate IFS split of a record we wrote ourselves
-  set -- $1
-  for tok in "$@"; do
+  for tok in "${MI_LED_TOK[@]}"; do
     case "$tok" in "${want}="*) printf '%s\n' "${tok#*=}"; return 0 ;; esac
   done
   return 3
@@ -457,6 +509,36 @@ _mi_prov_class_ok() {
 # reason.
 _mi_prov_key() { printf '%s:%s\n' "$1" "$2"; }
 
+# DOES THIS RECORD DESCRIBE THE OBJECT IT WAS FOUND UNDER? rc 0 yes · 1 no, REPORTED.
+#
+# A record is retrieved by its `key=` field, but `key`, `class` and `name` are three INDEPENDENT
+# fields and nothing makes them agree. A record keyed `volume:v1` while carrying `class=container`
+# and `name=other` answers the lookup for `volume v1` and then speaks about something else entirely.
+#
+# It is one predicate with TWO call sites, and they are two different acts on such a record — reading
+# it as permission to delete, and consuming it to build the record that outlives the object. The
+# check was at the first and not the second, so the record deletion authority correctly refused was
+# quietly destroyed by the tombstone instead: its nonce and generation copied into a tombstone for
+# the object that was ASKED about, and the record itself dropped. Conflicting evidence is preserved
+# and reported; it is never replaced.
+#
+# One predicate rather than the same test written out twice: a second copy is a guard that can be
+# deleted with nothing observable changing at the site that kept it, and this module has already had
+# one of those (see the note at mi_prov_tombstone). Neither call site shadows the other — they are on
+# different paths, and each has its own mutation proving so.
+_mi_prov_record_describes() {
+  local rec="$1" class="$2" name="$3" rclass rname
+  rclass="$(mi_led_field "$rec" class)" || rclass=""
+  rname="$(mi_led_field "$rec" name)" || rname=""
+  if [ "$rclass" = "$class" ] && [ "$rname" = "$name" ]; then return 0; fi
+  mi_warn "prov: the record found for ${class} '${name}' does not describe it — it describes"
+  mi_warn "  ${rclass:-<no class>} '${rname:-<no name>}'. A record that is about something else is"
+  mi_warn "  not authority over this and is not the record OF this either, so it is PRESERVED and"
+  mi_warn "  reported rather than acted on."
+  mi_warn "  Run 'mythical-ctl state repair'."
+  return 1
+}
+
 # A VALUE PARSED OUT OF A FILE IS NOT A NUMBER UNTIL IT HAS BEEN CHECKED, AND `$(( ))` IS NOT A
 # PARSER — IT IS AN EVALUATOR.
 #
@@ -574,7 +656,27 @@ mi_prov_tombstone() {
   # returns its status rather than writing — a tombstone is never written over a ledger we could not
   # read, so an empty record here cannot become an empty tombstone on disk.
   if [ -n "$rec" ]; then
-    nonce="$(mi_led_field "$rec" nonce)" || nonce=""
+    # THE RECORD MUST DESCRIBE WHAT IS BEING TOMBSTONED — the same door as deletion authority's, on
+    # the other act performed on the same record. Both sources above are found by `key=` alone, and a
+    # record whose class and name describe something else was consumed here anyway: its identity was
+    # copied into a tombstone for the object that was ASKED about, and the record itself dropped by
+    # the loop below. That is conflicting evidence REPLACED, which is the one thing this module may
+    # never do — and it is reachable from a restored ledger, whose checksum proves the bytes were not
+    # altered after they were written, not that this installation wrote them.
+    _mi_prov_record_describes "$rec" "$class" "$name" || return 1
+    # A MISSING `nonce=` loses the same way. Deletion authority refuses such a record; a tombstone
+    # that consumed it would record an empty identity in place of the record that said there was
+    # one — indistinguishable afterwards from the honest tombstone written for an object that never
+    # had provenance at all. PRESENCE is the question, not emptiness: a tombstone written for an
+    # object with no record carries `nonce=` with an empty value on purpose, and a repeat removal
+    # must be able to read that back and copy it forward unchanged.
+    if nonce="$(mi_led_field "$rec" nonce)"; then :; else
+      mi_warn "prov: the record for '$name' carries no nonce — a tombstone records the identity of"
+      mi_warn "  what was removed, and this record does not carry one. Preserving it and reporting;"
+      mi_warn "  an empty tombstone would erase the fact that a record was there at all."
+      mi_warn "  Run 'mythical-ctl state repair'."
+      return 1
+    fi
     gen="$(mi_led_field "$rec" gen)" || gen=""
     # THE SAME RULE AS THE READER'S, because this is the module's second reader of `gen` and its only
     # writer of a gen it did not compute. Nothing here evaluates the value — but copying a generation
@@ -651,28 +753,16 @@ mi_prov_authority() {
   [ "$rc" -eq 0 ] || return 1
 
   # THE RECORD MUST BE ABOUT WHAT WAS ASKED ABOUT — the third door, and the one that stays shut when
-  # the other two are walked around.
-  #
-  # A record is retrieved by its `key=` field, but `key`, `class` and `name` are three independent
-  # fields: nothing made them agree. A record whose key says one object while its class and name
+  # the other two are walked around. A record whose key says one object while its class and name
   # describe another answers the lookup for the first and then hands this function the SECOND
   # object's nonce, which is compared against the FIRST object's label — and if they happen to match,
   # deletion of an object this installer never created is authorized.
   #
-  # Checked here rather than in mi_prov_find, in ONE place: this is the only function that turns a
-  # record into permission to delete, and a check in both would be a check in neither — whichever ran
-  # first would shadow the other, and the shadowed one could then be deleted with nothing observable
-  # changing.
-  local rclass rname
-  rclass="$(mi_led_field "$rec" class)" || rclass=""
-  rname="$(mi_led_field "$rec" name)" || rname=""
-  if [ "$rclass" != "$class" ] || [ "$rname" != "$name" ]; then
-    mi_warn "prov: the record found for ${class} '${name}' does not describe it — it describes"
-    mi_warn "  ${rclass:-<no class>} '${rname:-<no name>}'. A record that is about something else is"
-    mi_warn "  not authority over this, so it is PRESERVED and reported."
-    mi_warn "  Run 'mythical-ctl state repair'."
-    return 1
-  fi
+  # Checked here rather than in mi_prov_find: this is the only function that turns a record into
+  # permission to delete, and a check in mi_prov_find as well would be a check in neither — the
+  # earlier would shadow the later. The predicate is shared with mi_prov_tombstone, which performs
+  # the OTHER act on such a record; see the note there.
+  _mi_prov_record_describes "$rec" "$class" "$name" || return 1
 
   recorded="$(mi_led_field "$rec" nonce)" || recorded=""
   if [ -z "$recorded" ]; then
