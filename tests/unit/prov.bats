@@ -877,3 +877,146 @@ put_raw() { { mi_ledger_read; printf '%s\n' "$1"; } | mi_ledger_write; }
   [ "$(grep -ac '^identity' "$led")" = 1 ] || { echo "the identity record set changed" >&2; return 1; }
   [ "$(grep -ac 'id=i' "$led")" = 0 ] || { echo "an identity was minted beside the record" >&2; return 1; }
 }
+
+# --- is this object OURS? the half of the question the nonce does not answer -----------------------
+# The module's stated question is "did THIS installer create this object, and is the thing there now
+# still it?". The recorded nonce answers only the second half: it says the record and the object agree
+# about which object this is. It says nothing about WHOSE. The installation label is the evidence for
+# the first half, the adapter has exposed it all along, and authority simply never read it.
+
+@test "deletion authority requires the object to carry THIS installation's label" {
+  mi_ident_ensure >/dev/null
+  id="$(mi_ident_get)"
+  led="$MYTHICAL_HOME/.state/ledger"
+
+  # Another installation's volume on the same daemon, carrying the very nonce our ledger records for
+  # it. The realistic path is a restored or foreign ledger: whoever supplied the record supplied the
+  # nonce with it, so a nonce that matches proves the two agree — not that either is ours. This is
+  # acceptance row "two OS users, one daemon: no collision, no adoption", and it failed.
+  mi_rt_volume_create foreign-v shared-nonce i0badf00d99
+  mi_prov_record volume foreign-v shared-nonce
+  run mi_prov_authority volume foreign-v
+  [ "$status" -ne 0 ] \
+    || { echo "another installation's object was AUTHORIZED for deletion" >&2; return 1; }
+  assert_contains "another installation"
+  # PRESERVED — the object itself, still labelled for its owner, and the record that describes it.
+  # A refusal that removed either would be the misidentification this whole module exists to stop.
+  run mi_rt_inspect volume v.install foreign-v
+  [ "$status" -eq 0 ] || { echo "the foreign volume is gone: rc=$status" >&2; return 1; }
+  [ "$output" = "i0badf00d99" ] \
+    || { echo "the foreign volume's label changed: '$output'" >&2; return 1; }
+  [ "$(grep -acF 'name=foreign-v' "$led")" = 1 ] \
+    || { echo "the record was not preserved" >&2; return 1; }
+
+  # An object with NO installation label is refused too, and for the reason the design already gives
+  # one: nothing labels it ours, and nothing proves it is not someone else's. Written straight into
+  # the runtime's state, because a create through this installer always labels.
+  printf 'labels=\ndriver=local\n' > "$FAKE_DOCKER_STATE/volumes/bare-v"
+  mi_prov_record volume bare-v shared-nonce
+  run mi_prov_authority volume bare-v
+  [ "$status" -ne 0 ] || { echo "an UNLABELLED object was AUTHORIZED for deletion" >&2; return 1; }
+  assert_contains "no installation label"
+  assert_contains "neither adopted nor removed"
+  [ -e "$FAKE_DOCKER_STATE/volumes/bare-v" ] \
+    || { echo "the unlabelled volume is gone" >&2; return 1; }
+
+  # THE CONTROL: the same nonce, the same code path, OUR label — still authorized. Without it the two
+  # refusals above are satisfied by any function that refuses everything.
+  mi_rt_volume_create ours-v shared-nonce "$id"
+  mi_prov_record volume ours-v shared-nonce
+  run mi_prov_authority volume ours-v
+  [ "$status" -eq 0 ] || { echo "our own object was refused: rc=$status $output" >&2; return 1; }
+}
+
+@test "authority refuses when this installation's OWN identity cannot be read" {
+  mi_ident_ensure >/dev/null
+  id="$(mi_ident_get)"
+  mi_rt_volume_create v1 good-nonce "$id"
+  mi_prov_record volume v1 good-nonce
+  run mi_prov_authority volume v1
+  [ "$status" -eq 0 ] || { echo "the fixture does not authorize to begin with: $output" >&2; return 1; }
+  # A second identity record makes the identity unreadable (it cannot say which one this installation
+  # is). Comparing the object's label against an identity we could not establish would compare it
+  # against the empty string, which no label equals — a refusal for the wrong reason today, and an
+  # authorization the moment anything treats an unreadable identity as absent.
+  put_raw "$(printf 'identity\tid=i0000000000')"
+  run mi_prov_authority volume v1
+  [ "$status" -ne 0 ] || { echo "authorized without an establishable identity" >&2; return 1; }
+  assert_contains "identity"
+}
+
+# --- a row is a record of its KIND, with or without fields -----------------------------------------
+
+@test "a row that is only its KIND is a malformed record, not an absent one" {
+  led="$MYTHICAL_HOME/.state/ledger"
+  # `identity` alone: no TAB, no fields. Every reader recognised a kind by the pattern
+  # `<kind><TAB>*`, so this row was a record of NO kind — skipped in silence by all of them.
+  # mi_ident_get counted zero identity records, reported "none recorded" (which means first use), and
+  # mi_ident_ensure minted a fresh identity BESIDE the row already on disk, leaving two. That is the
+  # same "an existing identity looks absent" defect as an `id=` carrying an empty value, one step
+  # earlier — before any record gate is reached.
+  printf 'identity\n' | mi_ledger_write
+  run mi_ident_get
+  [ "$status" -eq 1 ] || { echo "expected 1, got $status: $output" >&2; return 1; }
+  run mi_ident_ensure
+  [ "$status" -ne 0 ] || { echo "minted '$output' beside a row already on disk" >&2; return 1; }
+  [ "$(grep -ac '^identity' "$led")" = 1 ] || { echo "the identity row set changed" >&2; return 1; }
+  [ "$(grep -ac 'id=i' "$led")" = 0 ] || { echo "an identity was minted beside the row" >&2; return 1; }
+}
+
+@test "the bare-kind blind spot was in how a kind is RECOGNISED, so it was in every kind at once" {
+  led="$MYTHICAL_HOME/.state/ledger"
+  printf 'object\ntombstone\nproduct\nimage\n' | mi_ledger_write
+  # A listing says "these are all of them", so a row of that kind it cannot read refuses the listing
+  # rather than leaving it out. Before the fix each of these rows belonged to no kind and every
+  # listing reported success with nothing in it.
+  for k in object tombstone product image; do
+    run mi_led_all "$k"
+    [ "$status" -eq 1 ] || { echo "mi_led_all $k answered $status for a bare '$k' row" >&2; return 1; }
+    assert_contains "cannot be read"
+  done
+  # Inert, not deleted: a lookup matches nothing, and an ordinary edit of another kind keeps every one
+  # of them exactly where it is.
+  run mi_led_find object key volume:v1
+  [ "$status" -eq 3 ] || { echo "a bare row answered a lookup: rc=$status" >&2; return 1; }
+  mi_led_put identity id i0000000000 "id=i0000000000"
+  for k in object tombstone product image; do
+    [ "$(grep -ac "^${k}\$" "$led")" = 1 ] || { echo "the bare '$k' row was dropped" >&2; return 1; }
+  done
+}
+
+@test "a blank body row is preserved by an editor rewrite, and reported" {
+  led="$MYTHICAL_HOME/.state/ledger"
+  # A blank row is the one row shape that is a record of no kind at all. It cannot authorise anything,
+  # but the rewrite loop skipped it, so the next ordinary write dropped it silently — and this module
+  # preserves and REPORTS what it cannot read rather than tidying it away.
+  printf 'product\tname=p1\n\nproduct\tname=p2\n' | mi_ledger_write
+  [ "$(grep -ac '^$' "$led")" = 1 ] || { echo "the fixture has no blank row" >&2; return 1; }
+  run mi_led_put product name p3 "name=p3"
+  [ "$status" -eq 0 ] || { echo "the put failed: $output" >&2; return 1; }
+  assert_contains "blank row"
+  [ "$(grep -ac '^$' "$led")" = 1 ] || { echo "the blank row was dropped by mi_led_put" >&2; return 1; }
+  run mi_led_del product name p3
+  [ "$status" -eq 0 ] || { echo "the delete failed: $output" >&2; return 1; }
+  [ "$(grep -ac '^$' "$led")" = 1 ] || { echo "the blank row was dropped by mi_led_del" >&2; return 1; }
+  # And the ordinary records either side of it are still there and still readable.
+  run mi_led_all product
+  [ "$status" -eq 0 ] || { echo "the listing broke: $output" >&2; return 1; }
+  assert_contains "name=p1"
+  assert_contains "name=p2"
+}
+
+@test "an EMPTY ledger body is not a blank row — the first write neither reports one nor makes one" {
+  led="$MYTHICAL_HOME/.state/ledger"
+  # The rewrite reads the body through a here-string, which supplies a newline of its own, so an empty
+  # body arrives as one empty line. Preserving that as a blank row would invent one on the very first
+  # write of every installation, and report it on every write after.
+  run mi_led_put product name q1 "name=q1"
+  [ "$status" -eq 0 ] || { echo "the first write failed: $output" >&2; return 1; }
+  [ "$(printf '%s\n' "$output" | grep -ac 'blank row')" = 0 ] \
+    || { echo "an ordinary write reported a blank row that is not there" >&2; return 1; }
+  [ "$(grep -ac '^$' "$led")" = 0 ] || { echo "the first write created a blank row" >&2; return 1; }
+  run mi_led_all product
+  [ "$status" -eq 0 ]
+  assert_contains "name=q1"
+}

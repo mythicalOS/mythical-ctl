@@ -19,7 +19,9 @@
 # module's inputs and not at the rest is how each of this file's earlier defects got in.
 #
 # HOW a record is split is part of that rule, not a detail below it — see _mi_led_split. Every read
-# path takes its fields from that one walk, and there is no second way to obtain them.
+# path takes its fields from that one walk, and there is no second way to obtain them. WHICH ROWS ARE
+# RECORDS OF A KIND is part of it too, for the same reason and in one place — see _mi_led_row_of: a
+# row a reader does not recognise as a record is not preserved-and-reported, it is invisible.
 #
 # And asked of a record SET rather than of a record, the same invariant is: A LOOKUP THAT DOES NOT
 # RESOLVE TO EXACTLY ONE THING IS AMBIGUOUS, AND AMBIGUITY PRESERVES AND REPORTS — enforced in ONE
@@ -188,6 +190,43 @@ _mi_led_split() {
   done
 }
 
+# WHICH ROWS ARE RECORDS OF <kind> — ASKED IN ONE PLACE, BECAUSE A KIND THAT IS ONLY RECOGNISED WHEN
+# IT IS FOLLOWED BY A FIELD IS A KIND THAT DISAPPEARS WHEN IT IS NOT.
+#
+# Every reader matched the pattern `<kind><TAB>*`, so a row that is only its kind —
+#
+#   identity
+#
+# with no TAB and no fields — was a record of NO kind. Not a malformed identity record: not an
+# identity record at all, and not anything else either. Both readers skipped it in silence. mi_ident_get
+# then counted ZERO identity records, reported "none recorded", which means first use, and
+# mi_ident_ensure minted a fresh identity BESIDE the row already on disk — leaving two, after which
+# every later read of the identity refuses. That is the same "an existing identity looks absent"
+# defect as an `id=` carrying an empty value, one step earlier in the pipeline: before any record gate
+# is reached, so no record gate could have caught it.
+#
+# It is closed HERE, where the kind is recognised, rather than at either reader — which closes it for
+# all five kinds at once, since none of them was recognised any differently. And it is closed in the
+# direction this module answers everything else: the row IS a record of that kind, its field list is
+# empty, and an empty field list is what the gate below already refuses. So on a lookup it matches
+# nothing and is inert, on a listing it is a reported refusal, and in neither case is it dropped.
+#
+# rc 0 this row is a record of <kind>, AND ITS FIELDS ARE LEFT IN MI_LED_ROW (empty for the bare
+# form) · 1 it is a row of some other kind. MI_LED_ROW is valid until the next call, exactly as
+# MI_LED_TOK is; both callers copy it into a local on the following line rather than reading it twice.
+MI_LED_ROW=""
+
+_mi_led_row_of() {
+  # `"$2"` is quoted in both patterns, so the kind is matched LITERALLY — an unquoted `$2` here would
+  # make a kind containing a glob character a pattern, and _mi_led_kind_ok closes that vocabulary
+  # anyway. Quoted is the rule; the closed vocabulary is the belt.
+  case "$1" in
+    "$2")       MI_LED_ROW=""; return 0 ;;
+    "$2"$'\t'*) MI_LED_ROW="${1#"$2"$'\t'}"; return 0 ;;
+  esac
+  return 1
+}
+
 # ONE RECORD, ONE MEANING — THE SINGLE GATE EVERY PATH THAT READS A RECORD OFF DISK GOES THROUGH.
 #
 # The rule: a record read off disk is either WELL-FORMED, or it matches nothing and is preserved and
@@ -283,16 +322,19 @@ _mi_led_record_matches() {
 # duplicates would be choosing which duplicates are allowed to be silently collapsed. Nothing is lost
 # by refusing — both rows stay exactly where they are.
 _mi_led_select() {
-  local records="$1" kind="$2" kf="$3" kv="$4" line hit="" count=0
+  local records="$1" kind="$2" kf="$3" kv="$4" line row hit="" count=0
   while IFS= read -r line; do
     [ -n "$line" ] || continue
-    case "$line" in
-      "$kind"$'\t'*)
-        if _mi_led_record_matches "${line#*$'\t'}" "$kf" "$kv"; then
-          count=$((count + 1))                      # a loop counter, not a value parsed out of a file
-          if [ "$count" -eq 1 ]; then hit="${line#*$'\t'}"; fi
-        fi ;;
-    esac
+    # The kind question is asked by the one function that asks it, and the answer is copied out of
+    # MI_LED_ROW before anything else runs — _mi_led_record_matches does not touch it, and a reader
+    # that took the global twice would be one call away from reading another row's fields.
+    if _mi_led_row_of "$line" "$kind"; then
+      row="$MI_LED_ROW"
+      if _mi_led_record_matches "$row" "$kf" "$kv"; then
+        count=$((count + 1))                        # a loop counter, not a value parsed out of a file
+        if [ "$count" -eq 1 ]; then hit="$row"; fi
+      fi
+    fi
   done <<< "$records"
   if [ "$count" -eq 0 ]; then return 3; fi
   if [ "$count" -gt 1 ]; then
@@ -315,16 +357,30 @@ _mi_led_select() {
 # chance to disagree with it, and the count would then be a check that the drop could walk around. It
 # is matched as a whole line, byte for byte, so the row removed is the row that was judged.
 _mi_led_without() {
-  local records="$1" kind="$2" drop="$3" line out="" want=""
+  local records="$1" kind="$2" drop="$3" line out="" want="" blank=0
   if [ -n "$drop" ]; then want="${kind}"$'\t'"${drop}"; fi
+  # AN EMPTY BODY IS NOT A BLANK ROW. The here-string below supplies a newline of its own, so `""`
+  # arrives as one empty line — and preserving that would invent a blank row on the very first write
+  # of every installation, and report one on every write after it.
+  [ -n "$records" ] || return 0
   while IFS= read -r line; do
-    [ -n "$line" ] || continue
     # `want` is cleared on the first hit, so a ledger holding the same bytes twice cannot lose both
     # rows here. It cannot reach this function anyway — _mi_led_select refuses two of anything — and
     # this is the belt: dropping ONE row is the contract of the argument, not a property of the input.
     if [ -n "$want" ] && [ "$line" = "$want" ]; then want=""; continue; fi
+    # A BLANK ROW IS PRESERVED AND REPORTED LIKE EVERY OTHER ROW THIS MODULE CANNOT READ. It is a
+    # record of no kind, so it authorises nothing and answers nothing — but this loop used to skip it,
+    # which meant the next ordinary edit dropped it, silently, and a foreign ledger quietly lost a row
+    # on the first operation that touched it. Preserving-and-reporting is the module's rule for
+    # everything it cannot read; "harmless" is not a licence to tidy evidence away.
+    if [ -z "$line" ]; then blank=$((blank + 1)); fi   # a loop counter, not a value out of a file
     out="${out}${line}"$'\n'
   done <<< "$records"
+  if [ "$blank" -gt 0 ]; then
+    mi_warn "prov: the installer state ledger holds ${blank} blank row(s) — a row that is not a record"
+    mi_warn "  of any kind. It grants nothing and answers nothing, and it is kept exactly where it is"
+    mi_warn "  rather than dropped by the next write. Run 'mythical-ctl state repair'."
+  fi
   printf '%s' "$out"
 }
 
@@ -429,23 +485,22 @@ mi_led_find() {
 # disk and is reported.
 mi_led_all() {
   if [ "$#" -ne 1 ]; then mi_warn "prov: mi_led_all needs <kind>"; return 1; fi
-  local kind="$1" records line out=""
+  local kind="$1" records line row out=""
   _mi_led_args_ok "$kind" || return 1
   records="$(mi_ledger_read)" || return $?
   while IFS= read -r line; do
     [ -n "$line" ] || continue
-    case "$line" in
-      "$kind"$'\t'*)
-        if ! _mi_led_record_ok "${line#*$'\t'}"; then
-          mi_warn "prov: refusing to list '${kind}' records — one of them cannot be read, and a"
-          mi_warn "  listing that leaves out what it could not read is not a listing of all of them."
-          mi_warn "  It is preserved as it is. Run 'mythical-ctl state repair'."
-          return 1
-        fi
-        # Buffered rather than printed as the loop goes: a partial listing followed by a failure
-        # status is the shape a caller reads as success with data.
-        out="${out}${line#*$'\t'}"$'\n' ;;
-    esac
+    _mi_led_row_of "$line" "$kind" || continue
+    row="$MI_LED_ROW"
+    if ! _mi_led_record_ok "$row"; then
+      mi_warn "prov: refusing to list '${kind}' records — one of them cannot be read, and a"
+      mi_warn "  listing that leaves out what it could not read is not a listing of all of them."
+      mi_warn "  It is preserved as it is. Run 'mythical-ctl state repair'."
+      return 1
+    fi
+    # Buffered rather than printed as the loop goes: a partial listing followed by a failure
+    # status is the shape a caller reads as success with data.
+    out="${out}${row}"$'\n'
   done <<< "$records"
   printf '%s' "$out"
   return 0
@@ -845,6 +900,11 @@ mi_prov_image_record() {
 # --- deletion authority ---------------------------------------------------------------------------
 # THE function every removal path must call, and the only one that may say yes.
 #
+# It answers ONE question in two halves, and it takes evidence for both: DID THIS INSTALLER CREATE
+# THIS OBJECT (the object's installation label equals this installation's identity) AND IS THE THING
+# THERE NOW STILL IT (the object's nonce label equals the recorded one). A record alone is a claim
+# about the past; both labels are the object's own answer about the present.
+#
 # rc 0 authorized · 3 the object is already gone (nothing to do) · 1 NOT authorized (reported).
 #
 # Every "no" preserves. There is no argument that flips it, and no caller may fall back to deleting by
@@ -886,16 +946,70 @@ mi_prov_authority() {
     return 1
   fi
 
-  # Compare against what is ACTUALLY there. A record is a claim about the past; the nonce label is the
-  # object's own answer about the present.
-  local field
+  # Compare against what is ACTUALLY there. A record is a claim about the past; the labels are the
+  # object's own answer about the present, and there are TWO of them because the question has two
+  # halves: did THIS installer create this object, and is the thing there now still it?
+  local field ifield
   case "$class" in
-    volume)             field=v.nonce ;;
-    container|probe)    field=c.nonce ;;
-    network)            field=n.nonce ;;
+    volume)             field=v.nonce ; ifield=v.install ;;
+    container|probe)    field=c.nonce ; ifield=c.install ;;
+    network)            field=n.nonce ; ifield=n.install ;;
   esac
   local ikind="$class"
   [ "$ikind" = probe ] && ikind=container
+
+  # WHOSE IS IT — the half the nonce does not answer, and the half this function did not ask.
+  #
+  # Authority used to rest on the nonce alone. A nonce says the record and the object agree about
+  # WHICH object this is; it says nothing about WHOSE. So with this installation `iA`, a ledger record
+  # for `volume:v` carrying `nonce=N`, and a live volume `v` labelled `installation=iB, nonce=N`, this
+  # function returned 0 and authorized deleting ANOTHER INSTALLATION'S OBJECT — the exact collision
+  # the installation identity exists to prevent (§4b.4: two OS users on one daemon, no collision and
+  # no adoption). The realistic source is a restored or foreign ledger, where whoever supplied the
+  # record supplied the nonce with it, so the nonce proves nothing on its own; the evidence that does
+  # is the object's own installation label, which the adapter has exposed all along.
+  #
+  # BOTH ANSWERS BELOW ARE THE SAME ANSWER THE DESIGN ALREADY GIVES, not a third one:
+  #   labelled for ANOTHER installation  — reported as unattributed. Never removed, never adopted.
+  #   NOT labelled at all                — an unlabelled object at a name this installer would create
+  #                                        blocks creation: no label proves it is ours, and no
+  #                                        provenance proves it is not someone else's.
+  # Neither is "already gone" (rc 3, which tells a caller there is nothing to do) and neither is a
+  # weaker refusal. Both preserve and report, like every other "no" in this module.
+  #
+  # Asked BEFORE the nonce so the refusal names the real fact: telling an operator that a foreign
+  # object's nonce mismatched would be true and useless, and if the nonces happened to match there
+  # would be nothing to tell them at all.
+  local label self
+  if label="$(mi_rt_inspect "$ikind" "$ifield" "$name")"; then rc=0; else rc=$?; fi
+  if [ "$rc" -eq 3 ]; then return 3; fi          # already gone: nothing to authorize, nothing to fear
+  [ "$rc" -eq 0 ] || return 1                    # daemon unreachable: authorize nothing
+  # Docker's `index` on a label map that has no such key prints `<no value>`, not the empty string, so
+  # the unlabelled case arrives spelled two ways depending on whether the object has any labels at
+  # all. Both mean the same thing here, and the same normalization is applied wherever this label is
+  # classified. It cannot collide with a real identity: a minted one is `i` + 10 hex digits.
+  case "$label" in '<no value>') label="" ;; esac
+  if [ -z "$label" ]; then
+    mi_warn "prov: '$name' carries no installation label — nothing about the object itself says this"
+    mi_warn "  installer created it. An unlabelled object standing at a name this installer would"
+    mi_warn "  create is neither adopted nor removed: no label proves it is ours, and no provenance"
+    mi_warn "  proves it is not someone else's. PRESERVED and reported."
+    return 1
+  fi
+  if self="$(mi_ident_get)"; then :; else
+    mi_warn "prov: this installation's own identity cannot be read, so nothing can be shown to belong"
+    mi_warn "  to it — no removal is authorized. Every runtime name and every ownership claim is"
+    mi_warn "  scoped by that identity. Run 'mythical-ctl state repair'."
+    return 1
+  fi
+  if [ "$label" != "$self" ]; then
+    mi_warn "prov: '$name' is labelled for installation '$label'; this installation is '$self'."
+    mi_warn "  It belongs to another installation on the same daemon. A ledger record and a matching"
+    mi_warn "  nonce do not make it ours — a restored or foreign ledger supplies both — so it is"
+    mi_warn "  PRESERVED and reported, never removed and never adopted."
+    return 1
+  fi
+
   if actual="$(mi_rt_inspect "$ikind" "$field" "$name")"; then rc=0; else rc=$?; fi
   if [ "$rc" -eq 3 ]; then return 3; fi          # already gone: nothing to authorize, nothing to fear
   [ "$rc" -eq 0 ] || return 1                    # daemon unreachable: authorize nothing
