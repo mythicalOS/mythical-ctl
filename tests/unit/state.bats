@@ -78,7 +78,7 @@ teardown() { mi_lock_release; teardown_test_env; }
 }
 
 @test "the plan for desired=running, stopped, no outstanding, is start-then-verify" {
-  mi_state_commit "$C" running
+  mi_state_commit "$C" running +none
   run mi_state_plan "$C"
   [ "$output" = "start verify" ]
 }
@@ -113,21 +113,21 @@ teardown() { mi_lock_release; teardown_test_env; }
   # The REAL record shape: kind `storagemig`, keyed <product>:<role>. Using a container `intent` here
   # would pass for the wrong reason — that is a different suspension path, and it is tested below.
   mi_prov_record container "$C" cn "product=p1"
-  mi_state_commit "$C" running
+  mi_state_commit "$C" running +none
   mi_led_put storagemig key "p1:state" "key=p1:state" "phase=3" "product=p1" "role=state" "dest=/d"
   run mi_state_plan "$C"
   [ "$output" = "suspended" ]
 }
 
 @test "an unconfirmed CONTAINER intent also suspends — a half-built container is not reconcilable" {
-  mi_state_commit "$C" running
+  mi_state_commit "$C" running +none
   mi_intent_open container "$C" cn
   run mi_state_plan "$C"
   [ "$output" = "suspended" ]
 }
 
 @test "an absent container with desired=running plans a rebuild, never a bare start" {
-  mi_state_commit "$C" running
+  mi_state_commit "$C" running +none
   mi_rt_container_rm "$C"
   run mi_state_plan "$C"
   [ "$output" = "rebuild" ]
@@ -185,7 +185,7 @@ put_raw() { { mi_ledger_read; printf '%s\n' "$1"; } | mi_ledger_write; }
   # mi_led_find returns 1 for an unreadable ledger AND for a key more than one record answers for.
   # `if mi_intent_find …; then suspended; fi` folds both into "proceed", and proceeding on a container
   # whose half-built state nobody could read is the direction that acts.
-  mi_state_commit "$C" running
+  mi_state_commit "$C" running +none
   mi_intent_open container "$C" cn
   put_raw "intent"$'\t'"key=container:${C}"$'\t'"class=container"$'\t'"name=${C}"$'\t'"nonce=other"$'\t'"created=1"
   run mi_state_plan "$C"
@@ -197,7 +197,7 @@ put_raw() { { mi_ledger_read; printf '%s\n' "$1"; } | mi_ledger_write; }
   # `rec="$(mi_prov_find …)" || return 1` reports "no migration governs" for an unreadable or
   # ambiguous ledger, which is "proceed" — and proceeding restarts a container a migration
   # deliberately stopped.
-  mi_state_commit "$C" running
+  mi_state_commit "$C" running +none
   mi_prov_find() { return 1; }
   run mi_state_plan "$C"
   [ "$status" -ne 0 ]
@@ -228,7 +228,7 @@ put_raw() { { mi_ledger_read; printf '%s\n' "$1"; } | mi_ledger_write; }
 @test "a container name that would forge a record is refused, never serialized" {
   # mi_state_commit writes two kinds in one write, so mi_led_put — which applies the field rule — is
   # not on this path. Unchecked, a TAB forges a field boundary and a newline forges a whole record.
-  run mi_state_commit "forged"$'\n'"desired"$'\t'"container=elsewhere" running
+  run mi_state_commit "forged"$'\n'"desired"$'\t'"container=elsewhere" running +none
   [ "$status" -ne 0 ]
   run mi_state_commit "$C" running alias "net"$'\t'"kind=alias"
   [ "$status" -ne 0 ]
@@ -246,9 +246,9 @@ put_raw() { { mi_ledger_read; printf '%s\n' "$1"; } | mi_ledger_write; }
 @test "two contradicting desired rows are PRESERVED, not replaced by one" {
   # Dropping every matching row and appending one destroys the only evidence that the ledger needs
   # repairing, at the first ordinary operation that touches this container.
-  mi_state_commit "$C" running
+  mi_state_commit "$C" running +none
   put_raw "desired"$'\t'"container=${C}"$'\t'"state=stopped"
-  run mi_state_commit "$C" running
+  run mi_state_commit "$C" running +none
   [ "$status" -ne 0 ]
   run mi_state_desired_get "$C"
   [ "$status" -eq 1 ]
@@ -467,4 +467,187 @@ put_raw() { { mi_ledger_read; printf '%s\n' "$1"; } | mi_ledger_write; }
   case $'\n'"$output"$'\n' in
     *$'\n'"alias"$'\t'"${NET}"$'\n'*) echo "the verified alias check survived: $output" >&2; return 1 ;;
   esac
+}
+
+# --- fix wave 3: EVERY TRANSITION THAT LEAVES A CONTAINER RUNNING ENDS IN A LIVE VERIFICATION ------
+#
+# Two rules, and both turn on a fact that has to be WRITTEN DOWN rather than inferred from an empty
+# set — what this intent owes, and whether this installer has already tried to start the container.
+# An absence cannot carry either fact, which is precisely what made both defects invisible.
+
+@test "a running intent that owes NO live verification must SAY so — silence is refused" {
+  # `mi_state_commit "$C" running` wrote an empty outstanding set and said nothing about it. Start the
+  # container, crash before anything else is recorded, and the ledger reads running/running with
+  # nothing outstanding — plan `none`, fully reconciled, and the live verification never happened.
+  # That is byte for byte the state a COMPLETED verification leaves, so nothing downstream can tell
+  # the two apart. "It started" is not evidence that its alias resolves.
+  run mi_state_commit "$C" running
+  [ "$status" -ne 0 ]
+  assert_contains "owes no live verification"
+  # and nothing was written — the refusal is not a warning printed beside a completed write
+  run mi_state_desired_get "$C"
+  [ "$status" -eq 3 ]
+}
+
+@test "an intent that owes nothing RECORDS that it owes nothing" {
+  mi_state_commit "$C" running +none
+  run mi_state_desired_get "$C"
+  [ "$status" -eq 0 ]
+  [ "$output" = running ]
+  run mi_state_outstanding "$C"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  # THE POINT OF THE WHOLE FIX: the answer is ON THE ROW, not implied by the empty set beside it.
+  rec="$(mi_led_find desired container "$C")"
+  run mi_led_field "$rec" verify
+  [ "$status" -eq 0 ]
+  [ "$output" = none ]
+  # and it still plans the verification step — D42 walks it on every path that leaves it running
+  run mi_state_plan "$C"
+  [ "$output" = "start verify" ]
+}
+
+@test "a running row that does not say what it owes is refused on READ" {
+  # The crash shape, arriving from disk: an intent recorded, nothing outstanding, and nothing saying
+  # whether anything ever was. This core can no longer write it; a restored or older ledger still
+  # can, and reading it as "there is no work to do" is the entire defect.
+  put_raw "desired"$'\t'"container=${C}"$'\t'"state=running"
+  run mi_state_desired_get "$C"
+  [ "$status" -eq 1 ]
+  assert_contains "does not say whether a live verification is"
+  assert_contains "indistinguishable from a crash"
+  mi_rt_container_start "$C"
+  run mi_state_plan "$C"
+  [ "$status" -ne 0 ]
+  run mi_state_reconciled "$C"
+  [ "$status" -ne 0 ]
+}
+
+@test "a verify value this core has no meaning for is refused, not planned around" {
+  # The same closed-vocabulary rule the desired state itself gets, and for the same reason: a value
+  # nothing has a row for must not reach the reconciler and be silently treated as one that does.
+  put_raw "desired"$'\t'"container=${C}"$'\t'"state=running"$'\t'"verify=later"
+  run mi_state_desired_get "$C"
+  [ "$status" -eq 1 ]
+  assert_contains "'owed' or 'none'"
+  run mi_state_plan "$C"
+  [ "$status" -ne 0 ]
+}
+
+@test "declaring nothing is owed while a check IS owed is a contradiction, and refused" {
+  # The declaration is a claim about the state this write LEAVES BEHIND, not about its own argument
+  # list — a commit preserves the outstanding set, so a commit that carries no pairs is not a commit
+  # that owes nothing.
+  mi_state_commit "$C" running alias "$NET"
+  run mi_state_commit "$C" running +none
+  [ "$status" -ne 0 ]
+  assert_contains "still owes"
+  # nor can it be smuggled in beside a pair, which would be one call saying both things at once
+  run mi_state_commit "$C" running alias "${NET}x" +none
+  [ "$status" -ne 0 ]
+  assert_contains "owes NO live verification"
+  run mi_state_outstanding "$C"
+  assert_contains "$NET"
+}
+
+@test "a container that does not stay up is resumed ONCE, then reported" {
+  # For desired=running every observed `stopped` yielded `start verify`. Starting a container that
+  # exits immediately changes neither the desired state nor the outstanding set, so the next
+  # reconciliation produced the IDENTICAL action, for ever — nothing recorded said an attempt had
+  # already been made, so "has not been resumed" and "was resumed and exited" were the same state.
+  mi_state_commit "$C" running alias "$NET"
+  run mi_state_plan "$C"
+  [ "$output" = "start verify" ]
+  # the verb performs that plan: it records the attempt, then starts...
+  mi_state_resume_record "$C"
+  mi_rt_container_start "$C"
+  # ...and the container exits immediately
+  mi_rt_container_stop "$C"
+  # ASK AGAIN — the whole finding is that the second plan used to equal the first.
+  run mi_state_plan "$C"
+  [ "$status" -eq 0 ]
+  [ "$output" = "exited" ] || { echo "the second plan is still '$output' — it is resumed for ever" >&2; return 1; }
+}
+
+@test "a fresh statement of intent grants a fresh attempt" {
+  # Otherwise a container reported once could never be started again by any ordinary operation.
+  mi_state_commit "$C" running alias "$NET"
+  mi_state_resume_record "$C"
+  run mi_state_plan "$C"
+  [ "$output" = "exited" ]
+  mi_state_commit "$C" running alias "$NET"
+  run mi_state_plan "$C"
+  [ "$output" = "start verify" ] || { echo "a re-stated intent did not grant a fresh attempt: $output" >&2; return 1; }
+}
+
+@test "the attempt record is retired by the verification that proves the container came up" {
+  # A container that started perfectly well, was verified, and is later stopped out of band — by a
+  # reboot, or by hand — must be startable again. The clear is the one call that reports a live
+  # verification, and a live verification is evidence the container had an address to verify.
+  mi_state_commit "$C" running alias "$NET"
+  mi_state_resume_record "$C"
+  mi_rt_container_start "$C"
+  mi_state_outstanding_clear "$C" alias "$NET"
+  mi_rt_container_stop "$C"
+  run mi_state_plan "$C"
+  [ "$output" = "start verify" ] || { echo "a container that came up and was verified is not resumed again: $output" >&2; return 1; }
+}
+
+@test "an attempt record that cannot be read refuses the plan, never reads as 'not tried yet'" {
+  # Folding "could not answer" into "no attempt recorded" is the direction that starts the container
+  # again, which is the loop this record exists to stop. Same split as every other reader here.
+  mi_state_commit "$C" running alias "$NET"
+  mi_state_resume_record "$C"
+  put_raw "resumed"$'\t'"container=${C}"$'\t'"notafield"
+  run mi_state_plan "$C"
+  [ "$status" -ne 0 ]
+  assert_contains "already resumed"
+}
+
+@test "recording the same attempt twice records it once" {
+  mi_state_commit "$C" running alias "$NET"
+  mi_state_resume_record "$C"
+  mi_state_resume_record "$C"
+  n=0
+  while IFS= read -r l; do
+    case "$l" in "resumed"$'\t'*) n=$((n + 1)) ;; esac
+  done <<< "$(mi_ledger_read)"
+  [ "$n" -eq 1 ] || { echo "one attempt, expected one row, got ${n}" >&2; return 1; }
+  run mi_state_plan "$C"
+  [ "$output" = "exited" ]
+}
+
+@test "forget drops the attempt record too, and only for the container it names" {
+  local C2="${C}-two"
+  mi_rt_container_create "$C2" "$IMG" "$NET" p1 - label=installation="$IDENT" label=nonce=cn2 >/dev/null
+  mi_state_commit "$C" running alias "$NET"
+  mi_state_commit "$C2" running alias "$NET"
+  mi_state_resume_record "$C"
+  mi_state_resume_record "$C2"
+  mi_state_forget "$C"
+  n=0
+  while IFS= read -r l; do
+    case "$l" in "resumed"$'\t'*) n=$((n + 1)) ;; esac
+  done <<< "$(mi_ledger_read)"
+  [ "$n" -eq 1 ] || { echo "expected only the other container's attempt to survive, got ${n} row(s)" >&2; return 1; }
+  run mi_state_plan "$C2"
+  [ "$output" = "exited" ] || { echo "one container's forget retired another's attempt: $output" >&2; return 1; }
+}
+
+@test "the row says WHICH of the two answers this intent gave" {
+  # Both values are load-bearing and they are different facts: `owed` says a live verification is
+  # outstanding, `none` says the caller declared there is none to perform. A writer that recorded one
+  # of them for both cases would put the row back to carrying no information — an absence with a
+  # field name in front of it.
+  mi_state_commit "$C" running alias "$NET"
+  rec="$(mi_led_find desired container "$C")"
+  run mi_led_field "$rec" verify
+  [ "$status" -eq 0 ]
+  [ "$output" = owed ] || { echo "a commit that owes a check recorded verify='$output'" >&2; return 1; }
+  mi_state_outstanding_clear "$C" alias "$NET"
+  mi_state_commit "$C" running +none
+  rec="$(mi_led_find desired container "$C")"
+  run mi_led_field "$rec" verify
+  [ "$status" -eq 0 ]
+  [ "$output" = none ] || { echo "a declared-nothing commit recorded verify='$output'" >&2; return 1; }
 }

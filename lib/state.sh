@@ -58,6 +58,47 @@
 # preserved, `mi_state_commit <container> <state>` IS that intent-preserving write, taken through the
 # atomic path.
 #
+# AND THE SAME RULE ONE LEVEL UP, WHICH IS WHAT THAT WINDOW IS AN INSTANCE OF: EVERY TRANSITION THAT
+# LEAVES A CONTAINER RUNNING ENDS IN A LIVE VERIFICATION, so a `running` intent must SAY what it owes
+# — and "nothing" is a thing it has to say OUT LOUD. `mi_state_commit <container> running` with no
+# check wrote an empty outstanding set and recorded nothing about it, so a crash after starting left
+# observed = desired = running with an empty set: plan `none`, fully reconciled, the alias never
+# resolved even once (measured). That is BYTE FOR BYTE the state a COMPLETED verification leaves, so
+# nothing downstream can tell the two apart. The distinction is therefore RECORDED rather than
+# inferred from an absence:
+#
+#   * the `desired` row carries `verify=owed|none` — `owed` when the write leaves at least one
+#     outstanding entry, `none` when the caller DECLARED that this intent owes no live verification
+#     (the `+none` token, which shares the `+` prefix the modes below use for exactly their reason:
+#     _mi_led_field_ok's name grammar excludes it, so a declaration can never be confused with a
+#     check kind a later version defines);
+#   * a `running` commit that would leave nothing outstanding and declares nothing is REFUSED;
+#   * and a `desired` row that does not carry the field is refused ON READ. That is where the crash
+#     case actually lives: this core can no longer write a silent row, but a restored, foreign or
+#     older ledger still holds one, and reading it as "there is no work to do" is the whole defect.
+#
+# The declaration is a claim about the state the write LEAVES BEHIND, not about its own argument list.
+# A commit preserves the outstanding set, so a commit carrying no pairs is not a commit that owes
+# nothing — an intent-preserving rewrite of a container that already owes a check needs no
+# declaration, and `+none` beside a surviving entry is a contradiction rather than a retirement.
+#
+# AND ITS PAIR: A CONTAINER IS RESUMED ONCE, THEN REPORTED. For desired `running`, every observed
+# `stopped` planned `start verify` — and starting a container that exits immediately changes neither
+# the desired state nor the outstanding set, so the next plan was IDENTICAL, for ever (measured:
+# three consecutive plans, all `start verify`). No record could tell "has not been resumed" from "was
+# resumed and did not stay up", because they were the same ledger. So the attempt is recorded too, as
+# a `resumed` row, and it is:
+#
+#   set by     mi_state_resume_record — the only writer, called by the verb performing the plan.
+#   read by    mi_state_plan, which answers `exited` rather than resuming a second time.
+#   dropped by EVERY state write this module makes for that container, which is one line in
+#              _mi_state_filter rather than a decision each caller makes: a commit re-states the
+#              intent and grants a fresh attempt, a forget drops the container entirely, and a clear
+#              reports a live verification — which is evidence the container came up, so the run this
+#              row describes is over. Without that last one, a container that started perfectly well,
+#              was verified, and was later stopped by hand or by a reboot would be reported for ever
+#              as one that does not stay up, and never started again.
+#
 # And one rule this module shares with lib/intent.sh: ZERO IS ONLY EVIDENCE WHEN THE QUESTION WAS
 # ANSWERED. `mi_rt_inspect` splits rc 3 (the object is gone) from rc 1 (the runtime could not answer),
 # and the ledger readers split rc 3 (nothing recorded) from rc 1 (unreadable, or ambiguous). Every
@@ -73,6 +114,10 @@ MI_OUT_KIND=outstanding
 # and needs it for the suspension check below. lib/migrate.sh REFERENCES it; it must not redefine it —
 # two spellings of one ledger kind is how a suspension check stops matching the records it guards.
 MI_MIG_KIND=storagemig
+# The attempt record's kind: "this installer has already resumed that container under its currently
+# recorded intent". One row per container, presence IS the fact — there is nothing else to say about
+# it, and a count would invite a retry budget nobody has specified.
+MI_RESUME_KIND=resumed
 
 # D52: the outstanding set is TYPED, not a boolean. A single flag records no kind and no parameters,
 # so a `start` would resolve an alias, clear the flag, and report success having never checked
@@ -107,6 +152,55 @@ _mi_state_desired_ok() {
   return 1
 }
 
+# THE SECOND VOCABULARY ON THE SAME ROW, gated in both directions for the same reason the first one
+# is: a `verify=later` arriving in a restored ledger must not reach a caller as a value this core has
+# a meaning for. There are two, and neither is an absence — that is the entire point of the field.
+_mi_state_verify_ok() {
+  case "$1" in owed|none) return 0 ;; esac
+  mi_warn "state: a desired-state record says verify='$1' — it must be 'owed' or 'none'"
+  return 1
+}
+
+# WHAT DOES THIS INTENT OWE, AND MAY IT OWE NOTHING? The whole of the rule above, as one predicate,
+# asked once per commit — so no caller can answer half of it and no second place can answer it
+# differently.
+#
+#   <want>      the desired state being recorded.
+#   <declared>  yes iff the caller passed `+none`.
+#   <owed>      yes iff this write LEAVES at least one outstanding entry for the container.
+#
+# rc 0 prints the value to record on the row · 1 refused, reported.
+_mi_state_verify_of() {
+  local want="$1" declared="$2" owed="$3"
+  if [ "$owed" = yes ]; then
+    # A DECLARATION IS NOT A RETIREMENT. The clear is the only path an entry disappears down, so a
+    # commit that says "nothing needs verifying" while an entry stands is a caller contradicting the
+    # ledger rather than a caller clearing it — and recording `none` over it would retire an owed
+    # check in the one place this module promises never to.
+    if [ "$declared" = yes ]; then
+      mi_warn "state: refusing to record that nothing needs verifying while this container still owes"
+      mi_warn "  an outstanding check. A commit PRESERVES the set; it verifies nothing. Clear the check"
+      mi_warn "  with mi_state_outstanding_clear, naming what was verified. Nothing was written."
+      return 1
+    fi
+    printf 'owed\n'
+    return 0
+  fi
+  if [ "$declared" = yes ]; then printf 'none\n'; return 0; fi
+  # A `stopped` intent leaves nothing running, so there is no address to resolve and nothing to
+  # declare: `none` is structural there rather than a claim. A `running` one has to say it.
+  if [ "$want" = running ]; then
+    mi_warn "state: refusing to record 'running' for a container that owes no live verification and"
+    mi_warn "  does not say so. Every transition that leaves a container running ends in one — 'it"
+    mi_warn "  started' is not evidence that its alias resolves — and an empty outstanding set is"
+    mi_warn "  exactly what a crash between recording the intent and recording the check leaves"
+    mi_warn "  behind, so the two cannot be told apart afterwards. Pass the checks this start owes,"
+    mi_warn "  or '+none' to record that it owes none. Nothing was written."
+    return 1
+  fi
+  printf 'none\n'
+}
+
 # rc 0 prints running|stopped · 3 nothing recorded · 1 unreadable ledger, or a record that is there and
 # cannot be read as one.
 #
@@ -115,7 +209,7 @@ _mi_state_desired_ok() {
 # `stopped` would take a working install down. Callers handle 3 explicitly.
 mi_state_desired_get() {
   if [ "$#" -ne 1 ]; then mi_warn "state: mi_state_desired_get needs <container>"; return 1; fi
-  local rec rc v
+  local rec rc v vfy
   if rec="$(mi_led_find "$MI_STATE_KIND" container "$1")"; then rc=0; else rc=$?; fi
   [ "$rc" -eq 0 ] || return "$rc"
   # ONE RECORD, ZERO ANSWERS IS NOT ZERO RECORDS. `state=` with nothing after it is a legal field and
@@ -134,6 +228,24 @@ mi_state_desired_get() {
     mi_warn "  which proves the bytes were not altered after they were written, not that this"
     mi_warn "  installation wrote them. It is PRESERVED and reported."
     mi_warn "  Run 'mythical-ctl state repair'."
+    return 1
+  fi
+  # AND WHETHER A LIVE VERIFICATION IS OWED, by the same rule and in the same direction. A row that
+  # does not carry the field says a container should be running and says nothing about what proving
+  # that costs — so the empty outstanding set beside it reads as a completed verification. This core
+  # can no longer write such a row; a restored, foreign or older ledger holds one, and THIS is where
+  # it is caught, because a write-side refusal alone leaves the crash shape readable.
+  if vfy="$(mi_led_field "$rec" verify)"; then :; else
+    mi_warn "state: the record of desired state for '$1' does not say whether a live verification is"
+    mi_warn "  owed. An empty outstanding set beside a silent row is indistinguishable from a crash"
+    mi_warn "  between recording the intent and recording the check it owed, so this container can be"
+    mi_warn "  neither reconciled nor left alone. It is PRESERVED and reported."
+    mi_warn "  Run 'mythical-ctl state repair'."
+    return 1
+  fi
+  if ! _mi_state_verify_ok "$vfy"; then
+    mi_warn "  — and that value is on DISK, in the ledger, not in this call. It is PRESERVED and"
+    mi_warn "  reported. Run 'mythical-ctl state repair'."
     return 1
   fi
   printf '%s\n' "$v"
@@ -281,6 +393,15 @@ _mi_state_filter() {
       rec="$MI_LED_ROW"          # copied out before anything else runs; the global is valid until the next call
       if _mi_state_out_drop "$rec" "$c" "$mode" "$kind" "$param"; then continue; fi
     fi
+    # THE ATTEMPT RECORD IS STALE THE MOMENT ANY OF THESE WRITES HAPPENS, in EVERY mode — which is
+    # why it is dropped here rather than by each caller. A commit re-states the intent and so grants
+    # a fresh attempt; a forget drops the container from the records entirely; and a clear reports a
+    # live verification, which is evidence the container came up, so the run this row describes is
+    # over. "The attempt is stale" has one meaning, so it is asked once and not gated on the mode.
+    if _mi_led_row_of "$line" "$MI_RESUME_KIND"; then
+      rec="$MI_LED_ROW"
+      if _mi_led_record_matches "$rec" container "$c"; then continue; fi
+    fi
     if [ -z "$line" ]; then blank=$((blank + 1)); fi   # a loop counter, not a value out of a file
     out="${out}${line}"$'\n'
   done <<< "$records"
@@ -307,22 +428,32 @@ _mi_state_take() {
   _mi_state_filter "$records" "$c" "$old" "$mode"
 }
 
-# Is this container's <kind>/<param> check ALREADY in <records>? An obligation already recorded is the
-# same obligation: writing it twice puts two rows in the ledger naming ONE verification, which is not
-# two things to check — it is one thing written down twice, and it makes the listing report a set that
-# has a member it does not have. rc 0 present · 1 not, or the rows could not be read as records (in
-# which case nothing here matches, and the caller adds its entry rather than assuming it is covered).
-_mi_state_out_has() {
-  local records="$1" c="$2" kind="$3" param="$4" line rec
+# Does <records> hold an outstanding row for <container> that <mode>/<kind>/<param> selects? TWO
+# questions are asked through this one walk, and both are asked with the SAME predicate the rewrite
+# uses to decide what may disappear — "is this row the check I am about to write?" and "may this row
+# disappear when that check is verified" are the same comparison, and two implementations of one
+# match drift the moment either is touched.
+#
+#   '+match' <kind> <param>  IS THIS CHECK ALREADY OWED? An obligation already recorded is the same
+#                            obligation: writing it twice puts two rows in the ledger naming ONE
+#                            verification, which is not two things to check — it is one thing written
+#                            down twice, and it makes the listing report a member the set does not
+#                            have.
+#   '+all'                   DOES THIS CONTAINER OWE ANYTHING AT ALL after this write? That is what
+#                            decides whether a `running` intent is allowed to record that it owes
+#                            nothing, and it is the container half of the same predicate.
+#
+# rc 0 yes · 1 no, or the rows could not be read as records. In that case nothing here matches, and
+# both callers take the safe direction from it: the dedupe adds its entry rather than assuming it is
+# covered, and a `running` commit that cannot see a surviving entry must still say what it owes.
+_mi_state_out_scan() {
+  local records="$1" c="$2" mode="$3" kind="${4:-}" param="${5:-}" line rec
   [ -n "$records" ] || return 1
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     _mi_led_row_of "$line" "$MI_OUT_KIND" || continue
     rec="$MI_LED_ROW"
-    # "Is this row the check I am about to write?" is the SAME question as "may this row disappear when
-    # that check is verified", so it is asked with the same predicate rather than a second copy of the
-    # comparison — two implementations of one match drift the moment either is touched.
-    if _mi_state_out_drop "$rec" "$c" '+match' "$kind" "$param"; then return 0; fi
+    if _mi_state_out_drop "$rec" "$c" "$mode" "$kind" "$param"; then return 0; fi
   done <<< "$records"
   return 1
 }
@@ -334,21 +465,12 @@ _mi_state_out_has() {
 # be written separately; two updates to it in sequence is the same defect the consolidation removed.
 #
 # Usage: mi_state_commit <container> <running|stopped> [<kind> <param>]...
+#        mi_state_commit <container> <running|stopped> +none
 mi_state_commit() {
-  if [ "$#" -lt 2 ]; then mi_warn "state: mi_state_commit needs <container> <desired> [<kind> <param>]..."; return 1; fi
+  if [ "$#" -lt 2 ]; then mi_warn "state: mi_state_commit needs <container> <desired> [<kind> <param>]... | +none"; return 1; fi
   local c="$1" want="$2"; shift 2
   _mi_state_desired_ok "$want" || return 1
   mi_lock_assert_held "record desired state"
-
-  # THE FIELD RULE, ON A WRITER THAT SERIALIZES ITS OWN RECORD. mi_led_put is not on this path — this
-  # function writes two kinds in one ledger write and mi_led_put writes one record — so `container`
-  # and `param` would otherwise reach the serializer unchecked, and a TAB in either forges a field
-  # boundary while a newline forges a whole record. It is the WRITER's own list rule, applied to the
-  # exact list about to be serialized, so what was validated is what gets written.
-  if ! _mi_led_fields_ok "container=${c}" "state=${want}"; then
-    mi_warn "state: refusing to record desired state for '${c}'. Nothing was written."
-    return 1
-  fi
 
   # Validate every pair BEFORE building the record: a rejected kind or field halfway through would
   # otherwise commit a partial set. `pairs` is the array name deliberately — the release bundler
@@ -356,7 +478,22 @@ mi_state_commit() {
   # so an array-typed local must not reuse a name another module uses for a scalar.
   local -a pairs
   pairs=()
+  local declared=no
   while [ "$#" -gt 0 ]; do
+    # THE DECLARATION, WHICH IS NOT A CHECK KIND. It carries the `+` prefix the filter's modes carry,
+    # for their reason: _mi_led_field_ok's name grammar excludes `+`, so no declaration can ever
+    # collide with a kind a later version defines. It must stand ALONE — given beside a pair it would
+    # be one call saying both "this owes that check" and "this owes nothing".
+    if [ "$1" = '+none' ]; then
+      if [ "$#" -ne 1 ] || [ "${#pairs[@]}" -ne 0 ]; then
+        mi_warn "state: '+none' records that this intent owes NO live verification, so it cannot be"
+        mi_warn "  given beside a check that IS owed. Nothing was written."
+        return 1
+      fi
+      declared=yes
+      shift
+      continue
+    fi
     _mi_state_kind_ok "$1" || return 1
     # AN ENTRY WITH NO PARAMETER IS THE BOOLEAN D52 REPLACED. `alias` carries the network its alias
     # must resolve on, and the clear matches on it — so an entry with nothing to match keeps its
@@ -377,7 +514,7 @@ mi_state_commit() {
     shift 2
   done
 
-  local records rest rc out="" i k p
+  local records rest rc acc="" i k p owed vfy
   if records="$(mi_ledger_read)"; then :; else
     # rc 3 is "no ledger yet", a legitimate first write. Anything else is corruption, already reported
     # by the reader — never overwrite a ledger we could not read.
@@ -386,8 +523,7 @@ mi_state_commit() {
   # +keep: THE OUTSTANDING SET IS PRESERVED. This write records an intent; it verifies nothing, so it
   # may not retire a check. The entries below are ADDED to what survives.
   rest="$(_mi_state_take "$records" "$c" '+keep')" || return 1
-  [ -z "$rest" ] || out="${rest}"$'\n'
-  out="${out}${MI_STATE_KIND}"$'\t'"container=${c}"$'\t'"state=${want}"$'\n'
+  [ -z "$rest" ] || acc="${rest}"$'\n'
   i=0
   # `i` is a loop counter this function set to 0 and advances by 2 — never a value parsed out of a
   # file. That distinction is the whole of lib/prov.sh's _mi_prov_gen_ok note: bash EVALUATES a
@@ -396,14 +532,50 @@ mi_state_commit() {
   while [ "$i" -lt "${#pairs[@]}" ]; do
     k="${pairs[$i]}"; p="${pairs[$((i + 1))]}"
     i=$((i + 2))
-    # Already owed? Then it is already recorded. Asked of `$out`, which is what this write will
+    # Already owed? Then it is already recorded. Asked of `$acc`, which is what this write will
     # actually contain — the rows it kept AND the ones this loop has already appended — so a check
     # carried over from an earlier commit and a pair repeated within ONE call are the same question,
     # answered once.
-    if _mi_state_out_has "$out" "$c" "$k" "$p"; then continue; fi
-    out="${out}${MI_OUT_KIND}"$'\t'"container=${c}"$'\t'"kind=${k}"$'\t'"param=${p}"$'\n'
+    if _mi_state_out_scan "$acc" "$c" '+match' "$k" "$p"; then continue; fi
+    acc="${acc}${MI_OUT_KIND}"$'\t'"container=${c}"$'\t'"kind=${k}"$'\t'"param=${p}"$'\n'
   done
-  printf '%s' "$out" | mi_ledger_write
+
+  # WHAT THIS WRITE LEAVES BEHIND is the question the rule turns on, so it is asked of `$acc` — the
+  # rows kept plus the ones just added — and never of the argument list. That is what makes an
+  # intent-preserving rewrite of a container which already owes a check need no declaration, and a
+  # bare `running` commit on one that owes nothing need one.
+  if _mi_state_out_scan "$acc" "$c" '+all'; then owed=yes; else owed=no; fi
+  vfy="$(_mi_state_verify_of "$want" "$declared" "$owed")" || return 1
+
+  # THE FIELD RULE, ON A WRITER THAT SERIALIZES ITS OWN RECORD. mi_led_put is not on this path — this
+  # function writes two kinds in one ledger write and mi_led_put writes one record — so `container`
+  # and `param` would otherwise reach the serializer unchecked, and a TAB in either forges a field
+  # boundary while a newline forges a whole record. It is the WRITER's own list rule, applied to the
+  # EXACT list about to be serialized, which is why it is asked here and not on the way in: the third
+  # field does not exist until the question above has been answered. The pairs were judged as they
+  # were validated, against this same rule, before any of this ran.
+  if ! _mi_led_fields_ok "container=${c}" "state=${want}" "verify=${vfy}"; then
+    mi_warn "state: refusing to record desired state for '${c}'. Nothing was written."
+    return 1
+  fi
+
+  printf '%s%s\n' "$acc" "${MI_STATE_KIND}"$'\t'"container=${c}"$'\t'"state=${want}"$'\t'"verify=${vfy}" | mi_ledger_write
+}
+
+# Record that this installer has RESUMED <container> — started it while performing a `start verify`
+# plan. The verb calls this BEFORE it starts the container, not after: a crash between the start and
+# the record would leave a container nobody knows was tried, and a start that does not survive is
+# still an attempt. It is what makes the SECOND plan differ from the first.
+#
+# It is one keyed record, so it goes through mi_led_put — the editor that already applies the field
+# rule, ties the replacement to its selector, and asks the cardinality question in the one place that
+# asks it. Recording the same attempt twice is therefore one row, and a ledger holding two rows for
+# one container is refused rather than quietly collapsed. There is nothing this function needs that
+# would justify a second serializer beside it.
+mi_state_resume_record() {
+  if [ "$#" -ne 1 ]; then mi_warn "state: mi_state_resume_record needs <container>"; return 1; fi
+  mi_lock_assert_held "record a resume attempt"
+  mi_led_put "$MI_RESUME_KIND" container "$1" "container=$1"
 }
 
 # There is no mi_state_desired_set, deliberately — see the rule at the top of this file. The verbs
@@ -576,6 +748,52 @@ _mi_state_storagemig_for() {
   return 1
 }
 
+# Has <container> already been resumed under its currently recorded intent?
+#
+# rc 0 yes · 1 no · 2 THE QUESTION COULD NOT BE ANSWERED, reported — the same three-valued shape
+# _mi_state_storagemig_for has, for the same reason: folding "could not read it" into "no attempt
+# recorded" is the direction that starts the container AGAIN, which is the loop this record exists to
+# stop.
+#
+# It reads with mi_led_all rather than mi_led_find deliberately, and the choice is the rc-3 question
+# again. A selector-based lookup answers 3 — "there is none" — for a set in which a row is ILL-FORMED,
+# because an ill-formed record matches nothing; that is right when asking about one object among many
+# and wrong here, where the ABSENCE of an answer is itself the licence to act. mi_led_all's contract
+# is completeness, so one unreadable row refuses the whole listing. Same choice, same reason, as
+# mi_state_outstanding.
+_mi_state_resumed() {
+  local c="$1" recs rc line
+  # The container is a SELECTOR, judged by the function every editor entry point judges one with: a
+  # selector no field could ever equal would otherwise answer "never resumed" for every name given.
+  _mi_led_args_ok "$MI_RESUME_KIND" container "$c" || return 2
+  if recs="$(mi_led_all "$MI_RESUME_KIND")"; then rc=0; else rc=$?; fi
+  if [ "$rc" -eq 3 ]; then return 1; fi   # no ledger yet: nothing has ever been resumed. An answer.
+  [ "$rc" -eq 0 ] || return 2
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    if _mi_led_record_matches "$line" container "$c"; then return 0; fi
+  done <<< "$recs"
+  return 1
+}
+
+# The `running`/`stopped` row of the table below, which is the one that can loop, so it is the one
+# whose answer is not a constant. Kept as its own function rather than a nested `case` inside the
+# table, so the table stays a lookup.
+#
+# rc 0 the word is printed · 1 refused, reported.
+_mi_state_resume_plan() {
+  local c="$1" rc
+  if _mi_state_resumed "$c"; then rc=0; else rc=$?; fi
+  case "$rc" in
+    0) printf 'exited\n'; return 0 ;;
+    1) printf 'start verify\n'; return 0 ;;
+  esac
+  mi_warn "state: cannot tell whether '${c}' was already resumed, so this container gets no plan."
+  mi_warn "  Reading that as 'not yet' would start it again — and starting a container that does not"
+  mi_warn "  stay up, on every pass, for ever, is the loop the attempt record exists to stop."
+  return 1
+}
+
 # THE reconciler's decision, as one word. Callers act on it; the table lives here so §6b.3's recovery
 # rows are a lookup rather than a judgement at each call site.
 #
@@ -585,13 +803,19 @@ _mi_state_storagemig_for() {
 #   rebuild    desired=running and the container is ABSENT. Never a bare `start`: there is nothing to
 #              start, and the launch spec is the verb's to supply.
 #   stop       desired=stopped, still running — a `stop` that crashed after writing intent.
-#   start verify  desired=running, stopped. EVERY path that leaves a container running walks the live
-#              verification, whether or not something was already outstanding. The tempting shape is
-#              `start` when the set is empty and `start verify` when it is not — and that is the D42
-#              defect: the outstanding entry was introduced for deferred migration checks and never
-#              wired into ordinary bring-up, so a fresh install or a `recreate` reported success
-#              having never resolved the container's alias even once. "It started" is not evidence
-#              that its alias resolves.
+#   start verify  desired=running, stopped, AND THIS INSTALLER HAS NOT ALREADY TRIED. Every path that
+#              leaves a container running walks the live verification, whether or not something was
+#              already outstanding. The tempting shape is `start` when the set is empty and `start
+#              verify` when it is not — and that is the D42 defect: the outstanding entry was
+#              introduced for deferred migration checks and never wired into ordinary bring-up, so a
+#              fresh install or a `recreate` reported success having never resolved the container's
+#              alias even once. "It started" is not evidence that its alias resolves.
+#   exited     desired=running, stopped, and a resume was ALREADY attempted under this intent. The
+#              container does not stay up. Reported, not started a second time: neither the desired
+#              state nor the outstanding set changes when a container exits immediately, so without
+#              the attempt record this row produced `start verify` again, and again, for ever. A
+#              re-stated intent (any mi_state_commit) grants a fresh attempt, and so does the clear
+#              that reports a live verification — see _mi_state_filter.
 #   verify     running, with something outstanding: verified NOW, not at a hypothetical next start. A
 #              container already running HAS an address, and D50 makes an outstanding entry mean
 #              not-reconciled — leaving it for a future `start` that may never come would let it sit
@@ -637,7 +861,7 @@ mi_state_plan() {
 
   case "${want}/${obs}" in
     running/absent)   printf 'rebuild\n' ;;
-    running/stopped)  printf 'start verify\n' ;;
+    running/stopped)  _mi_state_resume_plan "$c" || return 1 ;;
     running/running)  if [ -n "$out" ]; then printf 'verify\n'; else printf 'none\n'; fi ;;
     stopped/running)  printf 'stop\n' ;;
     stopped/stopped)  if [ -n "$out" ]; then printf 'defer\n'; else printf 'none\n'; fi ;;
