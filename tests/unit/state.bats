@@ -353,21 +353,31 @@ put_raw() { { mi_ledger_read; printf '%s\n' "$1"; } | mi_ledger_write; }
   # A missing `param` became `p=""`, so a restored `container=C kind=alias` row was listed as an
   # ordinary entry: it schedules a `verify` that names nothing to verify, and the by-kind clear then
   # deleted it. Fail closed, exactly as the missing-`kind` case already does.
+  # THE MESSAGE IS ASSERTED, NOT JUST THE STATUS, and that is not decoration. A record with no `param=`
+  # field and one carrying `param=` with nothing after it both arrive at the listing as an empty
+  # value, so either guard alone refuses both — and a test that checked only the status stayed green
+  # with the missing-field branch deleted, because the empty-value branch below caught it. The two are
+  # kept apart for the reason lib/prov.sh keeps "carries no fields at all" apart from "this token is
+  # not a field": they are different facts about a ledger someone has to repair. Asserting which fact
+  # is reported is what makes each branch independently observable.
   mi_state_commit "$C" running alias "$NET"
   put_raw "outstanding"$'\t'"container=${C}"$'\t'"kind=alias"
   run mi_state_outstanding "$C"
   [ "$status" -ne 0 ]
+  assert_contains "does not say WHAT it must verify"
   run mi_state_reconciled "$C"
   [ "$status" -ne 0 ]
 }
 
 @test "an outstanding entry whose parameter is EMPTY refuses the set too" {
-  # `param=` is a legal field carrying no value, so it reaches the listing as `p=""` — the same entry
-  # naming nothing, one byte later, and the same reason to refuse it.
+  # `param=` is a legal field carrying no value, so it reaches the listing as an empty value — the same
+  # entry naming nothing, one byte later, and the same reason to refuse it. The record DOES carry the
+  # field, so it is the other fact, and the other message.
   mi_state_commit "$C" running alias "$NET"
   put_raw "outstanding"$'\t'"container=${C}"$'\t'"kind=alias"$'\t'"param="
   run mi_state_outstanding "$C"
   [ "$status" -ne 0 ]
+  assert_contains "carries an EMPTY parameter"
 }
 
 @test "the desired row has exactly ONE writer, and it is the atomic one" {
@@ -390,14 +400,71 @@ put_raw() { { mi_ledger_read; printf '%s\n' "$1"; } | mi_ledger_write; }
   # commit ADDS to the set now, so a check already owed must not be written a second time: two rows
   # naming one verification are not two obligations, and the second would outlive the clear that
   # performed it if the clear dropped only one row.
-  mi_state_commit "$C" running alias "$NET"
+  #
+  # BOTH DIRECTIONS, and the first one is the one a weaker fixture misses. Asking only whether the
+  # kept rows already carry the check answers the ACROSS-CALLS case correctly and still writes two
+  # rows for a pair repeated WITHIN one call — so the duplicate below is committed first, with nothing
+  # recorded before it, where only the rows this same call has appended can answer.
   mi_state_commit "$C" running alias "$NET" alias "$NET"
   run mi_state_outstanding "$C"
   [ "$status" -eq 0 ]
   n=0
   while IFS= read -r l; do if [ -n "$l" ]; then n=$((n + 1)); fi; done <<< "$output"
-  [ "$n" -eq 1 ] || { echo "expected one entry, got ${n}: $output" >&2; return 1; }
+  [ "$n" -eq 1 ] || { echo "one call, one check, expected one entry, got ${n}: $output" >&2; return 1; }
+  # and across calls, where the kept rows are what answers
+  mi_state_commit "$C" running alias "$NET"
+  run mi_state_outstanding "$C"
+  n=0
+  while IFS= read -r l; do if [ -n "$l" ]; then n=$((n + 1)); fi; done <<< "$output"
+  [ "$n" -eq 1 ] || { echo "a later commit re-recorded the same check, got ${n}: $output" >&2; return 1; }
   mi_state_outstanding_clear "$C" alias "$NET"
   run mi_state_outstanding "$C"
   [ -z "$output" ]
+}
+
+@test "a clear whose parameter could not be a field is refused, not a silent no-op" {
+  # The entry was serialized from these three fields, so the clear is judged by the writer's own list
+  # rule. Without it a selector no field could ever equal matches nothing, clears nothing, and reports
+  # success — a caller believing it retired a check that is still owed.
+  mi_state_commit "$C" running alias "$NET"
+  run mi_state_outstanding_clear "$C" alias "net"$'\t'"kind=alias"
+  [ "$status" -ne 0 ]
+  run mi_state_outstanding "$C"
+  assert_contains "$NET"
+}
+
+@test "forget and clear touch only the container they name" {
+  # The container half of the match is what keeps one container's uninstall, or one container's
+  # verified alias, from retiring the checks every other container owes.
+  local C2="${C}-two"
+  mi_rt_container_create "$C2" "$IMG" "$NET" p1 - label=installation="$IDENT" label=nonce=cn2 >/dev/null
+  mi_state_commit "$C" running alias "$NET"
+  mi_state_commit "$C2" running alias "$NET"
+  mi_state_outstanding_clear "$C" alias "$NET"
+  run mi_state_outstanding "$C2"
+  assert_contains "$NET"
+  mi_state_forget "$C"
+  run mi_state_outstanding "$C2"
+  assert_contains "$NET"
+  run mi_state_desired_get "$C2"
+  [ "$output" = running ]
+}
+
+@test "a check of a kind this core does not know is not retired by clearing another" {
+  # A newer version's kind, arriving in a restored ledger. This core lists it — it says what is owed
+  # and what it names, which is all the listing needs — and an `alias` clear must leave it exactly
+  # where it is. It is also the only shape available today for pinning the KIND half of the match,
+  # since `alias` is the one kind this core defines.
+  mi_state_commit "$C" running alias "$NET"
+  put_raw "outstanding"$'\t'"container=${C}"$'\t'"kind=storage"$'\t'"param=${NET}"
+  mi_state_outstanding_clear "$C" alias "$NET"
+  run mi_state_outstanding "$C"
+  [ "$status" -eq 0 ]
+  case $'\n'"$output"$'\n' in
+    *$'\n'"storage"$'\t'"${NET}"$'\n'*) : ;;
+    *) echo "a check of another kind was retired by an alias clear: $output" >&2; return 1 ;;
+  esac
+  case $'\n'"$output"$'\n' in
+    *$'\n'"alias"$'\t'"${NET}"$'\n'*) echo "the verified alias check survived: $output" >&2; return 1 ;;
+  esac
 }

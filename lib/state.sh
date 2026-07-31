@@ -217,14 +217,9 @@ mi_state_outstanding() {
 #                   mode can ever be confused with a real check kind. An unknown mode drops nothing:
 #                   the safe direction is to keep an owed check, never to retire one.
 #
-# +keep does not reach the drop decision and fall through it — it never looks at an outstanding row at
-# all. A mode that walks into the decision and is expected to decline is one edit away from accepting.
-#
-# +match matches BOTH halves. Matching the kind alone is what let a verified alias on one network
-# retire the check owed on another, and it matched every row of the kind, not one — which is correct
-# here and only here: several rows naming the same (kind, param) name the SAME verification, and that
-# verification happened. This is the one place in these modules where "every row that matches" is the
-# contract rather than the defect, so it is stated rather than left to be inferred.
+# The mode is not read here. The question "may this row disappear" is _mi_state_out_drop's, in one
+# piece, so that every part of the answer is load-bearing and a mode is a value rather than a branch
+# the next author extends in place.
 #
 # It performs _mi_led_without's single-row drop inline rather than calling it, because this edit
 # touches TWO record sets in one write and the body must be walked ONCE: a second pass reports the
@@ -241,6 +236,36 @@ mi_state_outstanding() {
 # A BLANK ROW IS PRESERVED AND REPORTED, not skipped. `[ -n "$line" ] || continue` in a rewriting loop
 # reads as harmless and is not: the row is silently absent from the output, so a foreign or restored
 # ledger quietly loses a row at the first operation that touches this container.
+# MAY THIS OUTSTANDING ROW DISAPPEAR? The whole of this module's rule, as one predicate, asked in one
+# place — so no caller can answer half of it, and every line of it is load-bearing.
+#
+#   * An unrecognised mode KEEPS, and so does +keep. The safe direction is to keep an owed check;
+#     retiring one is the thing that needs a reason. A mode added later without an arm here therefore
+#     preserves rather than deletes.
+#   * The CONTAINER must match, in every mode. Without it a forget or a clear would retire checks owed
+#     by every other container the ledger records.
+#   * +match needs the KIND AND THE PARAMETER. The kind alone is what let a verified alias on one
+#     network retire the check owed on another. Both halves are compared by _mi_led_record_matches,
+#     which gates the record first, so a row this module cannot read matches nothing and stays.
+#
+# It matches EVERY row that answers, not one, and that is the contract here rather than the defect it
+# would be elsewhere in these modules: rows naming the same (kind, param) name the SAME verification,
+# and that verification happened. The cardinality question belongs to keyed records; this set is
+# legitimately several rows per container.
+#
+# rc 0 drop it · 1 keep it.
+_mi_state_out_drop() {
+  local rec="$1" c="$2" mode="$3" kind="$4" param="$5"
+  case "$mode" in
+    '+all'|'+match') : ;;
+    *) return 1 ;;
+  esac
+  _mi_led_record_matches "$rec" container "$c" || return 1
+  if [ "$mode" = '+all' ]; then return 0; fi
+  _mi_led_record_matches "$rec" kind "$kind" || return 1
+  _mi_led_record_matches "$rec" param "$param"
+}
+
 _mi_state_filter() {
   local records="$1" c="$2" want="$3" mode="$4" kind="${5:-}" param="${6:-}" line rec out="" blank=0
   # AN EMPTY BODY IS NOT A BLANK ROW. The here-string below supplies a newline of its own, so `""`
@@ -252,15 +277,9 @@ _mi_state_filter() {
     # row removed is the row that was judged. `want` is cleared on the first hit, so a ledger holding
     # those bytes twice cannot lose both rows here.
     if [ -n "$want" ] && [ "$line" = "$want" ]; then want=""; continue; fi
-    if [ "$mode" != '+keep' ] && _mi_led_row_of "$line" "$MI_OUT_KIND"; then
+    if _mi_led_row_of "$line" "$MI_OUT_KIND"; then
       rec="$MI_LED_ROW"          # copied out before anything else runs; the global is valid until the next call
-      # The container gates first, so a row this module cannot read is refused ONCE, by the matcher
-      # that owns the message, rather than three times over.
-      if _mi_led_record_matches "$rec" container "$c"; then
-        if [ "$mode" = '+all' ]; then continue; fi
-        if [ "$mode" = '+match' ] && _mi_led_record_matches "$rec" kind "$kind" &&
-           _mi_led_record_matches "$rec" param "$param"; then continue; fi
-      fi
+      if _mi_state_out_drop "$rec" "$c" "$mode" "$kind" "$param"; then continue; fi
     fi
     if [ -z "$line" ]; then blank=$((blank + 1)); fi   # a loop counter, not a value out of a file
     out="${out}${line}"$'\n'
@@ -300,10 +319,10 @@ _mi_state_out_has() {
     [ -n "$line" ] || continue
     _mi_led_row_of "$line" "$MI_OUT_KIND" || continue
     rec="$MI_LED_ROW"
-    _mi_led_record_matches "$rec" container "$c" || continue
-    if _mi_led_record_matches "$rec" kind "$kind" && _mi_led_record_matches "$rec" param "$param"; then
-      return 0
-    fi
+    # "Is this row the check I am about to write?" is the SAME question as "may this row disappear when
+    # that check is verified", so it is asked with the same predicate rather than a second copy of the
+    # comparison — two implementations of one match drift the moment either is touched.
+    if _mi_state_out_drop "$rec" "$c" '+match' "$kind" "$param"; then return 0; fi
   done <<< "$records"
   return 1
 }
