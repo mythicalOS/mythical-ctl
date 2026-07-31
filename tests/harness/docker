@@ -45,7 +45,8 @@
 # real daemon's mouth. The `--flag=value` spelling is implemented only where a caller uses it
 # (`--label=`, `--driver=`); elsewhere it is refused rather than accepted and ignored.
 #
-# Knobs: FAKE_DOCKER_DOWN, FAKE_DOCKER_INFO_FAIL, FAKE_DOCKER_SERVER_VERSION,
+# Knobs: FAKE_DOCKER_DOWN, FAKE_DOCKER_DOWN_AFTER, FAKE_DOCKER_INSPECT_MISSING,
+#        FAKE_DOCKER_INFO_FAIL, FAKE_DOCKER_SERVER_VERSION,
 #        FAKE_DOCKER_CLIENT_VERSION, FAKE_DOCKER_ROOTLESS,
 #        FAKE_DOCKER_CONTEXT_HOST, FAKE_DOCKER_PULL, FAKE_DOCKER_NET_DUPLICATE,
 #        FAKE_DOCKER_NET_DRIVER, FAKE_DOCKER_NET_DEFAULT_DRIVER, FAKE_DOCKER_NET_THI,
@@ -57,6 +58,34 @@
 # can be made to report "could not ask" without the caller's earlier ping refusing first. Broadening
 # either to cover the other's case would mask a refusal the suite is meant to pin — see the `info`
 # arm below.
+#
+# THE TWO RACE KNOBS ARE NOT SETTINGS OF FAKE_DOCKER_DOWN EITHER, and they are not settings of each
+# other. A daemon that was already down when an operation started is the easy case: the operation's
+# FIRST query refuses and nothing has been decided yet. The failures that matter to recovery happen
+# BETWEEN two queries of one operation — a listing that answered, and then a question about what it
+# named that did not — and there are exactly two of those, which the adapter reports differently and
+# which authorize completely different things:
+#
+#   FAKE_DOCKER_DOWN_AFTER=<n>        the first <n> invocations made WHILE THIS IS SET answer, and
+#                                     every one after them dies exactly as FAKE_DOCKER_DOWN does,
+#                                     `version` included. The adapter's ping therefore also fails, so
+#                                     mi_rt_inspect reports 1 — THE QUESTION COULD NOT BE ASKED, which
+#                                     authorizes nothing at all. The counter lives in a file created
+#                                     only when the knob is set, so it counts the calls of the
+#                                     operation under test and nothing else.
+#   FAKE_DOCKER_INSPECT_MISSING=<name>  `<kind> inspect` of that exact name reports no such object,
+#                                     while the daemon keeps answering everything else — from the
+#                                     first such inspect, or from the one after
+#                                     FAKE_DOCKER_INSPECT_MISSING_AFTER=<n> of them, which is how an
+#                                     object that vanishes BETWEEN two questions of one operation is
+#                                     built. The
+#                                     adapter's ping succeeds, so mi_rt_inspect reports 3 — THE OBJECT
+#                                     IS GENUINELY GONE, which is a fact a later run can act on. This
+#                                     is what an object being removed between a listing and the
+#                                     inspection of what the listing named looks like.
+#
+# Folding either into the other would make a recovery path that adopts on an unanswered question
+# indistinguishable from one that correctly handles an object that vanished.
 #
 # The two driver knobs are NOT the same thing, and the difference is load-bearing:
 #
@@ -80,6 +109,44 @@ die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 # A down daemon fails EVERY command, including version — that is what makes the adapter's
 # absent-vs-unreachable split observable.
 [ -z "${FAKE_DOCKER_DOWN:-}" ] || die "Cannot connect to the Docker daemon. Is the docker daemon running?"
+
+# The daemon goes down PART WAY THROUGH an operation: the first <n> calls answer, the rest do not.
+# Counted in a file that only exists while the knob is set, so the count is the operation's own.
+if [ -n "${FAKE_DOCKER_DOWN_AFTER:-}" ]; then
+  da_file="$STATE/down-after.count"; da_n=0
+  [ ! -f "$da_file" ] || da_n="$(cat "$da_file")"
+  da_n=$((da_n + 1)); printf '%s\n' "$da_n" > "$da_file"
+  [ "$da_n" -le "$FAKE_DOCKER_DOWN_AFTER" ] || die "Cannot connect to the Docker daemon. Is the docker daemon running?"
+fi
+
+# One object is not there any more, while the daemon still answers. Applied HERE rather than in each
+# `inspect` arm: a knob honoured for volumes and not for networks would be the same "a rule that holds
+# on one path and not its neighbours" bug in the instrument used to find it. The kind and the verb
+# are skipped so a knob value that happens to spell one cannot match them, and `--format`'s argument
+# is skipped because a template is not a name.
+if [ -n "${FAKE_DOCKER_INSPECT_MISSING:-}" ] && [ "${2:-}" = inspect ]; then
+  case "${1:-}" in
+    container|network|volume|image)
+      im_skip=0; im_n=0
+      for im_a in "$@"; do
+        im_n=$((im_n + 1))
+        [ "$im_n" -gt 2 ] || continue
+        if [ "$im_skip" = 1 ]; then im_skip=0; continue; fi
+        case "$im_a" in --format) im_skip=1; continue ;; -*) continue ;; esac
+        [ "$im_a" = "$FAKE_DOCKER_INSPECT_MISSING" ] || continue
+        # _AFTER lets the object survive its first <n> inspections and disappear before the next one.
+        # One operation asks about one object more than once — whose is it, and then what is it — and
+        # each of those is a separate question that can be answered separately. Without this, the
+        # FIRST question always sees the object gone and every later one is unreachable, which is
+        # exactly how two honest-failure arms ended up unpinned by the suite.
+        im_after="${FAKE_DOCKER_INSPECT_MISSING_AFTER:-0}"
+        im_file="$STATE/inspect-missing.count"; im_c=0
+        [ ! -f "$im_file" ] || im_c="$(cat "$im_file")"
+        im_c=$((im_c + 1)); printf '%s\n' "$im_c" > "$im_file"
+        [ "$im_c" -le "$im_after" ] || die "No such object: $im_a"
+      done ;;
+  esac
+fi
 
 # Monotonic ids without $RANDOM, so a run is reproducible.
 next_id() {
