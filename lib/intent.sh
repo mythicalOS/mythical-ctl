@@ -299,7 +299,18 @@ mi_intent_open() {
     mi_warn "  that lets recovery find the object this intent describes."
     return 1
   fi
-  local now; now="$(date +%s 2>/dev/null || printf 0)"
+  # A CLOCK THAT CANNOT BE READ IS A REFUSAL, not `created=0`. The fallback was fail-OPEN in the
+  # one direction that matters: `created=0` makes the intent older than any grace period the moment
+  # it is written, so a network intent created seconds ago becomes abandonable immediately — and a
+  # delayed create can then surface after abandonment, which is precisely the bounded-retention rule
+  # this timestamp exists to enforce. Same rule as the grace period itself just above: an unreadable
+  # input does not fail the comparison, it fails it open.
+  local now
+  if ! now="$(date +%s 2>/dev/null)" || ! _mi_prov_gen_ok "$now"; then
+    mi_warn "intent: cannot read the clock, so this intent cannot carry a creation time."
+    mi_warn "  Refusing rather than recording a sentinel — a zero would make it abandonable at once."
+    return 1
+  fi
   mi_led_put "$MI_INTENT_KIND" key "$(_mi_intent_key "$class" "$name")" \
     "key=$(_mi_intent_key "$class" "$name")" "class=${class}" "name=${name}" "nonce=${nonce}" \
     "created=${now}" "$@"
@@ -677,7 +688,13 @@ mi_intent_abandonable() {
     mi_warn "  would read as older than the grace period. Refusing until it is a number."
     return 1
   fi
-  now="$(date +%s 2>/dev/null || printf 0)"
+  # Same refusal as mi_intent_open's: an unreadable clock here would make `now` zero, `created > now`
+  # true, and every intent read as future-dated — the mirror-image wrong answer.
+  if ! now="$(date +%s 2>/dev/null)" || ! _mi_prov_gen_ok "$now"; then
+    mi_warn "intent: cannot read the clock, so this intent's age cannot be established."
+    mi_warn "  Refusing rather than guessing — the grace period is the only bound on abandonment."
+    return 1
+  fi
   # Clock skew or a restored ledger can make created > now. Treat that as "not yet" rather than
   # computing a negative age that would pass every threshold.
   if [ "$created" -gt "$now" ]; then

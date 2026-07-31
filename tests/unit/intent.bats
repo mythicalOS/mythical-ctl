@@ -741,3 +741,35 @@ put_raw() { { mi_ledger_read; printf '%s\n' "$1"; } | mi_ledger_write; }
   run mi_prov_find volume v1
   [ "$status" -eq 0 ]
 }
+
+@test "a clock that cannot be read REFUSES, instead of recording created=0" {
+  # `created=0` was fail-open in the one direction that matters: it makes the intent older than any
+  # grace period the instant it is written, so a network intent created seconds ago is abandonable
+  # immediately — and a delayed create can then surface after abandonment, which is exactly what the
+  # bounded-retention rule exists to prevent.
+  local shim="$BATS_TEST_TMPDIR/shim"
+  mkdir -p "$shim"
+  printf '#!/bin/sh\nexit 1\n' > "$shim/date"
+  chmod 755 "$shim/date"
+
+  PATH="$shim:$PATH" run mi_intent_open network "mythical-${IDENT}-net" "$(mi_nonce_new)"
+  [ "$status" -ne 0 ]
+  assert_contains "cannot read the clock"
+
+  # and nothing was recorded — a refusal that still wrote the intent would be worse than none
+  run mi_intent_find network "mythical-${IDENT}-net"
+  [ "$status" -eq 3 ]
+}
+
+@test "a clock that cannot be read also refuses to AGE an intent, rather than aging it out" {
+  local n; n="$(mi_nonce_new)"
+  mi_intent_open network "mythical-${IDENT}-net" "$n"
+  local shim="$BATS_TEST_TMPDIR/shim2"
+  mkdir -p "$shim"
+  printf '#!/bin/sh\nexit 1\n' > "$shim/date"
+  chmod 755 "$shim/date"
+
+  MI_INTENT_GRACE=0 PATH="$shim:$PATH" run mi_intent_abandonable network "mythical-${IDENT}-net"
+  [ "$status" -ne 0 ]
+  assert_contains "cannot read the clock"
+}
