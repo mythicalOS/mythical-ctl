@@ -337,6 +337,42 @@ teardown() { rm -rf "$DST" "$STAGE"; mi_lock_release; teardown_test_env; }
   assert_contains "UNKNOWN"
 }
 
+# --- an exit status is not a result -------------------------------------------------------------
+#
+# Every knob above that makes the helper report a failure ALSO makes it exit nonzero, so each of those
+# tests would pass just as well against a core that read only the status and never looked at the
+# answer. HELPER_EXIT0 separates the two: the image states exactly the same findings and exits 0. A
+# pinned image that regressed this way is the thing the STATED-result rule exists for, and these four
+# are the tests that die if the per-observation reading is deleted.
+
+@test "a preflight failure stated with a ZERO exit is still a refusal" {
+  mkdir -p "$STAGE"
+  HELPER_PREFLIGHT=noown HELPER_EXIT0=1 run mi_copy_preflight "$IDX" "$STAGE" 900 1000
+  [ "$status" -ne 0 ]
+  assert_contains "ownership"
+}
+
+@test "a refusal stated with a ZERO exit still abandons the copy" {
+  mkdir -p "$STAGE"
+  HELPER_COPY=special HELPER_EXIT0=1 run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000
+  [ "$status" -ne 0 ]
+  assert_contains "/src/dev/thing"
+}
+
+@test "a verification MISMATCH stated with a ZERO exit still fails the verification" {
+  mkdir -p "$STAGE"
+  HELPER_VERIFY=digest HELPER_EXIT0=1 run mi_copy_verify "$IDX" srcvol1 "$STAGE"
+  [ "$status" -ne 0 ]
+  assert_contains "MISMATCH"
+}
+
+@test "an access failure stated with a ZERO exit is still a refusal" {
+  mkdir -p "$STAGE"
+  HELPER_ACCESS=mask HELPER_EXIT0=1 run mi_copy_access_check "$IDX" "$STAGE" 900
+  [ "$status" -ne 0 ]
+  assert_contains "not effective access"
+}
+
 # --- the manifest amendment this task depends on (D58) -----------------------------------------
 
 @test "the manifest declares the product's runtime uid, and it is REQUIRED" {

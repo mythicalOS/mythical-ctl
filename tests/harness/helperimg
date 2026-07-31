@@ -121,6 +121,13 @@ lookup() {
   return 1
 }
 
+# AN EXIT STATUS IS NOT A RESULT, and this is the knob that says so. With HELPER_EXIT0 set, the image
+# reports its findings exactly as it otherwise would and then exits 0 anyway — a pinned image that
+# regressed that way is the failure the caller has to survive by reading the STATED result rather than
+# the status beside it. Every Part B arm below ends through here, so no arm can be the one that is
+# still only pinned by its status.
+fin() { if [ -n "${HELPER_EXIT0:-}" ]; then exit 0; fi; exit "$1"; }
+
 cmd="${1:-}"; shift || true
 
 case "$cmd" in
@@ -186,7 +193,7 @@ case "$cmd" in
     esac
     printf 'ownership=%s\npermissions=%s\nsymlink=%s\nacl=%s\ninherit=%s\n' \
            "$own" "$perm" "$link" "$acl" "$inherit"
-    case "${own}${perm}${link}${inherit}${acl}" in *fail*) exit 1 ;; esac
+    case "${own}${perm}${link}${inherit}${acl}" in *fail*) fin 1 ;; esac
     ;;
   copy)
     src="${1:-}"; dst="${2:-}"; ruid="${3:-}"; ouid="${4:-}"; mapf="${5:-}"
@@ -237,7 +244,7 @@ case "$cmd" in
     # `done=ok` states COMPLETION, so it is printed only on a copy that completed. A refusal that also
     # claimed completion would be two contradictory answers in one response.
     [ "$rc" -ne 0 ] || printf 'done=ok\n'
-    exit "$rc"
+    fin "$rc"
     ;;
   verify)
     src="${1:-}"; dst="${2:-}"
@@ -254,7 +261,7 @@ case "$cmd" in
       type|digest|linktarget|mode|owner|mtime|hardlink)
         printf 'mismatch=%s/data/f:%s\n' "$dst" "$knob"
         printf 'checked=5\ndone=ok\n'
-        exit 1 ;;
+        fin 1 ;;
       *) printf 'helperimg: unknown HELPER_VERIFY setting: %s\n' "$knob" >&2; exit 2 ;;
     esac
     ;;
@@ -265,7 +272,7 @@ case "$cmd" in
       exit 1
     fi
     printf 'acl=%s\n' "${HELPER_ACL:-ok}"
-    [ "${HELPER_ACL:-ok}" = ok ] || exit 1
+    [ "${HELPER_ACL:-ok}" = ok ] || fin 1
     ;;
   access)
     dst="${1:-}"
@@ -279,8 +286,8 @@ case "$cmd" in
       ok)   printf 'traverse=ok\nread=ok\nwrite=ok\n' ;;
       # A PRESENT ACL entry limited by a restrictive mask: the entry is there, the access is not. This
       # is the case that makes "ACL presence is not effective access" more than a slogan.
-      mask) printf 'traverse=ok\nread=fail\nwrite=fail\n'; exit 1 ;;
-      notraverse) printf 'traverse=fail\nread=fail\nwrite=fail\n'; exit 1 ;;
+      mask) printf 'traverse=ok\nread=fail\nwrite=fail\n'; fin 1 ;;
+      notraverse) printf 'traverse=fail\nread=fail\nwrite=fail\n'; fin 1 ;;
       *) printf 'helperimg: unknown HELPER_ACCESS setting: %s\n' "$knob" >&2; exit 2 ;;
     esac
     ;;
