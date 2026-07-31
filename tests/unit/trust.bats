@@ -507,3 +507,23 @@ mkdoc() {   # <version> [<expires>]
   printf '%s' "$output" | grep -aq 'refusing to lower the recorded version floor'
   [ "$(mi_trust_floor_get index)" = "7" ]
 }
+
+@test "a version floor recorded twice is REFUSED, not silently compared as one string" {
+  # `mi_ledger_get` prints every matching field, so a record carrying its key twice — which a
+  # restored ledger can — came back as two lines and the numeric comparison ran on a string
+  # containing a newline.
+  #
+  # Direction matters and was measured: this did NOT fail open. `_mi_num_gt` compares by digit count
+  # first, and a two-line value is always longer than any single value below the real floor, so every
+  # rollback attempt was still refused. What it did instead was refuse LEGITIMATE upgrades — with a
+  # duplicated floor of 99999, moving to 100000 was rejected as a downgrade. Availability, not
+  # authenticity, with a refusal message that named a rollback which was not happening.
+  :   # setup() already ran: env, modules, layout, lock, empty ledger
+  printf 'trust-floor\tindex=99999\tindex=1000\n' | mi_ledger_write
+  run mi_trust_floor_get index
+  [ "$status" -ne 0 ]
+  assert_contains "more than once"
+  # and the record is preserved, not rewritten to whichever value we liked
+  run grep -ac 'index=99999' "$MYTHICAL_HOME/.state/ledger"
+  [ "$output" = "1" ]
+}

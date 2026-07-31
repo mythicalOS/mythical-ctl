@@ -82,7 +82,37 @@ mi_trust_floor_get() {
   # is what keeps "the ledger is damaged" from looking like "this is a first install".
   v="$(mi_ledger_get "$MI_TRUST_FLOOR_KIND" "$docid")" || return $?
   [ -n "$v" ] || return 3
+  _mi_trust_single_value "$v" "version floor for '$docid'" || return 1
   printf '%s\n' "$v"
+}
+
+# A floor or anchor must be ONE value. `mi_ledger_get` prints every matching field, so a record
+# carrying its key twice — which a restored ledger can — comes back as several lines, and the
+# comparison below then runs on a string containing a newline.
+#
+# Measured impact, stated precisely because the direction matters: this does NOT fail open.
+# `_mi_num_gt` compares by digit count first, and a two-line value is always longer than any single
+# value below the real floor, so every rollback attempt is still refused — exhaustively checked over
+# a matrix of floors and lower versions, with no accepting case. What it does instead is refuse
+# LEGITIMATE upgrades: with a duplicated floor of 99999, moving to 100000 is rejected as a downgrade.
+# So the failure is availability, not authenticity — a wedged installation whose refusal message is
+# actively misleading, because it names a rollback that is not happening.
+#
+# Refuse and report, rather than picking the first line or the largest: an ambiguous floor is exactly
+# the case where guessing is how a rollback floor silently becomes the wrong number.
+_mi_trust_single_value() {
+  local v="$1" what="$2"
+  # `$'\n'`, NOT `"$(printf '\n')"`. Command substitution strips trailing newlines, so the latter is
+  # the EMPTY string and the pattern degrades to `*` — matching every value and refusing every read.
+  # Caught by running the suite: it broke 25 trust tests at once.
+  case "$v" in
+    *$'\n'*)
+      mi_warn "trust: the $what is recorded more than once in the ledger, with differing values."
+      mi_warn "  Refusing rather than choosing one — an ambiguous floor is how a rollback floor"
+      mi_warn "  silently becomes the wrong number. Run 'mythical-ctl state repair'."
+      return 1 ;;
+  esac
+  return 0
 }
 
 # No arity guard: this takes no arguments, so there is nothing to expand and nothing that could
@@ -92,6 +122,7 @@ mi_trust_anchor_get() {
   local v
   v="$(mi_ledger_get "$MI_TRUST_ANCHOR_KIND" digest)" || return $?
   [ -n "$v" ] || return 3
+  _mi_trust_single_value "$v" "trust anchor digest" || return 1
   printf '%s\n' "$v"
 }
 
