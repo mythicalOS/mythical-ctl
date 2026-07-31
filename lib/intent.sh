@@ -431,11 +431,14 @@ mi_intent_confirm() {
 # --- reconciliation (§6b's recovery table) --------------------------------------------------------
 #
 #   exactly one match  ⇒ adopt it into the ledger — this IS the object the intent describes
-#   zero matches       ⇒ containers and volumes: reissue the deterministic create, then RE-INSPECT and
-#                        verify the labels. A conflict is not evidence — `docker volume create` against
-#                        an existing name succeeds, returning whatever volume already holds it — so
+#   zero matches       ⇒ VOLUMES: reissue the deterministic create, then RE-INSPECT and verify the
+#                        labels. A conflict is not evidence — `docker volume create` against an
+#                        existing name succeeds, returning whatever volume already holds it — so
 #                        adopt only on an exact identity AND nonce match. Any ambiguous or unexpected
-#                        error RETAINS the intent. NETWORKS: never reissue.
+#                        error RETAINS the intent. NETWORKS: never reissue (D38). PROBES: not reissued
+#                        here either — the launch spec belongs to the caller, so the intent is
+#                        retained for it. The row said "containers and volumes", which was never true
+#                        of a container even before the class was refused outright below.
 #   more than one       ⇒ STOP. Never delete to disambiguate. Report every candidate.
 #
 # and, before any of them, COULD NOT ASK ⇒ retain. That is not a fourth row of the table; it is the
