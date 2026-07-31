@@ -4,11 +4,28 @@
 # THE ORDER IS FIXED AND CONFIRMATION COMES LAST, so "confirmed" always means "attached correctly, and
 # to nothing else":
 #
-#   1 create, NOT started, attached to the target network ID AT CREATION
+#   1 create, NOT started, attached to the target network ID AT CREATION — behind a write-ahead intent
+#     that records the DESIRED STATE and the check this bring-up owes, not merely the nonce
 #   2 verify by inspection — the COMPLETE network set, exactly {expected}, with the expected alias
 #   3 record desired state and the outstanding check, then confirm
 #   4 start
-#   5 verify live — re-inspect for the address it actually has, resolve its alias, compare, then clear
+#   5 verify live — re-inspect, re-apply step 2's complete-set rule to THAT inspection, resolve the
+#     alias against the address it actually has, compare, and only then clear
+#
+# STEP 5 REPEATS STEP 2 BECAUSE STEP 5 IS THE STEP THAT CLEARS. Everything "confirmed" claims has to
+# be true at the moment the check is retired, and the second half of the claim — attached to NOTHING
+# ELSE — is the half a network attached after step 2 falsifies without disturbing anything step 5
+# used to look at.
+#
+# THE INTENT CARRIES THE DECISION BECAUSE THE WINDOW BEFORE THE FIRST STATE WRITE CANNOT BE CLOSED BY
+# ORDERING. Steps 1–2 can complete and the process die before step 3 writes anything, and a recovering
+# process cannot re-derive what the dead one decided. So it is written down before the object exists.
+#
+# CONSEQUENCE FOR CALLERS: a container intent opened here is finished by mi_bringup_recover and by
+# nothing else. lib/intent.sh's generic mi_intent_reconcile confirms a matched object directly — right
+# for a volume, whose existence is its whole state, and wrong for a container, which also owes a
+# desired state and a live verification. Reconciling one of these intents through the generic path
+# reintroduces exactly the defect this sequence's own recovery was fixed for.
 #
 # PURE library — no side effects at source time; no `set -euo pipefail`.
 #
