@@ -20,7 +20,7 @@ setup() {
   POL="$(mi_policy_load "$P")"
 }
 
-man() { { printf 'mythical-manifest 1\nversion=1\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nmin_core=0.1.0\n'
+man() { { printf 'mythical-manifest 1\nruntime_uid=900\nversion=1\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nmin_core=0.1.0\n'
           printf 'image=ghcr.io/example/brokkr@%s\n' "$DIG"
           printf '%s\n' "$1"; } > "$F"; }
 
@@ -36,7 +36,7 @@ man() { { printf 'mythical-manifest 1\nversion=1\nexpires=4102444800\nproduct=br
   local ref
   for ref in 'ghcr.io/example/brokkr:latest' 'ghcr.io/example/brokkr' 'brokkr:1.2.3' \
              'ghcr.io/example/brokkr@sha256:short' 'ghcr.io/example/brokkr@md5:abc'; do
-    { printf 'mythical-manifest 1\nversion=1\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nmin_core=0.1.0\nimage=%s\n' "$ref"; } > "$F"
+    { printf 'mythical-manifest 1\nruntime_uid=900\nversion=1\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nmin_core=0.1.0\nimage=%s\n' "$ref"; } > "$F"
     run mi_manifest_load "$F"
     [ "$status" -eq 1 ] || { echo "accepted unpinned reference '$ref'" >&2; return 1; }
   done
@@ -51,11 +51,11 @@ man() { { printf 'mythical-manifest 1\nversion=1\nexpires=4102444800\nproduct=br
 # "do not grow a parser" line this project draws for JSON. This is not "fixed": docs/DOCUMENT-FORMAT.md
 # is corrected to say so, and this test pins both directions.
 @test "a tag alongside a digest is accepted (still pinned by the digest); a bare tag with no digest is refused" {
-  { printf 'mythical-manifest 1\nversion=1\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nmin_core=0.1.0\nimage=ghcr.io/example/brokkr:latest@%s\n' "$DIG"; } > "$F"
+  { printf 'mythical-manifest 1\nruntime_uid=900\nversion=1\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nmin_core=0.1.0\nimage=ghcr.io/example/brokkr:latest@%s\n' "$DIG"; } > "$F"
   run mi_manifest_load "$F"
   [ "$status" -eq 0 ] || { echo "rejected a legitimate tag-plus-digest reference: $output" >&2; return 1; }
 
-  { printf 'mythical-manifest 1\nversion=1\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nmin_core=0.1.0\nimage=ghcr.io/example/brokkr:latest\n'; } > "$F"
+  { printf 'mythical-manifest 1\nruntime_uid=900\nversion=1\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nmin_core=0.1.0\nimage=ghcr.io/example/brokkr:latest\n'; } > "$F"
   run mi_manifest_load "$F"
   [ "$status" -eq 1 ] || { echo "accepted a bare tag with no digest" >&2; return 1; }
 }
@@ -69,7 +69,7 @@ man() { { printf 'mythical-manifest 1\nversion=1\nexpires=4102444800\nproduct=br
 # --- §7.3: launch state is declared, not inferred ---
 
 @test "launched=false reports rc 3 — the not-launched contract code" {
-  { printf 'mythical-manifest 1\nversion=1\nexpires=4102444800\nproduct=brokkr\nlaunched=false\nmin_core=0.1.0\n'
+  { printf 'mythical-manifest 1\nruntime_uid=900\nversion=1\nexpires=4102444800\nproduct=brokkr\nlaunched=false\nmin_core=0.1.0\n'
     printf 'image=ghcr.io/example/brokkr@%s\n' "$DIG"; } > "$F"
   local m; m="$(mi_manifest_load "$F")"
   run mi_manifest_launched "$m"
@@ -83,7 +83,7 @@ man() { { printf 'mythical-manifest 1\nversion=1\nexpires=4102444800\nproduct=br
 }
 
 @test "a missing launched field is refused — launch state is never inferred" {
-  { printf 'mythical-manifest 1\nversion=1\nexpires=4102444800\nproduct=brokkr\nmin_core=0.1.0\n'
+  { printf 'mythical-manifest 1\nruntime_uid=900\nversion=1\nexpires=4102444800\nproduct=brokkr\nmin_core=0.1.0\n'
     printf 'image=ghcr.io/example/brokkr@%s\n' "$DIG"; } > "$F"
   run mi_manifest_load "$F"
   [ "$status" -eq 1 ]
@@ -133,7 +133,7 @@ man() { { printf 'mythical-manifest 1\nversion=1\nexpires=4102444800\nproduct=br
 }
 
 @test "a manifest for a product the policy index does not know is rejected" {
-  { printf 'mythical-manifest 1\nversion=1\nexpires=4102444800\nproduct=ghost\nlaunched=true\n'
+  { printf 'mythical-manifest 1\nruntime_uid=900\nversion=1\nexpires=4102444800\nproduct=ghost\nlaunched=true\n'
     printf 'min_core=0.1.0\nimage=ghcr.io/example/ghost@%s\nvolume=state:/data\n' "$DIG"; } > "$F"
   run mi_manifest_check "$(mi_manifest_load "$F")" "$POL"
   [ "$status" -eq 1 ]
@@ -160,7 +160,7 @@ man() { { printf 'mythical-manifest 1\nversion=1\nexpires=4102444800\nproduct=br
 @test "a manifest requiring a newer core is refused, even when fully authentic" {
   mkindex
   local d="$MYTHICAL_HOME" dig="sha256:$(printf 'a%.0s' {1..64})"
-  printf 'mythical-manifest 1\nversion=1\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nmin_core=99.0.0\nimage=r@%s\nvolume=state:/data\n' "$dig" > "$d/mb"
+  printf 'mythical-manifest 1\nruntime_uid=900\nversion=1\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nmin_core=99.0.0\nimage=r@%s\nvolume=state:/data\n' "$dig" > "$d/mb"
   { printf 'mythical-index 1\nversion=1\nexpires=4102444800\npolicy_digest=%s\n' "$(mi_digest "$d/policy")"
     index_helper_images
     printf 'manifest=brokkr:%s\n' "$(mi_digest "$d/mb")"; } > "$d/index"
@@ -172,7 +172,7 @@ man() { { printf 'mythical-manifest 1\nversion=1\nexpires=4102444800\nproduct=br
 
 @test "a manifest with no min_core is refused — unstated must not mean any core will do" {
   local dig="sha256:$(printf 'a%.0s' {1..64})"
-  printf 'mythical-manifest 1\nversion=1\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nimage=r@%s\n' "$dig" > "$F"
+  printf 'mythical-manifest 1\nruntime_uid=900\nversion=1\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nimage=r@%s\n' "$dig" > "$F"
   run mi_manifest_load "$F"
   [ "$status" -eq 1 ]
   [[ "$output" == *min_core* ]]
@@ -244,8 +244,8 @@ mkindex() {   # writes $MYTHICAL_HOME/{policy,mb,ms,index}
   { printf 'mythical-policy 1\nversion=1\nexpires=4102444800\nfamily_gid=60748\n'
     printf 'brokkr.permitted_role=state\nbrokkr.bindable_role=state\n'
     printf 'skuld.permitted_role=state\n'; } > "$d/policy"
-  printf 'mythical-manifest 1\nversion=1\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nmin_core=0.1.0\nimage=r@%s\nvolume=state:/data\n' "$dig" > "$d/mb"
-  printf 'mythical-manifest 1\nversion=1\nexpires=4102444800\nproduct=skuld\nlaunched=true\nmin_core=0.1.0\nimage=r@%s\nvolume=state:/data\n' "$dig" > "$d/ms"
+  printf 'mythical-manifest 1\nruntime_uid=900\nversion=1\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nmin_core=0.1.0\nimage=r@%s\nvolume=state:/data\n' "$dig" > "$d/mb"
+  printf 'mythical-manifest 1\nruntime_uid=900\nversion=1\nexpires=4102444800\nproduct=skuld\nlaunched=true\nmin_core=0.1.0\nimage=r@%s\nvolume=state:/data\n' "$dig" > "$d/ms"
   { printf 'mythical-index 1\nversion=1\nexpires=4102444800\npolicy_digest=%s\n' "$(mi_digest "$d/policy")"
     index_helper_images
     printf 'manifest=brokkr:%s\nmanifest=skuld:%s\n' "$(mi_digest "$d/mb")" "$(mi_digest "$d/ms")"; } > "$d/index"
@@ -312,7 +312,7 @@ mkindex() {   # writes $MYTHICAL_HOME/{policy,mb,ms,index}
   mi_trust_anchor_set "$(mi_digest "$d/index")"     # anchors the REAL, untampered index
 
   # A forged manifest an attacker with local write access (but not the anchor) wants accepted.
-  printf 'mythical-manifest 1\nversion=1\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nmin_core=0.1.0\nimage=r@%s\nvolume=state:/data\n' "$dig" > "$d/forged-mb"
+  printf 'mythical-manifest 1\nruntime_uid=900\nversion=1\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nmin_core=0.1.0\nimage=r@%s\nvolume=state:/data\n' "$dig" > "$d/forged-mb"
 
   # The cached index is rewritten to vouch for it, without ever touching the recorded anchor.
   { printf 'mythical-index 1\nversion=1\nexpires=4102444800\npolicy_digest=%s\n' "$(mi_digest "$d/policy")"
@@ -366,7 +366,7 @@ mkindex() {   # writes $MYTHICAL_HOME/{policy,mb,ms,index}
 @test "tampering at any level of the chain is refused" {
   mkindex
   mi_trust_anchor_set "$(mi_digest "$MYTHICAL_HOME/index")"
-  printf 'mythical-manifest 1\nversion=9\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nmin_core=0.1.0\nimage=r@sha256:%s\n' "$(printf 'a%.0s' {1..64})" > "$MYTHICAL_HOME/mb"
+  printf 'mythical-manifest 1\nruntime_uid=900\nversion=9\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nmin_core=0.1.0\nimage=r@sha256:%s\n' "$(printf 'a%.0s' {1..64})" > "$MYTHICAL_HOME/mb"
   run mi_accept_manifest "$MYTHICAL_HOME/index" "$MYTHICAL_HOME/policy" "$MYTHICAL_HOME/mb" brokkr
   [ "$status" -eq 1 ]
 
@@ -385,7 +385,7 @@ mkindex() {   # writes $MYTHICAL_HOME/{policy,mb,ms,index}
   mkindex
   mi_trust_anchor_set "$(mi_digest "$MYTHICAL_HOME/index")"
   local dig; dig="sha256:$(printf 'a%.0s' {1..64})"
-  printf 'mythical-manifest 1\nversion=1\nexpires=4102444800\nproduct=saga\nlaunched=true\nmin_core=0.1.0\nimage=r@%s\n' "$dig" > "$MYTHICAL_HOME/mg"
+  printf 'mythical-manifest 1\nruntime_uid=900\nversion=1\nexpires=4102444800\nproduct=saga\nlaunched=true\nmin_core=0.1.0\nimage=r@%s\n' "$dig" > "$MYTHICAL_HOME/mg"
   run mi_accept_manifest "$MYTHICAL_HOME/index" "$MYTHICAL_HOME/policy" "$MYTHICAL_HOME/mg" saga
   [ "$status" -eq 1 ]
   [[ "$output" == *vouch* ]]
@@ -395,7 +395,7 @@ mkindex() {   # writes $MYTHICAL_HOME/{policy,mb,ms,index}
 @test "an authentic not-launched manifest reports rc 3, not 0" {
   mkindex
   local d="$MYTHICAL_HOME" dig="sha256:$(printf 'a%.0s' {1..64})"
-  printf 'mythical-manifest 1\nversion=1\nexpires=4102444800\nproduct=brokkr\nlaunched=false\nmin_core=0.1.0\nimage=r@%s\nvolume=state:/data\n' "$dig" > "$d/mb"
+  printf 'mythical-manifest 1\nruntime_uid=900\nversion=1\nexpires=4102444800\nproduct=brokkr\nlaunched=false\nmin_core=0.1.0\nimage=r@%s\nvolume=state:/data\n' "$dig" > "$d/mb"
   { printf 'mythical-index 1\nversion=1\nexpires=4102444800\npolicy_digest=%s\n' "$(mi_digest "$d/policy")"
     index_helper_images
     printf 'manifest=brokkr:%s\n' "$(mi_digest "$d/mb")"; } > "$d/index"
@@ -420,7 +420,7 @@ mkindex() {   # writes $MYTHICAL_HOME/{policy,mb,ms,index}
   mkindex
   local d="$MYTHICAL_HOME" dig="sha256:$(printf 'a%.0s' {1..64})"
   # mkindex's policy grants brokkr only the 'state' role — 'secrets' is not among its entitlements.
-  printf 'mythical-manifest 1\nversion=1\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nmin_core=0.1.0\nimage=r@%s\nvolume=secrets:/run/secrets\n' "$dig" > "$d/mb"
+  printf 'mythical-manifest 1\nruntime_uid=900\nversion=1\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nmin_core=0.1.0\nimage=r@%s\nvolume=secrets:/run/secrets\n' "$dig" > "$d/mb"
   { printf 'mythical-index 1\nversion=1\nexpires=4102444800\npolicy_digest=%s\n' "$(mi_digest "$d/policy")"
     index_helper_images
     printf 'manifest=brokkr:%s\nmanifest=skuld:%s\n' "$(mi_digest "$d/mb")" "$(mi_digest "$d/ms")"; } > "$d/index"
@@ -445,7 +445,7 @@ mkindex() {   # writes $MYTHICAL_HOME/{policy,mb,ms,index}
   # version=7, asking for the 'secrets' role — NOT entitled under mkindex's policy (brokkr only has
   # 'state' there). A pre-fix door would have committed floor=7 for manifest:brokkr before reaching
   # this refusal.
-  printf 'mythical-manifest 1\nversion=7\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nmin_core=0.1.0\nimage=r@%s\nvolume=secrets:/run/secrets\n' "$dig" > "$d/mb7"
+  printf 'mythical-manifest 1\nruntime_uid=900\nversion=7\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nmin_core=0.1.0\nimage=r@%s\nvolume=secrets:/run/secrets\n' "$dig" > "$d/mb7"
   { printf 'mythical-index 1\nversion=1\nexpires=4102444800\npolicy_digest=%s\n' "$(mi_digest "$d/policy")"
     index_helper_images
     printf 'manifest=brokkr:%s\nmanifest=skuld:%s\n' "$(mi_digest "$d/mb7")" "$(mi_digest "$d/ms")"; } > "$d/index"
@@ -462,7 +462,7 @@ mkindex() {   # writes $MYTHICAL_HOME/{policy,mb,ms,index}
 @test "Fix 1: an accepted-but-not-launched manifest still advances the version floor" {
   mkindex
   local d="$MYTHICAL_HOME" dig="sha256:$(printf 'a%.0s' {1..64})"
-  printf 'mythical-manifest 1\nversion=5\nexpires=4102444800\nproduct=brokkr\nlaunched=false\nmin_core=0.1.0\nimage=r@%s\nvolume=state:/data\n' "$dig" > "$d/mb5"
+  printf 'mythical-manifest 1\nruntime_uid=900\nversion=5\nexpires=4102444800\nproduct=brokkr\nlaunched=false\nmin_core=0.1.0\nimage=r@%s\nvolume=state:/data\n' "$dig" > "$d/mb5"
   { printf 'mythical-index 1\nversion=1\nexpires=4102444800\npolicy_digest=%s\n' "$(mi_digest "$d/policy")"
     index_helper_images
     printf 'manifest=brokkr:%s\nmanifest=skuld:%s\n' "$(mi_digest "$d/mb5")" "$(mi_digest "$d/ms")"; } > "$d/index"
@@ -479,7 +479,7 @@ mkindex() {   # writes $MYTHICAL_HOME/{policy,mb,ms,index}
 @test "Fix 2: an expired manifest is refused through the door" {
   mkindex
   local d="$MYTHICAL_HOME" dig="sha256:$(printf 'a%.0s' {1..64})"
-  printf 'mythical-manifest 1\nversion=1\nexpires=1\nproduct=brokkr\nlaunched=true\nmin_core=0.1.0\nimage=r@%s\nvolume=state:/data\n' "$dig" > "$d/mbx"
+  printf 'mythical-manifest 1\nruntime_uid=900\nversion=1\nexpires=1\nproduct=brokkr\nlaunched=true\nmin_core=0.1.0\nimage=r@%s\nvolume=state:/data\n' "$dig" > "$d/mbx"
   { printf 'mythical-index 1\nversion=1\nexpires=4102444800\npolicy_digest=%s\n' "$(mi_digest "$d/policy")"
     index_helper_images
     printf 'manifest=brokkr:%s\nmanifest=skuld:%s\n' "$(mi_digest "$d/mbx")" "$(mi_digest "$d/ms")"; } > "$d/index"
@@ -496,7 +496,7 @@ mkindex() {   # writes $MYTHICAL_HOME/{policy,mb,ms,index}
   run mi_accept_manifest "$d/index" "$d/policy" "$d/mb" brokkr    # mkindex's mb is version=1
   [ "$status" -eq 0 ]
 
-  printf 'mythical-manifest 1\nversion=2\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nmin_core=0.1.0\nimage=r@%s\nvolume=state:/data\n' "$dig" > "$d/mb2"
+  printf 'mythical-manifest 1\nruntime_uid=900\nversion=2\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nmin_core=0.1.0\nimage=r@%s\nvolume=state:/data\n' "$dig" > "$d/mb2"
   { printf 'mythical-index 1\nversion=1\nexpires=4102444800\npolicy_digest=%s\n' "$(mi_digest "$d/policy")"
     index_helper_images
     printf 'manifest=brokkr:%s\nmanifest=skuld:%s\n' "$(mi_digest "$d/mb2")" "$(mi_digest "$d/ms")"; } > "$d/index"
@@ -525,7 +525,7 @@ mkindex() {   # writes $MYTHICAL_HOME/{policy,mb,ms,index}
   local d="$MYTHICAL_HOME" dig="sha256:$(printf 'a%.0s' {1..64})"
   # A manifest asking for the 'secrets' role — NOT entitled under mkindex's real (untampered)
   # policy, where brokkr has only 'state'.
-  printf 'mythical-manifest 1\nversion=1\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nmin_core=0.1.0\nimage=r@%s\nvolume=secrets:/run/secrets\n' "$dig" > "$d/mbs"
+  printf 'mythical-manifest 1\nruntime_uid=900\nversion=1\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nmin_core=0.1.0\nimage=r@%s\nvolume=secrets:/run/secrets\n' "$dig" > "$d/mbs"
   { printf 'mythical-index 1\nversion=1\nexpires=4102444800\npolicy_digest=%s\n' "$(mi_digest "$d/policy")"
     index_helper_images
     printf 'manifest=brokkr:%s\n' "$(mi_digest "$d/mbs")"; } > "$d/index"
@@ -574,7 +574,7 @@ mkindex() {   # writes $MYTHICAL_HOME/{policy,mb,ms,index}
   mi_trust_anchor_set "$(mi_digest "$d/index")"
   # Tamper with the manifest bytes AFTER the index has already recorded a digest for the untampered
   # ones — the door must refuse on the mismatch and name $d/mb, not the private snapshot it read.
-  printf 'mythical-manifest 1\nversion=2\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nmin_core=0.1.0\nimage=r@%s\nvolume=state:/data\n' "$dig" > "$d/mb"
+  printf 'mythical-manifest 1\nruntime_uid=900\nversion=2\nexpires=4102444800\nproduct=brokkr\nlaunched=true\nmin_core=0.1.0\nimage=r@%s\nvolume=state:/data\n' "$dig" > "$d/mb"
   run mi_accept_manifest "$d/index" "$d/policy" "$d/mb" brokkr
   [ "$status" -ne 0 ]
   [[ "$output" == *"$d/mb"* ]] || { echo "output missing the operator's path $d/mb: $output" >&2; return 1; }

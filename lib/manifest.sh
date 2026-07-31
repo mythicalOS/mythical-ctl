@@ -32,6 +32,11 @@ mi_manifest_spec() {
   # cannot be checked, and "unstated" would silently mean "any core will do", which is the one
   # answer that is never safe.
   printf 'min_core\tcoreversion\tone\n'
+  # D58: the copy's ownership policy needs the product's runtime uid, and D60's supplementary-group
+  # mechanism is declared by the image. REQUIRED, because the alternative — guessing, or "preserve
+  # uid/gid raw" — is §4.5's dual-owner problem at directory scale: a preserved 0600 file owned by the
+  # operator is unreadable by a container still running as uid 900.
+  printf 'runtime_uid\tint:0:4294967295\tone\n'
   # Deliberately ABSENT, and their absence is the enforcement (§8.1):
   #   bindable_role  — bindability comes from the policy index, never from the product (D53)
   #   network        — joining a network is the cross-product reach D21 exists to prevent
@@ -53,6 +58,16 @@ mi_manifest_spec() {
 mi_manifest_load() {
   if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then mi_warn "manifest: mi_manifest_load needs a <file> and an optional <label>"; return 1; fi
   mi_doc_load "$1" manifest "$(mi_manifest_spec)" "${2:-$1}"
+}
+
+# The uid the product's container runs as. §5.1's copy MAPS ownership rather than preserving it, and
+# this is the principal it maps TO — so it is read from the authenticated manifest and never guessed,
+# never read out of the image, and never defaulted. A wrong value here does not fail loudly: it
+# produces a migrated tree the product cannot read, discovered on the first start after the source has
+# already been retired.
+mi_manifest_runtime_uid() {
+  if [ "$#" -ne 1 ]; then mi_warn "manifest: mi_manifest_runtime_uid needs <records>"; return 1; fi
+  mi_doc_value "$1" runtime_uid
 }
 
 mi_manifest_image() {

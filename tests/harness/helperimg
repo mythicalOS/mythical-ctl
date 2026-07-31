@@ -34,7 +34,62 @@
 #                                the caller can tell an answer to its question from an answer to
 #                                another one.
 #   egress                     → egress=ok
-#   preflight|copy|verify|acl|access  → Part B's commands (D54/D58), stubbed here.
+#
+# PART B — THE COPY CONTAINER (D54/D58). The host cannot read a named volume, so everything below runs
+# HERE, inside the pinned image, with /src mounted read-only and /dst the only writable mount. In
+# particular the ownership mapping and the ACLs are applied here and NEVER by the host CLI: `setfacl`
+# is not on the dependency floor and does not exist on macOS at all, while this image is ours, so the
+# tool is present by construction.
+#
+#   preflight <dst> <runtime-uid> <operator-uid>
+#                              EMPIRICAL, not inferred from the filesystem's name: create a file,
+#                              chown it, create a symlink, stat it back, set DEFAULT ACL entries
+#                              naming BOTH principals, then create a child AS EACH uid and read it as
+#                              the other. Report what was OBSERVED:
+#                                ownership=ok|fail  permissions=ok|fail  symlink=ok|fail
+#                                acl=ok|fail|skipped   inherit=ok|fail
+#                              `acl=skipped` is legitimate ONLY when the two uids are equal, where the
+#                              step is genuinely a no-op. `inherit` is the cross-read result — the
+#                              child created as one uid, read as the other — and is the observation
+#                              that says the DEFAULT entries actually carry.
+#                              exit 0 when every observation is ok (or acl=skipped); 1 otherwise.
+#   copy <src> <dst> <runtime-uid> <operator-uid> [--map-foreign]
+#                              The entry-type and metadata contract, reported as it goes:
+#                                entry=<type>:<path>        type ∈ file|dir|symlink|hardlink|special
+#                                linktarget=<path>:<verbatim target>
+#                                stripped=<path>:<bits>     setuid/setgid/sticky removed
+#                                mapped=<path>:<olduid>     a foreign uid folded into the operator's
+#                                refused=<path>:<reason>    reason ∈ special-entry|escaped-write
+#                                refused=<path>:foreign-uid:<uid>
+#                                done=ok                    printed ONLY on a completed copy
+#                              exit 0 when nothing was refused; 1 otherwise.
+#   verify <src> <dst>         PER-ENTRY over that same contract, never a byte count:
+#                                mismatch=<path>:type|digest|linktarget|mode|owner|mtime|hardlink
+#                                checked=<n>   done=ok
+#                              exit 0 when there is no mismatch; 1 otherwise.
+#   acl <dst> <runtime-uid> <operator-uid>
+#                              RESERVED, and deliberately separate: re-apply the dual-principal
+#                              default entries WITHOUT re-copying, for a repair path. The copy itself
+#                              applies them inline, so the core does not call this today.
+#                                acl=ok|fail
+#   access <dst>               EFFECTIVE ACCESS, exercised rather than inferred — this one is run with
+#                              `--user <runtime uid>`, so it answers as the product would: traverse
+#                              the tree, read a file, write a probe file and remove it.
+#                                traverse=ok|fail  read=ok|fail  write=ok|fail
+#                              exit 0 when all three are ok; 1 otherwise.
+#
+# THE FIELD SHAPES ARE PARSED, so their layout is part of the contract, and both of the two-part ones
+# put the FIXED-SHAPE component where a path's own bytes cannot reach it:
+#
+#   `entry=<type>:<path>`   — TYPE first. A path may legally contain a colon, so the path is
+#                             everything after the FIRST one and the type is bounded.
+#   `refused=<path>:<reason>` — REASON last, from the closed vocabulary above, so the path is
+#                             everything before the LAST colon. `foreign-uid` carries the numeric uid
+#                             after it (`…:foreign-uid:<uid>`), because a refusal that cannot say
+#                             WHICH uid is a refusal an operator cannot act on.
+#
+# Splitting either of them on the first colon reports the wrong path for a path containing one — in
+# the one message the operator acts on.
 #
 # WHY selfcheck TAKES AN ALIAS, since this is the property the whole probe exists for. `selfcheck=ok`
 # on its own is a claim no broken DNS can falsify: an image that printed it unconditionally, or that
@@ -102,9 +157,132 @@ case "$cmd" in
     if [ "${HELPER_EGRESS:-ok}" = fail ]; then printf 'egress=fail\n'; exit 1; fi
     printf 'egress=ok\n'
     ;;
-  preflight|copy|verify|acl|access)
-    # Part B's commands. Implemented in Task 11; a stub here keeps the closed command set honest.
-    printf '%s=stub\n' "$cmd"
+  preflight)
+    dst="${1:-}"; ruid="${2:-}"; ouid="${3:-}"
+    if [ -z "$dst" ] || [ -z "$ruid" ] || [ -z "$ouid" ]; then
+      printf 'helperimg: preflight needs <destination> <runtime-uid> <operator-uid>\n' >&2
+      exit 1
+    fi
+    knob="${HELPER_PREFLIGHT:-ok}"
+    # `silent`: the image ran, exited 0 and said nothing. It is a knob rather than an accident because
+    # the CALLER's handling of it is the property under test — an absent observation is a refusal, not
+    # a pass, and that is the fail-open this whole file is shaped to make visible.
+    [ "$knob" != silent ] || exit 0
+    own=ok; perm=ok; link=ok; inherit=ok
+    # The ACL step is a genuine no-op when the product's runtime uid IS the operator's: there is one
+    # principal, and a default entry naming it twice grants nothing new.
+    if [ "$ruid" = "$ouid" ]; then acl=skipped; else acl=ok; fi
+    case "$knob" in
+      ok)        : ;;
+      noown)     own=fail ;;
+      noperm)    perm=fail ;;
+      nolink)    link=fail ;;
+      noacl)     acl=fail ;;
+      noinherit) inherit=fail ;;
+      # A conforming image never does this: it reports the step SKIPPED where the two uids differ and
+      # skipping is therefore not a no-op. The caller has to catch it.
+      aclskip)   acl=skipped ;;
+      *) printf 'helperimg: unknown HELPER_PREFLIGHT setting: %s\n' "$knob" >&2; exit 2 ;;
+    esac
+    printf 'ownership=%s\npermissions=%s\nsymlink=%s\nacl=%s\ninherit=%s\n' \
+           "$own" "$perm" "$link" "$acl" "$inherit"
+    case "${own}${perm}${link}${inherit}${acl}" in *fail*) exit 1 ;; esac
+    ;;
+  copy)
+    src="${1:-}"; dst="${2:-}"; ruid="${3:-}"; ouid="${4:-}"; mapf="${5:-}"
+    if [ -z "$src" ] || [ -z "$dst" ] || [ -z "$ruid" ] || [ -z "$ouid" ]; then
+      printf 'helperimg: copy needs <source> <destination> <runtime-uid> <operator-uid>\n' >&2
+      exit 1
+    fi
+    knob="${HELPER_COPY:-ok}"
+    [ "$knob" != silent ] || exit 0
+    # The ordinary tree, reported on EVERY setting, so the contract observations are present in the
+    # plain case too and a caller cannot pass its symlink assertions only on a knobbed fixture.
+    printf 'entry=dir:%s/data\n'      "$src"
+    printf 'entry=file:%s/data/f\n'   "$src"
+    printf 'entry=symlink:%s/data/link\n' "$src"
+    printf 'linktarget=%s/data/link:../data/f\n' "$src"
+    printf 'entry=hardlink:%s/data/f2\n' "$src"
+    rc=0
+    case "$knob" in
+      ok) : ;;
+      special)
+        printf 'entry=special:%s/dev/thing\n' "$src"
+        printf 'refused=%s/dev/thing:special-entry\n' "$src"; rc=1 ;;
+      # The copier ENUMERATED a device node and then did not refuse it — a one-line omission in a real
+      # image, and one the caller must not accept on the strength of the exit status.
+      special-unrefused)
+        printf 'entry=special:%s/dev/thing\n' "$src" ;;
+      # A path containing a colon, so the caller's parse of `<path>:<reason>` is exercised on the shape
+      # that breaks a first-colon split.
+      colon)
+        printf 'entry=special:%s/od:d/dev/thing\n' "$src"
+        printf 'refused=%s/od:d/dev/thing:special-entry\n' "$src"; rc=1 ;;
+      escape)
+        printf 'entry=symlink:%s/data/evil\n' "$src"
+        printf 'linktarget=%s/data/evil:../../../../etc/passwd\n' "$src" ;;
+      escaped-write)
+        printf 'refused=%s/data/../outside:escaped-write\n' "$src"; rc=1 ;;
+      setuid)
+        printf 'entry=file:%s/bin/tool\n' "$src"
+        printf 'stripped=%s/bin/tool:4755\n' "$src" ;;
+      foreign)
+        if [ "$mapf" = --map-foreign ]; then
+          printf 'mapped=%s/data/alien:4242\n' "$src"
+        else
+          printf 'refused=%s/data/alien:foreign-uid:4242\n' "$src"; rc=1
+        fi ;;
+      *) printf 'helperimg: unknown HELPER_COPY setting: %s\n' "$knob" >&2; exit 2 ;;
+    esac
+    # `done=ok` states COMPLETION, so it is printed only on a copy that completed. A refusal that also
+    # claimed completion would be two contradictory answers in one response.
+    [ "$rc" -ne 0 ] || printf 'done=ok\n'
+    exit "$rc"
+    ;;
+  verify)
+    src="${1:-}"; dst="${2:-}"
+    if [ -z "$src" ] || [ -z "$dst" ]; then
+      printf 'helperimg: verify needs <source> <destination>\n' >&2
+      exit 1
+    fi
+    knob="${HELPER_VERIFY:-ok}"
+    [ "$knob" != silent ] || exit 0
+    case "$knob" in
+      ok) printf 'checked=5\ndone=ok\n' ;;
+      # Completion claimed with no count: nothing in the answer says a single entry was looked at.
+      nocount) printf 'done=ok\n' ;;
+      type|digest|linktarget|mode|owner|mtime|hardlink)
+        printf 'mismatch=%s/data/f:%s\n' "$dst" "$knob"
+        printf 'checked=5\ndone=ok\n'
+        exit 1 ;;
+      *) printf 'helperimg: unknown HELPER_VERIFY setting: %s\n' "$knob" >&2; exit 2 ;;
+    esac
+    ;;
+  acl)
+    dst="${1:-}"; ruid="${2:-}"; ouid="${3:-}"
+    if [ -z "$dst" ] || [ -z "$ruid" ] || [ -z "$ouid" ]; then
+      printf 'helperimg: acl needs <destination> <runtime-uid> <operator-uid>\n' >&2
+      exit 1
+    fi
+    printf 'acl=%s\n' "${HELPER_ACL:-ok}"
+    [ "${HELPER_ACL:-ok}" = ok ] || exit 1
+    ;;
+  access)
+    dst="${1:-}"
+    if [ -z "$dst" ]; then
+      printf 'helperimg: access needs <destination>\n' >&2
+      exit 1
+    fi
+    knob="${HELPER_ACCESS:-ok}"
+    [ "$knob" != silent ] || exit 0
+    case "$knob" in
+      ok)   printf 'traverse=ok\nread=ok\nwrite=ok\n' ;;
+      # A PRESENT ACL entry limited by a restrictive mask: the entry is there, the access is not. This
+      # is the case that makes "ACL presence is not effective access" more than a slogan.
+      mask) printf 'traverse=ok\nread=fail\nwrite=fail\n'; exit 1 ;;
+      notraverse) printf 'traverse=fail\nread=fail\nwrite=fail\n'; exit 1 ;;
+      *) printf 'helperimg: unknown HELPER_ACCESS setting: %s\n' "$knob" >&2; exit 2 ;;
+    esac
     ;;
   *) printf 'helperimg: unsupported command: %s\n' "$cmd" >&2; exit 2 ;;
 esac
