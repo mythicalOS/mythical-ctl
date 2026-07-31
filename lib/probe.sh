@@ -130,6 +130,14 @@ _mi_probe_reap() {
 
 # Run one closed command, under write-ahead intent, and account for the container afterwards. Prints
 # the helper's `key=value` lines on stdout.
+#
+# rc 0 the helper answered AND its container is accounted for — the only status that means the run is
+#      finished · 4 the container could not be accounted for (REPORTED); whatever the check itself
+#      said, this run left an object nobody can speak for · otherwise the helper's own status.
+#
+# 4 IS SEPARATE ON PURPOSE. Folding it into the check's own failure would make every caller report a
+# verification verdict it never obtained — "DNS is broken" for a daemon that stopped answering after
+# the probe had already resolved its alias.
 _mi_probe_run() {
   if [ "$#" -lt 3 ]; then
     mi_warn "probe: _mi_probe_run needs an <index file>, a <network id> and a <command>"
@@ -160,13 +168,42 @@ _mi_probe_run() {
   # No `2>/dev/null`: a helper that could not be launched at all and a check that ran and failed are
   # different facts, and the runtime's own words are what tell them apart (§7.3).
   if out="$(mi_rt_run_helper "$ref" "$netid" - "$nonce" "$cmd" "${hspecs[@]}")"; then rc=0; else rc=$?; fi
+  # The helper's contract is 0 (the check ran and passed) · 1 (it ran and FAILED) · 2 (the command
+  # word is not implemented). ANYTHING ELSE IS OUT OF CONTRACT and is normalised to a failed check —
+  # loudly, because an unnormalised one would COLLIDE with this function's own 4 below, and the caller
+  # would then suppress its verdict as "already reported by the accounting path" while the accounting
+  # path said nothing: a silent non-zero, from the module whose subject is never confusing two facts.
+  # (Measured — a mutation that removed only the normalisation survived a test asserting absences.)
+  case "$rc" in
+    0|1|2) : ;;
+    *) mi_warn "probe: the probe exited $rc, which is not a status the helper contract defines"
+       mi_warn "  (0 the check passed · 1 the check FAILED · 2 the command is not implemented). It is"
+       mi_warn "  treated as a FAILED CHECK — never as this installer's own accounting failure."
+       rc=1 ;;
+  esac
 
   # `--rm` removes the container, so the ordinary path has nothing to delete — but "ordinary" is not
   # "always", and the intent is the only thing that accounts for the container if one survived. So the
   # record goes only once the runtime has SAID the object is gone (or it has been removed here). A
   # question that could not be asked leaves both the container and its record exactly where they are.
+  local accounted=0
   if _mi_probe_reap "$name" "$nonce" "$ident"; then
-    mi_intent_drop probe "$name" || return 1
+    mi_intent_drop probe "$name" || accounted=1
+  else
+    accounted=1
+  fi
+
+  # A FAILED REAP IS NOT A SUCCESSFUL RUN. Preserving the intent while returning the helper's earlier
+  # zero told the caller both "there might still be a container" (the record) and "there is nothing
+  # outstanding" (rc 0) at once — and the caller acts on the rc. It then proceeds believing a probe
+  # container nobody can account for was cleaned up, which is §6b.2's unaccounted class being
+  # manufactured by the very function that exists to prevent it. It takes precedence over the check's
+  # own status: an outstanding object is what the caller must act on, and the check's verdict has
+  # already been reported by whoever asked for it.
+  if [ "$accounted" -ne 0 ]; then
+    mi_warn "probe: the '$cmd' probe container could not be accounted for, so this run REPORTS FAILURE"
+    mi_warn "  whatever the check itself answered. Its intent is preserved; run 'mythical-ctl state repair'."
+    return 4
   fi
 
   if [ "$rc" -ne 0 ]; then return "$rc"; fi
@@ -184,15 +221,53 @@ _mi_probe_field() {
   return 3
 }
 
+# AN EXIT STATUS IS NOT A RESULT. rc 0 only when the answer STATES `<key>=ok`; 1 otherwise, REPORTED.
+#
+# The helper interface declares what each check says (`selfcheck=ok`, `egress=ok`), so that — not the
+# exit status beside it — is the check's result. A pinned image that regressed to exiting 0 while
+# printing nothing, or while printing `<key>=fail`, would otherwise be accepted as proof by the two
+# functions whose entire purpose is to decide whether a network was verified. FAIL CLOSED: the absence
+# of the expected result is never the presence of a pass.
+#
+# It is one function because the two doors are the same decision. Both checks are "did the helper
+# state this result", and a second copy at the second site is a guard that can be deleted with nothing
+# observable changing — the shape this plan has already shipped fixes for elsewhere.
+_mi_probe_asserted() {
+  local blob="$1" key="$2" val rc
+  if val="$(_mi_probe_field "$blob" "$key")"; then rc=0; else rc=$?; fi
+  if [ "$rc" -ne 0 ]; then
+    mi_warn "probe: the probe exited 0 but its answer carries no '${key}=' field at all, so nothing in"
+    mi_warn "  it says the check was performed. An exit status is not a result; it is REFUSED rather"
+    mi_warn "  than read as a pass."
+    return 1
+  fi
+  if [ "$val" != ok ]; then
+    mi_warn "probe: the probe exited 0 but reported '${key}=${val:-<empty>}' rather than '${key}=ok'."
+    mi_warn "  The STATED result governs, not the status beside it. It is REFUSED."
+    return 1
+  fi
+  return 0
+}
+
 # THE DNS-mechanism check. The probe's OWN alias is what separates "DNS on this network is broken" from
 # "that product is simply not running" — an earlier revision required "every alias, always" from the
 # probe, which no fleet containing a stopped product can satisfy.
 mi_probe_selfcheck() {
   if [ "$#" -ne 2 ]; then mi_warn "probe: mi_probe_selfcheck needs an <index file> and a <network id>"; return 1; fi
   mi_probe_available "$1" || return 1
-  if _mi_probe_run "$1" "$2" selfcheck >/dev/null; then return 0; fi
-  mi_warn "probe: the probe could not resolve its OWN alias on network '$2'."
-  mi_warn "  DNS on this network is not working — this is not about any one product being stopped."
+  local out rc
+  if out="$(_mi_probe_run "$1" "$2" selfcheck)"; then rc=0; else rc=$?; fi
+  if [ "$rc" -eq 0 ]; then
+    _mi_probe_asserted "$out" selfcheck || return 1
+    return 0
+  fi
+  # rc 4 is "the container could not be accounted for", already reported by _mi_probe_run. The probe
+  # may well have resolved its own alias before the runtime stopped answering, so calling DNS broken
+  # here would send an operator to debug a network that was never shown to be at fault.
+  if [ "$rc" -ne 4 ]; then
+    mi_warn "probe: the probe could not resolve its OWN alias on network '$2'."
+    mi_warn "  DNS on this network is not working — this is not about any one product being stopped."
+  fi
   return 1
 }
 
@@ -207,6 +282,9 @@ mi_probe_resolve() {
   if [ "$#" -ne 3 ]; then mi_warn "probe: mi_probe_resolve needs an <index file>, a <network id> and an <alias>"; return 1; fi
   mi_probe_available "$1" || return 1
   local out answered addr rc
+  # EVERY non-zero lands on 1, including _mi_probe_run's 4 (the run's container could not be accounted
+  # for): rc 3 is reserved for the probe having LOOKED and found nothing, and a run that did not
+  # finish never looked.
   out="$(_mi_probe_run "$1" "$2" resolve "$3")" || return 1
 
   # AN ANSWER IS ONLY AN ANSWER TO THE QUESTION THAT WAS ASKED. The helper echoes the alias it looked
@@ -246,8 +324,16 @@ mi_probe_resolve() {
 mi_probe_egress() {
   if [ "$#" -ne 2 ]; then mi_warn "probe: mi_probe_egress needs an <index file> and a <network id>"; return 1; fi
   mi_probe_available "$1" || return 1
-  if _mi_probe_run "$1" "$2" egress >/dev/null; then return 0; fi
-  mi_warn "probe: egress from network '$2' is not working."
+  local out rc
+  if out="$(_mi_probe_run "$1" "$2" egress)"; then rc=0; else rc=$?; fi
+  if [ "$rc" -eq 0 ]; then
+    # The same rule as selfcheck's, for the same reason: `egress=ok` is this check's stated result,
+    # and an answer about a DIFFERENT check is no more this one's answer than a resolve reply about
+    # another alias is that alias's address.
+    _mi_probe_asserted "$out" egress || return 1
+    return 0
+  fi
+  if [ "$rc" -ne 4 ]; then mi_warn "probe: egress from network '$2' is not working."; fi
   return 1
 }
 

@@ -96,6 +96,46 @@ put_raw() { { mi_ledger_read; printf '%s\n' "$1"; } | mi_ledger_write; }
   assert_contains "DNS on this network"
 }
 
+# AN EXIT STATUS IS NOT A RESULT. The helper interface STATES its answer (`selfcheck=ok`), so that is
+# what has to be present — a pinned image that regressed to exiting 0 while saying nothing, or while
+# saying `selfcheck=fail`, would otherwise be read as a verified network by the one function whose
+# whole purpose is to decide whether DNS works. This is the rule mi_probe_resolve already applies to
+# `alias=`, at the two doors that did not have it.
+@test "selfcheck refuses a zero-exit helper that does not STATE selfcheck=ok" {
+  fake_helper 'exit 0'
+  run mi_probe_selfcheck "$MYTHICAL_HOME/index" "$NET"
+  [ "$status" -ne 0 ] \
+    || { echo "a silent zero-exit helper was accepted as a verified network" >&2; return 1; }
+  assert_contains "selfcheck"
+
+  fake_helper 'printf "selfcheck=fail\n"; exit 0'
+  run mi_probe_selfcheck "$MYTHICAL_HOME/index" "$NET"
+  [ "$status" -ne 0 ] \
+    || { echo "'selfcheck=fail' with exit 0 was accepted as a verified network" >&2; return 1; }
+}
+
+# The helper's contract is 0/1/2. An OUT-OF-CONTRACT status is a failed check like any other, and it
+# is SAID so — what it must never become is this module's own "the container could not be accounted
+# for", which sends an operator to 'state repair' over an object that was reaped normally and no
+# longer exists.
+#
+# The middle assertion is the one that matters and the one a first draft of this test did not have:
+# asserting only the two ABSENCES passes just as well when an out-of-contract status collides with
+# this module's own rc 4, and the failure is then reported by nobody at all — no verdict, no warning,
+# a silent non-zero. Measured: that draft survived the mutation that removes the normalisation.
+@test "an out-of-contract helper status is a REPORTED failed check, not an unaccounted-for container" {
+  fake_helper 'exit 4'
+  run mi_probe_selfcheck "$MYTHICAL_HOME/index" "$NET"
+  [ "$status" -ne 0 ] \
+    || { echo "an out-of-contract helper status was accepted as a verified network" >&2; return 1; }
+  assert_contains "not a status the helper contract defines"
+  assert_contains "DNS on this network"
+  case "$output" in
+    *"could not be accounted for"*)
+      echo "a reaped container was reported as outstanding: $output" >&2; return 1 ;;
+  esac
+}
+
 @test "resolve returns the address for an alias" {
   HELPER_RESOLVE_ADDR=10.88.1.7 run mi_probe_resolve "$MYTHICAL_HOME/index" "$NET" p1
   [ "$status" -eq 0 ]
@@ -155,13 +195,33 @@ put_raw() { { mi_ledger_read; printf '%s\n' "$1"; } | mi_ledger_write; }
 # accounts for a container that survived, so it may go only once the runtime has SAID the container is
 # gone. Here the daemon stops answering between the run and that question: the container's fate is
 # unknown, so the record stays.
-@test "a run whose container could not be accounted for afterwards KEEPS its intent" {
+#
+# AND THE CALL ITSELF FAILS. Keeping the intent while returning 0 tells the caller both "there is
+# nothing outstanding" (rc 0) and "there might be" (the record) at once, and the caller acts on the
+# rc: it proceeds, believing a probe container nobody can account for was cleaned up. The status
+# assertion is not decoration — without it this test passes with that defect installed.
+@test "a run whose container could not be accounted for afterwards KEEPS its intent AND FAILS" {
   mi_rt_image_pull "$PROBE_REF" >/dev/null     # so the call count below is the run's own
   # Calls made while the knob is set: 1 image inspect (present), 2 container run. The reap's inspect
   # is the third, and its ping the fourth — both die, so mi_rt_inspect reports "could not ask".
   FAKE_DOCKER_DOWN_AFTER=2 run mi_probe_selfcheck "$MYTHICAL_HOME/index" "$NET"
+  [ "$status" -ne 0 ] \
+    || { echo "a run whose container could not be accounted for reported success" >&2; return 1; }
   run mi_intent_all
   assert_contains "class=probe"
+}
+
+# ...and it fails as the fact it IS. The probe answered here — the daemon died afterwards — so
+# claiming DNS is broken would send an operator to debug a network that was never shown to be at
+# fault. The two facts are reported separately or one of them is a lie.
+@test "an unaccountable probe container is not reported as a DNS verdict" {
+  mi_rt_image_pull "$PROBE_REF" >/dev/null
+  FAKE_DOCKER_DOWN_AFTER=2 run mi_probe_selfcheck "$MYTHICAL_HOME/index" "$NET"
+  case "$output" in
+    *"DNS on this network"*)
+      echo "an unaccounted-for container was reported as broken DNS: $output" >&2; return 1 ;;
+  esac
+  assert_contains "could not be accounted for"
 }
 
 # §6a/§6b: a probe container is an object like any other while it exists. Without the installation
@@ -241,4 +301,25 @@ put_raw() { { mi_ledger_read; printf '%s\n' "$1"; } | mi_ledger_write; }
   [ "$status" -eq 0 ]
   HELPER_EGRESS=fail run mi_probe_egress "$MYTHICAL_HOME/index" "$NET"
   [ "$status" -ne 0 ]
+}
+
+# The same door, the same rule: `egress=ok` is the stated result and nothing else is one. An answer
+# to ANOTHER check is not an answer to this one either — the third case below exits 0 and states a
+# perfectly good `selfcheck=ok`, which says nothing whatever about egress.
+@test "egress refuses a zero-exit helper that does not STATE egress=ok" {
+  fake_helper 'exit 0'
+  run mi_probe_egress "$MYTHICAL_HOME/index" "$NET"
+  [ "$status" -ne 0 ] \
+    || { echo "a silent zero-exit helper was accepted as working egress" >&2; return 1; }
+  assert_contains "egress"
+
+  fake_helper 'printf "egress=fail\n"; exit 0'
+  run mi_probe_egress "$MYTHICAL_HOME/index" "$NET"
+  [ "$status" -ne 0 ] \
+    || { echo "'egress=fail' with exit 0 was accepted as working egress" >&2; return 1; }
+
+  fake_helper 'printf "selfcheck=ok\n"; exit 0'
+  run mi_probe_egress "$MYTHICAL_HOME/index" "$NET"
+  [ "$status" -ne 0 ] \
+    || { echo "an answer about another check was accepted as working egress" >&2; return 1; }
 }
