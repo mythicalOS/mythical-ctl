@@ -231,6 +231,19 @@ put_raw() { { mi_ledger_read; printf '%s\n' "$1"; } | mi_ledger_write; }
   mi_rt_volume_create v1 "$n" "$IDENT"
   run mi_intent_confirm volume v1 "$n"
   [ "$status" -ne 0 ]
+  # AND FOR THE RIGHT REASON. Found by mutation: routing an ambiguous set into the absent-intent arm
+  # refuses too, so a status-only assertion passed and the arm could be deleted with the suite green.
+  # The two are not the same fact — "the ledger holds two records that contradict each other, run
+  # state repair" versus "nothing here recorded an intent" — and they send an operator to different
+  # places.
+  #
+  # THE POSITIVE CONTROL FIRST, then the absence. Asserting the ambiguity wording alone does NOT
+  # distinguish them: _mi_led_select prints that itself whenever it finds two, so it is in the output
+  # either way — measured, the mutation survived this assertion. What only the defect produces is the
+  # SECOND, contradicting sentence printed after it.
+  assert_contains "records answer for"
+  run grep -a 'no recorded intent' <<<"$output"
+  [ "$status" -ne 0 ]
   # Both rows are still there, and no provenance was written on the strength of a ledger that
   # contradicts itself.
   run mi_led_all intent
@@ -414,13 +427,18 @@ put_raw() { { mi_ledger_read; printf '%s\n' "$1"; } | mi_ledger_write; }
   n="$(mi_nonce_new)"
   mi_rt_network_create mythical-i1-net "$IDENT" "$n" >/dev/null
   mi_intent_open network mythical-i1-net "$n"
-  # The listing answers (1), the installation label answers (2), and the daemon stops before the id
-  # (3). EVERY inspect on this path is its own question and every one of them has to be able to fail:
-  # found by mutation, the identity read added above shadowed this arm, so restoring the `|| true`
-  # on the id read left the suite green. The empty-id guard below it reaches the same rc, so what
-  # this asserts is the REASON — an operator sent to look for a network the runtime "named no id"
-  # for, when in fact nobody could be asked, is being sent to the wrong place.
-  FAKE_DOCKER_DOWN_AFTER=2 run mi_intent_reconcile network mythical-i1-net
+  # The listing answers (1), the installation label answers (2), the nonce answers (3), and the
+  # daemon stops before the id (4). EVERY inspect on this path is its own question and every one of
+  # them has to be able to fail: found by mutation, the identity read added above shadowed this arm,
+  # so restoring the `|| true` on the id read left the suite green. The empty-id guard below it
+  # reaches the same rc, so what this asserts is the REASON — an operator sent to look for a network
+  # the runtime "named no id" for, when in fact nobody could be asked, is being sent to the wrong
+  # place.
+  #
+  # THE COUNT IS PART OF THE FIXTURE, not a detail: when the adoption predicate gained the nonce
+  # question this was a 2, and the daemon then died on the NONCE read instead — the assertion below
+  # went red rather than passing against an unpinned arm, which is the only reason it is 3 now.
+  FAKE_DOCKER_DOWN_AFTER=3 run mi_intent_reconcile network mythical-i1-net
   [ "$status" -eq 4 ]
   assert_contains "could not be inspected"
   run mi_prov_find network mythical-i1-net
@@ -493,10 +511,14 @@ put_raw() { { mi_ledger_read; printf '%s\n' "$1"; } | mi_ledger_write; }
   n="$(mi_nonce_new)"
   mi_rt_network_create mythical-i1-net "$IDENT" "$n" >/dev/null
   mi_intent_open network mythical-i1-net "$n"
-  # Inspect 1 answers whose it is; it is removed before inspect 2 asks what it is. rc 3, not rc 1:
-  # the daemon answered, and its answer is that the object is gone — which is a fact a later run can
-  # act on, and is reported as such rather than as a question nobody could ask.
-  FAKE_DOCKER_INSPECT_MISSING=mythical-i1-net FAKE_DOCKER_INSPECT_MISSING_AFTER=1 \
+  # Inspects 1 and 2 answer whose it is and which it is; it is removed before inspect 3 asks what it
+  # is. rc 3, not rc 1: the daemon answered, and its answer is that the object is gone — which is a
+  # fact a later run can act on, and is reported as such rather than as a question nobody could ask.
+  #
+  # The count is part of the fixture. At 1 the object now vanishes before the NONCE read, which is a
+  # real arm but a DIFFERENT one — this test would still have passed on the same assertion while the
+  # id read's gone arm went unpinned, and the mutation that deletes it would have survived.
+  FAKE_DOCKER_INSPECT_MISSING=mythical-i1-net FAKE_DOCKER_INSPECT_MISSING_AFTER=2 \
     run mi_intent_reconcile network mythical-i1-net
   [ "$status" -eq 4 ]
   assert_contains "already gone"
@@ -517,5 +539,205 @@ put_raw() { { mi_ledger_read; printf '%s\n' "$1"; } | mi_ledger_write; }
   [ "$status" -eq 4 ]
   assert_contains "already gone"
   run mi_intent_find volume v1
+  [ "$status" -eq 0 ]
+}
+
+# --- a name alone never binds an object; the nonce does ---------------------------------------------
+#
+# The rule mi_prov_authority refuses on — `docker volume create` against an existing name succeeds
+# and returns whatever already holds it, WITHOUT applying our labels, so a name can be silently
+# reassigned — asked of the two lookups that decide whether the ledger accounts for something.
+
+@test "a record does NOT account for a DIFFERENT object standing at the name it records" {
+  n="$(mi_nonce_new)"; name="mythical-${IDENT}-p1-state"
+  mi_intent_open volume "$name" "$n"
+  mi_rt_volume_create "$name" "$n" "$IDENT"
+  mi_intent_confirm volume "$name" "$n"
+  # The recorded object goes and another takes its name — labelled for THIS installation, so every
+  # identity question still answers "ours", and carrying a nonce this ledger never recorded. A
+  # same-name row is not an account of the replacement, and the gate every mutating verb calls first
+  # reported clear on the strength of one.
+  mi_rt_volume_rm "$name" >/dev/null
+  m="$(mi_nonce_new)"
+  mi_rt_volume_create "$name" "$m" "$IDENT"
+  run mi_unaccounted_gate
+  [ "$status" -ne 0 ]
+  assert_contains "unrecorded"
+  assert_contains "$name"
+  # And the record is preserved as it stands, still naming the object that is gone.
+  run mi_prov_find volume "$name"
+  [ "$status" -eq 0 ]
+  assert_contains "nonce=$n"
+}
+
+@test "an INTENT does not account for an object carrying a different nonce either" {
+  n="$(mi_nonce_new)"; m="$(mi_nonce_new)"; name="mythical-${IDENT}-p1-state"
+  mi_intent_open volume "$name" "$n"
+  # Ours by label, standing at the intended name — and not the object the intent describes. The
+  # identical hole as the record above, one lookup along, which is why both are asked by one
+  # predicate rather than by two same-shaped conditions.
+  mi_rt_volume_create "$name" "$m" "$IDENT"
+  run mi_unaccounted_gate
+  [ "$status" -ne 0 ]
+  assert_contains "unrecorded"
+  assert_contains "$name"
+  run mi_intent_find volume "$name"
+  [ "$status" -eq 0 ]
+}
+
+@test "an object the LEDGER cannot answer for stops the gate as UNASKED, not as unrecorded" {
+  n="$(mi_nonce_new)"; name="mythical-${IDENT}-p1-state"
+  mi_rt_volume_create "$name" "$n" "$IDENT"
+  mi_intent_open volume "$name" "$n"
+  mi_intent_confirm volume "$name" "$n"
+  # A second record answering for the same key, which only a restored or foreign ledger produces.
+  # Two records are neither one nor none: the ledger cannot say which describes the object, so
+  # nothing has been SHOWN to account for it — and "could not ask" was folded into "there is no
+  # record", which is the same fail-open the three `|| true` inspects had.
+  put_raw "$(printf 'object\tkey=volume:%s\tclass=volume\tname=%s\tnonce=%s\tgen=9' "$name" "$name" "$n")"
+  # ASSERTED ON THE ROWS, WITH STDERR DISCARDED: both classifications stop the gate, so only the
+  # scan's own output distinguishes them, and the remedy an operator is given differs.
+  rows="$(mi_unaccounted_scan 2>/dev/null)"
+  want="$(printf 'unasked\tvolume\t%s' "$name")"
+  case "$rows" in
+    *"$want"*) : ;;
+    *) echo "expected an unasked row for the object; rows were: [$rows]" >&2; return 1 ;;
+  esac
+  run mi_unaccounted_gate
+  [ "$status" -ne 0 ]
+}
+
+@test "a record describing something ELSE accounts for nothing, even with a matching nonce" {
+  n="$(mi_nonce_new)"; name="mythical-${IDENT}-p1-state"
+  mi_rt_volume_create "$name" "$n" "$IDENT"
+  # A row keyed for this VOLUME while describing a CONTAINER — key, class and name are three
+  # independent fields and nothing makes them agree. It is reachable from a restored ledger, and the
+  # name collision is real besides: _mi_prov_key records that a product named `p1-state` derives a
+  # container name byte-identical to this volume's.
+  #
+  # THE NONCE MATCHES ON PURPOSE. Found by mutation: with any other nonce the nonce check refuses
+  # first and shadows this one entirely, so deleting the describes-check left the suite green. Making
+  # the nonce agree is what leaves this the only thing standing between a record about a container
+  # and an account of a volume.
+  put_raw "$(printf 'object\tkey=volume:%s\tclass=container\tname=%s\tnonce=%s\tgen=1' "$name" "$name" "$n")"
+  run mi_unaccounted_gate
+  [ "$status" -ne 0 ]
+  assert_contains "unrecorded"
+  assert_contains "$name"
+}
+
+@test "an EMPTY nonce on both sides is not a match — a record with no identity accounts for nothing" {
+  name="mythical-${IDENT}-p1-state"
+  # An object of ours carrying an installation label and NO nonce, and a record for that name whose
+  # nonce field is present and empty. String equality alone calls those two a match, and an empty
+  # nonce names no object — so a record with nothing identifying in it would account for whatever
+  # happened to be standing at the name.
+  mkdir -p "$FAKE_DOCKER_STATE/volumes"
+  printf 'labels=mythicalos.installation=%s;\ndriver=local\n' "$IDENT" > "$FAKE_DOCKER_STATE/volumes/$name"
+  mi_prov_record volume "$name" ""
+  run mi_unaccounted_gate
+  [ "$status" -ne 0 ]
+  assert_contains "unrecorded"
+  assert_contains "$name"
+}
+
+@test "two INTENT rows answering for one key stop the gate as unasked, like two records do" {
+  n="$(mi_nonce_new)"; name="mythical-${IDENT}-p1-state"
+  mi_rt_volume_create "$name" "$n" "$IDENT"
+  mi_intent_open volume "$name" "$n"
+  # The mirror of the ambiguous-provenance case above. The rule has to hold on BOTH lookups: it was
+  # written out twice as `>/dev/null 2>&1`, and a fix applied to one of two same-shaped conditions is
+  # this plan's recurring defect.
+  put_raw "$(printf 'intent\tkey=volume:%s\tclass=volume\tname=%s\tnonce=%s\tcreated=1' "$name" "$name" "$n")"
+  rows="$(mi_unaccounted_scan 2>/dev/null)"
+  want="$(printf 'unasked\tvolume\t%s' "$name")"
+  case "$rows" in
+    *"$want"*) : ;;
+    *) echo "expected an unasked row for the object; rows were: [$rows]" >&2; return 1 ;;
+  esac
+  run mi_unaccounted_gate
+  [ "$status" -ne 0 ]
+}
+
+@test "an object whose NONCE could not be read is not accounted for by a record that names it" {
+  n="$(mi_nonce_new)"; name="mythical-${IDENT}-p1-state"
+  mi_rt_volume_create "$name" "$n" "$IDENT"
+  mi_intent_open volume "$name" "$n"
+  mi_intent_confirm volume "$name" "$n"
+  # Call 1 lists containers, 2 lists volumes, 3 asks whose this one is — and the daemon stops before
+  # 4, which is the question the record has to be matched against. A record still answers for the
+  # NAME; nothing answers for the object, and an unreadable question authorizes nothing.
+  rows="$(FAKE_DOCKER_DOWN_AFTER=3 mi_unaccounted_scan 2>/dev/null)"
+  want="$(printf 'unasked\tvolume\t%s' "$name")"
+  case "$rows" in
+    *"$want"*) : ;;
+    *) echo "expected an unasked row for the object; rows were: [$rows]" >&2; return 1 ;;
+  esac
+}
+
+# --- a confirmation is the second half of ONE intent ------------------------------------------------
+
+@test "confirm REFUSES a nonce that is not the durable intent's, and consumes nothing" {
+  n="$(mi_nonce_new)"; m="$(mi_nonce_new)"
+  mi_intent_open volume v1 "$n"
+  mi_rt_volume_create v1 "$n" "$IDENT"
+  # Tasks 7, 8 and 9 call this from thirteen places, so a caller arriving with the wrong nonce is an
+  # ordinary future bug. It used to atomically discard the intent that named the object and record a
+  # different one in its place, after which the live object matches neither — and the unaccounted
+  # gate, which is what would catch that, said "recorded" for the same reason.
+  run mi_intent_confirm volume v1 "$m"
+  [ "$status" -ne 0 ]
+  run mi_intent_find volume v1
+  [ "$status" -eq 0 ]
+  assert_contains "nonce=$n"
+  run mi_prov_find volume v1
+  [ "$status" -eq 3 ]
+}
+
+@test "confirm REFUSES when there is no intent for it to be the second half of" {
+  n="$(mi_nonce_new)"
+  mi_rt_volume_create v1 "$n" "$IDENT"
+  run mi_intent_confirm volume v1 "$n"
+  [ "$status" -ne 0 ]
+  # THE REASON, not just the refusal. The describes-check one line further down also refuses an
+  # absent intent — an empty record describes nothing — so a status assertion alone passes whichever
+  # of the two spoke, and the arm this test exists for could be deleted with the suite green. It is
+  # the message that differs, and an operator told "the record found does not describe this object"
+  # when in fact no record was found is sent to look for the wrong thing.
+  assert_contains "no recorded intent"
+  run mi_prov_find volume v1
+  [ "$status" -eq 3 ]
+}
+
+@test "confirm REFUSES an intent row whose class and name describe something else" {
+  n="$(mi_nonce_new)"
+  # key, class and name are three independent fields and nothing makes them agree; a row keyed for
+  # this object while describing another answers the lookup and then speaks about something else.
+  put_raw "$(printf 'intent\tkey=volume:v1\tclass=container\tname=other\tnonce=%s\tcreated=1' "$n")"
+  mi_rt_volume_create v1 "$n" "$IDENT"
+  run mi_intent_confirm volume v1 "$n"
+  [ "$status" -ne 0 ]
+  run mi_prov_find volume v1
+  [ "$status" -eq 3 ]
+  run mi_led_all intent
+  [ "$(printf '%s\n' "$output" | grep -ac .)" = 1 ]
+}
+
+@test "confirm is ONE ledger write — the count is the crash-window guarantee, so the count is pinned" {
+  n="$(mi_nonce_new)"
+  mi_intent_open volume v1 "$n"
+  mi_rt_volume_create v1 "$n" "$IDENT"
+  # INTERPOSED ON THE WRITER, because inspecting the final rows cannot tell one write from two: a
+  # provenance-then-drop-the-intent implementation reaches the same end state through a window in
+  # which the object is BOTH intended and recorded, and a crash there hands the next run two
+  # accounts of one object. That window is the whole reason this is one write, and nothing was
+  # asserting it.
+  eval "$(declare -f mi_ledger_write | sed '1s/^mi_ledger_write/_mctl_real_ledger_write/')"
+  mi_ledger_write() { printf 'w\n' >> "$BATS_TEST_TMPDIR/ledger-writes"; _mctl_real_ledger_write "$@"; }
+  mi_intent_confirm volume v1 "$n"
+  [ "$(grep -ac . "$BATS_TEST_TMPDIR/ledger-writes")" = 1 ]
+  run mi_intent_find volume v1
+  [ "$status" -eq 3 ]
+  run mi_prov_find volume v1
   [ "$status" -eq 0 ]
 }

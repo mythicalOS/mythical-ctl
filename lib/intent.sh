@@ -25,9 +25,21 @@
 #     _mi_prov_gen_ok the generation counter does — which is what that function's own note asks the
 #     next author to do rather than write a second one.
 #
-# And one rule of this module's own: ZERO MATCHES IS ONLY EVIDENCE WHEN THE RUNTIME ANSWERED. Every
-# decision here that turns on "there are none" — reissue, adopt, abandon, gate — goes through a
-# function that refuses to fold "could not ask" into "there are none".
+# And two rules of this module's own:
+#
+#   * ZERO MATCHES IS ONLY EVIDENCE WHEN THE RUNTIME ANSWERED. Every decision here that turns on
+#     "there are none" — reissue, adopt, abandon, gate — goes through a function that refuses to fold
+#     "could not ask" into "there are none".
+#   * A NAME ALONE NEVER BINDS AN OBJECT; THE NONCE DOES. §6a rejects names as reassignable, and it
+#     means it literally: `docker volume create` against an existing name SUCCEEDS and returns
+#     whatever already holds it, so an object can be removed and another created at the same name
+#     between any two questions this module asks. mi_prov_authority refuses a removal on exactly that
+#     mismatch. Every decision here that treats something as "the object this record or intent
+#     describes" — adopting, confirming, ageing out, and the §6b.2 gate — therefore compares nonces,
+#     and a nonce it could not read STOPS rather than falling through. The two places that did not
+#     ask (the unaccounted classifier, and the confirmation's choice of which intent it consumes)
+#     were how a live object could be recorded, gated and later authorized for deletion under a
+#     record that was never about it.
 #
 # PURE library — no side effects at source time; no `set -euo pipefail`.
 
@@ -104,29 +116,42 @@ _mi_intent_nonce() {
 
 # --- whose is it, and is it the one -----------------------------------------------------------------
 #
-# ONE OBJECT'S INSTALLATION LABEL, or a REASON there is none. rc 0 the label is printed, and an EMPTY
-# value means the object genuinely carries none · 3 the object is gone · 1 the question could not be
-# answered (REPORTED).
+# ONE LABEL OFF ONE OBJECT, or a REASON there is none. rc 0 the value is printed, and an EMPTY value
+# means the object genuinely carries no such label · 3 the object is gone · 1 the question could not
+# be answered (REPORTED).
 #
 # It replaces `mi_rt_inspect … || true` at three call sites, and that `|| true` was not a shortcut: it
 # turned both failures into the empty string, which every reader here treats as a FACT — "this object
-# carries no installation label". A down daemon therefore reported a foreign object as unlabelled, and
-# an object that had already been removed reported the same. mi_rt_inspect splits 3 from 1 precisely
-# so callers need not guess; this is the one place in this module that consumes the split.
+# carries no such label". A down daemon therefore reported a foreign object as unlabelled, and an
+# object that had already been removed reported the same. mi_rt_inspect splits 3 from 1 precisely so
+# callers need not guess; this is the one place in this module that consumes the split.
+#
+# IT TAKES THE LABEL RATHER THAN HARD-CODING THE INSTALLATION ONE, because the nonce is read in three
+# places — is this candidate the object the intent named, does the volume a reissue returned carry
+# our nonce, and does a ledger record account for what is actually standing there — and each one
+# otherwise carries its own copy of the `<no value>` normalisation below and its own answer to a
+# failed inspect. Two of the three already disagreed once. One reader, one normalisation, one split.
 _mi_intent_label() {
-  local kind="$1" name="$2" ifield label rc
+  local kind="$1" name="$2" want="$3" pfx label rc
   case "$kind" in
-    volume)    ifield=v.install ;;
-    network)   ifield=n.install ;;
-    container) ifield=c.install ;;
-    *) mi_warn "intent: '$kind' has no installation label this adapter can read"; return 1 ;;
+    volume)    pfx=v ;;
+    network)   pfx=n ;;
+    container) pfx=c ;;
+    *) mi_warn "intent: '$kind' has no labels this adapter can read"; return 1 ;;
   esac
-  if label="$(mi_rt_inspect "$kind" "$ifield" "$name")"; then rc=0; else rc=$?; fi
+  # The vocabulary is closed for the same reason the runtime adapter's template map is: an unknown
+  # field would otherwise reach mi_rt_inspect as a typo and come back as a refusal that reads like a
+  # daemon failure.
+  case "$want" in
+    install|nonce) : ;;
+    *) mi_warn "intent: '$want' is not a label this module reads"; return 1 ;;
+  esac
+  if label="$(mi_rt_inspect "$kind" "${pfx}.${want}" "$name")"; then rc=0; else rc=$?; fi
   [ "$rc" -ne 3 ] || return 3
   if [ "$rc" -ne 0 ]; then
-    mi_warn "intent: the container runtime could not be asked which installation $kind '$name'"
-    mi_warn "  belongs to. Nothing is adopted, aged out or accounted for on the strength of a"
-    mi_warn "  question that was never answered."
+    mi_warn "intent: the container runtime could not be asked for the ${want} label of $kind '$name'."
+    mi_warn "  Nothing is adopted, aged out or accounted for on the strength of a question that was"
+    mi_warn "  never answered."
     return 1
   fi
   # Docker's `index` on a label map with no such key prints `<no value>`, not the empty string, so the
@@ -156,14 +181,25 @@ _mi_intent_label() {
 # and later a deletion authority, for a name nothing holds. Everything downstream of this record
 # looks an object up by name.
 #
+# AND IT MUST STILL CARRY THE NONCE, ASKED OF THE OBJECT ITSELF. The candidate on the direct path
+# came out of a find-by-label listing, so the runtime has already said it carried the nonce — a
+# moment ago. Everything below re-asks the runtime BY NAME, and a name is precisely what §6a rejects
+# as binding: between the listing and these questions the object can be removed and another created
+# at the same name, and the answers would then describe an object the listing never named. That is
+# the same reassignment mi_prov_authority refuses on, and asking here makes this the single complete
+# answer to "is this the object this intent describes". It is also the check the reissue path already
+# had to make for a different reason (D56: a create against an existing name returns what already
+# holds it, unlabelled), which is now this one rather than a second copy of it.
+#
 # rc 0 yes · 2 it is NOT ours: another installation's, or unlabelled (REPORTED) · 4 it IS ours but
-# stands under another name (REPORTED) · 3 it is gone · 1 the question could not be answered
-# (REPORTED). The five are five, not two: "gone" is a fact a later run can act on, "could not ask"
-# authorizes nothing, and the two refusals differ in what an operator has to go and look at.
+# stands under another name (REPORTED) · 5 it is ours and correctly named but carries ANOTHER nonce
+# (REPORTED) · 3 it is gone · 1 the question could not be answered (REPORTED). The six are six, not
+# two: "gone" is a fact a later run can act on, "could not ask" authorizes nothing, and the refusals
+# differ in what an operator has to go and look at.
 _mi_intent_ours() {
-  local class="$1" name="$2" cand="$3" ident="$4" kind label rc
+  local class="$1" name="$2" cand="$3" ident="$4" nonce="$5" kind label actual rc
   kind="$(_mi_intent_rtkind "$class")" || return 1
-  if label="$(_mi_intent_label "$kind" "$cand")"; then rc=0; else rc=$?; fi
+  if label="$(_mi_intent_label "$kind" "$cand" install)"; then rc=0; else rc=$?; fi
   [ "$rc" -ne 3 ] || return 3
   [ "$rc" -eq 0 ] || return 1
   if [ -z "$label" ]; then
@@ -185,6 +221,17 @@ _mi_intent_ours() {
     mi_warn "  so recording this one under '$name' would record it for a name nothing holds. It is"
     mi_warn "  reported rather than adopted, and it is not removed."
     return 4
+  fi
+  if actual="$(_mi_intent_label "$kind" "$cand" nonce)"; then rc=0; else rc=$?; fi
+  [ "$rc" -ne 3 ] || return 3
+  [ "$rc" -eq 0 ] || return 1
+  if [ "$actual" != "$nonce" ]; then
+    mi_warn "intent: $kind '$cand' carries nonce '${actual:-<none>}', which does not match the"
+    mi_warn "  '$nonce' this intent recorded. A create against an existing name SUCCEEDS and returns"
+    mi_warn "  whatever already holds it without applying our labels, so the name standing here is"
+    mi_warn "  not evidence that this is the object. It is NOT adopted — nothing proves it is ours —"
+    mi_warn "  and NOT removed."
+    return 5
   fi
   return 0
 }
@@ -298,9 +345,42 @@ mi_intent_confirm() {
 
   records="$(mi_ledger_read)" || { rc=$?; [ "$rc" -eq 3 ] || return "$rc"; records=""; }
 
-  # The intent this confirmation consumes.
-  if oint="$(_mi_led_select "$records" "$MI_INTENT_KIND" key "$ikey")"; then :; else
-    rc=$?; [ "$rc" -eq 3 ] || return 1; oint=""
+  # THE INTENT THIS CONFIRMATION CONSUMES — AND IT MUST BE THE ONE.
+  #
+  # It was selected by KEY alone and dropped, while the record written carried the nonce the CALLER
+  # passed. Nothing compared the two. So a caller arriving with the wrong nonce — Tasks 7, 8 and 9
+  # call this from thirteen places, and a recovery mix-up or an ordinary bug is all it takes —
+  # atomically discarded the intent that named the object and recorded a different one in its place,
+  # in the single write that is supposed to make the exchange safe. Afterwards the live object
+  # matches neither: not the record, whose nonce it never carried, and not any intent, because the
+  # one that named it is gone. A nonce says WHICH object; two nonces are two objects, and this
+  # function's whole contract is that provenance replaces the intent FOR THE SAME ONE.
+  #
+  # ABSENCE FAILS TOO, and it was the benign case. "There is no intent" means either that this is not
+  # an object the write-ahead sequence opened, or that the record which would have let a later run
+  # recover has already been lost — and writing provenance on top of either records an object nothing
+  # ever said it was about to create.
+  if oint="$(_mi_led_select "$records" "$MI_INTENT_KIND" key "$ikey")"; then rc=0; else rc=$?; fi
+  if [ "$rc" -eq 3 ]; then
+    mi_warn "intent: there is no recorded intent for ${class} '${name}', so there is nothing this"
+    mi_warn "  confirmation is the second half of. Provenance is written for an object this installer"
+    mi_warn "  recorded that it was about to create, never on its own. Nothing was written."
+    return 1
+  fi
+  [ "$rc" -eq 0 ] || return 1
+  # key, class and name are three INDEPENDENT fields and nothing makes them agree, so a row keyed for
+  # this object while describing another answers the lookup and then speaks about something else.
+  # The same predicate deletion authority and the tombstone apply, on the third act performed on such
+  # a record — consuming it as the thing a confirmation replaces.
+  _mi_prov_record_describes "$oint" "$class" "$name" || return 1
+  local inonce
+  inonce="$(_mi_intent_nonce "$oint" "$name")" || return 1
+  if [ "$inonce" != "$nonce" ]; then
+    mi_warn "intent: the intent for ${class} '${name}' names nonce '${inonce}', and this confirmation"
+    mi_warn "  carries '${nonce}'. Those are two different objects, and recording one while dropping"
+    mi_warn "  the record of the other would leave whatever is actually standing there accounted for"
+    mi_warn "  by nothing at all. Both are PRESERVED and nothing was written."
+    return 1
   fi
   # The provenance record it supersedes. mi_prov_gen has already refused an ambiguous set above; this
   # is not that check repeated, it is what decides WHICH row is dropped — the row the selector
@@ -386,7 +466,7 @@ mi_intent_reconcile() {
     # IS IT OURS, AND IS IT THE ONE — asked BEFORE anything is written, because this is an adoption
     # and this is the path that did not ask. Every answer but the first preserves both the object and
     # the intent.
-    if _mi_intent_ours "$class" "$name" "$found" "$ident"; then orc=0; else orc=$?; fi
+    if _mi_intent_ours "$class" "$name" "$found" "$ident" "$nonce"; then orc=0; else orc=$?; fi
     case "$orc" in
       0) : ;;
       3) mi_warn "intent: the $class carrying nonce '$nonce' is already gone. Nothing is adopted; the"
@@ -480,40 +560,25 @@ mi_intent_reconcile() {
   # RE-INSPECT. The create succeeding is not evidence of creation: against an existing name
   # `docker volume create` returns the existing volume WITHOUT applying our labels.
   #
-  # Both halves go through the same two functions the direct one-match path above uses. They used to
-  # be two `… || true` inspects compared in one condition, which was fail-CLOSED — an unanswerable
-  # inspect became an empty string, which matched nothing, which refused — but it refused with the
-  # wrong stated reason, telling an operator that an identity did not match when in fact nobody could
-  # be asked. This module reports what actually happened everywhere else.
-  local actual arc
-  if _mi_intent_ours volume "$name" "$name" "$ident"; then arc=0; else arc=$?; fi
+  # ASKED BY THE ONE PREDICATE THE DIRECT PATH ABOVE USES, all three halves of it. This was two
+  # separate blocks — an identity check and then a nonce check written out again — so the two paths
+  # that adopt could disagree about what an adoption requires, and they did: the direct path never
+  # asked about the nonce at all once the listing had named the object, while this one did. The
+  # earlier form was also two `… || true` inspects compared in one condition, which was fail-CLOSED
+  # but refused with the wrong stated reason, telling an operator that an identity did not match when
+  # in fact nobody could be asked.
+  local arc
+  if _mi_intent_ours volume "$name" "$name" "$ident" "$nonce"; then arc=0; else arc=$?; fi
   case "$arc" in
     0) : ;;
     3) mi_warn "intent: the volume the reissue returned is already gone. The intent is RETAINED."
        return 4 ;;
-    1) mi_warn "  The intent for volume '$name' is RETAINED and will be reconciled on a later run."
+    1) mi_warn "  '$name' could not be inspected after the reissue, so nothing shows the volume"
+       mi_warn "  standing there is the one this intent describes. The intent is RETAINED."
        return 4 ;;
     *) mi_warn "  The intent for volume '$name' is RETAINED, and nothing was recorded for it."
        return 1 ;;
   esac
-  if actual="$(mi_rt_inspect volume v.nonce "$name")"; then arc=0; else arc=$?; fi
-  if [ "$arc" -eq 3 ]; then
-    mi_warn "intent: the volume the reissue returned is already gone. The intent is RETAINED."
-    return 4
-  fi
-  if [ "$arc" -ne 0 ]; then
-    mi_warn "intent: '$name' could not be inspected after the reissue, so nothing shows the volume"
-    mi_warn "  standing there is the one this intent describes. The intent is RETAINED."
-    return 4
-  fi
-  case "$actual" in '<no value>') actual="" ;; esac
-  if [ "$actual" != "$nonce" ]; then
-    mi_warn "intent: '$name' already existed and carries nonce '$actual', which does not match the"
-    mi_warn "  '$nonce' this intent recorded — a create against an existing name succeeds and returns"
-    mi_warn "  that volume without applying our labels."
-    mi_warn "  It is NOT adopted — nothing proves it is ours — and NOT removed. The intent is retained."
-    return 1
-  fi
   mi_intent_confirm volume "$name" "$nonce"
 }
 
@@ -561,7 +626,7 @@ mi_intent_abandonable() {
     fi
     while IFS= read -r m; do
       [ -n "$m" ] || continue
-      if _mi_intent_ours "$class" "$name" "$m" "$ident"; then orc=0; else orc=$?; fi
+      if _mi_intent_ours "$class" "$name" "$m" "$ident" "$nonce"; then orc=0; else orc=$?; fi
       case "$orc" in
         0) mine=1 ;;
         # Reported by the call above. Another installation's object, or one that was listed and is
@@ -570,6 +635,12 @@ mi_intent_abandonable() {
         # Ours, under another name. Abandoning would drop the only record tying this nonce to
         # anything, so it stops and an operator decides.
         4) mi_warn "  Refusing to age this intent out while an object of ours carries its nonce."
+           return 1 ;;
+        # Ours, at this intent's own name, carrying a different nonce. Every candidate here came out
+        # of a listing FOR this nonce, so reaching this arm means the object was replaced between the
+        # listing and the questions about it — which is the state §6b.2 stops a mutating verb on, and
+        # not one to clear an intent from.
+        5) mi_warn "  Refusing to age this intent out while an object of ours stands at its name."
            return 1 ;;
         *) mi_warn "  Refusing to age an intent out on a question that was never answered."
            return 1 ;;
@@ -655,8 +726,35 @@ mi_intent_abandon() {
 # mi_unaccounted_scan REPORTS all of them on stdout, one per line, and always succeeds.
 # mi_unaccounted_gate returns nonzero for the three that must stop a mutating operation.
 
-# Only the INSTALLATION label is read. The nonce says which object this is; the question here is only
-# whose it is, and the nonce answer was computed and never used.
+# DOES THIS RECORD ACCOUNT FOR THE OBJECT THAT IS ACTUALLY STANDING THERE? rc 0 yes · 1 no.
+#
+# THE SAME RULE THE ADOPTION PATH APPLIES, ON THE OTHER SIDE OF THE LEDGER. §6b.2 asked it by NAME
+# alone — "is there a record keyed class:name?" — and a name is exactly what §6a rejects as binding:
+# `docker volume create` against an existing name succeeds and returns whatever already holds it, so
+# a recorded object can be removed and REPLACED, and the replacement inherited an account it was
+# never given. mi_prov_authority refuses a removal on precisely this mismatch; this is the same
+# refusal on the gate every mutating verb calls BEFORE it touches anything, which is the earlier of
+# the two doors and the one that decides whether the operation runs at all.
+#
+# Silent, deliberately: it is asked of two record sets in turn, and a record that does not account for
+# the object is only worth reporting once the OTHER one has failed to as well — a superseded
+# provenance record beside a live intent for the same object is an ordinary mid-reissue state, not a
+# finding. The caller reports, once, when nothing accounted for it. _mi_prov_record_describes is the
+# exception and reports for itself: a record whose class and name describe something else is broken
+# whatever else answers.
+_mi_unacc_accounts() {
+  local rec="$1" class="$2" name="$3" live="$4" recorded
+  _mi_prov_record_describes "$rec" "$class" "$name" || return 1
+  if recorded="$(mi_led_field "$rec" nonce)"; then :; else recorded=""; fi
+  # PRESENCE IS NOT A VALUE, AND TWO EMPTIES ARE NOT A MATCH. An empty nonce names no object, so
+  # reading empty-equals-empty as agreement would let a record with no identity in it account for
+  # anything at all standing at that name — the same shape _mi_intent_nonce refuses one field along,
+  # and the same one mi_prov_authority refuses before it authorizes a removal.
+  [ -n "$recorded" ] && [ -n "$live" ] && [ "$recorded" = "$live" ]
+}
+
+# Only the INSTALLATION label decides WHOSE an object is. What decides whether the ledger accounts for
+# it is the NONCE, and that is asked here too — see _mi_unacc_accounts.
 #
 # THE THIRD SITE THAT SWALLOWED A FAILED INSPECT, and the one where doing so was fail-OPEN. `|| true`
 # made an unanswerable question read as "this object carries no label", after which a name outside our
@@ -665,9 +763,15 @@ mi_intent_abandon() {
 # built on it reported clear. The two failures are now two answers, and both are the scan's to report:
 # GONE (rc 3 — it is not there, so it accounts for nothing) and UNASKED (rc 1 — nothing here can be
 # shown to be accounted for).
+#
+# AND THE LEDGER IS ASKED THE SAME WAY. Both lookups below were `>/dev/null 2>&1`, which folds rc 1 —
+# the ledger could not be read, or TWO records answer for one key — into rc 3, "there is no record".
+# An ambiguous ledger is the one state that cannot say what accounts for anything, and it was being
+# consumed as a definite answer. `unasked` is what this module calls a question it could not get an
+# answer to, and it is what stops the gate.
 _mi_unacc_classify() {
-  local kind="$1" name="$2" ident="$3" lident rc
-  if lident="$(_mi_intent_label "$kind" "$name")"; then rc=0; else rc=$?; fi
+  local kind="$1" name="$2" ident="$3" lident lnonce rec why="" rc
+  if lident="$(_mi_intent_label "$kind" "$name" install)"; then rc=0; else rc=$?; fi
   if [ "$rc" -eq 3 ]; then printf 'gone\n'; return 0; fi
   if [ "$rc" -ne 0 ]; then printf 'unasked\n'; return 0; fi
 
@@ -680,9 +784,39 @@ _mi_unacc_classify() {
   fi
   if [ "$lident" != "$ident" ]; then printf 'foreign\n'; return 0; fi
 
-  # Same identity. Accounted for iff it has a live provenance record OR a live intent.
-  if mi_prov_find "$kind" "$name" >/dev/null 2>&1; then printf 'recorded\n'; return 0; fi
-  if mi_intent_find "$kind" "$name" >/dev/null 2>&1; then printf 'intended\n'; return 0; fi
+  # Same identity. The object's own nonce is what any record has to be matched against, so it is read
+  # BEFORE either lookup — and read honestly: an object that has gone accounts for nothing, and one
+  # nobody could ask about cannot be shown to be accounted for.
+  if lnonce="$(_mi_intent_label "$kind" "$name" nonce)"; then rc=0; else rc=$?; fi
+  if [ "$rc" -eq 3 ]; then printf 'gone\n'; return 0; fi
+  if [ "$rc" -ne 0 ]; then printf 'unasked\n'; return 0; fi
+
+  # Accounted for iff a live provenance record OR a live intent both describes this object and names
+  # the nonce it is actually carrying.
+  if rec="$(mi_prov_find "$kind" "$name")"; then rc=0; else rc=$?; fi
+  case "$rc" in
+    0) if _mi_unacc_accounts "$rec" "$kind" "$name" "$lnonce"; then printf 'recorded\n'; return 0; fi
+       why="its provenance record" ;;
+    3) : ;;
+    *) printf 'unasked\n'; return 0 ;;
+  esac
+  if rec="$(mi_intent_find "$kind" "$name")"; then rc=0; else rc=$?; fi
+  case "$rc" in
+    0) if _mi_unacc_accounts "$rec" "$kind" "$name" "$lnonce"; then printf 'intended\n'; return 0; fi
+       if [ -n "$why" ]; then why="${why} and its intent"; else why="its intent"; fi ;;
+    3) : ;;
+    *) printf 'unasked\n'; return 0 ;;
+  esac
+  # Reported here rather than inside the predicate, so it is said once and only when nothing accounted
+  # for the object at all. Without it the gate's stop below reads "the ledger has no record of it",
+  # which is false and sends an operator looking for the wrong thing: there IS a record, and it is
+  # about an object that is no longer the one standing there.
+  if [ -n "$why" ]; then
+    mi_warn "note: $kind '$name' is not accounted for by ${why} — the ledger answers for the NAME,"
+    mi_warn "  and the object standing at it carries nonce '${lnonce:-<none>}', which is not the one"
+    mi_warn "  recorded. A name can be reassigned: an object can be removed and another created at"
+    mi_warn "  the same name, and it inherits nothing from the record of the one that is gone."
+  fi
   printf 'unrecorded\n'
 }
 
