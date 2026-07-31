@@ -12,6 +12,12 @@
 # with no record — all resolve to leave it alone and report. No ambiguity is ever resolved in favour
 # of deletion.
 #
+# Applied to what is read off disk, that invariant is one rule: A RECORD IS WELL-FORMED, OR IT
+# MATCHES NOTHING AND IS PRESERVED AND REPORTED. It is enforced in ONE place — _mi_led_record_ok —
+# which every read path goes through: matching (and therefore deletion and supersession), field
+# extraction, and listing. It is not restated at any of them, because a rule enforced at some of a
+# module's inputs and not at the rest is how each of this file's earlier defects got in.
+#
 # PUBLIC SURFACE: mi_led_put, mi_led_del, mi_led_find, mi_led_all, mi_led_field, mi_ident_get,
 # mi_ident_ensure, mi_member_add, mi_member_has, mi_member_del, mi_prov_record, mi_prov_find,
 # mi_prov_tombstone, mi_prov_authority, mi_prov_image_record, mi_prov_gen, mi_first_use.
@@ -82,11 +88,18 @@ _mi_led_args_ok() {
 # Judge a whole field list. It lives beside the rule rather than inside mi_led_put because
 # mi_prov_tombstone serializes a record itself and must reach the identical check — two copies of a
 # serialization rule drift, and this one is the difference between a record and a forged record.
+#
+# IT IS ALSO THE READ SIDE'S RULE, reached through _mi_led_record_ok below, which splits a record
+# into its fields and hands them here. One implementation, both directions: what this module refuses
+# to write, it refuses to read, and neither can drift away from the other. The wording is therefore
+# neutral about direction — the caller's own message says whether it was writing or reading.
 _mi_led_fields_ok() {
   local f k seen=""
   for f in "$@"; do
     if ! _mi_led_field_ok "$f"; then
-      mi_warn "prov: refusing to write ledger field '$f' — fields are key=value, with no tab or newline"
+      mi_warn "prov: '$f' is not a ledger field — a field is key=value, with a lowercase name and no"
+      mi_warn "  tab and no newline. A record carrying one is ill-formed: it is never written, and if"
+      mi_warn "  it is already on disk it matches nothing and is left exactly where it is."
       return 1
     fi
     # ONE NAME, ONE FIELD — and this is a property of the LIST, not of a field, which is why it is
@@ -97,15 +110,17 @@ _mi_led_fields_ok() {
     # record answers the lookup for a DIFFERENT object's key while describing its own — and the
     # authority check then reads ITS nonce and compares it against the OTHER object's label. That is
     # authority over something this installer never created, assembled entirely out of accepted field
-    # syntax. Every reader here (mi_led_field, mi_ledger_get) also takes the first hit and ignores the
-    # rest, so a duplicate name is ambiguous even where it is not hostile.
+    # syntax. Every reader here (mi_led_field, and the ledger module's own getter) also takes the
+    # first hit and ignores the rest, so a duplicate name is ambiguous even where it is not hostile.
     k="${f%%=*}"
     # `seen` is one space-delimited string on purpose: bash 3.2 has no associative arrays, and
     # _mi_led_field_ok has already proved the name is [a-z_]+, so no name can contain a space and the
     # padded comparison below cannot match a prefix by accident.
     case " ${seen} " in
       *" ${k} "*)
-        mi_warn "prov: refusing a ledger record that carries '${k}' twice — one name, one field"
+        mi_warn "prov: a ledger record carries '${k}' twice — one name, one field. It is ambiguous:"
+        mi_warn "  every reader takes the first hit and ignores the rest, so such a record can answer"
+        mi_warn "  for one object while describing another. Refused on write; inert on read."
         return 1 ;;
     esac
     seen="${seen} ${k}"
@@ -113,38 +128,68 @@ _mi_led_fields_ok() {
   return 0
 }
 
-# Does <record> carry <field>=<value>, EXACTLY ONCE? Used to key an edit.
+# ONE RECORD, ONE MEANING — THE SINGLE GATE EVERY PATH THAT READS A RECORD OFF DISK GOES THROUGH.
 #
-# "Exactly once" is the whole guarantee, and returning on the first hit was not it: a record carrying
-# two `key=` fields matched two different selectors, so one record could be superseded, deleted or
-# retrieved as if it were another object's. mi_led_put refuses to write such a record, but the ledger
-# is a file — a restore puts one there that this installation never authored, and a checksum proves
-# integrity, not provenance. So the reader has to refuse it too, and independently.
+# The rule: a record read off disk is either WELL-FORMED, or it matches nothing and is preserved and
+# reported. Well-formed means every token is a field the writer above would have accepted — key=value
+# with a valid name, no forged separator — and no field NAME appears twice.
 #
-# An ambiguous record matches NOTHING, including its own key: it is inert rather than deleted. Any
-# mismatch preserves — the record stays on disk, is reported, and grants nothing.
-_mi_led_record_matches() {
-  local record="$1" field="$2" value="$3" tok hits=0 matched=1
+# It exists because the rule was being enforced at one of this module's inputs and not at the rest.
+# The key SELECTOR was validated, and the record could still be ill-formed anywhere else:
+#
+#   object<TAB>key=volume:v1<TAB>class=volume<TAB>name=v1<TAB>nonce=actual<TAB>gen=1<TAB>nonce=other
+#   object<TAB>key=volume:v1<TAB>class=volume<TAB>name=v1<TAB>nonce=actual<TAB>gen=1<TAB>not-a-field
+#
+# Both are checksum-valid on disk (a restored backup is the realistic source), both carry a unique
+# `key=`, and both describe the object they are found under — so every earlier rule passed them.
+# mi_led_field then returned the FIRST `nonce=` and silently ignored the second, the bare token was
+# ignored entirely, and mi_prov_authority granted deletion on the strength of a record that
+# contradicts itself. The same weakness ran the other way: mi_led_del and mi_led_put matched the
+# single `key=` and removed or superseded such a record, destroying the evidence that a ledger needs
+# repairing at the first ordinary operation that touched that key.
+#
+# ONE function, called by every reader, rather than the same test written out at each site: a copy at
+# a second site becomes a shadowed guard — deletable with nothing observable changing — and this
+# module has already had one of those (see the note at mi_prov_tombstone). The rule itself is not
+# restated here either; the record is split into its fields and judged by the WRITER's list rule
+# above, so the two directions cannot drift apart.
+#
+# rc 0 well-formed · 1 ill-formed, REPORTED. Every caller must treat 1 as "this matches nothing" and
+# must leave the record where it is.
+_mi_led_record_ok() {
   local IFS
   IFS=$'\t'
-  # shellcheck disable=SC2086   # deliberate IFS split on TAB of a record we wrote ourselves
-  set -- $record
-  for tok in "$@"; do
-    case "$tok" in
-      "${field}="*)
-        hits=$((hits + 1))
-        if [ "$tok" = "${field}=${value}" ]; then matched=0; fi ;;
-    esac
-  done
+  # shellcheck disable=SC2086   # deliberate IFS split on TAB, which IS this format's field separator
+  set -- $1
   # Restore word-splitting BEFORE reporting: mi_warn joins its arguments with the first character of
   # IFS, so a message emitted while IFS is a TAB would come out tab-joined the day someone gives it a
   # second argument. Cheap here, invisible to find later.
   IFS=$' \t\n'
-  if [ "$hits" -gt 1 ]; then
-    mi_warn "prov: a ledger record carries '${field}' ${hits} times — it is ambiguous, so it matches"
+  if [ "$#" -eq 0 ]; then
+    mi_warn "prov: a ledger record carries no fields at all — it describes nothing, so it matches"
     mi_warn "  nothing and grants nothing. Run 'mythical-ctl state repair'."
     return 1
   fi
+  _mi_led_fields_ok "$@" || return 1
+  return 0
+}
+
+# Does <record> carry <field>=<value>? Used to key an edit — and it answers only for a record this
+# module is willing to read at all, which is the gate above.
+#
+# An ill-formed or ambiguous record matches NOTHING, including its own key: it is inert rather than
+# deleted. Any mismatch preserves — the record stays on disk, is reported, and grants nothing.
+_mi_led_record_matches() {
+  local record="$1" field="$2" value="$3" tok matched=1
+  _mi_led_record_ok "$record" || return 1
+  local IFS
+  IFS=$'\t'
+  # shellcheck disable=SC2086   # deliberate IFS split on TAB of a record the gate has just judged
+  set -- $record
+  IFS=$' \t\n'
+  for tok in "$@"; do
+    if [ "$tok" = "${field}=${value}" ]; then matched=0; fi
+  done
   return "$matched"
 }
 
@@ -223,21 +268,50 @@ mi_led_find() {
 }
 
 # Every record of <kind>, one per line, without the kind prefix.
+#
+# COMPLETENESS IS THIS FUNCTION'S CONTRACT, which is why one record it cannot read refuses the WHOLE
+# listing instead of being quietly left out of it. The selector-based readers above differ
+# deliberately and for a reason that does not apply here: a selector asks about ONE object, so a
+# record that is not well-formed simply does not match it while every other record still answers for
+# itself. A listing says "these are all of them". One that silently omits what it could not read
+# cannot be reasoned about by its caller — and a caller enumerating records in order to ACT on them
+# would act on a subset believing it had the set. Nothing is deleted either way: the record stays on
+# disk and is reported.
 mi_led_all() {
   if [ "$#" -ne 1 ]; then mi_warn "prov: mi_led_all needs <kind>"; return 1; fi
-  local kind="$1" records line
+  local kind="$1" records line out=""
   _mi_led_args_ok "$kind" || return 1
   records="$(mi_ledger_read)" || return $?
   while IFS= read -r line; do
     [ -n "$line" ] || continue
-    case "$line" in "$kind"$'\t'*) printf '%s\n' "${line#*$'\t'}" ;; esac
+    case "$line" in
+      "$kind"$'\t'*)
+        if ! _mi_led_record_ok "${line#*$'\t'}"; then
+          mi_warn "prov: refusing to list '${kind}' records — one of them cannot be read, and a"
+          mi_warn "  listing that leaves out what it could not read is not a listing of all of them."
+          mi_warn "  It is preserved as it is. Run 'mythical-ctl state repair'."
+          return 1
+        fi
+        # Buffered rather than printed as the loop goes: a partial listing followed by a failure
+        # status is the shape a caller reads as success with data.
+        out="${out}${line#*$'\t'}"$'\n' ;;
+    esac
   done <<< "$records"
+  printf '%s' "$out"
   return 0
 }
 
 # Read one field out of a record printed by mi_led_find / mi_led_all.
+# rc 0 prints the value · 3 the record has no such field · 1 bad arguments, or a record this module
+# will not read.
 mi_led_field() {
   if [ "$#" -ne 2 ]; then mi_warn "prov: mi_led_field needs <record> <field>"; return 1; fi
+  # THE SAME GATE, ON THE EXTRACTION PATH. Taking the first hit and ignoring the rest is exactly what
+  # made a duplicate field name invisible here, and this is the function every other reader in the
+  # module gets its values from. It is applied in THIS function, not only in the ones that call it,
+  # because it is public, it is the only reader of a field out of a record, and the next caller may
+  # hold a record that came from a path which did not check.
+  _mi_led_record_ok "$1" || return 1
   # Save the field name BEFORE `set --`, which REPLACES the positional parameters: reading "$2"
   # afterwards would compare against the record's second field instead of the name we were asked for.
   # Found by executing this function, not by reading it.
@@ -281,13 +355,37 @@ _mi_ident_mint() {
   printf 'i%s\n' "$(printf '%s' "$h" | cut -c1-10)"
 }
 
-# rc 0 prints the identity · 3 no ledger / no identity recorded · 1 the ledger could not be read.
+# rc 0 prints the identity · 3 no ledger / no identity recorded · 1 the ledger could not be read, or
+# what it holds is not ONE answer.
 #
 # The 3-vs-1 split is what keeps a CORRUPT ledger from looking like a fresh machine. §6b: "cannot
 # answer 'is this installation mine?' ⇒ refuse to act on any container".
+#
+# IT READS THROUGH THIS MODULE'S OWN READER, not through the ledger module's convenience getter,
+# because the getter answers from any record of the kind without judging it — and it prints the value
+# of EVERY matching field it finds rather than one. An identity record carrying `id=` twice therefore
+# answered with a TWO-LINE identity, reported as success, and so did a ledger holding two identity
+# records. The identity scopes every runtime name and therefore every deletion decision, so it is the
+# last value in this module that may be assembled out of a record set nobody judged. mi_led_all
+# applies the well-formedness gate to each record; the count below is the other half of the question,
+# because "exactly one of them" is not a property of any single record.
 mi_ident_get() {
-  local v
-  v="$(mi_ledger_get "$MI_IDENT_KIND" id)" || return $?
+  local recs line rec="" count=0 v
+  recs="$(mi_led_all "$MI_IDENT_KIND")" || return $?
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    count=$((count + 1))          # a loop counter, not a value parsed out of a file
+    [ -n "$rec" ] || rec="$line"
+  done <<< "$recs"
+  if [ "$count" -eq 0 ]; then return 3; fi
+  if [ "$count" -gt 1 ]; then
+    mi_warn "prov: the ledger records ${count} installation identities — it cannot say which one this"
+    mi_warn "  installation is, so it says none. Every runtime name is scoped by the identity, so"
+    mi_warn "  guessing here would adopt or delete another installation's objects."
+    mi_warn "  Run 'mythical-ctl state repair'."
+    return 1
+  fi
+  v="$(mi_led_field "$rec" id)" || return 1
   [ -n "$v" ] || return 3
   printf '%s\n' "$v"
 }

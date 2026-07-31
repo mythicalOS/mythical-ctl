@@ -445,9 +445,12 @@ teardown() { mi_lock_release; teardown_test_env; }
   assert_contains "ambiguous"
   run mi_prov_find volume mine
   [ "$status" -eq 3 ]
-  # Inert, not deleted — any mismatch preserves and reports.
-  run mi_led_all object
-  assert_contains "key=volume:mine"
+  # Inert, not deleted — any mismatch preserves and reports. Asserted against the ledger FILE rather
+  # than against a listing: a listing now refuses a kind it cannot read completely, and the bytes on
+  # disk are the stronger evidence of preservation in any case — they prove the record survived,
+  # rather than proving that some reader was willing to hand it back.
+  [ "$(grep -ac 'key=volume:target' "$MYTHICAL_HOME/.state/ledger")" = 1 ] \
+    || { echo "the ambiguous record was not preserved" >&2; return 1; }
 }
 
 @test "authority checks that the record it found DESCRIBES the object it was asked about" {
@@ -463,6 +466,126 @@ teardown() { mi_lock_release; teardown_test_env; }
   run mi_prov_authority volume target
   [ "$status" -ne 0 ]
   assert_contains "does not describe it"
+}
+
+# --- a record is well-formed, or it matches nothing and is preserved and reported ------------------
+# The rule was applied to the SELECTOR and to nothing else, so a record could be ill-formed or
+# self-contradictory in any OTHER field and every read path tolerated it: matching accepted it,
+# extraction returned the first of two values and ignored the second, and the two editors matched the
+# single `key=` and removed or superseded it — destroying the evidence that should have been kept.
+
+# Put one record on disk the way a RESTORE does: through the ledger writer, checksum and all. The
+# editor refuses to write these, which is precisely why the READER has to refuse them independently —
+# a checksum proves the bytes were not altered after they were written, not that this installation
+# wrote them.
+put_raw() { { mi_ledger_read; printf '%s\n' "$1"; } | mi_ledger_write; }
+
+@test "a record ill-formed in a field OTHER than the selector is never authority, and is preserved" {
+  mi_ident_ensure >/dev/null
+  id="$(mi_ident_get)"
+  led="$MYTHICAL_HOME/.state/ledger"
+  for n in v1 v2 v3; do mi_rt_volume_create "$n" actual-nonce "$id"; done
+
+  # Each of the three carries exactly ONE `key=`, and its class and name describe the object it is
+  # found under — so the selector rule, the duplicate-selector rule and the class/name agreement rule
+  # all pass it. The nonce it then hands over is the LIVE one, so with no rule about the rest of the
+  # record, deleting each of these objects was authorized on the strength of a record that
+  # contradicts itself.
+  put_raw "$(printf 'object\tkey=volume:v1\tclass=volume\tname=v1\tnonce=actual-nonce\tgen=1\tnonce=other')"
+  put_raw "$(printf 'object\tkey=volume:v2\tclass=volume\tname=v2\tnonce=actual-nonce\tgen=1\tclass=container')"
+  put_raw "$(printf 'object\tkey=volume:v3\tclass=volume\tname=v3\tnonce=actual-nonce\tgen=1\tnot-a-field')"
+
+  run mi_prov_authority volume v1
+  [ "$status" -ne 0 ] || { echo "a duplicate nonce= AUTHORIZED deletion" >&2; return 1; }
+  run mi_prov_authority volume v2
+  [ "$status" -ne 0 ] || { echo "a duplicate class= AUTHORIZED deletion" >&2; return 1; }
+  run mi_prov_authority volume v3
+  [ "$status" -ne 0 ] || { echo "a bare non-field token AUTHORIZED deletion" >&2; return 1; }
+
+  # PRESERVATION IS THE OTHER HALF OF THE INVARIANT, and a test that asserts only the return value
+  # proves only half the rule: refusing while quietly dropping the record destroys exactly the
+  # evidence that says this ledger needs repairing.
+  [ "$(grep -ac 'nonce=other' "$led")" = 1 ] || { echo "the duplicate-nonce record was not preserved" >&2; return 1; }
+  [ "$(grep -ac 'class=container' "$led")" = 1 ] || { echo "the duplicate-class record was not preserved" >&2; return 1; }
+  [ "$(grep -ac 'not-a-field' "$led")" = 1 ] || { echo "the bare-token record was not preserved" >&2; return 1; }
+}
+
+@test "neither editor deletes or supersedes a record it refuses to read" {
+  mi_ident_ensure >/dev/null
+  led="$MYTHICAL_HOME/.state/ledger"
+  put_raw "$(printf 'object\tkey=volume:v9\tclass=volume\tname=v9\tnonce=preserve-me\tgen=1\tgen=2')"
+
+  # A deletion that finds nothing has achieved its purpose — but it must find nothing HERE, and leave
+  # what it could not read behind. Matching on the single `key=` made both editors act on the record.
+  run mi_led_del object key volume:v9
+  [ "$status" -eq 0 ] || { echo "expected 0, got $status: $output" >&2; return 1; }
+  [ "$(grep -ac 'nonce=preserve-me' "$led")" = 1 ] || { echo "mi_led_del REMOVED a record it cannot read" >&2; return 1; }
+
+  # Supersession is the same act by another name: it drops the matched record and writes one in its
+  # place, so an unreadable record disappeared at the first ordinary re-record of that object.
+  mi_prov_record volume v9 n2
+  [ "$(grep -ac 'nonce=preserve-me' "$led")" = 1 ] || { echo "mi_led_put SUPERSEDED a record it cannot read" >&2; return 1; }
+  [ "$(grep -ac 'nonce=n2' "$led")" = 1 ] || { echo "the new record was not written beside it" >&2; return 1; }
+}
+
+@test "mi_led_field refuses to read a field out of a record that is not well-formed" {
+  # The extraction half of the same rule. Every reader here takes the FIRST hit and ignores the rest,
+  # so a record carrying a name twice does not read as ambiguous — it reads as whichever value comes
+  # first, and the caller is never told there was a second one.
+  run mi_led_field "$(printf 'key=volume:v1\tclass=volume\tname=v1\tnonce=actual\tnonce=other')" nonce
+  [ "$status" -ne 0 ] || { echo "extracted '$output' from a record carrying nonce= twice" >&2; return 1; }
+  run mi_led_field "$(printf 'key=volume:v1\tclass=volume\tname=v1\tnot-a-field')" name
+  [ "$status" -ne 0 ] || { echo "extracted '$output' from a record carrying a bare token" >&2; return 1; }
+  # A record with no fields at all describes nothing. That is not the same as a record whose field is
+  # merely absent, which is rc 3.
+  run mi_led_field "" nonce
+  [ "$status" -eq 1 ] || { echo "expected 1, got $status: $output" >&2; return 1; }
+  # The gate is in this function, not only in the ones that call it: it is public, it is the only
+  # reader of a field out of a record, and the next caller may hold a record from a path that did not
+  # check. A well-formed record still answers.
+  run mi_led_field "$(printf 'key=volume:v1\tclass=volume\tname=v1\tnonce=actual')" nonce
+  [ "$status" -eq 0 ] || { echo "expected 0, got $status: $output" >&2; return 1; }
+  [ "$output" = actual ] || { echo "expected 'actual', got '$output'" >&2; return 1; }
+}
+
+@test "a listing refuses rather than silently omitting a record it cannot read" {
+  mi_ident_ensure >/dev/null
+  led="$MYTHICAL_HOME/.state/ledger"
+  mi_prov_record volume good good-nonce
+  put_raw "$(printf 'object\tkey=volume:bad\tclass=volume\tname=bad\tnonce=n1\tgen=1\tnonce=n2')"
+  # A selector asks about ONE object, so a record that is not well-formed simply does not match it and
+  # the others still answer for themselves. A listing claims to be ALL of them: one that quietly
+  # leaves out what it could not read cannot be reasoned about by a caller enumerating records in
+  # order to act on them, because "is this all of them?" has no answer.
+  run mi_led_all object
+  [ "$status" -ne 0 ] || { echo "listed a kind it cannot read completely: $output" >&2; return 1; }
+  case "$output" in
+    *good-nonce*) echo "a partial listing was printed beside the failure: $output" >&2; return 1 ;;
+  esac
+  [ "$(grep -ac 'nonce=n2' "$led")" = 1 ] || { echo "the unreadable record was not preserved" >&2; return 1; }
+}
+
+@test "an identity the ledger cannot answer for is refused, not read as a fresh machine" {
+  led="$MYTHICAL_HOME/.state/ledger"
+  # The identity scopes every runtime name, and therefore every deletion decision. It used to be read
+  # through a convenience getter that answers from any record of the kind without judging it: the
+  # getter prints the value of EVERY `id=` it finds, so the record below answered with a TWO-LINE
+  # identity, reported as success.
+  printf 'identity\tid=i0000000000\tid=iffffffffff\n' | mi_ledger_write
+  run mi_ident_get
+  [ "$status" -eq 1 ] || { echo "expected 1, got $status: $output" >&2; return 1; }
+  # And 1, not 3: 3 is "no identity recorded", which is first use — minting a fresh identity over a
+  # record we could not read is how every object the previous identity named becomes unreachable.
+  run mi_ident_ensure
+  [ "$status" -ne 0 ] || { echo "minted a new identity over one it could not read: $output" >&2; return 1; }
+  [ "$(grep -ac 'id=iffffffffff' "$led")" = 1 ] || { echo "the unreadable identity record was not preserved" >&2; return 1; }
+
+  # TWO well-formed identity records are the same question one level up: each is fine on its own, and
+  # "which installation is this?" still has no answer.
+  printf 'identity\tid=i0000000000\nidentity\tid=iffffffffff\n' | mi_ledger_write
+  run mi_ident_get
+  [ "$status" -eq 1 ] || { echo "expected 1, got $status: $output" >&2; return 1; }
+  assert_contains "identities"
 }
 
 @test "a REPEATED tombstone keeps the identity the tombstone exists to preserve" {
