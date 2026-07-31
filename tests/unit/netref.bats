@@ -119,9 +119,20 @@ probe_answers() { HELPER_RESOLVE_ADDR="$1"; export HELPER_RESOLVE_ADDR; }
   mi_rt_network_create opnet "" x >/dev/null
   printf 'MYTHICAL_NET=opnet\n' > "$MYTHICAL_HOME/mythical.conf"
   mi_net_target "$IDX" >/dev/null
+  # WHAT MUST NOT BE THERE, ASKED DIRECTLY. Reading the refusal alone is not enough: the wording
+  # "no provenance" also occurs inside the UNLABELLED-object refusal, which this fixture's network
+  # would draw anyway — so a mutation that recorded provenance for the operator's network kept the
+  # whole suite green. The absence of the record is the property, so the record is what is asked about.
+  run mi_prov_find network opnet
+  [ "$status" -eq 3 ]
   run mi_prov_authority network opnet
   [ "$status" -ne 0 ]
-  assert_contains "no provenance"
+  assert_contains "has no provenance record"
+  # And the thing that SHOULD have happened did: the reference itself is recorded, attach-only.
+  run mi_net_ref_get
+  [ "$status" -eq 0 ]
+  run mi_led_find netref key family
+  assert_contains "owned=no"
 }
 
 @test "an AMBIGUOUS resolution stops the operation rather than picking one" {
