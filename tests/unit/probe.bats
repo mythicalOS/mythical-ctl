@@ -96,22 +96,120 @@ put_raw() { { mi_ledger_read; printf '%s\n' "$1"; } | mi_ledger_write; }
   assert_contains "DNS on this network"
 }
 
-# AN EXIT STATUS IS NOT A RESULT. The helper interface STATES its answer (`selfcheck=ok`), so that is
-# what has to be present — a pinned image that regressed to exiting 0 while saying nothing, or while
-# saying `selfcheck=fail`, would otherwise be read as a verified network by the one function whose
-# whole purpose is to decide whether DNS works. This is the rule mi_probe_resolve already applies to
-# `alias=`, at the two doors that did not have it.
-@test "selfcheck refuses a zero-exit helper that does not STATE selfcheck=ok" {
+# THE NAME THE CHECK IS ABOUT IS THE CALLER'S, AND IT IS NEW EVERY RUN. `selfcheck=ok` on its own is
+# a claim no broken DNS could falsify: an image that printed it unconditionally, or that resolved its
+# own hostname out of /etc/hosts, would pass while the network's resolver was entirely dead. So the
+# caller mints an alias per run, REGISTERS it with the network itself, and asks the probe to resolve
+# THAT — a name that did not exist when the image was built and that no hosts file inside it contains.
+@test "selfcheck asks about a PER-RUN alias it registered with the network itself" {
+  mi_probe_selfcheck "$MYTHICAL_HOME/index" "$NET"
+  mi_probe_selfcheck "$MYTHICAL_HOME/index" "$NET"
+  a1="$(sed -n 's/.*--network-alias \([^ ]*\).*/\1/p' "$FAKE_DOCKER_STATE/calls.log" | head -n1)"
+  a2="$(sed -n 's/.*--network-alias \([^ ]*\).*/\1/p' "$FAKE_DOCKER_STATE/calls.log" | tail -n1)"
+  [ -n "$a1" ] \
+    || { echo "the probe registered no network alias at all" >&2; return 1; }
+  # A name minted per run cannot have been baked into the image.
+  [ "$a1" != "$a2" ] \
+    || { echo "two runs asked about the same alias: $a1" >&2; return 1; }
+  # ...and the question asked is that same name. Registering one name and looking up another would
+  # verify nothing about the one the caller controls.
+  run grep -ac -- "--network-alias ${a1} .* selfcheck ${a1}$" "$FAKE_DOCKER_STATE/calls.log"
+  [ "$output" = 1 ] \
+    || { echo "the registered alias is not the one looked up: $(cat "$FAKE_DOCKER_STATE/calls.log")" >&2; return 1; }
+}
+
+# THE TEST THE WHOLE MODULE EXISTS FOR: a conforming-looking selfcheck that answers out of the
+# container's HOSTS FILE — the one surface a dead resolver leaves working — must FAIL.
+#
+# The first half is the control, and it is not decoration: it shows the very same alias IS answerable
+# on this network through the resolver, so the second half fails because of WHERE it looked and not
+# because nothing could be resolved at all. The helper reports on stderr what its hosts file could
+# have answered, so a hosts view that was simply empty cannot masquerade as this result either.
+@test "a selfcheck answered from the container's HOSTS FILE cannot satisfy the check" {
+  run mi_probe_selfcheck "$MYTHICAL_HOME/index" "$NET"
+  [ "$status" -eq 0 ] \
+    || { echo "the reference probe could not resolve its own alias: $output" >&2; return 1; }
+
+  fake_helper '
+want="${2:-}"
+found=""
+mine=""
+IFS=";"
+for pair in ${HELPER_NET_HOSTS:-}; do
+  case "$pair" in
+    "${want}="*) found="${pair#*=}" ;;
+    "${HELPER_NET_HOSTNAME:-nosuchname}="*) mine="${pair#*=}" ;;
+  esac
+done
+printf "hosts-selfcheck: hosts-file-can-resolve=%s=%s\n" "${HELPER_NET_HOSTNAME:-}" "$mine" >&2
+printf "alias=%s\naddress=%s\n" "$want" "$found"
+if [ -n "$found" ]; then printf "selfcheck=ok\n"; else printf "selfcheck=fail\n"; exit 1; fi
+'
+  run mi_probe_selfcheck "$MYTHICAL_HOME/index" "$NET"
+  [ "$status" -ne 0 ] \
+    || { echo "a hosts-file selfcheck was accepted as a verified network" >&2; return 1; }
+  assert_contains "DNS on this network"
+  # ...and it failed because the ALIAS is not in the hosts file, not because the hosts file was
+  # empty: the helper reports what its own hosts file COULD answer, and it answered its hostname.
+  # Matched line-wise, deliberately — `case "$output" in *foo=?*)` matches the NEWLINE after `foo=`
+  # and passes on an empty value, which is how the first draft of this assertion was vacuous.
+  printf '%s\n' "$output" | grep -aq 'hosts-file-can-resolve=..*=..*' \
+    || { echo "the hosts view answered nothing, so this proves nothing: $output" >&2; return 1; }
+}
+
+# AN EXIT STATUS IS NOT A RESULT, and neither is a stated one on its own. `selfcheck=ok` is accepted
+# only ALONGSIDE the lookup it claims to have made — the alias echo and a real address — so a pinned
+# image that regressed to exiting 0 while saying nothing, or while saying `selfcheck=fail`, is refused
+# by the one function whose whole purpose is to decide whether DNS works.
+@test "selfcheck refuses an answer that does not STATE selfcheck=ok" {
+  fake_helper 'printf "alias=%s\naddress=10.88.1.7\nselfcheck=fail\n" "$2"'
+  run mi_probe_selfcheck "$MYTHICAL_HOME/index" "$NET"
+  [ "$status" -ne 0 ] \
+    || { echo "'selfcheck=fail' with exit 0 was accepted as a verified network" >&2; return 1; }
+  assert_contains "rather than 'selfcheck=ok'"
+
+  # A complete, well-formed lookup that says nothing about the check itself is not a passed check.
+  fake_helper 'printf "alias=%s\naddress=10.88.1.7\n" "$2"'
+  run mi_probe_selfcheck "$MYTHICAL_HOME/index" "$NET"
+  [ "$status" -ne 0 ] \
+    || { echo "an answer stating no result at all was accepted as a verified network" >&2; return 1; }
+  assert_contains "carries no 'selfcheck=' field"
+}
+
+@test "selfcheck refuses a zero-exit helper that answers nothing at all" {
   fake_helper 'exit 0'
   run mi_probe_selfcheck "$MYTHICAL_HOME/index" "$NET"
   [ "$status" -ne 0 ] \
     || { echo "a silent zero-exit helper was accepted as a verified network" >&2; return 1; }
-  assert_contains "selfcheck"
+  # Reported as the broken probe it is, NOT as a DNS verdict: nothing here shows the network at fault.
+  assert_contains "answered about"
+  case "$output" in
+    *"DNS on this network"*)
+      echo "a probe that answered nothing was reported as broken DNS: $output" >&2; return 1 ;;
+  esac
+}
 
-  fake_helper 'printf "selfcheck=fail\n"; exit 0'
+# The same rule selfcheck's sibling applies to resolve: an answer about another name is an answer to
+# another question, and here it would be a verified network claimed on a lookup of something else.
+@test "a selfcheck answer about a DIFFERENT alias is refused" {
+  fake_helper 'printf "alias=somethingelse\naddress=10.88.1.9\nselfcheck=ok\n"'
   run mi_probe_selfcheck "$MYTHICAL_HOME/index" "$NET"
   [ "$status" -ne 0 ] \
-    || { echo "'selfcheck=fail' with exit 0 was accepted as a verified network" >&2; return 1; }
+    || { echo "an answer about another alias was accepted as a verified network" >&2; return 1; }
+  assert_contains "answered about"
+}
+
+# A DUPLICATED FIELD IS MALFORMED EVIDENCE, NOT ITS FIRST COPY. The flat answer format has no meaning
+# for a repeated key — nothing in it says a second copy replaces, refines or contradicts the first —
+# so an answer that states a result twice states two, and is refused rather than read down to the
+# copy that happens to come first. Reading the first match let every check in this module be passed
+# by an answer that also contained its own refutation.
+@test "an answer that states its result TWICE is refused, not read as the first copy" {
+  fake_helper 'printf "alias=%s\naddress=10.88.1.7\nselfcheck=ok\nselfcheck=fail\n" "$2"'
+  run mi_probe_selfcheck "$MYTHICAL_HOME/index" "$NET"
+  [ "$status" -ne 0 ] \
+    || { echo "'selfcheck=ok' followed by 'selfcheck=fail' was accepted" >&2; return 1; }
+  assert_contains "more than once"
 }
 
 # The helper's contract is 0/1/2. An OUT-OF-CONTRACT status is a failed check like any other, and it
@@ -155,6 +253,29 @@ put_raw() { { mi_ledger_read; printf '%s\n' "$1"; } | mi_ledger_write; }
   run mi_probe_resolve "$MYTHICAL_HOME/index" "$NET" p1
   [ "$status" -eq 1 ]
   assert_contains "answered about"
+}
+
+# The finding's own example, at the door it was found in: an answer that names the alias asked about
+# AND another one is not an answer about the first. The address must not come back — the refusal is
+# what this test is for, and returning 10.88.1.9 would hand D42/D48's rebind another container's
+# address on the strength of a field that was contradicted two lines later.
+@test "an answer naming TWO aliases, or TWO addresses, is refused rather than read down to one" {
+  fake_helper 'printf "alias=p1\naddress=10.88.1.9\nalias=other\n"'
+  run mi_probe_resolve "$MYTHICAL_HOME/index" "$NET" p1
+  [ "$status" -eq 1 ]
+  assert_contains "more than once"
+  case "$output" in
+    *10.88.1.9*) echo "an address was returned out of an ambiguous answer: $output" >&2; return 1 ;;
+  esac
+
+  fake_helper 'printf "alias=p1\naddress=10.88.1.9\naddress=10.88.1.10\n"'
+  run mi_probe_resolve "$MYTHICAL_HOME/index" "$NET" p1
+  [ "$status" -eq 1 ]
+  assert_contains "more than once"
+  case "$output" in
+    *10.88.1.9*|*10.88.1.10*)
+      echo "an address was returned out of an ambiguous answer: $output" >&2; return 1 ;;
+  esac
 }
 
 # A missing address FIELD is a broken probe; an EMPTY address is the documented "did not resolve".
@@ -322,4 +443,14 @@ put_raw() { { mi_ledger_read; printf '%s\n' "$1"; } | mi_ledger_write; }
   run mi_probe_egress "$MYTHICAL_HOME/index" "$NET"
   [ "$status" -ne 0 ] \
     || { echo "an answer about another check was accepted as working egress" >&2; return 1; }
+}
+
+# The duplicate rule lives in the READER, so it holds at every door that reads a field — including
+# this one, which is the door a per-call copy of the rule would have been forgotten at.
+@test "egress refuses an answer that states its result more than once" {
+  fake_helper 'printf "egress=ok\negress=fail\n"'
+  run mi_probe_egress "$MYTHICAL_HOME/index" "$NET"
+  [ "$status" -ne 0 ] \
+    || { echo "'egress=ok' followed by 'egress=fail' was accepted as working egress" >&2; return 1; }
+  assert_contains "more than once"
 }

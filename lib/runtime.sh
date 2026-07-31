@@ -499,6 +499,17 @@ mi_rt_run_helper() {
       # two facts every other create in this module records. See the note above the function.
       name=*)    _mi_rt_arg_ok "${s#name=}" || { mi_warn "runtime: invalid helper container name"; return 1; }
                  rtargv+=(--name "${s#name=}") ;;
+      # A per-run DNS name for this container on the network it is joining (D49's selfcheck asks the
+      # probe to resolve the name it was registered under). It is a NETWORK alias, so it is refused
+      # outright when there is no network: a container in private (`none`) mode has no resolver for a
+      # name to be registered with, and a daemon asked for both answers with an error rather than a
+      # container. Refusing here means no caller can build that call at all.
+      netalias=*) if [ "$netspec" = none ]; then
+                    mi_warn "runtime: a network alias cannot be registered on a helper with no network"
+                    return 1
+                  fi
+                  _mi_rt_arg_ok "${s#netalias=}" || { mi_warn "runtime: invalid helper network alias"; return 1; }
+                  rtargv+=(--network-alias "${s#netalias=}") ;;
       install=*) _mi_rt_arg_ok "${s#install=}" || { mi_warn "runtime: invalid installation identity"; return 1; }
                  rtargv+=(--label "${MI_RT_NS}.installation=${s#install=}") ;;
       # An argument to the CLOSED command word, INSIDE the container — never a docker flag. Every

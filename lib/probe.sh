@@ -139,11 +139,15 @@ _mi_probe_reap() {
 # verification verdict it never obtained — "DNS is broken" for a daemon that stopped answering after
 # the probe had already resolved its alias.
 _mi_probe_run() {
-  if [ "$#" -lt 3 ]; then
-    mi_warn "probe: _mi_probe_run needs an <index file>, a <network id> and a <command>"
+  if [ "$#" -lt 4 ]; then
+    mi_warn "probe: _mi_probe_run needs an <index file>, a <network id>, a <network alias|-> and a <command>"
     return 1
   fi
-  local idx="$1" netid="$2" cmd="$3"; shift 3
+  # <network alias> is the name to REGISTER this container under on the network, or `-` for none. It
+  # is deliberately not derived from the nonce below: the caller has to know the name in order to
+  # check the answer against it, and a run that minted it privately could only hand it back through
+  # the same stdout the helper's answer uses.
+  local idx="$1" netid="$2" netalias="$3" cmd="$4"; shift 4
   local ref ident nonce name out rc
   ref="$(mi_probe_image "$idx")" || return 1
   ident="$(mi_ident_get)" || return 1
@@ -163,6 +167,7 @@ _mi_probe_run() {
   # `arg=` so they land AFTER the command word, where the helper's own entrypoint reads them — not
   # among the docker flags.
   hspecs=("install=${ident}" "name=${name}")
+  if [ "$netalias" != "-" ]; then hspecs+=("netalias=${netalias}"); fi
   local x
   for x in "$@"; do hspecs+=("arg=${x}"); done
   # No `2>/dev/null`: a helper that could not be launched at all and a check that ran and failed are
@@ -212,13 +217,36 @@ _mi_probe_run() {
 }
 
 # One field out of the helper's answer. rc 0 the value is printed — an EMPTY value is a real answer —
-# · 3 the answer carries no such field at all.
+# · 3 the answer carries no such field at all · 1 the answer states the field MORE THAN ONCE, which is
+# not one answer (REPORTED).
+#
+# THE DUPLICATE RULE IS THE READER'S, NOT EACH CALLER'S. The flat response format has no meaning for a
+# repeated key: nothing in it says a second copy replaces, refines or contradicts the first. So an
+# answer that says `selfcheck=ok` and then `selfcheck=fail` does not say `ok`, it says two things, and
+# it is malformed evidence. Returning the FIRST match let every check in this module be passed by an
+# answer that also contained its own refutation, and the same trick worked on `alias=` at the door
+# whose whole subject is refusing a reply about a different alias.
+#
+# It is applied HERE, where the format is read, and not at the four call sites: a rule every caller
+# must remember is a rule that gets forgotten once, and the copy that is forgotten is the door nobody
+# thought about. lib/prov.sh made an ambiguous LEDGER record inert for exactly this reason; this is
+# that same rule for the helper's response format.
 _mi_probe_field() {
-  local blob="$1" key="$2" line
+  local blob="$1" key="$2" line val="" seen=0
+  # Every line is read, never stopping at the first hit — a reader that returns early cannot see the
+  # second copy, which is precisely the evidence it has to refuse on.
   while IFS= read -r line; do
-    case "$line" in "${key}="*) printf '%s\n' "${line#*=}"; return 0 ;; esac
+    case "$line" in "${key}="*) val="${line#*=}"; seen=$((seen + 1)) ;; esac
   done <<< "$blob"
-  return 3
+  if [ "$seen" -eq 0 ]; then return 3; fi
+  if [ "$seen" -gt 1 ]; then
+    mi_warn "probe: the probe's answer states '${key}=' more than once (${seen} times), and the answer"
+    mi_warn "  format gives a repeated field no meaning — an answer that says a thing twice says two"
+    mi_warn "  things. It is REFUSED as ambiguous rather than read down to whichever copy came first."
+    return 1
+  fi
+  printf '%s\n' "$val"
+  return 0
 }
 
 # AN EXIT STATUS IS NOT A RESULT. rc 0 only when the answer STATES `<key>=ok`; 1 otherwise, REPORTED.
@@ -235,6 +263,9 @@ _mi_probe_field() {
 _mi_probe_asserted() {
   local blob="$1" key="$2" val rc
   if val="$(_mi_probe_field "$blob" "$key")"; then rc=0; else rc=$?; fi
+  # rc 1 is the reader's own refusal — the field is stated more than once — and it has already said
+  # so. Restating it below as "no such field at all" would report the wrong fact about the answer.
+  if [ "$rc" -eq 1 ]; then return 1; fi
   if [ "$rc" -ne 0 ]; then
     mi_warn "probe: the probe exited 0 but its answer carries no '${key}=' field at all, so nothing in"
     mi_warn "  it says the check was performed. An exit status is not a result; it is REFUSED rather"
@@ -249,26 +280,123 @@ _mi_probe_asserted() {
   return 0
 }
 
+# THE ADDRESS OUT OF AN ANSWER TO ONE QUESTION. rc 0 the address is printed · 3 the probe LOOKED and
+# the name did not resolve · 1 the answer is not an answer to this question (REPORTED).
+#
+# Both doors that read a lookup answer — the selfcheck and the sibling resolve — ask the same three
+# things of it, so they ask them once, here. The three are not interchangeable and each is a fact this
+# module has already been wrong about:
+#
+#   the alias ECHO     an answer is only an answer to the question that was asked. A reply about
+#                      another name is a malfunctioning probe, and returning its address would hand
+#                      D42/D48's rebind the address of a different container entirely.
+#   a MISSING address  is not an empty one. An empty value is the documented "did not resolve"; no
+#                      field at all means the probe did not answer the question, and folding the
+#                      second into the first reports a working probe that found nothing.
+#   the address ITSELF a sanity gate on a value crossing a trust boundary. The image is digest-pinned,
+#                      so this is not the security boundary — but the value is printed to callers that
+#                      compare it, log it and put it in messages, and an address is an address. 45
+#                      characters is the longest textual IPv6 form.
+_mi_probe_address() {
+  local blob="$1" want="$2" answered addr rc
+  if answered="$(_mi_probe_field "$blob" alias)"; then rc=0; else rc=$?; fi
+  if [ "$rc" -eq 1 ]; then return 1; fi          # ambiguous; the reader has reported it
+  if [ "$rc" -ne 0 ] || [ "$answered" != "$want" ]; then
+    mi_warn "probe: the probe answered about alias '${answered:-<none>}' when it was asked about '$want'."
+    mi_warn "  An answer to another question is not this alias's address, so nothing is returned."
+    return 1
+  fi
+  if addr="$(_mi_probe_field "$blob" address)"; then rc=0; else rc=$?; fi
+  if [ "$rc" -eq 1 ]; then return 1; fi
+  if [ "$rc" -ne 0 ]; then
+    mi_warn "probe: the probe's answer carries no address at all — it did not answer the question."
+    return 1
+  fi
+  if [ -z "$addr" ]; then return 3; fi
+  local LC_ALL=C ok=1        # byte order, not locale collation: the class must mean ASCII
+  case "$addr" in *[!0-9a-fA-F:.]*) ok=0 ;; esac
+  if [ "${#addr}" -gt 45 ]; then ok=0; fi
+  if [ "$ok" -eq 0 ]; then
+    mi_warn "probe: the probe reported '$addr', which is not an address. Nothing is returned."
+    return 1
+  fi
+  printf '%s\n' "$addr"
+}
+
+# THE NAME THE SELFCHECK ASKS ABOUT — minted here, per run, by the CALLER.
+#
+# This is what makes the check a check. A probe asked "is DNS working?" can answer yes without doing
+# anything; a probe asked "what address does <a name you have never seen> have?" cannot, because the
+# name did not exist when the image was built. The caller registers it with the network itself
+# (`--network-alias`, see _mi_probe_run) immediately before asking, so:
+#
+#   * no `/etc/hosts` INSIDE the image can contain it — it is minted after the image is;
+#   * no hosts file the DAEMON writes contains it either. Docker writes the container's own HOSTNAME
+#     there; a network ALIAS is a name the network's embedded resolver answers for, and nothing else
+#     does. It is deliberately NOT the container's name for that reason: whatever a given engine
+#     version chooses to put in a hosts file, this name is not it.
+#
+# So a conforming selfcheck MUST query the resolver, and the answer is bound to a lookup that a
+# working resolver is the only thing able to satisfy.
+#
+# The nonce here is NOT the container's — it is the freshness of the QUESTION, not the identity of an
+# object, and §6a's "a nonce says which object" is about objects. Deriving it from the container's
+# would mean the run had to hand its nonce back out, and this function exists precisely so the caller
+# knows the name it is about to ask about without waiting for the run to tell it.
+_mi_probe_alias() {
+  local nonce alias
+  nonce="$(mi_nonce_new)" || { mi_warn "probe: cannot mint a selfcheck alias"; return 1; }
+  alias="probe-selfcheck-${nonce}"
+  # The same `ident` type every runtime name in this installer is checked against, so the alias cannot
+  # be a shape the daemon (or a later reader of a log line) has to guess the boundaries of.
+  if ! _mi_doc_type_ok ident "$alias"; then
+    mi_warn "probe: '$alias' is not a usable network alias"
+    return 1
+  fi
+  printf '%s\n' "$alias"
+}
+
+# One wording, at both doors that reach it. A verdict this load-bearing spelled twice is a verdict
+# that gets edited once.
+_mi_probe_dns_verdict() {
+  mi_warn "probe: the probe could not resolve its OWN per-run alias '$2' on network '$1'."
+  mi_warn "  DNS on this network is not working — this is not about any one product being stopped."
+}
+
 # THE DNS-mechanism check. The probe's OWN alias is what separates "DNS on this network is broken" from
 # "that product is simply not running" — an earlier revision required "every alias, always" from the
 # probe, which no fleet containing a stopped product can satisfy.
+#
+# `selfcheck=ok` IS NOT THE EVIDENCE, it is the probe's opinion of the evidence. What is accepted is
+# the probe RESOLVING the per-run alias the caller registered for it and reporting the address it got;
+# the stated result is required as well, so a probe that looked and considers the result wrong is not
+# overruled. Both, or the network is not verified.
 mi_probe_selfcheck() {
   if [ "$#" -ne 2 ]; then mi_warn "probe: mi_probe_selfcheck needs an <index file> and a <network id>"; return 1; fi
   mi_probe_available "$1" || return 1
-  local out rc
-  if out="$(_mi_probe_run "$1" "$2" selfcheck)"; then rc=0; else rc=$?; fi
-  if [ "$rc" -eq 0 ]; then
-    _mi_probe_asserted "$out" selfcheck || return 1
-    return 0
+  local alias out rc
+  alias="$(_mi_probe_alias)" || return 1
+  # The alias is passed TWICE on purpose, and the two are different things: the first registers the
+  # container under that name with the network, the second asks the probe to look that name up. The
+  # check is exactly "resolve the name I have just registered you under".
+  if out="$(_mi_probe_run "$1" "$2" "$alias" selfcheck "$alias")"; then rc=0; else rc=$?; fi
+  if [ "$rc" -ne 0 ]; then
+    # rc 4 is "the container could not be accounted for", already reported by _mi_probe_run. The probe
+    # may well have resolved its own alias before the runtime stopped answering, so calling DNS broken
+    # here would send an operator to debug a network that was never shown to be at fault.
+    if [ "$rc" -ne 4 ]; then _mi_probe_dns_verdict "$2" "$alias"; fi
+    return 1
   fi
-  # rc 4 is "the container could not be accounted for", already reported by _mi_probe_run. The probe
-  # may well have resolved its own alias before the runtime stopped answering, so calling DNS broken
-  # here would send an operator to debug a network that was never shown to be at fault.
-  if [ "$rc" -ne 4 ]; then
-    mi_warn "probe: the probe could not resolve its OWN alias on network '$2'."
-    mi_warn "  DNS on this network is not working — this is not about any one product being stopped."
+  # rc 3 — the probe looked and the resolver had no answer — IS the broken-DNS finding, and the only
+  # thing here that is. Everything else (no echo, no address, a reply about another name) is a broken
+  # PROBE, reported by the reader as such: a malfunctioning verifier is not a verification result.
+  if _mi_probe_address "$out" "$alias" >/dev/null; then rc=0; else rc=$?; fi
+  if [ "$rc" -ne 0 ]; then
+    if [ "$rc" -eq 3 ]; then _mi_probe_dns_verdict "$2" "$alias"; fi
+    return 1
   fi
-  return 1
+  _mi_probe_asserted "$out" selfcheck || return 1
+  return 0
 }
 
 # Resolve <alias> on <network id>. rc 0 prints the address · 3 the alias did not resolve · 1 the probe
@@ -281,43 +409,18 @@ mi_probe_selfcheck() {
 mi_probe_resolve() {
   if [ "$#" -ne 3 ]; then mi_warn "probe: mi_probe_resolve needs an <index file>, a <network id> and an <alias>"; return 1; fi
   mi_probe_available "$1" || return 1
-  local out answered addr rc
+  local out addr rc
   # EVERY non-zero lands on 1, including _mi_probe_run's 4 (the run's container could not be accounted
   # for): rc 3 is reserved for the probe having LOOKED and found nothing, and a run that did not
   # finish never looked.
-  out="$(_mi_probe_run "$1" "$2" resolve "$3")" || return 1
-
-  # AN ANSWER IS ONLY AN ANSWER TO THE QUESTION THAT WAS ASKED. The helper echoes the alias it looked
-  # up; a reply about a different one is a malfunctioning probe, and returning its address would hand
-  # D42/D48's rebind the address of another container entirely.
-  if answered="$(_mi_probe_field "$out" alias)"; then rc=0; else rc=$?; fi
-  if [ "$rc" -ne 0 ] || [ "$answered" != "$3" ]; then
-    mi_warn "probe: the probe answered about alias '${answered:-<none>}' when it was asked about '$3'."
-    mi_warn "  An answer to another question is not this alias's address, so nothing is returned."
-    return 1
-  fi
-
-  if addr="$(_mi_probe_field "$out" address)"; then rc=0; else rc=$?; fi
-  # NO ADDRESS FIELD IS NOT AN EMPTY ADDRESS. An empty value is the documented "did not resolve"; a
-  # missing field means the probe did not answer the question at all. Folding the second into the
-  # first reports a working probe that found nothing, and D48 then treats a broken verifier as a
-  # verification result.
-  if [ "$rc" -ne 0 ]; then
-    mi_warn "probe: the probe's answer carries no address at all — it did not answer the question."
-    return 1
-  fi
-  if [ -z "$addr" ]; then return 3; fi
-  # A SANITY GATE ON A VALUE CROSSING A TRUST BOUNDARY. The image is digest-pinned, so this is not the
-  # security boundary — but the value is printed to callers that compare it, log it and put it in
-  # messages, and an address is an address. 45 characters is the longest textual IPv6 form
-  # (an IPv4-mapped address with a zone-free full-length prefix).
-  local LC_ALL=C ok=1        # byte order, not locale collation: the class must mean ASCII
-  case "$addr" in *[!0-9a-fA-F:.]*) ok=0 ;; esac
-  if [ "${#addr}" -gt 45 ]; then ok=0; fi
-  if [ "$ok" -eq 0 ]; then
-    mi_warn "probe: the probe reported '$addr', which is not an address. Nothing is returned."
-    return 1
-  fi
+  #
+  # No `--network-alias` for this one: the question is about a SIBLING's name, and registering a name
+  # of our own would add an attachment to the family network for no reason the answer depends on.
+  out="$(_mi_probe_run "$1" "$2" - resolve "$3")" || return 1
+  # The alias echo, the missing-vs-empty address split and the sanity gate are _mi_probe_address's,
+  # shared with the selfcheck door — including the rc 3 this function's contract is built on.
+  if addr="$(_mi_probe_address "$out" "$3")"; then rc=0; else rc=$?; fi
+  [ "$rc" -eq 0 ] || return "$rc"
   printf '%s\n' "$addr"
 }
 
@@ -325,7 +428,7 @@ mi_probe_egress() {
   if [ "$#" -ne 2 ]; then mi_warn "probe: mi_probe_egress needs an <index file> and a <network id>"; return 1; fi
   mi_probe_available "$1" || return 1
   local out rc
-  if out="$(_mi_probe_run "$1" "$2" egress)"; then rc=0; else rc=$?; fi
+  if out="$(_mi_probe_run "$1" "$2" - egress)"; then rc=0; else rc=$?; fi
   if [ "$rc" -eq 0 ]; then
     # The same rule as selfcheck's, for the same reason: `egress=ok` is this check's stated result,
     # and an answer about a DIFFERENT check is no more this one's answer than a resolve reply about

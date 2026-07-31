@@ -15,8 +15,19 @@
 #   exit status   0 the check ran and passed · 1 the check ran and FAILED · 2 the command word is not
 #                 one this image implements. "The check failed" and "I could not run the check" are
 #                 never the same answer.
+#   fields        EVERY key appears AT MOST ONCE. The format gives a repeated key no meaning, and the
+#                 caller REFUSES an answer that states one twice rather than reading the first copy.
 #
-#   selfcheck                  → selfcheck=ok
+#   selfcheck <alias>          REQUIRES the alias argument. Resolve <alias> THROUGH THE NETWORK
+#                              RESOLVER — the nameserver the container is configured with, which on a
+#                              user-defined network is the daemon's embedded DNS. It must NOT be
+#                              answered out of /etc/hosts, out of the container's own hostname or
+#                              interface addresses, or out of a constant.
+#                              → alias=<the alias ASKED about, echoed verbatim>
+#                                address=<the address the resolver returned; EMPTY = did not resolve>
+#                                selfcheck=ok      printed ONLY when the lookup returned an address
+#                              exit 0 with all three when it resolved; exit 1 with an empty address
+#                              and selfcheck=fail when it did not, or when no alias was given.
 #   resolve <alias>            → alias=<alias>, address=<addr>. An EMPTY address is a legitimate
 #                                answer meaning "did not resolve", reported with exit 0; the caller
 #                                maps it to its own rc 3. `alias=` echoes the alias ASKED about, so
@@ -25,17 +36,59 @@
 #   egress                     → egress=ok
 #   preflight|copy|verify|acl|access  → Part B's commands (D54/D58), stubbed here.
 #
+# WHY selfcheck TAKES AN ALIAS, since this is the property the whole probe exists for. `selfcheck=ok`
+# on its own is a claim no broken DNS can falsify: an image that printed it unconditionally, or that
+# looked its own hostname up in /etc/hosts, would answer it with the network's resolver stone dead.
+# So the CALLER mints a name per run, registers the probe container under it with the network
+# (`--network-alias`), and asks for THAT name. It did not exist when this image was built, so no hosts
+# file inside the image can hold it; it is a network alias rather than the container's name, so the
+# hosts file the daemon writes does not hold it either. The only thing that can answer is the
+# resolver. The caller then requires the echo, a non-empty well-formed address AND `selfcheck=ok`
+# together — it takes none of them on trust alone.
+#
 # Its answers are driven by HELPER_* environment variables so a test can make the probe succeed, fail,
-# or report a non-resolving alias without a real daemon.
+# or report a non-resolving alias without a real daemon. `selfcheck` is the exception and is answered
+# by an actual lookup in the resolver view the fake runtime hands it (HELPER_NET_DNS), because the
+# lookup IS this command's subject; `resolve`'s answer stays knob-driven, since what its tests are
+# about is how the CALLER reads an answer it did not produce.
 set -euo pipefail
+
+# One name → one address, out of ONE surface. Which surface answered is the entire question here, so
+# it is an argument rather than a fallback chain: a lookup that tries DNS and then the hosts file is
+# exactly the implementation this contract exists to forbid.
+lookup() {
+  local n="$1" view="$2" pair
+  local IFS=';'
+  # shellcheck disable=SC2086   # deliberate split: the view is a `;`-separated key=value list
+  for pair in $view; do
+    case "$pair" in "${n}="*) printf '%s' "${pair#*=}"; return 0 ;; esac
+  done
+  return 1
+}
 
 cmd="${1:-}"; shift || true
 
 case "$cmd" in
   selfcheck)
-    # The DNS-MECHANISM check: the probe resolves its OWN alias on the target network. This is what
-    # separates "DNS on this network is broken" from "that product is simply not running".
-    if [ "${HELPER_SELFCHECK:-ok}" = fail ]; then printf 'selfcheck=fail\n'; exit 1; fi
+    # The DNS-MECHANISM check: resolve the per-run alias the caller registered this container under.
+    # This is what separates "DNS on this network is broken" from "that product is simply not
+    # running" — and, unlike a bare `selfcheck=ok`, it is a claim a broken resolver can falsify.
+    want="${1:-}"
+    if [ -z "$want" ]; then
+      printf 'selfcheck=fail\n'
+      printf 'helperimg: selfcheck needs the alias to look up\n' >&2
+      exit 1
+    fi
+    if [ "${HELPER_SELFCHECK:-ok}" = fail ]; then
+      printf 'alias=%s\naddress=\nselfcheck=fail\n' "$want"
+      exit 1
+    fi
+    # HELPER_NET_DNS ONLY. Never HELPER_NET_HOSTS — the hosts file is the surface that keeps working
+    # when the resolver does not, which is the failure this command exists to detect.
+    if addr="$(lookup "$want" "${HELPER_NET_DNS:-}")"; then :; else addr=""; fi
+    printf 'alias=%s\n' "$want"
+    printf 'address=%s\n' "$addr"
+    if [ -z "$addr" ]; then printf 'selfcheck=fail\n'; exit 1; fi
     printf 'selfcheck=ok\n'
     ;;
   resolve)
