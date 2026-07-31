@@ -28,6 +28,9 @@
 #   * A container joins a network under its own NAME as well as any explicit alias, so an omitted
 #     `--alias` is observable rather than invisible.
 #   * `container run` WITHOUT `--rm` leaves the container behind, as a real daemon does.
+#   * A container's NAME and its `--network-alias`es are answered by the NETWORK RESOLVER; only its
+#     HOSTNAME is in its own hosts file. The two surfaces are handed to the helper entrypoint
+#     separately, so a selfcheck that answers out of the wrong one is observably different.
 #
 # THE CLOSED SURFACE — why an unimplemented flag is fatal here.
 # Every parse loop below used to end in a catch-all that either swallowed the word (`*) shift`) or
@@ -490,6 +493,50 @@ alias_list() {
 
 # The address a started container gets on a network. Deterministic per (container, netid).
 addr_for() { printf '10.88.%d.%d\n' $(( $(printf '%s' "$1$2" | cksum | cut -d' ' -f1) % 250 + 1 )) $(( ${#1} % 250 + 2 )); }
+
+# The container's own HOSTNAME as the daemon assigns it: the short form of the id it minted, NOT the
+# container's name and NOT any alias. That distinction is the whole of the selfcheck property below,
+# so the fake keeps it: whatever else ends up in a hosts file, the hostname is a name the IMAGE could
+# in principle have known nothing about but the RESOLVER was never asked for.
+short_id() { printf '%012x\n' "$(printf '%s' "$1" | cksum | cut -d' ' -f1)"; }
+
+# --- the two NAME-RESOLUTION SURFACES a container really has ---------------------------------------
+# A container turns a name into an address two ways, and they are not interchangeable:
+#
+#   its hosts file   what the daemon WRITES INTO the container at start — localhost, and the
+#                    container's own HOSTNAME. It is a file inside the container; a dead network
+#                    resolver does not stop it answering.
+#   the network      the embedded DNS server on a user-defined network, which answers for every
+#   resolver         container's NAME and for every --network-alias registered on it. A NETWORK ALIAS
+#                    IS ONLY EVER HERE.
+#
+# D49's selfcheck rests entirely on that last sentence: the caller mints an alias per run, registers
+# it with the network, and asks the probe to resolve it — a name that did not exist when the image was
+# built and that no hosts file contains. Modelling the two surfaces SEPARATELY is what lets a test
+# install a hosts-file selfcheck and watch it fail; merged into one map, the two implementations would
+# be indistinguishable here and the property would be asserted by nothing.
+#
+# Both are handed to the fixture entrypoint as `;`-separated `name=address` lists. The DNS view holds
+# every name the network answers for; a STOPPED container contributes none, because the daemon
+# releases its address and the resolver stops answering for it (the same D48 fidelity `stop` keeps).
+dns_view_for() {
+  local net="$1" c caddr pair grp a out=""
+  for c in "$STATE"/containers/*; do
+    [ -e "$c" ] || continue
+    caddr=""
+    for pair in $(printf '%s' "$(rec_get "$c" nets)" | tr ';' ' '); do
+      case "$pair" in "${net}="*) caddr="${pair#*=}" ;; esac
+    done
+    [ -n "$caddr" ] || continue
+    for grp in $(printf '%s' "$(rec_get "$c" aliases)" | tr ';' ' '); do
+      case "$grp" in "${net}:"*) : ;; *) continue ;; esac
+      for a in $(printf '%s' "${grp#*:}" | tr ',' ' '); do
+        out="${out}${a}=${caddr};"
+      done
+    done
+  done
+  printf '%s' "$out"
+}
 
 case "${1:-}" in
   version)
@@ -1037,12 +1084,13 @@ case "${1:-}" in
         # The pinned helper (D49/D54). Its result comes from the fixture image script so a test can
         # make the probe answer, fail, or be unobtainable.
         shift
-        img=""; cmd=""; mounts=""; netid=""; autorm=""; name=""
+        img=""; cmd=""; mounts=""; netid=""; autorm=""; name=""; netalias=""
         while [ "$#" -gt 0 ]; do
           case "$1" in
             --rm) autorm=1; shift ;;
             --network) netid="$2"; shift 2 ;;
             --name) name="$2"; shift 2 ;;
+            --network-alias) netalias="$2"; shift 2 ;;
             --user) shift 2 ;;
             --label) parse_label "$2"; shift 2 ;;
             --mount) mounts="${mounts}${2};"; shift 2 ;;
@@ -1095,13 +1143,27 @@ case "${1:-}" in
           rec_set "$rf" state exited
           rec_set "$rf" labels "$labels"
           rec_set "$rf" nets "${rnet}=;"
-          rec_set "$rf" aliases "${rnet}:$(alias_list "" "$name");"
+          rec_set "$rf" aliases "${rnet}:$(alias_list "$netalias" "$name");"
         fi
         [ -z "${FAKE_DOCKER_HELPER_FAIL:-}" ] || die "helper: ${FAKE_DOCKER_HELPER_FAIL}"
         [ -x "${FAKE_HELPER_BIN:-}" ] || die "fake docker: FAKE_HELPER_BIN is not set to an executable fixture entrypoint"
+        # The two surfaces (see dns_view_for above), built for THIS container and handed to the
+        # entrypoint. The container's own registrations go in the DNS view because that is where the
+        # daemon puts them — its name and every alias — and the hosts view gets its HOSTNAME and
+        # nothing else, which is what the daemon writes into the file.
+        dnsview=""; hostsview="localhost=127.0.0.1;"; ownaddr=""
+        hostid="$(short_id "${name:-helper}")"
+        if [ -n "$rnet" ] && [ "$rnet" != none ]; then
+          dnsview="$(dns_view_for "$rnet")"
+          ownaddr="$(addr_for "${name:-$hostid}" "$rnet")"
+          [ -z "$netalias" ] || dnsview="${dnsview}${netalias}=${ownaddr};"
+          [ -z "$name" ] || dnsview="${dnsview}${name}=${ownaddr};"
+          hostsview="${hostsview}${hostid}=${ownaddr};"
+        fi
         # `${1+"$@"}` rather than a bare "$@": under `set -u`, bash 3.2 errors on "$@" when there are
         # no positional parameters left, which is the ordinary case for a no-argument helper command.
-        "$FAKE_HELPER_BIN" "$cmd" ${1+"$@"}
+        HELPER_NET_DNS="$dnsview" HELPER_NET_HOSTS="$hostsview" HELPER_NET_HOSTNAME="$hostid" \
+          "$FAKE_HELPER_BIN" "$cmd" ${1+"$@"}
         ;;
       *) die "fake docker: unsupported container subcommand: ${1:-}" ;;
     esac
