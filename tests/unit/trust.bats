@@ -527,3 +527,35 @@ mkdoc() {   # <version> [<expires>]
   run grep -ac 'index=99999' "$MYTHICAL_HOME/.state/ledger"
   [ "$output" = "1" ]
 }
+
+@test "a floor that is RECORDED but unreadable is refused, never read as never-seen" {
+  # rc 3 from this getter means "no floor has ever been recorded", which is the first-use branch
+  # that accepts any version on trust. A floor that exists but carries no value used to take that
+  # branch, so anti-rollback silently stopped applying to the one document whose record was damaged.
+  # Both spellings are covered: an empty value, and a record with no fields at all.
+  :   # setup() already ran: env, modules, layout, lock, empty ledger
+  printf 'trust-floor\tindex=\n' | mi_ledger_write
+  run mi_trust_floor_get index
+  [ "$status" -eq 1 ]
+  assert_contains "carries no value"
+}
+
+@test "a trust record with no fields at all is refused, not read as absent" {
+  :
+  printf 'trust-floor\n' | mi_ledger_write
+  run mi_trust_floor_get index
+  [ "$status" -eq 1 ]
+  assert_contains "no fields at all"
+}
+
+@test "a genuinely absent floor is still rc 3, and a good floor still reads back" {
+  # The counterpart: the refusals above must not swallow the legitimate first-use branch, which is
+  # what makes trust-on-first-use possible at all.
+  :
+  run mi_trust_floor_get index
+  [ "$status" -eq 3 ]
+  printf 'trust-floor\tindex=42\n' | mi_ledger_write
+  run mi_trust_floor_get index
+  [ "$status" -eq 0 ]
+  [ "$output" = "42" ]
+}
