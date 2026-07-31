@@ -35,7 +35,7 @@ run_mctl() { run "${_MCTL_ROOT}/bin/mythical-ctl" "$@"; }
 # tests run before later tasks have created their modules (e.g. Task 2 has no lock.sh yet).
 load_mctl() {
   local m f
-  for m in common layout config lock ledger doc trust policy manifest detect runtime preflight exit prov intent state probe; do
+  for m in common layout config lock ledger doc trust policy manifest detect runtime preflight exit prov intent state probe bringup; do
     f="${_MCTL_ROOT}/lib/${m}.sh"
     # shellcheck disable=SC1090
     [ -f "$f" ] && source "$f"
