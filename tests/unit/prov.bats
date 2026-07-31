@@ -1020,3 +1020,27 @@ put_raw() { { mi_ledger_read; printf '%s\n' "$1"; } | mi_ledger_write; }
   [ "$status" -eq 0 ]
   assert_contains "name=q1"
 }
+
+@test "an ABSENT installation label is refused as absent however the runtime spells it" {
+  mi_ident_ensure >/dev/null
+  mi_prov_record volume nv1 good-nonce
+  # Docker's `index` prints `<no value>`, not the empty string, when the object's label map is nil —
+  # which is precisely an object created with no labels at all. The fake runtime reproduces the OTHER
+  # spelling (a label map that is present and has no such key, which yields ""), so replacing the
+  # adapter call is the only way to see the one a real daemon produces. Both are the same fact and
+  # must reach the same answer: refused as UNLABELLED. Read as an identity instead, `<no value>` is a
+  # foreign installation, which is a true refusal for a false reason — and the operator is told their
+  # volume belongs to an installation called `<no value>`.
+  mi_rt_inspect() {
+    case "$2" in
+      *.install) printf '<no value>\n' ;;
+      *)         printf 'good-nonce\n' ;;
+    esac
+    return 0
+  }
+  run mi_prov_authority volume nv1
+  [ "$status" -ne 0 ] || { echo "an unlabelled object was AUTHORIZED for deletion" >&2; return 1; }
+  assert_contains "no installation label"
+  [ "$(printf '%s\n' "$output" | grep -ac 'another installation')" = 0 ] \
+    || { echo "'<no value>' was read as another installation's identity" >&2; return 1; }
+}
