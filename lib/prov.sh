@@ -21,6 +21,10 @@
 # HOW a record is split is part of that rule, not a detail below it — see _mi_led_split. Every read
 # path takes its fields from that one walk, and there is no second way to obtain them.
 #
+# And asked of a record SET rather than of a record, the same invariant is: A LOOKUP THAT DOES NOT
+# RESOLVE TO EXACTLY ONE THING IS AMBIGUOUS, AND AMBIGUITY PRESERVES AND REPORTS — enforced in ONE
+# place, _mi_led_select. See the note above it for the three directions that rule runs in.
+#
 # PUBLIC SURFACE: mi_led_put, mi_led_del, mi_led_find, mi_led_all, mi_led_field, mi_ident_get,
 # mi_ident_ensure, mi_member_add, mi_member_has, mi_member_del, mi_prov_record, mi_prov_find,
 # mi_prov_tombstone, mi_prov_authority, mi_prov_image_record, mi_prov_gen, mi_first_use.
@@ -248,6 +252,82 @@ _mi_led_record_matches() {
   return "$matched"
 }
 
+# ONE LOOKUP, ONE ANSWER — THE SINGLE PLACE THE CARDINALITY QUESTION IS ASKED.
+#
+# The rule: A LOOKUP THAT DOES NOT RESOLVE TO EXACTLY ONE THING IS AMBIGUOUS, AND AMBIGUITY PRESERVES
+# AND REPORTS. Zero is an answer ("there is no record"). One is an answer. MANY IS NOT AN ANSWER — it
+# is a question the ledger cannot settle, and nothing here settles it by choosing. It runs in three
+# directions, and each was a defect of its own:
+#
+#   * A READER MUST NOT PICK ONE OF THEM. Two records, each individually well-formed, each carrying
+#     one `key=`, each describing the object it is found under — every gate above passes both, and the
+#     first one won. So a volume the ledger recorded twice, with two different nonces, was deleted on
+#     the strength of whichever record happened to be written first.
+#   * A WRITER MUST NOT REPLACE THEM WITH ONE. The editors dropped EVERY matching row and appended
+#     one, so the first ordinary operation to touch that key replaced the contradiction with a single
+#     record — destroying the only evidence that the ledger needed repairing at all. That is the one
+#     thing this module may never do.
+#   * A KEYED REPLACEMENT MUST CARRY ITS KEY. The selector's syntax was validated and nothing required
+#     the replacement fields to contain it, so a function whose contract is keyed replacement would
+#     delete the record its key named and write a record about something else entirely.
+#
+# It is the same invariant the gates above enforce one level down — one name, one field; one record,
+# one meaning — asked of the record SET instead of of a record.
+#
+# rc 0 exactly one, and its fields are printed (without the kind) · 3 none · 1 MORE THAN ONE,
+# reported. Ill-formed records match nothing (the gate says so), so they cannot make a set ambiguous
+# and cannot be counted into one either.
+#
+# TWO BYTE-IDENTICAL ROWS ARE AMBIGUOUS TOO, deliberately: they contradict nothing, but "how many
+# records answer for this object" still has the answer two, and a reader that special-cased identical
+# duplicates would be choosing which duplicates are allowed to be silently collapsed. Nothing is lost
+# by refusing — both rows stay exactly where they are.
+_mi_led_select() {
+  local records="$1" kind="$2" kf="$3" kv="$4" line hit="" count=0
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    case "$line" in
+      "$kind"$'\t'*)
+        if _mi_led_record_matches "${line#*$'\t'}" "$kf" "$kv"; then
+          count=$((count + 1))                      # a loop counter, not a value parsed out of a file
+          if [ "$count" -eq 1 ]; then hit="${line#*$'\t'}"; fi
+        fi ;;
+    esac
+  done <<< "$records"
+  if [ "$count" -eq 0 ]; then return 3; fi
+  if [ "$count" -gt 1 ]; then
+    mi_warn "prov: ${count} '${kind}' records answer for '${kf}=${kv}' — the ledger cannot say which"
+    mi_warn "  of them describes it, so it says none. Reading one would act on a claim another record"
+    mi_warn "  contradicts, and replacing them with one would destroy the contradiction, which is the"
+    mi_warn "  evidence that this ledger needs repairing. Every one of them is PRESERVED."
+    mi_warn "  Run 'mythical-ctl state repair'."
+    return 1
+  fi
+  printf '%s\n' "$hit"
+  return 0
+}
+
+# Every record except the ONE row _mi_led_select resolved to, which is passed in as its fields (empty
+# for "drop nothing"). Printed without a trailing newline, since command substitution strips it.
+#
+# THE EDITORS DROP THE ROW THE SELECTOR RESOLVED TO, NOT "EVERY ROW THAT MATCHES". That is what makes
+# "exactly one" structural rather than re-derived: a second matching loop beside the count is a second
+# chance to disagree with it, and the count would then be a check that the drop could walk around. It
+# is matched as a whole line, byte for byte, so the row removed is the row that was judged.
+_mi_led_without() {
+  local records="$1" kind="$2" drop="$3" line out="" want=""
+  if [ -n "$drop" ]; then want="${kind}"$'\t'"${drop}"; fi
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    # `want` is cleared on the first hit, so a ledger holding the same bytes twice cannot lose both
+    # rows here. It cannot reach this function anyway — _mi_led_select refuses two of anything — and
+    # this is the belt: dropping ONE row is the contract of the argument, not a property of the input.
+    if [ -n "$want" ] && [ "$line" = "$want" ]; then want=""; continue; fi
+    out="${out}${line}"$'\n'
+  done <<< "$records"
+  printf '%s' "$out"
+}
+
 # Replace (or insert) one record of <kind> whose <field> equals <value>, preserving every other
 # record. Read-modify-write under the lock; mi_ledger_write proves lock ownership itself, and this
 # function asserts it too so the refusal names the caller's operation rather than "write the ledger".
@@ -256,70 +336,85 @@ mi_led_put() {
   local kind="$1" kf="$2" kv="$3"; shift 3
   mi_lock_assert_held "record installer state"
   _mi_led_args_ok "$kind" "$kf" "$kv" || return 1
-  local f rec="" records line out=""
+  local f rec="" records rest rc nsel=0
   _mi_led_fields_ok "$@" || return 1
+
+  # THE REPLACEMENT MUST CARRY THE SELECTOR, EXACTLY ONCE — this function's contract is keyed
+  # REPLACEMENT, and without this it was a record-drop path: the selector's syntax was validated and
+  # nothing tied it to what actually gets written, so
+  #
+  #   mi_led_put object key volume:keep 'key=volume:other' 'class=volume' 'name=other' …
+  #
+  # deleted the record for `volume:keep` and wrote a record about `volume:other`. Counted rather than
+  # merely searched for, because the rule is "exactly once": the >1 half is shadowed today by the
+  # one-name-one-field rule above (a second `key=` is refused before this runs), and it is written
+  # this way so the rule stays true of the arguments rather than true only as a consequence.
+  #
+  # mi_prov_tombstone serializes its own record and does NOT repeat this check: it builds `key=${key}`
+  # and selects on the same `$key` in the same function, so the two are the same string by
+  # construction, and a check that cannot fail is a guard that gets deleted with nothing changing.
   for f in "$@"; do
+    if [ "$f" = "${kf}=${kv}" ]; then nsel=$((nsel + 1)); fi
     rec="${rec}"$'\t'"${f}"
   done
+  if [ "$nsel" -ne 1 ]; then
+    mi_warn "prov: the replacement for '${kf}=${kv}' does not carry it exactly once (${nsel} times)."
+    mi_warn "  This function replaces the record its key SELECTS, so a field list that does not carry"
+    mi_warn "  that key drops one record and writes another. Nothing was written."
+    return 1
+  fi
+
   if records="$(mi_ledger_read)"; then :; else
-    local rc=$?
+    rc=$?
     # rc 3 is "no ledger yet", a legitimate first write. Anything else is corruption, already
     # reported by mi_ledger_read — never overwrite a ledger we could not read.
     [ "$rc" -eq 3 ] || return "$rc"
     records=""
   fi
-  while IFS= read -r line; do
-    [ -n "$line" ] || continue
-    case "$line" in
-      "$kind"$'\t'*)
-        if _mi_led_record_matches "${line#*$'\t'}" "$kf" "$kv"; then continue; fi ;;
-    esac
-    out="${out}${line}"$'\n'
-  done <<< "$records"
-  out="${out}${kind}${rec}"$'\n'
-  printf '%s' "$out" | mi_ledger_write
+  # HOW MANY DOES IT SUPERSEDE? Zero (an insert) and one (a replacement) are both answers; more than
+  # one is not, and superseding them all is exactly how the contradiction stops being visible.
+  local old=""
+  if old="$(_mi_led_select "$records" "$kind" "$kf" "$kv")"; then :; else
+    rc=$?; [ "$rc" -eq 3 ] || return 1; old=""
+  fi
+  # `$( )` strips the trailing newline, so the kept records are re-terminated here rather than fused
+  # onto the record being appended. Skipped entirely when nothing is kept, or the ledger would gain a
+  # leading blank line on every first write.
+  rest="$(_mi_led_without "$records" "$kind" "$old")"
+  { [ -z "$rest" ] || printf '%s\n' "$rest"; printf '%s%s\n' "$kind" "$rec"; } | mi_ledger_write
 }
 
-# Delete every record of <kind> whose <field> equals <value>. rc 0 even when none matched — a
-# deletion that finds nothing has achieved its purpose.
+# Delete the record of <kind> whose <field> equals <value>. rc 0 even when none matched — a deletion
+# that finds nothing has achieved its purpose.
 mi_led_del() {
   if [ "$#" -ne 3 ]; then mi_warn "prov: mi_led_del needs <kind> <key-field> <key-value>"; return 1; fi
-  local kind="$1" kf="$2" kv="$3" records line out=""
+  local kind="$1" kf="$2" kv="$3" records rest rc old=""
   mi_lock_assert_held "remove installer state"
   _mi_led_args_ok "$kind" "$kf" "$kv" || return 1
   if records="$(mi_ledger_read)"; then :; else
-    local rc=$?
+    rc=$?
     [ "$rc" -eq 3 ] && return 0
     return "$rc"
   fi
-  while IFS= read -r line; do
-    [ -n "$line" ] || continue
-    case "$line" in
-      "$kind"$'\t'*)
-        if _mi_led_record_matches "${line#*$'\t'}" "$kf" "$kv"; then continue; fi ;;
-    esac
-    out="${out}${line}"$'\n'
-  done <<< "$records"
-  printf '%s' "$out" | mi_ledger_write
+  # HOW MANY WOULD IT DELETE? This used to remove every matching row, so one call turned two
+  # contradicting records into none at all — the evidence gone and nothing left to report it with.
+  if old="$(_mi_led_select "$records" "$kind" "$kf" "$kv")"; then :; else
+    rc=$?; [ "$rc" -eq 3 ] || return 1; old=""
+  fi
+  rest="$(_mi_led_without "$records" "$kind" "$old")"
+  printf '%s' "$rest" | mi_ledger_write
 }
 
 # Print the one record of <kind> whose <field> equals <value> (field list, TAB-separated, without the
-# kind). rc 0 found · 3 absent · 1 the ledger could not be read.
+# kind). rc 0 found · 3 absent · 1 the ledger could not be read, or more than one record answers.
 mi_led_find() {
   if [ "$#" -ne 3 ]; then mi_warn "prov: mi_led_find needs <kind> <key-field> <key-value>"; return 1; fi
-  local kind="$1" kf="$2" kv="$3" records line
+  local kind="$1" kf="$2" kv="$3" records
   _mi_led_args_ok "$kind" "$kf" "$kv" || return 1
   records="$(mi_ledger_read)" || return $?
-  while IFS= read -r line; do
-    [ -n "$line" ] || continue
-    case "$line" in
-      "$kind"$'\t'*)
-        if _mi_led_record_matches "${line#*$'\t'}" "$kf" "$kv"; then
-          printf '%s\n' "${line#*$'\t'}"; return 0
-        fi ;;
-    esac
-  done <<< "$records"
-  return 3
+  # The whole of this function is the cardinality question, asked in the one place that asks it. It
+  # used to return the FIRST match and never look at the rest.
+  _mi_led_select "$records" "$kind" "$kf" "$kv"
 }
 
 # Every record of <kind>, one per line, without the kind prefix.
@@ -438,7 +533,19 @@ mi_ident_get() {
     return 1
   fi
   v="$(mi_led_field "$rec" id)" || return 1
-  [ -n "$v" ] || return 3
+  # ONE RECORD, ZERO ANSWERS IS NOT ZERO RECORDS. An `id=` carrying an empty value is a legal field —
+  # nothing in the format forbids it — and this reported 3, which means "no identity recorded", which
+  # is first use. mi_ident_ensure then minted a fresh identity BESIDE the record already on disk,
+  # leaving two of them, after which every read of the identity refuses. Presence is the evidence here
+  # exactly as it is at the ledger path itself: something is there, and it cannot be read, so it is
+  # preserved and reported rather than initialised over.
+  if [ -z "$v" ]; then
+    mi_warn "prov: the ledger records an installation identity with no value — it says an identity was"
+    mi_warn "  established without saying which. Minting a new one over it would orphan every object"
+    mi_warn "  the previous identity named, so it is PRESERVED and reported."
+    mi_warn "  Run 'mythical-ctl state repair'."
+    return 1
+  fi
   printf '%s\n' "$v"
 }
 
@@ -467,6 +574,10 @@ mi_member_add() {
   mi_led_put "$MI_MEMBER_KIND" name "$1" "name=${1}"
 }
 
+# rc 0 a member · 3 NOT a member · 1 CANNOT SAY (the ledger could not be read, or more than one record
+# answers). The three are not two: a caller that treats any non-zero as "not a member" takes the
+# first-use TOFU branch on a ledger this module refused to read, which is how a recorded trust floor
+# gets re-accepted from nothing. The distinction is in the return code; using it is the caller's.
 mi_member_has() {
   if [ "$#" -ne 1 ]; then mi_warn "prov: mi_member_has needs <product>"; return 1; fi
   mi_led_find "$MI_MEMBER_KIND" name "$1" >/dev/null
@@ -623,7 +734,7 @@ mi_prov_find() {
 # removed and keeps the rest.
 mi_prov_tombstone() {
   if [ "$#" -ne 2 ]; then mi_warn "prov: mi_prov_tombstone needs <class> <name>"; return 1; fi
-  local class="$1" name="$2" rec nonce="" gen="0" records line out="" key trec
+  local class="$1" name="$2" rec="" nonce="" gen="0" records rest rc key trec orec="" otomb=""
   _mi_prov_class_ok "$class" || return 1
   mi_lock_assert_held "tombstone an object"
   key="$(_mi_prov_key "$class" "$name")"
@@ -648,13 +759,29 @@ mi_prov_tombstone() {
   # everywhere else in this module, and this is the one operation whose entire purpose is preserving
   # the identity of something removed, so a retry destroying exactly that inverted the supersession
   # rule below — "supersedes the earlier tombstone" has to mean "with equivalent content".
-  if rec="$(mi_prov_find "$class" "$name")"; then :
-  elif rec="$(mi_led_find "$MI_PROV_TOMB" key "$key")"; then :
-  else rec=""
+  # ONE READ, AND BOTH CARDINALITY QUESTIONS ASKED BEFORE ANYTHING IS READ AS EVIDENCE OR DROPPED.
+  # This function rewrites TWO record sets — the object record it consumes, and the earlier tombstone
+  # it supersedes — so "how many are there?" has to be answered for both, and answered up front. The
+  # second one is not covered by the first: when the object record is present the tombstone lookup
+  # below is never reached, and the loop still replaced every tombstone row for this key.
+  #
+  # A failed lookup is PROPAGATED rather than falling through to "there is no record". It used to
+  # fall through, which was already wrong for an unreadable ledger (it relied on the read below
+  # failing again) and became a way to lose evidence the moment a lookup could also fail because the
+  # answer was ambiguous: two object records would have been read as none, and then dropped by a
+  # tombstone written with an empty identity.
+  records="$(mi_ledger_read)" || {
+    rc=$?; [ "$rc" -eq 3 ] || return "$rc"; records="";
+  }
+  if orec="$(_mi_led_select "$records" "$MI_PROV_KIND" key "$key")"; then :; else
+    rc=$?; [ "$rc" -eq 3 ] || return 1; orec=""
   fi
-  # An unreadable ledger reaches this as an empty record and is caught by the read below, which
-  # returns its status rather than writing — a tombstone is never written over a ledger we could not
-  # read, so an empty record here cannot become an empty tombstone on disk.
+  if otomb="$(_mi_led_select "$records" "$MI_PROV_TOMB" key "$key")"; then :; else
+    rc=$?; [ "$rc" -eq 3 ] || return 1; otomb=""
+  fi
+  # The object record is authoritative while it exists; once it is gone the earlier tombstone is the
+  # surviving record of what was there.
+  if [ -n "$orec" ]; then rec="$orec"; else rec="$otomb"; fi
   if [ -n "$rec" ]; then
     # THE RECORD MUST DESCRIBE WHAT IS BEING TOMBSTONED — the same door as deletion authority's, on
     # the other act performed on the same record. Both sources above are found by `key=` alone, and a
@@ -690,25 +817,14 @@ mi_prov_tombstone() {
     fi
   fi
   trec=$'\t'"key=${key}"$'\t'"class=${class}"$'\t'"name=${name}"$'\t'"nonce=${nonce}"$'\t'"gen=${gen}"
-  records="$(mi_ledger_read)" || {
-    local rc=$?; [ "$rc" -eq 3 ] || return "$rc"; records="";
-  }
-  while IFS= read -r line; do
-    [ -n "$line" ] || continue
-    case "$line" in
-      "$MI_PROV_KIND"$'\t'*)
-        # CLASS AND NAME, not name alone: a container and a volume can derive the same name (see
-        # _mi_prov_key), and tombstoning one must not silently erase the other's provenance.
-        if _mi_led_record_matches "${line#*$'\t'}" key "$key"; then continue; fi ;;
-      "$MI_PROV_TOMB"$'\t'*)
-        # A second removal of the same object supersedes the earlier tombstone rather than appending
-        # beside it — otherwise a reinstall/uninstall cycle accumulates one tombstone per generation.
-        if _mi_led_record_matches "${line#*$'\t'}" key "$key"; then continue; fi ;;
-    esac
-    out="${out}${line}"$'\n'
-  done <<< "$records"
-  out="${out}${MI_PROV_TOMB}${trec}"$'\n'
-  printf '%s' "$out" | mi_ledger_write
+  # Each of the two rows the selectors resolved to, and no other. The object row goes because it is
+  # what is being tombstoned — CLASS AND NAME, not name alone: a container and a volume can derive the
+  # same name (see _mi_prov_key), and tombstoning one must not erase the other's provenance. The
+  # earlier tombstone row goes because a second removal of the same object supersedes it rather than
+  # appending beside it, or a reinstall/uninstall cycle accumulates one tombstone per generation.
+  rest="$(_mi_led_without "$records" "$MI_PROV_KIND" "$orec")"
+  rest="$(_mi_led_without "$rest" "$MI_PROV_TOMB" "$otomb")"
+  { [ -z "$rest" ] || printf '%s\n' "$rest"; printf '%s%s\n' "$MI_PROV_TOMB" "$trec"; } | mi_ledger_write
 }
 
 # --- images (D37) ---------------------------------------------------------------------------------

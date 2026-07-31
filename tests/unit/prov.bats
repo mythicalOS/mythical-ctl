@@ -27,15 +27,24 @@ teardown() { mi_lock_release; teardown_test_env; }
 }
 
 @test "a field value containing a TAB or newline is REFUSED — it would forge a field or a record" {
-  run mi_led_put object name x "class=container" "name=$(printf 'a\tb')"
+  # THE FIELD LIST CARRIES THE SELECTOR, and both the message assertions below are load-bearing.
+  # Written without them (`mi_led_put object name x "class=container" …`), these calls are refused by
+  # the "a replacement carries its key" rule instead — the selector `name=x` is simply not in the
+  # list — and the status assertion is satisfied by a rule that has nothing to do with TABs. Measured:
+  # deleting the TAB/newline refusal outright left this test green.
+  run mi_led_put object name x "name=x" "class=container" "note=$(printf 'a\tb')"
   [ "$status" -ne 0 ]
-  run mi_led_put object name y "class=container" "name=$(printf 'a\nb')"
+  assert_contains "is not a ledger field"
+  run mi_led_put object name y "name=y" "class=container" "note=$(printf 'a\nb')"
   [ "$status" -ne 0 ]
+  assert_contains "is not a ledger field"
 }
 
 @test "a field that is not KEY=VALUE is refused" {
-  run mi_led_put object name x "classcontainer"
+  run mi_led_put object name x "name=x" "classcontainer"
   [ "$status" -ne 0 ]
+  # Same reason as above: refused for the shape of the field, not for a missing key.
+  assert_contains "is not a ledger field"
 }
 
 @test "the editor refuses without the family lock" {
@@ -283,8 +292,12 @@ teardown() { mi_lock_release; teardown_test_env; }
   id="$(mi_ident_ensure)"
   # A TAB forges a field boundary and a newline forges a whole record. That rule was applied to the
   # appended fields and not to the kind, which is written to the same line by the same function.
-  run mi_led_put "$(printf 'identity\tid=forged\nobject')" ignored ignored "x=y"
+  # The selector is `x=y` and the field list carries it, so the call is honest in every respect
+  # except the kind — otherwise the "a replacement carries its key" rule refuses it first and the
+  # kind rule could be deleted with this test still green. Measured.
+  run mi_led_put "$(printf 'identity\tid=forged\nobject')" x y "x=y"
   [ "$status" -ne 0 ]
+  assert_contains "refusing ledger record kind"
   run mi_ident_get
   [ "$status" -eq 0 ]
   [ "$output" = "$id" ] || { echo "identity forged through the record kind: '$output'" >&2; return 1; }
@@ -292,12 +305,26 @@ teardown() { mi_lock_release; teardown_test_env; }
 
 @test "the key SELECTOR is validated too — it is one field split in two" {
   mi_ident_ensure >/dev/null
-  run mi_led_put object "$(printf 'na\tme')" x "class=container"
+  # ASKED OF THE TWO ENTRY POINTS THAT TAKE NO REPLACEMENT LIST, which is where this rule is the only
+  # thing that can refuse. Through mi_led_put the same inputs are refused twice over and neither
+  # refusal is this one: a selector no field can ever equal cannot be present in a valid field list,
+  # so the "a replacement carries its key" rule answers first — and with this rule deleted the put
+  # calls still refused, leaving the test green over a missing guard. Measured.
+  run mi_led_del object "$(printf 'na\tme')" x
   [ "$status" -ne 0 ]
-  run mi_led_put object name "$(printf 'a\nb')" "class=container"
+  assert_contains "refusing ledger key selector"
+  run mi_led_find object name "$(printf 'a\nb')"
   [ "$status" -ne 0 ]
+  assert_contains "refusing ledger key selector"
   # And the key half obeys the key grammar, because the selector has to match a serialized field
   # byte for byte — a selector no field can ever equal silently supersedes nothing.
+  run mi_led_del object Name x
+  [ "$status" -ne 0 ]
+  assert_contains "refusing ledger key selector"
+  # The put path refuses them too, whichever rule reaches them first. Kept as the control: these are
+  # the calls the test used to make, and they must still not go through.
+  run mi_led_put object "$(printf 'na\tme')" x "class=container"
+  [ "$status" -ne 0 ]
   run mi_led_put object Name x "class=container"
   [ "$status" -ne 0 ]
 }
@@ -717,4 +744,136 @@ put_raw() { { mi_ledger_read; printf '%s\n' "$1"; } | mi_ledger_write; }
   [ "$(printf '%s\n' "$output" | grep -ac 'name=v1')" = 1 ]
   assert_contains "nonce=nonce-a"
   assert_contains "gen=1"
+}
+
+# --- ONE LOOKUP, ONE ANSWER: the same rule asked of the record SET rather than of a record ---------
+# Every gate above judges ONE record. These four judge how MANY of them answer a question, and the
+# rule does not change: what does not resolve to exactly one thing is ambiguous, and ambiguity
+# preserves and reports. A reader must not pick one of them; a writer must not replace them with one.
+
+@test "two records answering one selector are ambiguous — nothing is read from them" {
+  mi_ident_ensure >/dev/null
+  id="$(mi_ident_get)"
+  led="$MYTHICAL_HOME/.state/ledger"
+  mi_rt_volume_create v1 first "$id"
+  # Each row is well-formed ON ITS OWN, so every gate above passes both: one `key=`, no field name
+  # twice, class and name agreeing with the object they are found under. What they do not agree about
+  # is EACH OTHER. The reader took the first, and the first carries the LIVE nonce — so deletion of a
+  # volume that a second, equally valid record describes differently was authorized.
+  put_raw "$(printf 'object\tkey=volume:v1\tclass=volume\tname=v1\tnonce=first\tgen=1')"
+  put_raw "$(printf 'object\tkey=volume:v1\tclass=volume\tname=v1\tnonce=second\tgen=2')"
+
+  run mi_prov_authority volume v1
+  [ "$status" -ne 0 ] || { echo "two contradicting records AUTHORIZED deletion" >&2; return 1; }
+  assert_contains "records answer for"
+  run mi_prov_find volume v1
+  [ "$status" -eq 1 ] || { echo "expected 1, got $status: $output" >&2; return 1; }
+  run mi_prov_gen volume v1
+  [ "$status" -ne 0 ] || { echo "a generation was read out of an ambiguous set: $output" >&2; return 1; }
+  run mi_led_find object key volume:v1
+  [ "$status" -eq 1 ] || { echo "expected 1, got $status: $output" >&2; return 1; }
+
+  # PRESERVED — both of them. A refusal that dropped either row would destroy the contradiction, which
+  # is the evidence that says this ledger needs repairing.
+  [ "$(grep -acF 'nonce=first' "$led")" = 1 ] || { echo "the first record was not preserved" >&2; return 1; }
+  [ "$(grep -acF 'nonce=second' "$led")" = 1 ] || { echo "the second record was not preserved" >&2; return 1; }
+}
+
+@test "neither editor collapses a contradiction into one record" {
+  mi_ident_ensure >/dev/null
+  led="$MYTHICAL_HOME/.state/ledger"
+  put_raw "$(printf 'object\tkey=volume:v2\tclass=volume\tname=v2\tnonce=first\tgen=1')"
+  put_raw "$(printf 'object\tkey=volume:v2\tclass=volume\tname=v2\tnonce=second\tgen=2')"
+
+  # The other direction, and the worse one: these three all removed EVERY matching row, so the first
+  # ordinary operation to touch that key replaced two contradicting records with one.
+  run mi_led_del object key volume:v2
+  [ "$status" -ne 0 ] || { echo "mi_led_del removed a contradiction instead of reporting it" >&2; return 1; }
+  [ "$(grep -acF 'key=volume:v2' "$led")" = 2 ] || { echo "a row was dropped by mi_led_del" >&2; return 1; }
+
+  run mi_led_put object key volume:v2 "key=volume:v2" "class=volume" "name=v2" "nonce=third" "gen=3"
+  [ "$status" -ne 0 ] || { echo "mi_led_put superseded a contradiction" >&2; return 1; }
+  [ "$(grep -acF 'key=volume:v2' "$led")" = 2 ] || { echo "a row was dropped by mi_led_put" >&2; return 1; }
+  [ "$(grep -acF 'nonce=third' "$led")" = 0 ] || { echo "a record was written over a contradiction" >&2; return 1; }
+
+  run mi_prov_record volume v2 fourth
+  [ "$status" -ne 0 ] || { echo "mi_prov_record superseded a contradiction" >&2; return 1; }
+  [ "$(grep -acF 'key=volume:v2' "$led")" = 2 ] || { echo "a row was dropped by mi_prov_record" >&2; return 1; }
+
+  run mi_prov_tombstone volume v2
+  [ "$status" -ne 0 ] || { echo "a tombstone consumed a contradiction" >&2; return 1; }
+  [ "$(grep -acF 'key=volume:v2' "$led")" = 2 ] || { echo "a row was dropped by mi_prov_tombstone" >&2; return 1; }
+  [ "$(grep -ac '^tombstone' "$led")" = 0 ] || { echo "a tombstone was written over a contradiction" >&2; return 1; }
+}
+
+@test "a contradiction among TOMBSTONES is preserved too, even when the object record reads fine" {
+  mi_ident_ensure >/dev/null
+  led="$MYTHICAL_HOME/.state/ledger"
+  # The object record is unique and readable, so the lookup that carries the identity forward is
+  # answered by it and never consults the tombstones at all — but the write below REPLACES them, so
+  # how many of them there are is its own question. Two tombstones for one object were collapsed into
+  # one, which is the same evidence-destroying act one kind over.
+  mi_prov_record volume v3 real-nonce
+  put_raw "$(printf 'tombstone\tkey=volume:v3\tclass=volume\tname=v3\tnonce=old-a\tgen=1')"
+  put_raw "$(printf 'tombstone\tkey=volume:v3\tclass=volume\tname=v3\tnonce=old-b\tgen=2')"
+
+  run mi_prov_tombstone volume v3
+  [ "$status" -ne 0 ] || { echo "two tombstones were collapsed into one" >&2; return 1; }
+  [ "$(grep -acF 'nonce=old-a' "$led")" = 1 ] || { echo "the first tombstone was not preserved" >&2; return 1; }
+  [ "$(grep -acF 'nonce=old-b' "$led")" = 1 ] || { echo "the second tombstone was not preserved" >&2; return 1; }
+  run mi_prov_find volume v3
+  [ "$status" -eq 0 ] || { echo "the object record was not preserved: rc=$status" >&2; return 1; }
+}
+
+@test "a keyed replacement must carry its key — a put never drops one record while writing another" {
+  mi_ident_ensure >/dev/null
+  led="$MYTHICAL_HOME/.state/ledger"
+  mi_led_put object key volume:keep "key=volume:keep" "class=volume" "name=keep" "nonce=k" "gen=1"
+
+  # The selector's SYNTAX was validated and nothing required the replacement to actually carry it, so
+  # a function whose contract is keyed REPLACEMENT was a record-drop path: the line below deletes the
+  # record for `volume:keep` and writes a record about `volume:other`.
+  run mi_led_put object key volume:keep "key=volume:other" "class=volume" "name=other" "nonce=n" "gen=1"
+  [ "$status" -ne 0 ] || { echo "a put dropped one record while writing another" >&2; return 1; }
+  assert_contains "does not carry"
+  [ "$(grep -acF 'key=volume:keep' "$led")" = 1 ] || { echo "the keyed record was dropped" >&2; return 1; }
+  [ "$(grep -acF 'key=volume:other' "$led")" = 0 ] || { echo "an unrelated record was written" >&2; return 1; }
+
+  # The field simply missing is the same defect with nothing to notice at the call site.
+  run mi_led_put object key volume:keep "class=volume" "name=keep" "nonce=n" "gen=2"
+  [ "$status" -ne 0 ] || { echo "a put with no key= at all replaced the keyed record" >&2; return 1; }
+  [ "$(grep -acF 'key=volume:keep' "$led")" = 1 ] || { echo "the keyed record was dropped" >&2; return 1; }
+  [ "$(grep -acF 'nonce=n' "$led")" = 0 ] || { echo "a keyless record was written" >&2; return 1; }
+
+  # And the honest replacement still supersedes, which is what the function is for.
+  mi_led_put object key volume:keep "key=volume:keep" "class=volume" "name=keep" "nonce=k2" "gen=2"
+  [ "$(grep -acF 'key=volume:keep' "$led")" = 1 ] || { echo "an honest replacement did not supersede" >&2; return 1; }
+  [ "$(grep -acF 'nonce=k2' "$led")" = 1 ] || { echo "an honest replacement did not land" >&2; return 1; }
+}
+
+@test "the editor drops exactly ONE row, even when the ledger holds that row twice" {
+  # The helper is asked directly, and deliberately so. Its argument is the ONE row the selector
+  # resolved to, and its contract is to drop THAT row — not "every row that looks like it". No public
+  # path can hand it two identical rows, because the selector refuses two of anything before this is
+  # reached, so nothing above it can pin the contract: measured, removing the drop-one belt left the
+  # whole suite green. A helper whose arity is only incidentally right is one a later caller — a
+  # repair verb, holding duplicates on purpose — turns into a double deletion.
+  out="$(_mi_led_without "$(printf 'object\tkey=a\nobject\tkey=a\nobject\tkey=b')" object "key=a")"
+  [ "$(printf '%s' "$out" | grep -acF 'key=a')" = 1 ] || { echo "both identical rows went: $out" >&2; return 1; }
+  [ "$(printf '%s' "$out" | grep -acF 'key=b')" = 1 ] || { echo "an unrelated row went: $out" >&2; return 1; }
+}
+
+@test "an identity record that answers nothing is not a fresh machine" {
+  led="$MYTHICAL_HOME/.state/ledger"
+  # ONE record, well-formed, and the value it carries is EMPTY — so the lookup resolves to one record
+  # and zero answers. That was reported as 3, which means "no identity recorded", which is first use:
+  # a fresh identity was minted BESIDE a record already there, leaving two of them and wedging every
+  # later read. Presence is the evidence here exactly as it is at the ledger path itself.
+  printf 'identity\tid=\n' | mi_ledger_write
+  run mi_ident_get
+  [ "$status" -eq 1 ] || { echo "expected 1, got $status: $output" >&2; return 1; }
+  run mi_ident_ensure
+  [ "$status" -ne 0 ] || { echo "minted '$output' over an identity record already on disk" >&2; return 1; }
+  [ "$(grep -ac '^identity' "$led")" = 1 ] || { echo "the identity record set changed" >&2; return 1; }
+  [ "$(grep -ac 'id=i' "$led")" = 0 ] || { echo "an identity was minted beside the record" >&2; return 1; }
 }
