@@ -146,38 +146,45 @@ _mi_copy_helper() {
   mi_rt_run_helper "$ref" none "${MI_COPY_RUNAS:--}" "$nonce" "$cmd" "$@"
 }
 
+# The honest three-way statement of whether the dual-principal ACL machinery is MEANINGFULLY ENFORCED
+# on this daemon (§4.5 residual 2 / D60). SHARED by preflight — which SETS the default entries — and
+# verify — which checks they were APPLIED — so the two halves cannot tell the operator different
+# stories about the same daemon. Docker Desktop translates ownership at the file-sharing layer, so the
+# gid/ACL path is bypassed there; native Linux enforces it (the silent default); and an endpoint that
+# could not be read at all is UNKNOWN — neither claimed nor dismissed, because "I could not ask" is
+# never "there is nothing there", and silence there would let the run be read as the native-Linux case
+# where the step IS enforced. <subject> names the step so the one message fits both callers.
+_mi_copy_acl_context_note() {
+  local subject="$1" ep
+  if [ -n "${DOCKER_HOST:-}" ]; then ep="$DOCKER_HOST"; else ep="$(mi_rt_context_host 2>/dev/null)" || ep=""; fi
+  case "$ep" in
+    *"/.docker/run/docker.sock"|npipe://*)
+      mi_warn "copy: this is Docker Desktop, where ownership is translated at the file-sharing layer, so"
+      mi_warn "  $subject is not meaningfully enforced here. It is exercised and reported, but passing on"
+      mi_warn "  Docker Desktop proves NOTHING about the gid/ACL path — that is exercised on native Linux"
+      mi_warn "  (§4.5, §10a)." ;;
+    '')
+      mi_warn "copy: the active daemon endpoint could not be read, so whether $subject is meaningfully"
+      mi_warn "  enforced on this daemon is UNKNOWN. It is neither claimed nor dismissed: it is enforced"
+      mi_warn "  on native Linux and bypassed by Docker Desktop's file-sharing layer, and nothing here"
+      mi_warn "  established which of those this is." ;;
+  esac
+}
+
 # EMPIRICAL destination preflight, probed rather than inferred from the filesystem's name: create,
 # chown, link, stat, set a default ACL, create a child AS EACH UID, read it as the other. A destination
 # that cannot represent the contract is REFUSED, naming what failed — a silent best-effort copy is a
 # copy that lies.
 mi_copy_preflight() {
   if [ "$#" -ne 4 ]; then mi_warn "copy: mi_copy_preflight needs <index> <staging> <runtime-uid> <operator-uid>"; return 1; fi
-  local idx="$1" stage="$2" ruid="$3" ouid="$4" out rc k v ep
+  local idx="$1" stage="$2" ruid="$3" ouid="$4" out rc k v
   _mi_copy_uid_ok "$ruid" "the product's runtime uid" || return 1
   _mi_copy_uid_ok "$ouid" "the operator uid" || return 1
   mi_copy_available "$idx" || return 1
 
-  # §4.5 residual 2 / D60: Docker Desktop translates ownership at the file-sharing layer, so group and
-  # ACL semantics are effectively bypassed there — both sides simply see access. The mechanism is
-  # load-bearing on NATIVE LINUX specifically. Say so rather than claiming a check that is not enforced.
-  #
-  # THREE ANSWERS, NOT TWO. "Docker Desktop", "something else", and "the endpoint could not be read at
-  # all" — and the third is not the second. Saying nothing when the question could not be asked would
-  # let the run be read as the native-Linux case, where the ACL step IS enforced: a claim nothing here
-  # established. "I could not ask" is never "there is nothing there".
-  if [ -n "${DOCKER_HOST:-}" ]; then ep="$DOCKER_HOST"; else ep="$(mi_rt_context_host 2>/dev/null)" || ep=""; fi
-  case "$ep" in
-    *"/.docker/run/docker.sock"|npipe://*)
-      mi_warn "copy: this is Docker Desktop, where ownership is translated at the file-sharing layer, so"
-      mi_warn "  the ACL step is not meaningfully enforced here. It is applied and reported, but passing"
-      mi_warn "  on Docker Desktop proves NOTHING about the gid/ACL path — that is exercised on native"
-      mi_warn "  Linux (§4.5, §10a)." ;;
-    '')
-      mi_warn "copy: the active daemon endpoint could not be read, so whether the ACL step below is"
-      mi_warn "  meaningfully enforced on this daemon is UNKNOWN. It is neither claimed nor dismissed:"
-      mi_warn "  it is enforced on native Linux and bypassed by Docker Desktop's file-sharing layer, and"
-      mi_warn "  nothing here established which of those this is." ;;
-  esac
+  # Whether the ACL step below is meaningfully enforced on this daemon — Docker Desktop bypasses it,
+  # native Linux enforces it, an unreadable endpoint is UNKNOWN. Shared with verify (see the function).
+  _mi_copy_acl_context_note "the ACL step"
 
   if [ "$ruid" = "$ouid" ]; then
     mi_log "copy: the product's runtime uid equals the operator's ($ruid), so the ACL step is a no-op"
@@ -223,37 +230,15 @@ mi_copy_preflight() {
   return 0
 }
 
-# The staging destination must be EMPTY before the copy runs. The copy MERGES the source's entries
-# over whatever is already in staging, and verification compares only the SOURCE — so a file, a
-# symlink or a special entry that was already there survives inside the migrated tree, unexamined,
-# with `done=ok` still reported. (A pre-existing ESCAPING symlink in the destination is that hole
-# wearing the symlink refusal's hat.) It is a HOST-side check: staging is the operator's own bind
-# path, so no container is needed to see into it, and refusing here — before the pull and the helper
-# — is the cheapest place to catch it.
-#
-# Called at the start of mi_copy_run. The EMPIRICAL preflight writes probe files into this same
-# destination and MUST remove them before it returns, or the copy that follows would read them as a
-# non-empty staging: a preflight that leaves droppings has corrupted the tree it was validating.
-mi_copy_stage_empty_check() {
-  if [ "$#" -ne 1 ]; then mi_warn "copy: mi_copy_stage_empty_check needs a <staging>"; return 1; fi
-  local stage="$1" listing
-  [ -d "$stage" ] || { mi_warn "copy: the staging destination '$stage' is not a directory"; return 1; }
-  # `ls -A`: dotfiles included, `.`/`..` excluded. Any entry at all — regular, dot, symlink or special
-  # — makes the destination non-empty. Read inside the `if` condition so an unreadable directory is a
-  # refusal (cannot prove emptiness) rather than an errexit abort.
-  if ! listing="$(ls -A -- "$stage" 2>/dev/null)"; then
-    mi_warn "copy: the staging destination '$stage' could not be read to confirm it is empty."
-    return 1
-  fi
-  if [ -n "$listing" ]; then
-    mi_warn "copy: the staging destination '$stage' is not empty. The copy would MERGE the source over"
-    mi_warn "  its existing entries, and verification checks only the source, so anything already here"
-    mi_warn "  would survive inside the migrated tree unexamined. Refusing: migrate into an empty"
-    mi_warn "  staging directory."
-    return 1
-  fi
-  return 0
-}
+# THE EMPTY-STAGING GUARANTEE IS ESTABLISHED INSIDE THE COPY CONTAINER, not here. Staging is the only
+# writable mount the copy container holds, so its emptiness is a precondition the container checks
+# where the mount actually is — on the mount it is about to write, ATOMICALLY with the copy — and
+# refuses with `refused=<entry>:staging-nonempty` naming the offending entry. A host-side `ls -A` was
+# wrong twice over: it mangles untrusted filenames, and it RACES the mount (an entry created after the
+# host looks and before the container mounts staging is invisible to it). See _mi_copy_refusals and the
+# helper-image contract (tests/harness/helperimg). The EMPIRICAL preflight writes probe files into this
+# same staging and MUST remove them before returning, or the copy that follows will refuse it as
+# non-empty: a preflight that leaves droppings has corrupted the tree it was validating.
 
 # The copy itself. Entry types and metadata are a stated contract, not a tool's defaults:
 #
@@ -286,8 +271,10 @@ mi_copy_run() {
   done
   _mi_copy_uid_ok "$ruid" "the product's runtime uid" || return 1
   _mi_copy_uid_ok "$ouid" "the operator uid" || return 1
-  mi_copy_stage_empty_check "$stage" || return 1
   mi_copy_available "$idx" || return 1
+  # Cleared up front so a refused or failed copy never leaves a STALE source count behind for the
+  # verify half to be measured against. Set only on a completed, non-empty copy at the very end.
+  MI_COPY_ENTRIES=
 
   local -a cspecs
   cspecs=("arg=/src" "arg=/dst" "arg=${ruid}" "arg=${ouid}")
@@ -342,6 +329,7 @@ mi_copy_run() {
       *:special-entry) reason=special-entry; path="${v%:*}" ;;
       *:escaped-write) reason=escaped-write; path="${v%:*}" ;;
       *:escaping-symlink) reason=escaping-symlink; path="${v%:*}" ;;
+      *:staging-nonempty) reason=staging-nonempty; path="${v%:*}" ;;
       *) reason=unreadable; path="$v" ;;
     esac
     # One path, one message: the two sources of a refusal (an explicit `refused=` line and an `entry=`
@@ -366,6 +354,12 @@ mi_copy_run() {
         mi_warn "  absolute path, or climbs above the root with '..'). The copy preserves a target"
         mi_warn "  verbatim and does not resolve it, so carrying this one would point outside the tree"
         mi_warn "  the moment any later product or container followed it. Refused rather than kept." ;;
+      staging-nonempty)
+        mi_warn "copy: REFUSED $path — the staging destination was not empty when the copy container"
+        mi_warn "  reached it. Emptiness is checked INSIDE the container, on the writable mount and"
+        mi_warn "  atomically with the copy: the copy MERGES the source over whatever is already there"
+        mi_warn "  and verification checks only the source, so a pre-existing entry would survive inside"
+        mi_warn "  the migrated tree unexamined. Refused." ;;
       *)
         mi_warn "copy: REFUSED — the copier stated a refusal in a form this core cannot read: '$v'."
         mi_warn "  It is treated as a refusal rather than skipped: an unreadable refusal is still one." ;;
@@ -381,7 +375,51 @@ mi_copy_run() {
     mi_warn "  failure. An exit status is not a result."
     return 1
   fi
+  # THE COPY'S OWN ENUMERATION OF THE SOURCE is the number that binds verification. Every `entry=` line
+  # is one source entry the copier read; their count is a source-derived number no caller invents, and
+  # it is PERSISTED here (MI_COPY_ENTRIES) for the verify half to be measured against — the real call
+  # site (mi_copy_run_verify) threads it through, closing the "count nobody derives" hole (round-2
+  # finding 1). A copy that reports done=ok having enumerated ZERO entries is a vacuous completion —
+  # unmeasured is not measured-clean, and over a non-empty source it is exactly that fail-open — so it
+  # is REFUSED here rather than recorded as a success measured on nothing.
+  local entries=0
+  while IFS= read -r v; do [ -n "$v" ] || continue; entries=$((entries + 1)); done <<< "$(_mi_copy_fields "$out" entry)"
+  if [ "$entries" -eq 0 ]; then
+    mi_warn "copy: the copier reported done=ok having enumerated ZERO source entries. A completed copy"
+    mi_warn "  that measured nothing is not evidence of a copy — refusing rather than recording a"
+    mi_warn "  vacuous success over what may be a non-empty source."
+    return 1
+  fi
+  MI_COPY_ENTRIES="$entries"
   return 0
+}
+
+# THE REAL CALL SITE THAT BINDS THE COPY TO ITS VERIFICATION. It runs the copy and then verifies it
+# against the source using the count the COPY ITSELF enumerated (persisted in MI_COPY_ENTRIES by
+# mi_copy_run), never a number chosen here or at any call site. Without a caller that threads that
+# count, the "checked matches the source" gate is a convention nobody honours: the count degenerates to
+# "whatever the caller invents", the tests hard-code it, and the vacuity simply moves (round-2 finding
+# 1). Task 12's migrate verb calls THIS — the two halves are never wired by hand with a caller-chosen
+# count.
+#
+# The runtime and operator uids are threaded on to verification so it can confirm the dual-principal
+# default ACL was actually APPLIED to the copied tree (round-2 finding 3), not merely possible.
+mi_copy_run_verify() {
+  if [ "$#" -lt 5 ]; then
+    mi_warn "copy: mi_copy_run_verify needs <index> <source volume> <staging> <runtime-uid> <operator-uid> [--map-foreign-to-operator]"
+    return 1
+  fi
+  local idx="$1" srcvol="$2" stage="$3" ruid="$4" ouid="$5"
+  mi_copy_run "$@" || return 1
+  local n="${MI_COPY_ENTRIES:-}"
+  case "$n" in
+    ''|*[!0-9]*)
+      mi_warn "copy: the copy did not report how many source entries it enumerated, so verification"
+      mi_warn "  cannot be bound to the source. Refusing rather than verifying against a count no step"
+      mi_warn "  derived."
+      return 1 ;;
+  esac
+  mi_copy_verify "$idx" "$srcvol" "$stage" "$n" "$ruid" "$ouid"
 }
 
 # Does a symlink at <linkpath> whose stored target is <target> point OUTSIDE the tree rooted at
@@ -461,16 +499,25 @@ _mi_copy_refusals() {
 # The destination is mounted READ-ONLY here (`dstro=`): a verifier that can repair what it finds cannot
 # report it.
 mi_copy_verify() {
-  if [ "$#" -ne 4 ]; then mi_warn "copy: mi_copy_verify needs <index> <source volume> <destination> <expected-entries>"; return 1; fi
-  local idx="$1" srcvol="$2" dst="$3" expect="$4" out rc bad=0 v n
+  if [ "$#" -ne 6 ]; then mi_warn "copy: mi_copy_verify needs <index> <source volume> <destination> <expected-entries> <runtime-uid> <operator-uid>"; return 1; fi
+  local idx="$1" srcvol="$2" dst="$3" expect="$4" ruid="$5" ouid="$6" out rc bad=0 v n da
   # <expected-entries> is the source's entry count, derived by the CALLER from the copy step's own
   # `entry=` enumeration — an INDEPENDENT, source-derived number the verifier is measured against, and
   # the thing that binds `checked` to the source. Without it `checked=0 done=ok` is a completion claim
   # over no evidence, and `checked=<a large number> done=ok` is a claim to have compared entries that
   # were never there. Neither the count nor the verdict may come from the verifier alone.
   case "$expect" in ''|*[!0-9]*) mi_warn "copy: mi_copy_verify's <expected-entries> '$expect' is not a count"; return 1 ;; esac
+  # The uids are validated HERE too (not only in the adapter's --user gate): they are passed to the
+  # verifier so it can check the copied tree for the default entries naming BOTH principals, and are
+  # named in the messages below.
+  _mi_copy_uid_ok "$ruid" "the product's runtime uid" || return 1
+  _mi_copy_uid_ok "$ouid" "the operator uid" || return 1
   mi_copy_available "$idx" || return 1
-  if out="$(_mi_copy_helper "$idx" verify "arg=/src" "arg=/dst" "srcvol=${srcvol}" "dstro=${dst}")"; then rc=0; else rc=$?; fi
+  # Whether the default-ACL application check below is meaningfully enforced on THIS daemon — the same
+  # honest three-way statement preflight makes, shared so verify never claims enforcement Docker Desktop
+  # does not give (round-2 finding 3).
+  _mi_copy_acl_context_note "the default-ACL application check"
+  if out="$(_mi_copy_helper "$idx" verify "arg=/src" "arg=/dst" "arg=${ruid}" "arg=${ouid}" "srcvol=${srcvol}" "dstro=${dst}")"; then rc=0; else rc=$?; fi
   while IFS= read -r v; do
     [ -n "$v" ] || continue
     mi_warn "copy: VERIFICATION MISMATCH ${v}"
@@ -507,6 +554,31 @@ mi_copy_verify() {
     mi_warn "  zero against a non-empty source is this failure's most important shape.)"
     return 1
   fi
+  # THE DUAL-PRINCIPAL DEFAULT ACL WAS ACTUALLY APPLIED to the copied tree — checked empirically here,
+  # not inferred from preflight capability (capability is not application — round-2 finding 3). A
+  # missing default entry on a copied directory is reported as `mismatch=<dir>:default-acl` above, like
+  # any other attribute; this REQUIRES the positive observation on top, because a verifier that never
+  # looked emits no acl mismatch and would otherwise pass on no evidence — the very vacuity the finding
+  # is about, one level down. Absent is a refusal (_mi_copy_stated); `skipped` is a no-op ONLY when the
+  # two principals are one uid, exactly as preflight's acl step.
+  da="$(_mi_copy_stated "$out" acl verify "the default-ACL application")" || return 1
+  case "$da" in
+    ok) : ;;
+    skipped)
+      if [ "$ruid" != "$ouid" ]; then
+        mi_warn "copy: verification reports the default-ACL check SKIPPED, but the product's runtime uid"
+        mi_warn "  ($ruid) is not the operator's ($ouid) — the only condition under which it is a no-op."
+        mi_warn "  Refusing: a load-bearing check reported as skipped is a check that did not run."
+        return 1
+      fi ;;
+    *)
+      mi_warn "copy: the copied tree did not pass the default-ACL application check (acl=${da:-<empty>})."
+      mi_warn "  Refusing: capability at preflight is not proof of application. Without the default"
+      mi_warn "  entries naming BOTH the operator and the runtime uid, the first file the product writes"
+      mi_warn "  after migration is unreadable by you — the failure reappears on the first post-migration"
+      mi_warn "  write."
+      return 1 ;;
+  esac
   mi_log "copy: verified $n entries against the source over the per-entry contract."
   return 0
 }

@@ -266,31 +266,76 @@ teardown() { rm -rf "$DST" "$STAGE"; mi_lock_release; teardown_test_env; }
   assert_contains "mapped"
 }
 
-# A §10a acceptance row: a NON-EMPTY staging destination is refused. The copy merges the source over
-# whatever is already there and verification checks only the source, so a pre-existing entry would
-# survive inside the migrated tree unexamined.
-@test "a NON-EMPTY staging destination (a leftover file) is REFUSED before the copy" {
-  mkdir -p "$STAGE"; printf 'x\n' > "$STAGE/leftover"
-  run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000
+# A §10a acceptance row: a NON-EMPTY staging destination is refused — and the check lives INSIDE the
+# copy container, on the writable mount, atomically with the copy, NOT in a host-side `ls -A` that
+# races the mount and mangles untrusted names (round-2 finding 2). The copy merges the source over
+# whatever is already there and verification checks only the source, so a pre-existing entry (a file, a
+# dotfile, or a symlink — the destination half of the escaping-symlink row) would survive inside the
+# migrated tree unexamined. The container names the offending entry.
+@test "a NON-EMPTY staging destination is REFUSED inside the copy container, naming the entry" {
+  mkdir -p "$STAGE"
+  HELPER_COPY=stage-nonempty run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000
   [ "$status" -ne 0 ]
-  assert_contains "not empty"
+  assert_contains "was not empty"
+  assert_contains "/dst/leftover"
 }
 
-# The same, for a pre-existing SYMLINK (which a directory-only or file-only emptiness check would
-# miss) — this is the destination half of the escaping-symlink row.
-@test "a pre-existing symlink also makes staging non-empty and is REFUSED" {
-  mkdir -p "$STAGE"; ln -s /etc/passwd "$STAGE/sneaky"
-  run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000
-  [ "$status" -ne 0 ]
-  assert_contains "not empty"
-}
-
-# The other half of the rule: an EMPTY staging passes the gate, so the refusals above are the leftover,
-# not the gate refusing everything.
-@test "an empty staging destination passes the emptiness gate" {
+# The other half of the rule: an EMPTY staging passes, so the refusal above is the leftover, not the
+# gate refusing everything.
+@test "an empty staging destination passes" {
   mkdir -p "$STAGE"
   run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000
   [ "$status" -eq 0 ]
+}
+
+# Finding 1: a copy that reports done=ok having enumerated ZERO source entries is a vacuous completion
+# and is REFUSED — a completed copy that measured nothing is not evidence of a copy, and over a
+# non-empty source it is exactly the fail-open the source-count binding exists to close.
+@test "a copy reporting done=ok with ZERO enumerated source entries is REFUSED" {
+  mkdir -p "$STAGE"
+  HELPER_COPY=empty run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000
+  [ "$status" -ne 0 ]
+  assert_contains "ZERO source entries"
+}
+
+# Finding 1, the headline: the REAL copy->verify path threads the count the COPY ITSELF enumerated
+# (five entries) into verification — never a constant a caller invents. The conforming path passes...
+@test "the real copy->verify path threads the copy's own source count into verification" {
+  mkdir -p "$STAGE"
+  run mi_copy_run_verify "$IDX" srcvol1 "$STAGE" 900 1000
+  [ "$status" -eq 0 ]
+  assert_contains "verified 5 entries"
+}
+
+# ...and a verifier that UNDERSTATES its checked count (3) against the copy's source count (5) is
+# caught — the count it is measured against came from the copy's enumeration, so understating it is a
+# NOT-verified copy, not a passing one. This is the vacuity finding 1 says had merely moved to "whatever
+# count the caller invents": here nobody invents it.
+@test "copy->verify catches a helper UNDERSTATING its checked count vs the copy's source count" {
+  mkdir -p "$STAGE"
+  HELPER_VERIFY=understate run mi_copy_run_verify "$IDX" srcvol1 "$STAGE" 900 1000
+  [ "$status" -ne 0 ]
+  assert_contains "checked 3 entries but the source has 5"
+}
+
+# The count that binds verification TRACKS the copy's own enumeration — it is not a constant. Here the
+# copy enumerated THREE (not the ordinary five) and an honest three-entry verify passes: no single
+# hard-coded number could satisfy both this and the five-entry conforming case above. This is what
+# distinguishes a derived count from "whatever constant the caller invents" — the round-2 finding.
+@test "the source count that binds verification TRACKS the copy's enumeration, not a constant" {
+  mkdir -p "$STAGE"
+  HELPER_COPY=count3 HELPER_VERIFY=count3 run mi_copy_run_verify "$IDX" srcvol1 "$STAGE" 900 1000
+  [ "$status" -eq 0 ]
+  assert_contains "verified 3 entries"
+}
+
+# ...and against a three-entry copy, a verifier that reports FIVE is caught — the mirror of the
+# understatement above, and the case a caller that hard-coded 5 would wrongly pass.
+@test "copy->verify catches a verifier OVERSTATING its count against a three-entry copy" {
+  mkdir -p "$STAGE"
+  HELPER_COPY=count3 HELPER_VERIFY=ok run mi_copy_run_verify "$IDX" srcvol1 "$STAGE" 900 1000
+  [ "$status" -ne 0 ]
+  assert_contains "checked 5 entries but the source has 3"
 }
 
 # Both uid principals are validated as 0..4294967295 before ANY helper call — not just numerically,
@@ -326,22 +371,22 @@ teardown() { rm -rf "$DST" "$STAGE"; mi_lock_release; teardown_test_env; }
 
 @test "verification is PER-ENTRY over the contract, not a byte count" {
   mkdir -p "$STAGE"
-  run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5
+  run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5 900 1000
   [ "$status" -eq 0 ]
-  HELPER_VERIFY=type run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5
+  HELPER_VERIFY=type run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5 900 1000
   [ "$status" -ne 0 ]
   assert_contains "type"
-  HELPER_VERIFY=digest run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5
+  HELPER_VERIFY=digest run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5 900 1000
   [ "$status" -ne 0 ]
-  HELPER_VERIFY=linktarget run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5
+  HELPER_VERIFY=linktarget run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5 900 1000
   [ "$status" -ne 0 ]
-  HELPER_VERIFY=mode run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5
+  HELPER_VERIFY=mode run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5 900 1000
   [ "$status" -ne 0 ]
-  HELPER_VERIFY=hardlink run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5
+  HELPER_VERIFY=hardlink run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5 900 1000
   [ "$status" -ne 0 ]
-  HELPER_VERIFY=owner run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5
+  HELPER_VERIFY=owner run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5 900 1000
   [ "$status" -ne 0 ]
-  HELPER_VERIFY=mtime run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5
+  HELPER_VERIFY=mtime run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5 900 1000
   [ "$status" -ne 0 ]
 }
 
@@ -349,16 +394,78 @@ teardown() { rm -rf "$DST" "$STAGE"; mi_lock_release; teardown_test_env; }
 # it is checking, and a verifier that can repair what it finds cannot report it.
 @test "verification mounts the destination read-only" {
   mkdir -p "$STAGE"
-  mi_copy_verify "$IDX" srcvol1 "$STAGE" 5 || true
+  mi_copy_verify "$IDX" srcvol1 "$STAGE" 5 900 1000 || true
   run grep -a "type=bind,source=${STAGE},target=/dst,readonly" "$FAKE_DOCKER_STATE/calls.log"
   [ "$status" -eq 0 ]
+}
+
+# Finding 3: the copied tree is EMPIRICALLY checked for the dual-principal default ACL — a copied
+# directory missing it is reported as a mismatch like any other attribute, and fails verification.
+# Capability at preflight is not proof of application.
+@test "verification catches a copied directory MISSING the dual-principal default ACL" {
+  mkdir -p "$STAGE"
+  HELPER_VERIFY=default-acl run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5 900 1000
+  [ "$status" -ne 0 ]
+  assert_contains "default-acl"
+}
+
+# ...and non-vacuously: a verifier that never REPORTS the default-ACL result (never looked) is refused,
+# not read as a pass — the same "absent is not measured-clean" rule, one level down.
+@test "a verification that never reports the default-ACL application is REFUSED" {
+  mkdir -p "$STAGE"
+  HELPER_VERIFY=acl-absent run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5 900 1000
+  [ "$status" -ne 0 ]
+  assert_contains "missing observation"
+}
+
+# `skipped` is a no-op ONLY when the two principals are one uid. Reported where they DIFFER, it is a
+# load-bearing check that did not run, and must be caught — exactly as the preflight ACL step is.
+@test "the default-ACL check may NOT be reported skipped when the two uids differ" {
+  mkdir -p "$STAGE"
+  HELPER_VERIFY=acl-skip-differ run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5 900 1000
+  [ "$status" -ne 0 ]
+  assert_contains "SKIPPED"
+}
+
+# The other half of that rule: when the uids are equal the ACL step is genuinely a no-op, so `skipped`
+# is accepted and verification passes.
+@test "the default-ACL check skipped is ACCEPTED when runtime uid == operator uid" {
+  mkdir -p "$STAGE"
+  run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5 1000 1000
+  [ "$status" -eq 0 ]
+}
+
+# On Docker Desktop the ACL is translated away at the file-sharing layer, so verify must not CLAIM the
+# application it checked was enforced — it keeps the honest "not meaningfully enforced" reporting.
+@test "on Docker Desktop verify reports the default-ACL application as not meaningfully enforced" {
+  mkdir -p "$STAGE"
+  FAKE_DOCKER_CONTEXT_HOST="unix://$HOME/.docker/run/docker.sock" run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5 900 1000
+  assert_contains "not meaningfully enforced"
+}
+
+# The third answer for verify too: the endpoint could not be read, so neither enforcement claim is made.
+@test "when the daemon endpoint cannot be read, verify makes neither enforcement claim" {
+  mkdir -p "$STAGE"
+  mi_rt_context_host() { return 1; }
+  run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5 900 1000
+  [ "$status" -eq 0 ]
+  assert_contains "UNKNOWN"
+}
+
+# Both uid principals are validated for RANGE (0..2^32-1), not just numerically, before the verifier
+# runs — they are written into the ACL entries the verifier checks and named in every message.
+@test "verify validates the uid principals for range too" {
+  mkdir -p "$STAGE"
+  run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5 4294967296 1000
+  [ "$status" -ne 0 ]
+  assert_contains "out of range"
 }
 
 # "Verified" with no count is a verification claim on no evidence: a verifier that walked zero entries
 # and exited 0 would otherwise report the copy good.
 @test "a verification that does not say how many entries it checked is refused" {
   mkdir -p "$STAGE"
-  HELPER_VERIFY=nocount run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5
+  HELPER_VERIFY=nocount run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5 900 1000
   [ "$status" -ne 0 ]
   assert_contains "how many"
 }
@@ -368,7 +475,7 @@ teardown() { rm -rf "$DST" "$STAGE"; mi_lock_release; teardown_test_env; }
 # count so it can be caught — 0 checked against a source of 5 is not a verification.
 @test "a verification that checked ZERO entries against a non-empty source is refused" {
   mkdir -p "$STAGE"
-  HELPER_VERIFY=zero run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5
+  HELPER_VERIFY=zero run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5 900 1000
   [ "$status" -ne 0 ]
   assert_contains "the source has 5"
 }
@@ -377,7 +484,7 @@ teardown() { rm -rf "$DST" "$STAGE"; mi_lock_release; teardown_test_env; }
 # has) is as wrong as zero — it did not walk the source the copy read.
 @test "a verifier that checked a different count than the source is refused" {
   mkdir -p "$STAGE"
-  HELPER_VERIFY=ok run mi_copy_verify "$IDX" srcvol1 "$STAGE" 4
+  HELPER_VERIFY=ok run mi_copy_verify "$IDX" srcvol1 "$STAGE" 4 900 1000
   [ "$status" -ne 0 ]
   assert_contains "checked 5 entries but the source has 4"
 }
@@ -484,7 +591,7 @@ teardown() { rm -rf "$DST" "$STAGE"; mi_lock_release; teardown_test_env; }
 
 @test "a verification MISMATCH stated with a ZERO exit still fails the verification" {
   mkdir -p "$STAGE"
-  HELPER_VERIFY=digest HELPER_EXIT0=1 run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5
+  HELPER_VERIFY=digest HELPER_EXIT0=1 run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5 900 1000
   [ "$status" -ne 0 ]
   assert_contains "MISMATCH"
 }

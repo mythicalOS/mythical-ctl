@@ -52,8 +52,16 @@
 #                              step is genuinely a no-op. `inherit` is the cross-read result — the
 #                              child created as one uid, read as the other — and is the observation
 #                              that says the DEFAULT entries actually carry.
+#                              It writes probe files into /dst and MUST remove them before returning:
+#                              the copy that follows shares this staging and refuses a non-empty one,
+#                              so a preflight that leaves droppings breaks the very copy it validated.
 #                              exit 0 when every observation is ok (or acl=skipped); 1 otherwise.
 #   copy <src> <dst> <runtime-uid> <operator-uid> [--map-foreign]
+#                              STAGING (/dst) MUST BE EMPTY when this runs — it is the copy's own
+#                              precondition, checked HERE, inside the container, on the writable mount,
+#                              atomically with the copy (never by a host-side `ls -A` that races the
+#                              mount and mangles untrusted names). A non-empty /dst is refused,
+#                              `refused=<entry>:staging-nonempty`, naming the offending entry.
 #                              The entry-type and metadata contract, reported as it goes:
 #                                entry=<type>:<path>        type ∈ file|dir|symlink|hardlink|special
 #                                linktarget=<path>:<verbatim target>
@@ -61,24 +69,39 @@
 #                                mapped=<path>:<olduid>     a foreign uid folded into the operator's,
 #                                                           ONLY under --map-foreign
 #                                refused=<path>:<reason>    reason ∈ special-entry | escaped-write |
-#                                                           escaping-symlink
+#                                                           escaping-symlink | staging-nonempty
 #                                refused=<path>:foreign-uid:<uid>
 #                                done=ok                    printed ONLY on a completed copy
 #                              exit 0 when nothing was refused; 1 otherwise.
+#                              Every `entry=` line is one source entry the copier read; their COUNT is
+#                              the source-derived number the verify half is measured against, so the
+#                              caller refuses a `done=ok` reported with ZERO `entry=` lines — a
+#                              completed copy that measured nothing is a vacuous success over what may
+#                              be a non-empty source.
 #                              A symlink whose target is ABSOLUTE or climbs above the tree root with
 #                              `..` MUST be refused (escaping-symlink), never carried as text — the
 #                              caller ALSO derives this from the linktarget it logged, so a copier
 #                              that only logged it is caught. A foreign uid is refused unless
 #                              --map-foreign was given; a `mapped=` reported without it is refused by
 #                              the caller as an unrequested mapping.
-#   verify <src> <dst>         PER-ENTRY over that same contract, never a byte count:
-#                                mismatch=<path>:type|digest|linktarget|mode|owner|mtime|hardlink
+#   verify <src> <dst> <runtime-uid> <operator-uid>
+#                              PER-ENTRY over that same contract, never a byte count:
+#                                mismatch=<path>:type|digest|linktarget|mode|owner|mtime|hardlink|default-acl
+#                                acl=ok|fail|skipped
 #                                checked=<n>   done=ok
 #                              exit 0 when there is no mismatch; 1 otherwise. `checked=<n>` is the
 #                              number of source entries compared and MUST equal the source's own entry
 #                              count: the caller supplies that count (source-derived, from the copy
 #                              step's `entry=` lines) and refuses a `checked` that differs — a count
 #                              of zero against a non-empty source is a vacuous pass.
+#                              `acl` is the DUAL-PRINCIPAL DEFAULT ACL APPLICATION result, checked
+#                              EMPIRICALLY on the copied tree against the two uids passed in — capability
+#                              at preflight is not proof of application. A copied directory missing the
+#                              default entries naming both principals is reported as
+#                              `mismatch=<dir>:default-acl` AND `acl=fail`; the caller REQUIRES the
+#                              positive `acl` observation (absent is a refusal — a verifier that never
+#                              looked emits no mismatch and would otherwise pass on no evidence).
+#                              `acl=skipped` is legitimate ONLY when the two uids are equal.
 #   acl <dst> <runtime-uid> <operator-uid>
 #                              RESERVED, and deliberately separate: re-apply the dual-principal
 #                              default entries WITHOUT re-copying, for a repair path. The copy itself
@@ -215,10 +238,38 @@ case "$cmd" in
     fi
     knob="${HELPER_COPY:-ok}"
     [ "$knob" != silent ] || exit 0
+    # `empty`: a copy that COMPLETED having enumerated ZERO source entries. `done=ok` over no entries
+    # is a vacuous completion the caller must refuse — a copier that measured nothing cannot be
+    # distinguished from one that lied — so it is a knob, not an accident. It skips the ordinary tree
+    # precisely so the enumeration is empty.
+    [ "$knob" != empty ] || { printf 'done=ok\n'; fin 0; }
+    # `stage-nonempty`: the copy container found its one writable mount (/dst, the staging bind) NOT
+    # empty when it reached it. Emptiness is the copy's OWN precondition, established HERE — inside the
+    # container, on the mount it is about to write, atomically with the copy — never by a host-side
+    # glance that races the mount and mangles untrusted names. The offending entry is named; `done=ok`
+    # is NOT printed.
+    if [ "$knob" = stage-nonempty ]; then
+      printf 'refused=%s/leftover:staging-nonempty\n' "$dst"
+      fin 1
+    fi
+    # `count3`: a completed copy that enumerated exactly THREE source entries — a DIFFERENT count from
+    # the ordinary five. It exists so a test can prove the count that binds verification TRACKS the
+    # copy's own enumeration and is not a constant: no single hard-coded number satisfies both a
+    # five-entry and a three-entry copy (round-2 finding 1).
+    if [ "$knob" = count3 ]; then
+      printf 'entry=dir:%s/data\n'    "$src"
+      printf 'entry=file:%s/data/a\n' "$src"
+      printf 'entry=file:%s/data/b\n' "$src"
+      printf 'done=ok\n'
+      fin 0
+    fi
     # The ordinary tree, reported on EVERY setting, so the contract observations are present in the
-    # plain case too and a caller cannot pass its symlink assertions only on a knobbed fixture.
+    # plain case too and a caller cannot pass its symlink assertions only on a knobbed fixture. FIVE
+    # `entry=` lines: the copy's own source enumeration, and the count the verify half is measured
+    # against (its conforming `checked=5` matches — round-2 finding 1). `linktarget=` is not an entry.
     printf 'entry=dir:%s/data\n'      "$src"
     printf 'entry=file:%s/data/f\n'   "$src"
+    printf 'entry=file:%s/data/f3\n'  "$src"
     printf 'entry=symlink:%s/data/link\n' "$src"
     printf 'linktarget=%s/data/link:../data/f\n' "$src"
     printf 'entry=hardlink:%s/data/f2\n' "$src"
@@ -277,24 +328,48 @@ case "$cmd" in
     fin "$rc"
     ;;
   verify)
-    src="${1:-}"; dst="${2:-}"
-    if [ -z "$src" ] || [ -z "$dst" ]; then
-      printf 'helperimg: verify needs <source> <destination>\n' >&2
+    src="${1:-}"; dst="${2:-}"; ruid="${3:-}"; ouid="${4:-}"
+    if [ -z "$src" ] || [ -z "$dst" ] || [ -z "$ruid" ] || [ -z "$ouid" ]; then
+      printf 'helperimg: verify needs <source> <destination> <runtime-uid> <operator-uid>\n' >&2
       exit 1
     fi
     knob="${HELPER_VERIFY:-ok}"
     [ "$knob" != silent ] || exit 0
+    # The DEFAULT-ACL APPLICATION result on the COPIED tree: capability was proven at preflight, this
+    # is proof it was actually applied. Checked against the uids the caller passed, so it is the
+    # dual-principal default ACL specifically. `skipped` is a genuine no-op ONLY when the two
+    # principals are one uid — a default entry naming it twice grants nothing new.
+    if [ "$ruid" = "$ouid" ]; then acl=skipped; else acl=ok; fi
     case "$knob" in
-      ok) printf 'checked=5\ndone=ok\n' ;;
+      ok) printf 'checked=5\nacl=%s\ndone=ok\n' "$acl" ;;
       # Completion claimed with no count: nothing in the answer says a single entry was looked at.
-      nocount) printf 'done=ok\n' ;;
+      nocount) printf 'acl=%s\ndone=ok\n' "$acl" ;;
       # Completion claimed having checked ZERO entries — a vacuous pass the caller must reject against
       # a non-empty source (it binds `checked` to the source's own count).
-      zero) printf 'checked=0\ndone=ok\n' ;;
+      zero) printf 'checked=0\nacl=%s\ndone=ok\n' "$acl" ;;
+      # Fewer entries checked than the copy enumerated: an UNDERSTATED count. The real copy->verify
+      # path threads the copy's own source count (5) in, so 3 checked is caught (round-2 finding 1).
+      understate) printf 'checked=3\nacl=%s\ndone=ok\n' "$acl" ;;
+      # A verifier that HONESTLY checked three entries — the conforming partner of the copy's `count3`,
+      # so the end-to-end path passes when the copy also enumerated three, and no constant count works.
+      count3) printf 'checked=3\nacl=%s\ndone=ok\n' "$acl" ;;
       type|digest|linktarget|mode|owner|mtime|hardlink)
         printf 'mismatch=%s/data/f:%s\n' "$dst" "$knob"
-        printf 'checked=5\ndone=ok\n'
+        printf 'checked=5\nacl=%s\ndone=ok\n' "$acl"
         fin 1 ;;
+      # A copied DIRECTORY missing the dual-principal default ACL — reported as a mismatch like any
+      # other attribute (capability at preflight is not proof of application — round-2 finding 3).
+      default-acl)
+        printf 'mismatch=%s/data:default-acl\n' "$dst"
+        printf 'checked=5\nacl=fail\ndone=ok\n'
+        fin 1 ;;
+      # The ACL application was never CHECKED: the answer omits the acl observation entirely. The
+      # caller must refuse it — an unmeasured ACL is not a measured-clean one — the same vacuity one
+      # level down.
+      acl-absent) printf 'checked=5\ndone=ok\n' ;;
+      # `skipped` reported where the two principals DIFFER: the ACL step is load-bearing there, so a
+      # skip is a step that did not run. The caller must catch it, exactly as preflight does.
+      acl-skip-differ) printf 'checked=5\nacl=skipped\ndone=ok\n' ;;
       *) printf 'helperimg: unknown HELPER_VERIFY setting: %s\n' "$knob" >&2; exit 2 ;;
     esac
     ;;
