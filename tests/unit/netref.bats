@@ -447,6 +447,11 @@ probe_answers() { HELPER_RESOLVE_ADDR="$1"; export HELPER_RESOLVE_ADDR; }
 @test "a bare phase 4 on a fleet with no recorded migration REFUSES to detach" {
   src="$(mi_rt_network_create s "" x)"; tgt="$(mi_rt_network_create t "" y)"
   c="$(a_sibling p1 "$src")"
+  # The fleet is on BOTH networks — it LOOKS mid-migration, but no intent is recorded. This is the case
+  # only the admits gate guards: phase 4's own pre-detach re-inspection (fix wave 3) confirms the target
+  # is present and would let the detach through, so with the target attached the admits record gate is
+  # the SOLE refusal here, and removing it is a kill rather than a no-op masked by the re-inspection.
+  mi_rt_network_connect "$tgt" "$c" "$(mi_name_alias p1)" -1 >/dev/null
   run mi_netmig_run "$IDX" "$src" "$tgt" 4
   [ "$status" -ne 0 ]
   # STATE: the source is still attached — nothing was detached on invented proof.
@@ -479,9 +484,13 @@ probe_answers() { HELPER_RESOLVE_ADDR="$1"; export HELPER_RESOLVE_ADDR; }
 
 @test "a bare phase 6 with no verified migration REFUSES to commit-and-clear" {
   src="$(mi_rt_network_create s "" x)"; tgt="$(mi_rt_network_create t "" y)"
-  c="$(a_sibling p1 "$src")"
+  # The fleet is already on the TARGET ALONE, so phase 6's own pre-commit re-verification (fix wave 3)
+  # would PASS — but the recorded phase is 2, not 5, so there is no phase-5 proof the fleet was ever
+  # verified there. That makes the admits phase-window gate the SOLE refusal, and removing it a kill
+  # rather than a no-op masked by the re-verification.
+  c="$(a_sibling p1 "$tgt")"
   printf 'MYTHICAL_NET=t\n' > "$MYTHICAL_HOME/mythical.conf"
-  # An in-flight migration only at phase 2 (containers still on both, never verified on the target).
+  probe_answers "$(addr_on "$c" "$tgt")"
   mi_led_put netmig key family "key=family" "phase=2" "source=$src" "target=$tgt" "containers=$c"
   run mi_netmig_run "$IDX" "$src" "$tgt" 6
   [ "$status" -ne 0 ]
@@ -564,4 +573,58 @@ probe_answers() { HELPER_RESOLVE_ADDR="$1"; export HELPER_RESOLVE_ADDR; }
   # taken the forward-only path, and proceeded on a question the runtime never answered.
   run mi_rt_inspect container c.nets "$c"
   assert_contains "$src"
+}
+
+# --- fix wave 3: at an irreversible step, MEASURE the current state — never act on a phase marker -----
+
+# FINDING 1 — phase 4 must re-inspect that a container is STILL on the target before detaching it from
+# the source. A marker records that phase 3 verified the fleet ONCE; an external disconnect between the
+# phases can have removed a target attachment since, and detaching the source THEN leaves the container
+# on neither network.
+
+@test "phase 4 re-inspects the target and REFUSES to detach a container no longer on it" {
+  src="$(mi_rt_network_create s "" x)"; tgt="$(mi_rt_network_create t "" y)"
+  c="$(a_sibling p1 "$src")"
+  # As phase 2 left it: c on BOTH networks, the intent recorded at phase 3 (verified), ready to detach.
+  mi_rt_network_connect "$tgt" "$c" "$(mi_name_alias p1)" -1 >/dev/null
+  mi_led_put netmig key family "key=family" "phase=3" "source=$src" "target=$tgt" "containers=$c"
+  # BETWEEN phase 3 and phase 4 an external actor detaches c from the TARGET. The marker still says
+  # phase=3, but the fleet is no longer where it says — c is now on the SOURCE alone.
+  mi_rt_network_disconnect "$tgt" "$c" >/dev/null
+  run mi_netmig_run "$IDX" "$src" "$tgt" 4
+  [ "$status" -ne 0 ]
+  # STATE: c is STILL on the source — detaching it would have left it on neither network. This is the
+  # assertion that bites: acting on the marker alone detaches the source and c ends up attached to
+  # nothing, so the source would be absent here.
+  run mi_rt_inspect container c.nets "$c"
+  assert_contains "$src"
+  # RECORD: the intent stays recorded, so the migration is still resumable rather than lost.
+  run mi_led_find netmig key family
+  [ "$status" -eq 0 ]
+}
+
+# FINDING 2 — phase 6 must re-run phase 5's exact-{target} verification before committing the reference
+# and clearing the intent. A phase=5 marker records that the fleet WAS on the target alone; a container
+# reattached to the old network between phase 5 and this (public, re-runnable) phase 6 sits on
+# {source,target}, and clearing the only intent then makes that split permanent.
+
+@test "phase 6 re-verifies exactly {target} and REFUSES to clear when a container was reattached to the source" {
+  src="$(mi_rt_network_create s "" x)"; tgt="$(mi_rt_network_create t "" y)"
+  c="$(a_sibling p1 "$tgt")"
+  printf 'MYTHICAL_NET=t\n' > "$MYTHICAL_HOME/mythical.conf"
+  probe_answers "$(addr_on "$c" "$tgt")"
+  # Phase 5 completed: the fleet is on the target alone, the intent records phase=5 ready to commit.
+  mi_led_put netmig key family "key=family" "phase=5" "source=$src" "target=$tgt" "containers=$c"
+  # BETWEEN phase 5 and phase 6 an external actor REATTACHES c to the OLD source network. The marker
+  # still says phase=5, but c now straddles {source,target} — the silent split phase 5 exists to catch.
+  mi_rt_network_connect "$src" "$c" "$(mi_name_alias p1)" 0 >/dev/null
+  run mi_netmig_run "$IDX" "$src" "$tgt" 6
+  [ "$status" -ne 0 ]
+  # RECORD: the intent is STILL recorded (not cleared) — acting on the marker alone would have deleted
+  # it. The migration stays resumable.
+  run mi_led_find netmig key family
+  [ "$status" -eq 0 ]
+  # STATE: no reference was committed over the fleet while it straddles two networks.
+  run mi_net_ref_get
+  [ "$status" -ne 0 ]
 }

@@ -636,6 +636,33 @@ _mi_netmig_target_only_ok() {
   return 0
 }
 
+# IS <c> STILL ATTACHED TO <tgt> RIGHT NOW? A MEMBERSHIP test — deliberately NOT the exact-set one.
+# Phase 4 asks it the instant before it removes the source, while the container is meant to be on the
+# full {source,target} set; a crash re-entry asks it of one already detached down to {target} alone.
+# BOTH must answer "yes, the target is there", so the assertion is only "the target is present", which
+# holds across the whole {source,target}→{target} window the detach walks. The set-shape assertion
+# (exactly {target}) is phase 5's, made once the move is claimed complete; here it would refuse every
+# not-yet-detached container and stall the phase.
+#
+# It exists so phase 4 MEASURES the target attachment rather than trusting the recorded phase: the
+# admits gate proves phase 3 verified the fleet ONCE, not that an external `docker network disconnect`
+# (or a stale/restored phase=3) has not removed a target attachment since. Detaching the source from a
+# container no longer on the target leaves it on NEITHER network — the split the phase order exists to
+# prevent, arrived at through a marker trusted past the moment it was true.
+#
+# rc 0 attached to <tgt> · non-zero not confirmed attached — either genuinely not on it, or the
+# container could not be inspected at all (the inspect's rc is propagated). Both FAIL CLOSED at the
+# caller: "could not ask" is not "still there", and neither authorizes a detach.
+_mi_netmig_on_target() {
+  local c="$1" tgt="$2" nets line
+  nets="$(mi_rt_inspect container c.nets "$c")" || return $?
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    [ "${line%%$'\t'*}" = "$tgt" ] && return 0
+  done <<< "$(_mi_bringup_attachments "$nets")"
+  return 1
+}
+
 # THE AUTHORITATIVE RECORD IS THE PROOF A DESTRUCTIVE PHASE MAY RUN. Phase 4 detaches and phase 6 clears
 # the intent; both are irreversible, and both depend on the earlier phases having run — every container
 # connected to the target (phase 2) and verified there (phases 3, 5). That proof is the recorded phase,
@@ -896,6 +923,20 @@ mi_netmig_run() {
       _mi_netmig_record 4 "$src" "$tgt" "$cs" || return 1
       while IFS= read -r c; do
         [ -n "$c" ] || continue
+        # MEASURE THE TARGET ATTACHMENT BEFORE REMOVING THE SOURCE, never act on the marker alone. The
+        # admits gate above proves phase 3 verified this fleet ONCE; it does not prove '$c' is STILL on
+        # the target now. An external disconnect (or a stale/restored phase=3) between the phases can
+        # have taken the target attachment away — and detaching the source THEN leaves '$c' on neither
+        # network, the split the phase order exists to prevent, which phase 5 would only notice
+        # afterward with recovery stranded at phase 4. So re-inspect, and STOP without detaching if the
+        # target is gone. (Re-entry finds already-detached containers on {target} alone — still on the
+        # target, so this passes and the disconnect below is the no-op the comment describes.)
+        _mi_netmig_on_target "$c" "$tgt" || {
+          mi_warn "netref: phase 4: '$c' is not confirmed attached to the target network, so detaching"
+          mi_warn "  it from the source would leave it on neither. Stopping without detaching — the"
+          mi_warn "  intent stays at phase 4 and the migration resumes. Reconnect '$c' to the target, or"
+          mi_warn "  run 'mythical-ctl state repair', then re-run."
+          return 1; }
         # THE EXIT STATUS IS NOT THE RESULT, and here it must not be. Re-entering this phase after a
         # crash asks a runtime that has already detached some of them, where "it was never attached" is
         # an error — so a status-driven stop would make recovery impossible on exactly the path
@@ -945,6 +986,25 @@ mi_netmig_run() {
       # could commit a reference and delete an in-flight intent whose fleet was never verified on the
       # target, stranding a container on {source,target} with nothing left to resume it.
       _mi_netmig_admits 6 "$src" "$tgt" 5 5 || return 1
+      # MEASURE THE FLEET AGAIN BEFORE THE IRREVERSIBLE CLEAR, never act on the marker alone. The admits
+      # gate above proves phase 5 RECORDED its success once; it does not prove the fleet is STILL on the
+      # target alone now. mi_netmig_run is public and re-runnable, so a container reattached to the OLD
+      # network between phase 5 and this phase 6 (an external `docker network connect`, a restored
+      # ledger) would sit on {source,target} — and clearing the intent now, the intent being the only
+      # record of where the fleet came from, makes that split PERMANENT with nothing left to resume
+      # from. So phase 5's exact-{target} verification is RE-RUN over the recorded fleet here, through
+      # the very same verifier phase 5 uses, and any failure STOPS with the intent intact.
+      while IFS= read -r c; do
+        [ -n "$c" ] || continue
+        local alias6
+        alias6="$(_mi_netmig_alias "$c")" || return 1
+        _mi_netmig_target_only_ok "$idx" "$c" "$tgt" "$alias6" || {
+          mi_warn "netref: phase 6: '$c' is no longer on the target network alone, so committing the"
+          mi_warn "  reference and clearing the intent now would strand it mid-migration with nothing to"
+          mi_warn "  resume from — the split phase 5 exists to prevent. STOPPING with the intent intact;"
+          mi_warn "  the migration stays resumable. Run 'mythical-ctl state repair' if this persists."
+          return 1; }
+      done <<< "$cs"
       # COMMIT, then clear — and refuse to clear without committing. If MYTHICAL_NET has been removed
       # or edited since the migration started there is no correct reference to record, and clearing the
       # intent anyway would leave the fleet on the target while the ledger names something else: the
