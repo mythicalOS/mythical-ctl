@@ -233,6 +233,10 @@ probe_answers() { HELPER_RESOLVE_ADDR="$1"; export HELPER_RESOLVE_ADDR; }
 @test "a STOPPED sibling is DEFERRED, not demanded and not started to verify" {
   src="$(mi_rt_network_create s "" x)"; tgt="$(mi_rt_network_create t "" y)"
   c="$(a_sibling p1 "$src" stopped)"
+  # Phase 2 first: a stopped sibling must be ATTACHED to the target before phase 3 will defer its live
+  # check — deferring one that never reached the target is exactly the silent-connect split phase 3 now
+  # catches (see the critical-2 test below).
+  mi_netmig_run "$IDX" "$src" "$tgt" 2 >/dev/null
   run mi_netmig_run "$IDX" "$src" "$tgt" 3
   [ "$status" -eq 0 ]
   run mi_state_observed "$c"
@@ -348,4 +352,138 @@ probe_answers() { HELPER_RESOLVE_ADDR="$1"; export HELPER_RESOLVE_ADDR; }
   [ "$status" -eq 0 ]
   run mi_net_ref_get
   [ "$status" -ne 0 ]
+}
+
+# --- fix wave 1: a fleet must never split across two networks while everything reports healthy -------
+
+# CRITICAL 1 — a config change must not silently record a new network and leave the fleet behind.
+
+@test "adding MYTHICAL_NET to a running installation is REFUSED, not silently split" {
+  owned="$(mi_net_target "$IDX")"
+  c="$(a_sibling p1 "$owned")"
+  mi_rt_network_create opnet "" z >/dev/null
+  printf 'MYTHICAL_NET=opnet\n' > "$MYTHICAL_HOME/mythical.conf"
+  run mi_net_target "$IDX"
+  [ "$status" -ne 0 ]
+  # STATE, not wording: no attach-only reference was recorded, and the fleet is still on the owned
+  # network — resolving a target did not flip which network the family joins.
+  run mi_net_ref_get
+  [ "$status" -eq 3 ]
+  run mi_rt_inspect container c.nets "$c"
+  assert_contains "$owned"
+}
+
+@test "removing MYTHICAL_NET from a running installation is REFUSED, not silently split" {
+  mi_rt_network_create opnet "" z >/dev/null
+  printf 'MYTHICAL_NET=opnet\n' > "$MYTHICAL_HOME/mythical.conf"
+  op="$(mi_net_target "$IDX")"
+  c="$(a_sibling p1 "$op")"
+  rm -f "$MYTHICAL_HOME/mythical.conf"
+  run mi_net_target "$IDX"
+  [ "$status" -ne 0 ]
+  # STATE: no installer-owned network was created behind the fleet's back, and the fleet stays on the
+  # operator's network — the owned branch did not bypass the reference check.
+  run mi_rt_find_by_label network installation "$IDENT"
+  [ "$(printf '%s\n' "$output" | grep -ac .)" = 0 ]
+  run mi_rt_inspect container c.nets "$c"
+  assert_contains "$op"
+}
+
+# RESIDUAL (c) — the rebind must be able to migrate the fleet OFF the installer's own network, which is
+# what gives critical-1's "adding" case a correct path instead of a record-and-split.
+
+@test "a rebind can migrate the fleet OFF the installer's own network onto an operator's" {
+  owned="$(mi_net_target "$IDX")"
+  c="$(a_sibling p1 "$owned")"
+  op="$(mi_rt_network_create opnet "" z)"
+  printf 'MYTHICAL_NET=opnet\n' > "$MYTHICAL_HOME/mythical.conf"
+  probe_answers "$(addr_will_be "$c" "$op")"
+  run mi_net_ref_rebind "$IDX" "$op"
+  [ "$status" -eq 0 ]
+  # STATE: the reference now names the operator's network, the fleet is on it, and nothing is left on
+  # the owned network.
+  run mi_net_ref_get
+  [ "$output" = "$op" ]
+  run mi_rt_inspect container c.nets "$c"
+  assert_contains "$op"
+  run grep -a "$owned" <<<"$output"
+  [ "$status" -ne 0 ]
+}
+
+# CRITICAL 2 — a stopped container that never reached the target must not be deferred-and-passed, or
+# phase 4 detaches the source from a container attached to nothing.
+
+@test "phase 3 refuses to defer a STOPPED sibling that never reached the target" {
+  src="$(mi_rt_network_create s "" x)"; tgt="$(mi_rt_network_create t "" y)"
+  c="$(a_sibling p1 "$src" stopped)"
+  # Phase 3 with NO phase 2 — the state a silently-failed connect leaves: stopped, on the source only.
+  run mi_netmig_run "$IDX" "$src" "$tgt" 3
+  [ "$status" -ne 0 ]
+  # STATE: no deferred alias check toward the target was recorded (the defer was refused, not passed).
+  run mi_state_outstanding "$c"
+  run grep -a "$tgt" <<<"$output"
+  [ "$status" -ne 0 ]
+}
+
+# RESIDUAL (b) — a stopped container owing an alias check on the SOURCE cannot be migrated, or the check
+# outlives the network it names and can never be satisfied.
+
+@test "phase 3 refuses to migrate a stopped sibling owing an alias check on the source" {
+  src="$(mi_rt_network_create s "" x)"; tgt="$(mi_rt_network_create t "" y)"
+  c="$(a_sibling p1 "$src" stopped)"
+  mi_state_commit "$c" stopped alias "$src"
+  mi_netmig_run "$IDX" "$src" "$tgt" 2 >/dev/null
+  run mi_netmig_run "$IDX" "$src" "$tgt" 3
+  [ "$status" -ne 0 ]
+  # STATE: the stale check is still recorded on the SOURCE (not silently cleared), and nothing detached.
+  run mi_state_outstanding "$c"
+  assert_contains "$src"
+  run mi_rt_inspect container c.nets "$c"
+  assert_contains "$src"
+}
+
+# CRITICAL 3 — the public single-phase entry point must not detach without proof the connects happened.
+
+@test "a bare phase 4 on a fleet with no recorded migration REFUSES to detach" {
+  src="$(mi_rt_network_create s "" x)"; tgt="$(mi_rt_network_create t "" y)"
+  c="$(a_sibling p1 "$src")"
+  run mi_netmig_run "$IDX" "$src" "$tgt" 4
+  [ "$status" -ne 0 ]
+  # STATE: the source is still attached — nothing was detached on invented proof.
+  run mi_rt_inspect container c.nets "$c"
+  assert_contains "$src"
+}
+
+@test "a bare phase 6 with no verified migration REFUSES to commit-and-clear" {
+  src="$(mi_rt_network_create s "" x)"; tgt="$(mi_rt_network_create t "" y)"
+  c="$(a_sibling p1 "$src")"
+  printf 'MYTHICAL_NET=t\n' > "$MYTHICAL_HOME/mythical.conf"
+  # An in-flight migration only at phase 2 (containers still on both, never verified on the target).
+  mi_led_put netmig key family "key=family" "phase=2" "source=$src" "target=$tgt" "containers=$c"
+  run mi_netmig_run "$IDX" "$src" "$tgt" 6
+  [ "$status" -ne 0 ]
+  # STATE: the intent is still recorded (not cleared) and no reference was committed over it.
+  run mi_led_find netmig key family
+  [ "$status" -eq 0 ]
+  run mi_net_ref_get
+  [ "$status" -ne 0 ]
+}
+
+# RESIDUAL (a) — a forward-only migration (source deleted) must CONVERGE, not wedge on a source that is
+# gone, using phase 5's exact-{target} topology check.
+
+@test "a forward-only migration (source gone) CONVERGES instead of wedging" {
+  src="$(mi_rt_network_create s "" x)"; tgt="$(mi_rt_network_create t "" y)"
+  c="$(a_sibling p1 "$tgt")"
+  printf 'MYTHICAL_NET=t\n' > "$MYTHICAL_HOME/mythical.conf"
+  probe_answers "$(addr_on "$c" "$tgt")"
+  mi_rt_network_rm s >/dev/null
+  mi_led_put netmig key family "key=family" "phase=3" "source=$src" "target=$tgt" "containers=$c"
+  run mi_netmig_resume "$IDX"
+  [ "$status" -eq 0 ]
+  # STATE: the intent is cleared and the reference recorded — the wedge is gone.
+  run mi_led_find netmig key family
+  [ "$status" -eq 3 ]
+  run mi_net_ref_get
+  [ "$output" = "$tgt" ]
 }

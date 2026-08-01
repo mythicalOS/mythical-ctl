@@ -313,7 +313,7 @@ mi_net_ref_verify() {
 # The non-owned reference for <name>: the recorded one if there is one (re-verified), otherwise
 # resolved once and recorded.
 _mi_net_ref_ensure() {
-  local name="$1" id rc
+  local name="$1" id rc oident oname oprc
   if id="$(mi_net_ref_get)"; then rc=0; else rc=$?; fi
   case "$rc" in
     0) mi_net_ref_verify || return 1
@@ -324,6 +324,26 @@ _mi_net_ref_ensure() {
        return 0 ;;
     3) : ;;
     *) return 1 ;;                 # there IS a reference and it could not be read; already reported
+  esac
+  # A FIRST non-owned reference is about to be recorded. If this installation ALREADY stood up its own
+  # network, the fleet is on it — so silently recording a reference to the operator's network here would
+  # leave every existing container on the owned network while new ones land on the operator's, the split
+  # D45's phased rebind exists to prevent. Changing which network the family joins is the rebind's job,
+  # never a side effect of resolving a target. So this is REFUSED, not recorded; 'net rebind' migrates.
+  oident="$(mi_ident_get)" || return 1
+  oname="$(mi_name_network "$oident")" || return 1
+  if mi_prov_find network "$oname" >/dev/null; then oprc=0; else oprc=$?; fi
+  case "$oprc" in
+    3) : ;;                        # no owned network — a genuine first-time adoption of the operator's
+    0) mi_warn "netref: MYTHICAL_NET names an operator network, but this installation already has its"
+       mi_warn "  own family network with the fleet on it. Recording a reference now would split the"
+       mi_warn "  family — new containers on the operator's network, the existing ones left behind."
+       mi_warn "  Move the fleet with a confirmed rebind: 'mythical-ctl net rebind'."
+       return 1 ;;
+    *) mi_warn "netref: whether this installation already has its own family network could not be read,"
+       mi_warn "  so recording a reference to the operator's network might split the fleet. Nothing is"
+       mi_warn "  recorded. Run 'mythical-ctl state repair'."
+       return 1 ;;
   esac
   id="$(mi_net_ref_resolve "$name")" || return 1
   _mi_netref_commit "$id" || return 1
@@ -352,6 +372,22 @@ mi_net_target() {
     return 1
   fi
   if [ "$rc" -eq 3 ]; then
+    # MYTHICAL_NET is not set — the installer's own network is the target. But if a non-owned reference
+    # is RECORDED, the fleet is on an operator's network: MYTHICAL_NET was removed without moving it, and
+    # creating or selecting the owned network now would strand every existing container on the operator's
+    # network, the split D45 exists to prevent. That transition is the rebind's job, so it is REFUSED
+    # here — mi_net_target resolves a steady-state target and must never flip which network the family is
+    # on. (mi_net_owned_ensure's own path never calls verify, so this is the one place the check lands.)
+    local rgrc
+    if mi_net_ref_get >/dev/null; then rgrc=0; else rgrc=$?; fi
+    case "$rgrc" in
+      3) : ;;                       # no operator reference — the owned network is genuinely ours to use
+      0) mi_warn "netref: MYTHICAL_NET is not set, but a reference to an operator network is recorded and"
+         mi_warn "  the fleet is on it. Adopting the installer's own network now would split the family."
+         mi_warn "  Remove the reference with a confirmed rebind: 'mythical-ctl net rebind'."
+         return 1 ;;
+      *) return 1 ;;                # a reference exists but could not be read; mi_net_ref_get reported it
+    esac
     id="$(mi_net_owned_ensure)" || return $?
   else
     id="$(_mi_net_ref_ensure "$name")" || return $?
@@ -525,6 +561,92 @@ _mi_netmig_live_ok() {
   return 0
 }
 
+# PHASE 5'S PER-CONTAINER ASSERTION, factored so PHASE 3 can borrow it when the source network no
+# longer resolves (a forward-only migration). It is the STRICT half — the container is on EXACTLY
+# {target} — composed with the probe half (_mi_netmig_live_ok) for a running container. A stopped one
+# has no endpoint, so only its attachment is asserted and the live check is deferred, exactly as D48
+# requires. The attachment string is split by lib/bringup.sh's own walk (one separator at a time with
+# parameter expansion), because an unquoted IFS split also GLOBS.
+#
+# rc 0 verified · 1 refused (reported).
+_mi_netmig_target_only_ok() {
+  local idx="$1" c="$2" tgt="$3" alias="$4" nets line tid expect="" cnt=0 obs
+  nets="$(mi_rt_inspect container c.nets "$c")" || return 1
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    tid="${line%%$'\t'*}"
+    cnt=$((cnt + 1))
+    if [ "$tid" != "$tgt" ]; then
+      mi_warn "netref: '$c' is still attached to '$tid' — its network set must be exactly {$tgt}."
+      return 1
+    fi
+    expect="${line#*$'\t'}"
+  done <<< "$(_mi_bringup_attachments "$nets")"
+  if [ "$cnt" -ne 1 ]; then
+    mi_warn "netref: '$c' has $cnt network attachments and must have exactly one — the target."
+    return 1
+  fi
+  obs="$(mi_state_observed "$c")" || return 1
+  if [ "$obs" = running ]; then
+    _mi_netmig_live_ok "$idx" "$c" "$tgt" "$alias" "$expect" || return 1
+  fi
+  # A STOPPED container is not live-verified here (D48 — no endpoint to answer with). Its deferred alias
+  # check stands and is performed at its next explicit start.
+  return 0
+}
+
+# THE AUTHORITATIVE RECORD IS THE PROOF A DESTRUCTIVE PHASE MAY RUN. Phase 4 detaches and phase 6 clears
+# the intent; both are irreversible, and both depend on the earlier phases having run — every container
+# connected to the target (phase 2) and verified there (phases 3, 5). That proof is the recorded phase,
+# and it is the RECORD that is consulted, never the caller's word: mi_netmig_run is a public entry
+# point, and a bare `mi_netmig_run <idx> <src> <tgt> 4` against an ordinary attached fleet would
+# otherwise detach the only network it is on in one call, with no proof the connects ever happened.
+#
+# It also pins the source and target to the ones the record documents, so a destructive phase acts only
+# on the pair the intent names, never an arbitrary one handed in. The admissible recorded-phase window
+# is <lo>..<hi>: phase 4 accepts {3,4} (phase 3 completed, or re-entry after a crash); phase 6 accepts
+# {5} (phase 5 recorded its success — see there). A recorded phase below the window means the
+# connect-and-verify phases have not completed.
+#
+# rc 0 admissible · 1 refused (reported).
+_mi_netmig_admits() {
+  local run="$1" src="$2" tgt="$3" lo="$4" hi="$5" rec rrc rphase rsrc rtgt
+  if rec="$(mi_led_find "$MI_NETMIG_KIND" key family)"; then rrc=0; else rrc=$?; fi
+  if [ "$rrc" -eq 3 ]; then
+    mi_warn "netref: phase $run detaches or commits, and there is NO recorded migration to show the"
+    mi_warn "  connect-and-verify phases ran. Refusing to act on proof it would have to invent — a bare"
+    mi_warn "  phase against an ordinary attached fleet is how the family is split. Nothing is done."
+    return 1
+  fi
+  if [ "$rrc" -ne 0 ]; then
+    mi_warn "netref: whether a migration is recorded could not be read, so phase $run cannot establish"
+    mi_warn "  that the earlier phases ran. Nothing is done."
+    return 1
+  fi
+  if rphase="$(mi_led_field "$rec" phase)"; then :; else
+    mi_warn "netref: the recorded migration names no phase, so phase $run cannot tell whether the"
+    mi_warn "  earlier phases ran. It is PRESERVED and reported. Run 'mythical-ctl state repair'."
+    return 1
+  fi
+  _mi_netmig_phase_ok "$rphase" || return 1
+  if rsrc="$(mi_led_field "$rec" source)"; then :; else rsrc=""; fi
+  if rtgt="$(mi_led_field "$rec" target)"; then :; else rtgt=""; fi
+  if [ "$rsrc" != "$src" ] || [ "$rtgt" != "$tgt" ]; then
+    mi_warn "netref: phase $run was asked to act on source=$src target=$tgt, but the recorded migration"
+    mi_warn "  documents source=$rsrc target=$rtgt. Refusing to detach or commit against a pair the"
+    mi_warn "  record does not name."
+    return 1
+  fi
+  if [ "$rphase" -lt "$lo" ] || [ "$rphase" -gt "$hi" ]; then
+    mi_warn "netref: phase $run cannot run — the recorded migration is at phase $rphase, and phase $run"
+    mi_warn "  requires it to have reached phase $lo. The connect-and-verify phases have not completed,"
+    mi_warn "  and detaching or committing now is the split this ordering exists to prevent. Nothing is"
+    mi_warn "  done."
+    return 1
+  fi
+  return 0
+}
+
 # Run ONE phase. Split this way so recovery can enter at the recorded phase and so each phase's failure
 # mode is a separate test.
 mi_netmig_run() {
@@ -575,6 +697,14 @@ mi_netmig_run() {
       ;;
     3)
       _mi_netmig_record 3 "$src" "$tgt" "$cs" || return 1
+      # IS THE SOURCE STILL PRESENT? A forward-only migration — the operator deleted the old network —
+      # cannot be verified against {source,target}: the containers are on the target alone, and demanding
+      # the source would wedge the migration forever (nothing could ever satisfy the check, the intent
+      # could never clear). When the source is gone, the correct assertion is exactly {target}, which is
+      # phase 5's check, borrowed here. When it is present, verification goes through bring-up's door,
+      # where the permitted set during a recorded migration is {source,target}.
+      local src3
+      if mi_rt_inspect network n.id "$src" >/dev/null 2>&1; then src3=present; else src3=absent; fi
       # The probe is the PRIMARY verifier for every container, not a fallback for stopped ones — it is
       # the one participant whose toolchain the core controls (D48). If it cannot be obtained,
       # verification CANNOT BE PERFORMED, so the migration STOPS HERE and does not detach.
@@ -584,18 +714,60 @@ mi_netmig_run() {
         return 1; }
       while IFS= read -r c; do
         [ -n "$c" ] || continue
-        local alias3 obs3 want3 vrc
+        local alias3 obs3 want3 vrc out3 oline owant3
         alias3="$(_mi_netmig_alias "$c")" || return 1
         obs3="$(mi_state_observed "$c")" || return 1
+
+        # AN OUTSTANDING ALIAS CHECK ON THE SOURCE CANNOT SURVIVE THIS MIGRATION. Phase 4 removes the
+        # source network, after which a deferred `alias <source>` check — left from a bring-up whose live
+        # verification never ran — can never be satisfied, and the container stays unreconciled forever.
+        # It is NOT cleared here: clearing an outstanding check asserts it was VERIFIED, and nothing
+        # verified this one. The migration is refused instead, so the source stays attached and the check
+        # stays dischargeable; the operator starts the product (or runs state repair) to discharge it,
+        # then re-runs the migration. There is no permanent unreconciled state left behind.
+        if out3="$(mi_state_outstanding "$c")"; then :; else
+          mi_warn "netref: could not read the outstanding checks for '$c', so whether this migration"
+          mi_warn "  would strand one cannot be established. Stopping without detaching."
+          return 1
+        fi
+        owant3="alias"$'\t'"$src"
+        while IFS= read -r oline; do
+          [ -n "$oline" ] || continue
+          if [ "$oline" = "$owant3" ]; then
+            mi_warn "netref: '$c' owes an alias check on the SOURCE network, which phase 4 removes — after"
+            mi_warn "  which nothing could ever satisfy it and the container would stay unreconciled"
+            mi_warn "  forever. Refusing to migrate it into that state. Start '$c' to discharge the check,"
+            mi_warn "  or run 'mythical-ctl state repair', then re-run the migration."
+            return 1
+          fi
+        done <<< "$out3"
+
         if [ "$obs3" != running ]; then
-          # A STOPPED container has NO ADDRESS to verify — Docker releases it, so "confirm it answers
-          # at its expected endpoint" is not merely hard, there is no endpoint in existence to compare
-          # against. And D43 forbids starting one to find out: a product the operator stopped stays
-          # stopped, and "only for a moment, to verify" is exactly the reasoning that rule refuses.
+          # A STOPPED container has NO ADDRESS to verify — Docker releases it, so "confirm it answers at
+          # its expected endpoint" has no endpoint in existence to compare against, and D43 forbids
+          # starting one to find out. Its LIVE check is therefore deferred.
           #
-          # DEFERRING IS NOT SKIPPING: the check is recorded as outstanding and the next explicit start
-          # performs it. The desired state is READ rather than assumed — `|| want=stopped` would write
-          # `stopped` over a row this module could not read, which is D43's rule inverted by an
+          # BUT ITS ATTACHMENT TO THE TARGET IS ASSERTED HERE, never assumed. Phase 2's connect returns a
+          # status, not a proof; a silently-failed connect would leave this container off the target
+          # while phase 3 passed — and then phase 4 detaches the source and it is on nothing, the split
+          # the phase order exists to make impossible. The attachment is inspectable whether or not the
+          # container runs, so it is inspected. (Source present: the set is {source,target}, checked
+          # through bring-up's door. Source gone: exactly {target}, phase 5's check.)
+          if [ "$src3" = present ]; then
+            mi_bringup_verify_attach "$c" "$tgt" "$alias3" || {
+              mi_warn "netref: phase 3: '$c' is stopped and is NOT confirmed attached to the target"
+              mi_warn "  network — a connect returned success but the attachment is not there. Stopping"
+              mi_warn "  without detaching."
+              return 1; }
+          else
+            _mi_netmig_target_only_ok "$idx" "$c" "$tgt" "$alias3" || {
+              mi_warn "netref: phase 3: '$c' is stopped and is not on the target network alone (the source"
+              mi_warn "  is gone, so this is a forward-only migration). Stopping without detaching."
+              return 1; }
+          fi
+          # DEFERRING IS NOT SKIPPING: the check is recorded as outstanding on the TARGET and the next
+          # explicit start performs it. The desired state is READ rather than assumed — `|| want=stopped`
+          # would write `stopped` over a row this module could not read, D43's rule inverted by an
           # unreadable answer.
           if want3="$(mi_state_desired_get "$c")"; then :; else
             mi_warn "netref: '$c' is stopped and this installation has no readable record of what state"
@@ -608,31 +780,49 @@ mi_netmig_run() {
           mi_warn "  recorded as outstanding and performed at its next explicit start."
           continue
         fi
-        # Phase 3 verifies through bring-up's own door: the container is on BOTH networks here, which
-        # is exactly the {source,target} set _mi_bringup_attach_ok permits while this intent stands.
-        if mi_bringup_verify_live "$idx" "$c" "$tgt" "$alias3"; then vrc=0; else vrc=$?; fi
-        if [ "$vrc" -eq 4 ]; then
-          mi_warn "netref: phase 3 could not verify '$c' — the probe itself did not run, so nothing was"
-          mi_warn "  established either way. Stopping without detaching."
-          return 1
-        fi
-        if [ "$vrc" -ne 0 ]; then
-          mi_warn "netref: phase 3 verification failed for '$c' on the target network."
-          mi_warn "  Resolution is compared against the sibling's endpoint address on the TARGET"
-          mi_warn "  NETWORK — during phase 2 every container is on BOTH networks and Docker aliases"
-          mi_warn "  are network-scoped, so a name resolving via the OLD network proves nothing about"
-          mi_warn "  the new one. Stopping without detaching."
-          return 1
+        # RUNNING. Source present: verify through bring-up's own door — the container is on BOTH networks
+        # here, exactly the {source,target} set _mi_bringup_attach_ok permits while this intent stands.
+        # Source gone (forward-only): the container is on {target} alone, verified by phase 5's check.
+        if [ "$src3" = present ]; then
+          if mi_bringup_verify_live "$idx" "$c" "$tgt" "$alias3"; then vrc=0; else vrc=$?; fi
+          if [ "$vrc" -eq 4 ]; then
+            mi_warn "netref: phase 3 could not verify '$c' — the probe itself did not run, so nothing was"
+            mi_warn "  established either way. Stopping without detaching."
+            return 1
+          fi
+          if [ "$vrc" -ne 0 ]; then
+            mi_warn "netref: phase 3 verification failed for '$c' on the target network."
+            mi_warn "  Resolution is compared against the sibling's endpoint address on the TARGET"
+            mi_warn "  NETWORK — during phase 2 every container is on BOTH networks and Docker aliases"
+            mi_warn "  are network-scoped, so a name resolving via the OLD network proves nothing about"
+            mi_warn "  the new one. Stopping without detaching."
+            return 1
+          fi
+        else
+          _mi_netmig_target_only_ok "$idx" "$c" "$tgt" "$alias3" || {
+            mi_warn "netref: phase 3 verification failed for '$c' on the target network (forward-only —"
+            mi_warn "  the source is gone, so the container must be on the target alone). Stopping without"
+            mi_warn "  detaching."
+            return 1; }
         fi
       done <<< "$cs"
-      # Egress is verified UNCHANGED through phases 2–3: the containers are on both networks precisely
-      # so that nothing changes yet.
-      mi_probe_egress "$idx" "$src" || {
-        mi_warn "netref: egress through the SOURCE network is no longer working in phase 3, which means"
-        mi_warn "  attaching the target moved the route despite the lower gateway priority. Stopping."
-        return 1; }
+      # Egress is verified UNCHANGED through phases 2–3 while the source exists — the containers are on
+      # both networks precisely so that nothing changes yet. When the source is gone there is no route
+      # through it to check; phase 5 verifies final egress on the target.
+      if [ "$src3" = present ]; then
+        mi_probe_egress "$idx" "$src" || {
+          mi_warn "netref: egress through the SOURCE network is no longer working in phase 3, which means"
+          mi_warn "  attaching the target moved the route despite the lower gateway priority. Stopping."
+          return 1; }
+      fi
       ;;
     4)
+      # PROOF BEFORE DETACH. Phase 4 is the one destructive phase, and it may run only when the
+      # authoritative record shows phases 2 and 3 completed — every container connected to the target
+      # and verified there. Without this, a bare `mi_netmig_run <idx> <src> <tgt> 4` against an ordinary
+      # attached fleet detaches the only network it is on in a single call. Admissible recorded phases
+      # are {3, 4}: phase 3 completed, or this is a crash re-entry into phase 4.
+      _mi_netmig_admits 4 "$src" "$tgt" 3 4 || return 1
       _mi_netmig_record 4 "$src" "$tgt" "$cs" || return 1
       while IFS= read -r c; do
         [ -n "$c" ] || continue
@@ -645,50 +835,25 @@ mi_netmig_run() {
       done <<< "$cs"
       ;;
     5)
-      # DO NOT record phase 5 before verifying: a failure here must STAY IN PHASE 4 with the intent
+      # DO NOT record phase 5 BEFORE verifying: a failure here must STAY IN PHASE 4 with the intent
       # intact, so recovery re-detaches rather than treating the verification as the thing to resume.
+      # (The success record is written AFTER the checks, below.)
       while IFS= read -r c; do
         [ -n "$c" ] || continue
-        local alias5 obs5 nets5 line5 id5 expect5 cnt5
+        local alias5
         alias5="$(_mi_netmig_alias "$c")" || return 1
-        nets5="$(mi_rt_inspect container c.nets "$c")" || return 1
-        # EXACTLY {target}. The exact-set invariant is suspended only WHILE the intent is recorded and
-        # only to {old, new}; at phase 5 the migration is asserting it is done, so the strict check is
-        # made here — see _mi_netmig_live_ok for why it cannot be borrowed from bring-up.
-        #
-        # The attachment string is split by lib/bringup.sh's own walk, which consumes one separator at
-        # a time with parameter expansion: an unquoted IFS split also GLOBS, so an attachment whose
-        # value happened to be a pattern would be replaced by matching filenames in the working
-        # directory.
-        cnt5=0; expect5=""
-        while IFS= read -r line5; do
-          [ -n "$line5" ] || continue
-          id5="${line5%%$'\t'*}"
-          cnt5=$((cnt5 + 1))
-          if [ "$id5" != "$tgt" ]; then
-            mi_warn "netref: phase 5: '$c' is still attached to '$id5'."
-            mi_warn "  One detach did not take effect. STAYING IN PHASE 4 with the intent intact, so the"
-            mi_warn "  migration resumes — committing now would leave a container on {source,target}"
-            mi_warn "  with no intent recorded, which nothing can resume."
-            return 1
-          fi
-          expect5="${line5#*$'\t'}"
-        done <<< "$(_mi_bringup_attachments "$nets5")"
-        if [ "$cnt5" -ne 1 ]; then
-          mi_warn "netref: phase 5: '$c' has $cnt5 network attachments and must have exactly one — the"
-          mi_warn "  target. Staying in phase 4."
-          return 1
-        fi
-        obs5="$(mi_state_observed "$c")" || return 1
-        if [ "$obs5" = running ]; then
-          _mi_netmig_live_ok "$idx" "$c" "$tgt" "$alias5" "$expect5" || {
-            mi_warn "netref: phase 5 verification failed for '$c'. Staying in phase 4 with the intent"
-            mi_warn "  intact, so the migration resumes rather than committing over an unverified fleet."
-            return 1; }
-        fi
-        # A STOPPED container is not verified here either, for D48's reason — it has no endpoint. The
-        # check phase 3 recorded as outstanding for it is still outstanding, and the next explicit
-        # start performs it. Nothing above claims otherwise.
+        # EXACTLY {target}, plus the live check for a running sibling — phase 5's own assertion, shared
+        # with phase 3's forward-only path. The exact-set invariant is suspended only WHILE the intent is
+        # recorded and only to {source,target}; at phase 5 the migration is asserting it is done, so the
+        # strict check is made — see _mi_netmig_live_ok for why it cannot be borrowed from bring-up. A
+        # stopped sibling has no endpoint, so its live check stays deferred (the outstanding entry phase
+        # 3 recorded is performed at its next start); its attachment to {target} alone is still asserted.
+        _mi_netmig_target_only_ok "$idx" "$c" "$tgt" "$alias5" || {
+          mi_warn "netref: phase 5 verification failed for '$c'. STAYING IN PHASE 4 with the intent"
+          mi_warn "  intact, so the migration resumes rather than committing over an unverified fleet —"
+          mi_warn "  committing now would leave a container on {source,target} with no intent recorded,"
+          mi_warn "  which nothing can resume."
+          return 1; }
       done <<< "$cs"
       # Phase 4 is where the route deliberately MOVES, so "unchanged" is impossible across it —
       # detaching the source removes the very gateway being preserved. Phase 5 verifies FINAL egress on
@@ -696,8 +861,20 @@ mi_netmig_run() {
       mi_probe_egress "$idx" "$tgt" || {
         mi_warn "netref: phase 5: egress on the target network does not work. Staying in phase 4."
         return 1; }
+      # VERIFICATION IS COMPLETE — record phase 5, AFTER the checks and never before. This is the proof
+      # phase 6's gate requires that the fleet was verified on the target ALONE before the intent is
+      # cleared. A failure above returns without recording, so the record stays at phase 4 and recovery
+      # re-detaches; a bare `mi_netmig_run <idx> <src> <tgt> 6` cannot commit-and-clear a migration that
+      # was never verified here.
+      _mi_netmig_record 5 "$src" "$tgt" "$cs" || return 1
       ;;
     6)
+      # PROOF BEFORE CLEAR. Clearing the intent is irreversible — it is the only record of where the
+      # fleet came from — so phase 6 runs only when the record shows phase 5 recorded its success
+      # (admissible recorded phase is {5}). Without this, a bare `mi_netmig_run <idx> <src> <tgt> 6`
+      # could commit a reference and delete an in-flight intent whose fleet was never verified on the
+      # target, stranding a container on {source,target} with nothing left to resume it.
+      _mi_netmig_admits 6 "$src" "$tgt" 5 5 || return 1
       # COMMIT, then clear — and refuse to clear without committing. If MYTHICAL_NET has been removed
       # or edited since the migration started there is no correct reference to record, and clearing the
       # intent anyway would leave the fleet on the target while the ledger names something else: the
@@ -753,11 +930,10 @@ mi_netmig_resume() {
   if mi_rt_inspect network n.id "$src" >/dev/null; then irc=0; else irc=$?; fi
   if [ "$irc" -eq 3 ]; then
     mi_warn "netref: the previous network ($src) no longer exists, so this migration is forward-only:"
-    mi_warn "  there is NOTHING TO DETACH and nothing to return to."
-    mi_warn "  Phase 3 verifies each container against the set this intent documents — {source,"
-    mi_warn "  target} — so while the source is missing that check cannot pass, and the migration"
-    mi_warn "  stops there rather than detaching anything. That is stated here rather than hidden"
-    mi_warn "  behind a rollback promise which could not be kept: run 'mythical-ctl state repair'."
+    mi_warn "  there is nothing to detach and nothing to return to. Phases 3 and 5 verify each container"
+    mi_warn "  against exactly {target} rather than {source,target}, so the migration completes FORWARD"
+    mi_warn "  rather than wedging on a source that is gone. This is stated here rather than hidden"
+    mi_warn "  behind a rollback promise that could not be kept."
   elif [ "$irc" -ne 0 ]; then
     mi_warn "netref: whether the previous network ($src) still exists could not be established, so"
     mi_warn "  nothing is resumed. A detach planned against a network we could not ask about is a"
@@ -777,7 +953,7 @@ mi_netmig_resume() {
 # it refuses to run without a target the caller has already resolved.
 mi_net_ref_rebind() {
   if [ "$#" -ne 2 ]; then mi_warn "netref: mi_net_ref_rebind needs an <index file> and a <new network id>"; return 1; fi
-  local idx="$1" tgt="$2" src cs line count=0 rc
+  local idx="$1" tgt="$2" src cs line count=0 rc srrc oident oname orec oprc
   if [ -z "$tgt" ]; then
     mi_warn "netref: mi_net_ref_rebind needs a resolved target network id, not an empty one."
     return 1
@@ -811,11 +987,33 @@ mi_net_ref_rebind() {
     return $?
   fi
 
-  if src="$(mi_net_ref_get)"; then :; else
-    mi_warn "netref: there is no readable reference to migrate FROM, so phase 4 would not know what to"
-    mi_warn "  detach. Nothing is started."
-    return 1
-  fi
+  # WHERE THE FLEET IS NOW, which phase 4 detaches from. A recorded non-owned reference names it
+  # directly. When there is NONE, the fleet is on the installer's OWN network — the "operator adopts
+  # MYTHICAL_NET on an existing installation" migration — so the owned network is the source. It is read
+  # from provenance WITHOUT creating one: a source to detach from must be where the fleet already is,
+  # never a fresh empty network. An unreadable reference stops (an unreadable answer is not "there is
+  # none"), and neither-reference-nor-owned-network-recorded with containers present is an inconsistent
+  # state this cannot resolve blindly.
+  if src="$(mi_net_ref_get)"; then srrc=0; else srrc=$?; fi
+  case "$srrc" in
+    0) : ;;
+    3) oident="$(mi_ident_get)" || return 1
+       oname="$(mi_name_network "$oident")" || return 1
+       if orec="$(mi_prov_find network "$oname")"; then oprc=0; else oprc=$?; fi
+       case "$oprc" in
+         0) src="$(_mi_net_owned_adopt "$orec")" || return 1 ;;
+         3) mi_warn "netref: there is no reference to migrate FROM and no installer-owned network is"
+            mi_warn "  recorded, yet containers exist — where the fleet is cannot be established, so"
+            mi_warn "  phase 4 would not know what to detach. Run 'mythical-ctl state repair'."
+            return 1 ;;
+         *) mi_warn "netref: whether this installation has its own network could not be read, so the"
+            mi_warn "  migration source is unknown. Nothing is started."
+            return 1 ;;
+       esac ;;
+    *) mi_warn "netref: the recorded network reference could not be read, so phase 4 would not know what"
+       mi_warn "  to detach. Nothing is started."
+       return 1 ;;
+  esac
   mi_netmig_run "$idx" "$src" "$tgt" 1 || return 1
   mi_netmig_resume "$idx"
 }
