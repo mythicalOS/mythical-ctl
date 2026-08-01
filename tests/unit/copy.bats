@@ -153,6 +153,36 @@ teardown() { rm -rf "$DST" "$STAGE"; mi_lock_release; teardown_test_env; }
   assert_contains "/src/dev/thing"
 }
 
+# Finding 1 (round 3): the entry TYPE is a CLOSED vocabulary, and EVERY `entry=` is checked against it —
+# not just `special`. A copier that met a FIFO or a socket and enumerated it as `fifo:`/`socket:` rather
+# than `special:`, then exited 0 with done=ok, would otherwise have that entry COUNTED toward the total
+# and the copy reported verified. The exact hostile transcript — a `fifo:` entry alongside `done=ok` and
+# a zero exit — must be REFUSED.
+@test "an entry TYPE outside the closed set (a FIFO) is REFUSED even with done=ok" {
+  mkdir -p "$STAGE"
+  HELPER_COPY=unknown-type run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000
+  [ "$status" -ne 0 ]
+  assert_contains "type is not one of file"
+  assert_contains "fifo:/src/data/q"
+}
+
+# The same for a socket — the second type the finding names.
+@test "an entry TYPE outside the closed set (a socket) is REFUSED even with done=ok" {
+  mkdir -p "$STAGE"
+  HELPER_COPY=unknown-socket run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000
+  [ "$status" -ne 0 ]
+  assert_contains "socket:/src/data/s"
+}
+
+# A malformed entry line — no `<type>:<path>` shape at all — is likewise outside the contract and refused,
+# not silently counted.
+@test "a malformed entry line (no path) is REFUSED" {
+  mkdir -p "$STAGE"
+  HELPER_COPY=entry-malformed run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000
+  [ "$status" -ne 0 ]
+  assert_contains "bogus-no-path"
+}
+
 @test "SYMLINKS are copied AS symlinks, targets verbatim, never resolved" {
   mkdir -p "$STAGE"
   run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000
@@ -192,6 +222,39 @@ teardown() { rm -rf "$DST" "$STAGE"; mi_lock_release; teardown_test_env; }
   [ "$status" -ne 0 ]
   assert_contains "/src/data/evil"
   assert_contains "escapes the migrated tree"
+}
+
+# Finding 2 (round 3): a symlink whose own PATH contains a colon, with an ABSOLUTE (escaping) target,
+# logged but NOT refused by the copier. The OLD backstop split `linktarget=<path>:<target>` on the FIRST
+# colon, so a colon in the path mis-split the line — the target was read as a non-absolute string, the
+# escape was MISSED, and the copy succeeded. The length-delimited encoding isolates the target
+# regardless of the colon, so the escape is caught and the WHOLE colon-bearing path is named.
+@test "an escaping symlink whose PATH contains a colon is REFUSED, path reported whole" {
+  mkdir -p "$STAGE"
+  HELPER_COPY=escape-colon-path run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000
+  [ "$status" -ne 0 ]
+  assert_contains "/src/data/od:d/evil"
+  assert_contains "escapes the migrated tree"
+}
+
+# The finding's literal wording: a symlink whose TARGET contains a colon and climbs above the root. The
+# trailing length field keeps the colon inside the target from being read as the path/target separator,
+# so the `..` climb is still measured and the escape refused.
+@test "an escaping symlink whose TARGET contains a colon is REFUSED" {
+  mkdir -p "$STAGE"
+  HELPER_COPY=escape-colon-target run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000
+  [ "$status" -ne 0 ]
+  assert_contains "/src/data/evil"
+  assert_contains "escapes the migrated tree"
+}
+
+# A linktarget the caller cannot parse (a missing or non-numeric length) is refused, never guessed —
+# an unreadable target could be concealing an escape.
+@test "a linktarget with a malformed length field is REFUSED, not guessed" {
+  mkdir -p "$STAGE"
+  HELPER_COPY=linktarget-badlen run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000
+  [ "$status" -ne 0 ]
+  assert_contains "could not read"
 }
 
 @test "a copier that reports writing OUTSIDE the destination is a hard failure" {

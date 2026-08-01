@@ -249,7 +249,12 @@ mi_copy_preflight() {
 #                             that container's own root.
 #   hardlink                  link structure preserved WITHIN the copy — breaking it silently doubles
 #                             disk use and de-couples files a product expects to be the same inode
-#   device, socket, FIFO      REFUSED, naming the path
+#   device, socket, FIFO      REFUSED, naming the path — enumerated as `entry=special:<path>`
+#
+# The enumerated type is a CLOSED vocabulary (file|dir|symlink|hardlink|special) and EVERY `entry=` is
+# checked against it. A type outside the set — a copier that enumerated a FIFO or socket as `fifo:`/
+# `socket:` rather than `special:`, or a malformed line — is refused, not silently counted toward a
+# copy reported complete (see _mi_copy_refusals).
 #
 # Ownership: uid/gid are MAPPED, not copied, and access is GRANTED, not assumed. Existing files are
 # chowned to the operator with an access entry for the runtime uid; and every directory carries DEFAULT
@@ -288,7 +293,11 @@ mi_copy_run() {
   local v refused=0 seen="" reason detail path
   while IFS= read -r v; do
     [ -n "$v" ] || continue
-    mi_log "  symlink preserved verbatim: ${v}"
+    if _mi_copy_linktarget_split "$v"; then
+      mi_log "  symlink preserved verbatim: ${_MI_COPY_LT_PATH} -> ${_MI_COPY_LT_TARGET}"
+    else
+      mi_log "  symlink target logged in a form this core could not read: ${v}"
+    fi
   done <<< "$(_mi_copy_fields "$out" linktarget)"
   while IFS= read -r v; do
     [ -n "$v" ] || continue
@@ -330,6 +339,8 @@ mi_copy_run() {
       *:escaped-write) reason=escaped-write; path="${v%:*}" ;;
       *:escaping-symlink) reason=escaping-symlink; path="${v%:*}" ;;
       *:staging-nonempty) reason=staging-nonempty; path="${v%:*}" ;;
+      *:unknown-entry-type) reason=unknown-entry-type; path="${v%:*}" ;;
+      *:unreadable-linktarget) reason=unreadable-linktarget; path="${v%:*}" ;;
       *) reason=unreadable; path="$v" ;;
     esac
     # One path, one message: the two sources of a refusal (an explicit `refused=` line and an `entry=`
@@ -360,6 +371,15 @@ mi_copy_run() {
         mi_warn "  atomically with the copy: the copy MERGES the source over whatever is already there"
         mi_warn "  and verification checks only the source, so a pre-existing entry would survive inside"
         mi_warn "  the migrated tree unexamined. Refused." ;;
+      unknown-entry-type)
+        mi_warn "copy: REFUSED $path — the copier enumerated an entry whose type is not one of file,"
+        mi_warn "  dir, symlink, hardlink or special (or the entry line carries no path). An entry the"
+        mi_warn "  core cannot classify — a FIFO or socket smuggled past the special-entry check — is"
+        mi_warn "  refused rather than silently counted toward a copy reported complete." ;;
+      unreadable-linktarget)
+        mi_warn "copy: REFUSED $path — the copier logged a symlink target this core could not read (its"
+        mi_warn "  trailing length field is missing or not a number). A target we cannot parse might be"
+        mi_warn "  concealing one that escapes the migrated tree, so it is refused rather than guessed." ;;
       *)
         mi_warn "copy: REFUSED — the copier stated a refusal in a form this core cannot read: '$v'."
         mi_warn "  It is treated as a refusal rather than skipped: an unreadable refusal is still one." ;;
@@ -422,6 +442,32 @@ mi_copy_run_verify() {
   mi_copy_verify "$idx" "$srcvol" "$stage" "$n" "$ruid" "$ouid"
 }
 
+# UNAMBIGUOUSLY split a `linktarget=` VALUE into the symlink's path and its verbatim target,
+# regardless of colons in EITHER of them. The value is `<path><target>:<pathlen>` — a LENGTH-DELIMITED
+# encoding whose trailing, colon-free field is the path's BYTE length: the path is the first <pathlen>
+# bytes of the body and the target is the rest. This REPLACES the old first-colon split, which reported
+# the wrong path — and could MISS an escape — for a symlink whose own path contained a colon, a legal
+# byte on every filesystem this runs on. The length is a fixed-shape (numeric) token placed where
+# neither a path's nor a target's own bytes can reach it, the same discipline `refused=` (reason last)
+# and `entry=` (type first) use for their one variable component.
+#
+# Sets _MI_COPY_LT_PATH and _MI_COPY_LT_TARGET. rc 0 parsed · 1 the value is malformed (a non-numeric
+# or out-of-range length). A linktarget the core cannot parse is REFUSED by the caller, never guessed:
+# an unreadable target could be concealing an escape.
+_mi_copy_linktarget_split() {
+  local v="$1" pathlen body
+  local LC_ALL=C            # <pathlen> is a BYTE length; slice in bytes, not the operator's locale
+  pathlen="${v##*:}"
+  case "$pathlen" in ''|*[!0-9]*) return 1 ;; esac
+  body="${v%:*}"
+  # The path is at least one byte and cannot be longer than the body it prefixes. Length-bounded before
+  # the arithmetic so an absurd stated length cannot trip `[`'s integer-expression path (bash 3.2).
+  if [ "${#pathlen}" -gt 10 ] || [ "$pathlen" -lt 1 ] || [ "$pathlen" -gt "${#body}" ]; then return 1; fi
+  _MI_COPY_LT_PATH="${body:0:pathlen}"
+  _MI_COPY_LT_TARGET="${body:pathlen}"
+  return 0
+}
+
 # Does a symlink at <linkpath> whose stored target is <target> point OUTSIDE the tree rooted at
 # <root>? Purely LEXICAL — the target is never resolved on disk, because following it is exactly the
 # escape this refuses (the host-side walk deliberately does not follow links either). A target
@@ -462,32 +508,56 @@ _mi_copy_link_escapes() {
 
 # EVERY REFUSAL THE ANSWER STATES, from every thing that can state one, in ONE place.
 #
-#   `refused=<path>:<reason>`   the copier's own refusal
-#   `entry=special:<path>`      an entry it ENUMERATED as a device, socket or FIFO
-#   `linktarget=<path>:<t>`     a symlink it enumerated whose target ESCAPES the tree (<root>)
+#   `refused=<path>:<reason>`      the copier's own refusal
+#   `entry=<type>:<path>`          EVERY enumerated entry, checked against the closed type set
+#   `linktarget=<path><target>:<pathlen>`  a symlink it enumerated whose target ESCAPES the tree (<root>)
 #
 # The last two are folded in here rather than checked beside the loop because they are the same
-# decision: a special entry, or an escaping symlink, is a refusal whether or not the copier remembered
-# to say so — a copier that enumerated one and then exited 0 must not be believed. Two separate checks
-# would be two verdicts that can drift, and the one that drifts is the one nobody re-reads.
+# decision: an unclassifiable entry, or an escaping symlink, is a refusal whether or not the copier
+# remembered to say so — a copier that enumerated one and then exited 0 must not be believed. Two
+# separate checks would be two verdicts that can drift, and the one that drifts is the one nobody
+# re-reads.
+#
+# ENTRY TYPES ARE A CLOSED VOCABULARY, and EVERY `entry=` is checked against it — not just `special`.
+# The type is bounded on the left by the first colon (`entry=<type>:<path>`, type first). A type
+# outside `file|dir|symlink|hardlink|special`, or a line with no path, is a `fifo:`/`socket:` (or
+# malformed) entry a copier could otherwise smuggle past a `special`-only check: it would be counted
+# toward a copy reported complete while nothing ever classified it. So it is refused
+# (`:unknown-entry-type`), and `special` with a path is folded as before.
 #
 # For the symlink fold the authoritative, colon-robust refusal is the copier's own
-# `refused=<path>:escaping-symlink` (reason LAST); this backstop splits `linktarget=<path>:<target>`
-# on the FIRST colon, so a colon INSIDE the link's own path degrades only the backstop, never the
-# reason-last refusal.
+# `refused=<path>:escaping-symlink` (reason LAST); this backstop parses `linktarget=` through the
+# LENGTH-DELIMITED `_mi_copy_linktarget_split`, so a colon inside EITHER the link's own path or its
+# target no longer degrades it (the old first-colon split did). A linktarget it cannot parse is refused
+# (`:unreadable-linktarget`), never guessed.
 _mi_copy_refusals() {
-  local blob="$1" root="$2" v lp tg
+  local blob="$1" root="$2" v etype epath
   _mi_copy_fields "$blob" refused
   while IFS= read -r v; do
     [ -n "$v" ] || continue
-    # `entry=<type>:<path>` — TYPE FIRST, so the path is everything after the first colon and may
-    # contain colons of its own.
-    case "$v" in special:*) printf '%s:special-entry\n' "${v#*:}" ;; esac
+    case "$v" in
+      *:*) etype="${v%%:*}"; epath="${v#*:}" ;;
+      *)   etype=""; epath="" ;;
+    esac
+    if [ -n "$epath" ]; then
+      case "$etype" in
+        special) printf '%s:special-entry\n' "$epath"; continue ;;
+        file|dir|symlink|hardlink) continue ;;
+      esac
+    fi
+    # A type outside the closed set, or an entry line with no path: refused, carrying the raw entry so
+    # the operator sees exactly what the copier emitted (reason last, colon-robust downstream).
+    printf '%s:unknown-entry-type\n' "$v"
   done <<< "$(_mi_copy_fields "$blob" entry)"
   while IFS= read -r v; do
     [ -n "$v" ] || continue
-    lp="${v%%:*}"; tg="${v#*:}"
-    if _mi_copy_link_escapes "$lp" "$tg" "$root"; then printf '%s:escaping-symlink\n' "$lp"; fi
+    if _mi_copy_linktarget_split "$v"; then
+      if _mi_copy_link_escapes "$_MI_COPY_LT_PATH" "$_MI_COPY_LT_TARGET" "$root"; then
+        printf '%s:escaping-symlink\n' "$_MI_COPY_LT_PATH"
+      fi
+    else
+      printf '%s:unreadable-linktarget\n' "$v"
+    fi
   done <<< "$(_mi_copy_fields "$blob" linktarget)"
 }
 
