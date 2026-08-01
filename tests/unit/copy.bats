@@ -162,20 +162,46 @@ teardown() { rm -rf "$DST" "$STAGE"; mi_lock_release; teardown_test_env; }
   [ "$status" -ne 0 ]
 }
 
-@test "an ESCAPING symlink target is preserved as TEXT and is not followed" {
+# An escaping symlink is a §10a acceptance row: it must be REFUSED, not preserved as text. A symlink
+# whose target climbs above the tree with `..` escapes it the moment anything follows it, and the
+# host-side walk deliberately does not follow links — so the copy is where it has to be caught. The
+# copier here only LOGGED the link (via linktarget) and exited 0; the caller derives the escape from
+# that line, exactly as it does an enumerated-but-unrefused special entry.
+@test "an escaping (relative) symlink target the copier only logged is REFUSED" {
   mkdir -p "$STAGE"
   HELPER_COPY=escape run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000
-  [ "$status" -eq 0 ]
-  assert_contains "../../../../etc/passwd"
-  run grep -aiE 'followed|wrote outside' <<<"$output"
   [ "$status" -ne 0 ]
+  assert_contains "/src/data/evil"
+  assert_contains "escapes the migrated tree"
+}
+
+# An ABSOLUTE target escapes regardless of where the link sits, and is refused the same way.
+@test "an absolute symlink target the copier only logged is REFUSED" {
+  mkdir -p "$STAGE"
+  HELPER_COPY=escape-abs run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000
+  [ "$status" -ne 0 ]
+  assert_contains "/src/data/evil"
+  assert_contains "escapes the migrated tree"
+}
+
+# A conforming copier that refuses the escaping symlink ITSELF (reason-last grammar) is honoured with
+# the clear, escape-specific message — not the generic "cannot read this refusal" fallback.
+@test "a copier that refuses an escaping symlink is read with the escape-specific reason" {
+  mkdir -p "$STAGE"
+  HELPER_COPY=escape-refused run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000
+  [ "$status" -ne 0 ]
+  assert_contains "/src/data/evil"
+  assert_contains "escapes the migrated tree"
 }
 
 @test "a copier that reports writing OUTSIDE the destination is a hard failure" {
   mkdir -p "$STAGE"
   HELPER_COPY=escaped-write run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000
   [ "$status" -ne 0 ]
-  assert_contains "outside"
+  # The escaped-write-SPECIFIC wording, not a bare "outside": the refused path is /src/data/../outside,
+  # so "outside" is satisfied by the path bytes alone — and the generic "cannot read this refusal"
+  # fallback echoes the raw value, so it would pass even with the escaped-write reason arm disabled.
+  assert_contains "would land outside the"
 }
 
 @test "setuid, setgid and sticky bits are STRIPPED and each strip is reported" {
@@ -220,24 +246,102 @@ teardown() { rm -rf "$DST" "$STAGE"; mi_lock_release; teardown_test_env; }
   assert_contains "completion"
 }
 
+# A foreign uid is opt-in. A regressed or hostile copier that maps one into the operator's and reports
+# `mapped=` on a DEFAULT invocation — one the operator never gave --map-foreign-to-operator — must be
+# REFUSED, not logged and accepted. The flag only changes the helper's argv; the decision to fold
+# foreign ownership is the caller's, and it was not asked for.
+@test "an UNREQUESTED foreign-uid mapping is REFUSED, not applied" {
+  mkdir -p "$STAGE"
+  HELPER_COPY=foreign-mapped-unrequested run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000
+  [ "$status" -ne 0 ]
+  assert_contains "did NOT request"
+}
+
+# ...but WITH the opt-in, the very same mapping is honoured — so the refusal above is the missing flag,
+# not the mapping itself.
+@test "the same mapping WITH --map-foreign-to-operator is honoured" {
+  mkdir -p "$STAGE"
+  HELPER_COPY=foreign-mapped-unrequested run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000 --map-foreign-to-operator
+  [ "$status" -eq 0 ]
+  assert_contains "mapped"
+}
+
+# A §10a acceptance row: a NON-EMPTY staging destination is refused. The copy merges the source over
+# whatever is already there and verification checks only the source, so a pre-existing entry would
+# survive inside the migrated tree unexamined.
+@test "a NON-EMPTY staging destination (a leftover file) is REFUSED before the copy" {
+  mkdir -p "$STAGE"; printf 'x\n' > "$STAGE/leftover"
+  run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000
+  [ "$status" -ne 0 ]
+  assert_contains "not empty"
+}
+
+# The same, for a pre-existing SYMLINK (which a directory-only or file-only emptiness check would
+# miss) — this is the destination half of the escaping-symlink row.
+@test "a pre-existing symlink also makes staging non-empty and is REFUSED" {
+  mkdir -p "$STAGE"; ln -s /etc/passwd "$STAGE/sneaky"
+  run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000
+  [ "$status" -ne 0 ]
+  assert_contains "not empty"
+}
+
+# The other half of the rule: an EMPTY staging passes the gate, so the refusals above are the leftover,
+# not the gate refusing everything.
+@test "an empty staging destination passes the emptiness gate" {
+  mkdir -p "$STAGE"
+  run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000
+  [ "$status" -eq 0 ]
+}
+
+# Both uid principals are validated as 0..4294967295 before ANY helper call — not just numerically,
+# and not only in the runtime adapter's --user gate. A non-numeric or out-of-range uid would be
+# written into ACL entries and named in messages for a principal no step ever ran as.
+@test "a non-numeric uid is REFUSED before the copier runs" {
+  mkdir -p "$STAGE"
+  run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 notauid
+  [ "$status" -ne 0 ]
+  assert_contains "not a numeric uid"
+}
+
+@test "an out-of-range uid (> 2^32-1) is REFUSED by mi_copy_run" {
+  mkdir -p "$STAGE"
+  run mi_copy_run "$IDX" srcvol1 "$STAGE" 4294967296 1000
+  [ "$status" -ne 0 ]
+  assert_contains "out of range"
+}
+
+@test "the preflight validates both uid principals for range too" {
+  mkdir -p "$STAGE"
+  run mi_copy_preflight "$IDX" "$STAGE" 900 4294967296
+  [ "$status" -ne 0 ]
+  assert_contains "out of range"
+}
+
+@test "the access check validates the runtime uid range, not only that it is numeric" {
+  mkdir -p "$STAGE"
+  run mi_copy_access_check "$IDX" "$STAGE" 4294967296
+  [ "$status" -ne 0 ]
+  assert_contains "out of range"
+}
+
 @test "verification is PER-ENTRY over the contract, not a byte count" {
   mkdir -p "$STAGE"
-  run mi_copy_verify "$IDX" srcvol1 "$STAGE"
+  run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5
   [ "$status" -eq 0 ]
-  HELPER_VERIFY=type run mi_copy_verify "$IDX" srcvol1 "$STAGE"
+  HELPER_VERIFY=type run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5
   [ "$status" -ne 0 ]
   assert_contains "type"
-  HELPER_VERIFY=digest run mi_copy_verify "$IDX" srcvol1 "$STAGE"
+  HELPER_VERIFY=digest run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5
   [ "$status" -ne 0 ]
-  HELPER_VERIFY=linktarget run mi_copy_verify "$IDX" srcvol1 "$STAGE"
+  HELPER_VERIFY=linktarget run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5
   [ "$status" -ne 0 ]
-  HELPER_VERIFY=mode run mi_copy_verify "$IDX" srcvol1 "$STAGE"
+  HELPER_VERIFY=mode run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5
   [ "$status" -ne 0 ]
-  HELPER_VERIFY=hardlink run mi_copy_verify "$IDX" srcvol1 "$STAGE"
+  HELPER_VERIFY=hardlink run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5
   [ "$status" -ne 0 ]
-  HELPER_VERIFY=owner run mi_copy_verify "$IDX" srcvol1 "$STAGE"
+  HELPER_VERIFY=owner run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5
   [ "$status" -ne 0 ]
-  HELPER_VERIFY=mtime run mi_copy_verify "$IDX" srcvol1 "$STAGE"
+  HELPER_VERIFY=mtime run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5
   [ "$status" -ne 0 ]
 }
 
@@ -245,7 +349,7 @@ teardown() { rm -rf "$DST" "$STAGE"; mi_lock_release; teardown_test_env; }
 # it is checking, and a verifier that can repair what it finds cannot report it.
 @test "verification mounts the destination read-only" {
   mkdir -p "$STAGE"
-  mi_copy_verify "$IDX" srcvol1 "$STAGE" || true
+  mi_copy_verify "$IDX" srcvol1 "$STAGE" 5 || true
   run grep -a "type=bind,source=${STAGE},target=/dst,readonly" "$FAKE_DOCKER_STATE/calls.log"
   [ "$status" -eq 0 ]
 }
@@ -254,9 +358,28 @@ teardown() { rm -rf "$DST" "$STAGE"; mi_lock_release; teardown_test_env; }
 # and exited 0 would otherwise report the copy good.
 @test "a verification that does not say how many entries it checked is refused" {
   mkdir -p "$STAGE"
-  HELPER_VERIFY=nocount run mi_copy_verify "$IDX" srcvol1 "$STAGE"
+  HELPER_VERIFY=nocount run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5
   [ "$status" -ne 0 ]
   assert_contains "how many"
+}
+
+# A stated count is not enough: it must be BOUND to the source. A verifier that checked ZERO entries
+# and exited 0 (`checked=0 done=ok`) is a vacuous pass, and the caller supplies the source's own entry
+# count so it can be caught — 0 checked against a source of 5 is not a verification.
+@test "a verification that checked ZERO entries against a non-empty source is refused" {
+  mkdir -p "$STAGE"
+  HELPER_VERIFY=zero run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5
+  [ "$status" -ne 0 ]
+  assert_contains "the source has 5"
+}
+
+# The count is bound in BOTH directions: a fabricated surplus (more entries checked than the source
+# has) is as wrong as zero — it did not walk the source the copy read.
+@test "a verifier that checked a different count than the source is refused" {
+  mkdir -p "$STAGE"
+  HELPER_VERIFY=ok run mi_copy_verify "$IDX" srcvol1 "$STAGE" 4
+  [ "$status" -ne 0 ]
+  assert_contains "checked 5 entries but the source has 4"
 }
 
 @test "effective container-side access is TESTED as the runtime uid, not inferred from ACL presence" {
@@ -361,7 +484,7 @@ teardown() { rm -rf "$DST" "$STAGE"; mi_lock_release; teardown_test_env; }
 
 @test "a verification MISMATCH stated with a ZERO exit still fails the verification" {
   mkdir -p "$STAGE"
-  HELPER_VERIFY=digest HELPER_EXIT0=1 run mi_copy_verify "$IDX" srcvol1 "$STAGE"
+  HELPER_VERIFY=digest HELPER_EXIT0=1 run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5
   [ "$status" -ne 0 ]
   assert_contains "MISMATCH"
 }

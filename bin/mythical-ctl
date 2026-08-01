@@ -104,7 +104,8 @@ main() {
                 mi_bringup mi_bringup_create mi_bringup_verify_attach mi_bringup_verify_live \
                 mi_bringup_recover mi_bringup_reconcile \
                 mi_manifest_runtime_uid \
-                mi_copy_image mi_copy_available mi_copy_preflight mi_copy_run mi_copy_verify \
+                mi_copy_image mi_copy_available mi_copy_preflight mi_copy_stage_empty_check \
+                mi_copy_run mi_copy_verify \
                 mi_copy_access_check mi_copy_host_access_check; do
         if ! declare -F "$_f" >/dev/null 2>&1; then
           printf 'mythical-ctl: missing library function: %s\n' "$_f" >&2

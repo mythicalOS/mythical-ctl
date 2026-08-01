@@ -58,15 +58,27 @@
 #                                entry=<type>:<path>        type ∈ file|dir|symlink|hardlink|special
 #                                linktarget=<path>:<verbatim target>
 #                                stripped=<path>:<bits>     setuid/setgid/sticky removed
-#                                mapped=<path>:<olduid>     a foreign uid folded into the operator's
-#                                refused=<path>:<reason>    reason ∈ special-entry|escaped-write
+#                                mapped=<path>:<olduid>     a foreign uid folded into the operator's,
+#                                                           ONLY under --map-foreign
+#                                refused=<path>:<reason>    reason ∈ special-entry | escaped-write |
+#                                                           escaping-symlink
 #                                refused=<path>:foreign-uid:<uid>
 #                                done=ok                    printed ONLY on a completed copy
 #                              exit 0 when nothing was refused; 1 otherwise.
+#                              A symlink whose target is ABSOLUTE or climbs above the tree root with
+#                              `..` MUST be refused (escaping-symlink), never carried as text — the
+#                              caller ALSO derives this from the linktarget it logged, so a copier
+#                              that only logged it is caught. A foreign uid is refused unless
+#                              --map-foreign was given; a `mapped=` reported without it is refused by
+#                              the caller as an unrequested mapping.
 #   verify <src> <dst>         PER-ENTRY over that same contract, never a byte count:
 #                                mismatch=<path>:type|digest|linktarget|mode|owner|mtime|hardlink
 #                                checked=<n>   done=ok
-#                              exit 0 when there is no mismatch; 1 otherwise.
+#                              exit 0 when there is no mismatch; 1 otherwise. `checked=<n>` is the
+#                              number of source entries compared and MUST equal the source's own entry
+#                              count: the caller supplies that count (source-derived, from the copy
+#                              step's `entry=` lines) and refuses a `checked` that differs — a count
+#                              of zero against a non-empty source is a vacuous pass.
 #   acl <dst> <runtime-uid> <operator-uid>
 #                              RESERVED, and deliberately separate: re-apply the dual-principal
 #                              default entries WITHOUT re-copying, for a repair path. The copy itself
@@ -225,9 +237,22 @@ case "$cmd" in
       colon)
         printf 'entry=special:%s/od:d/dev/thing\n' "$src"
         printf 'refused=%s/od:d/dev/thing:special-entry\n' "$src"; rc=1 ;;
+      # A copier that ENUMERATED an escaping symlink (relative `..` climb) and then did NOT refuse it —
+      # a one-line omission in a real image. It exits 0 with done=ok; the caller must catch the escape
+      # from the linktarget it logged, exactly as it does the enumerated-but-unrefused special entry.
       escape)
         printf 'entry=symlink:%s/data/evil\n' "$src"
         printf 'linktarget=%s/data/evil:../../../../etc/passwd\n' "$src" ;;
+      # The same omission for an ABSOLUTE target, which escapes regardless of where the link sits.
+      escape-abs)
+        printf 'entry=symlink:%s/data/evil\n' "$src"
+        printf 'linktarget=%s/data/evil:/etc/passwd\n' "$src" ;;
+      # A CONFORMING copier that refuses the escaping symlink itself, in the reason-last grammar the
+      # caller reads for its clear message.
+      escape-refused)
+        printf 'entry=symlink:%s/data/evil\n' "$src"
+        printf 'linktarget=%s/data/evil:../../../../etc/passwd\n' "$src"
+        printf 'refused=%s/data/evil:escaping-symlink\n' "$src"; rc=1 ;;
       escaped-write)
         printf 'refused=%s/data/../outside:escaped-write\n' "$src"; rc=1 ;;
       setuid)
@@ -239,6 +264,11 @@ case "$cmd" in
         else
           printf 'refused=%s/data/alien:foreign-uid:4242\n' "$src"; rc=1
         fi ;;
+      # A regressed or hostile copier that folds a foreign uid into the operator's and reports the
+      # mapping on a DEFAULT invocation — one that never received --map-foreign. It exits 0 with
+      # done=ok; the caller must refuse the unrequested mapping rather than log it.
+      foreign-mapped-unrequested)
+        printf 'mapped=%s/data/alien:4242\n' "$src" ;;
       *) printf 'helperimg: unknown HELPER_COPY setting: %s\n' "$knob" >&2; exit 2 ;;
     esac
     # `done=ok` states COMPLETION, so it is printed only on a copy that completed. A refusal that also
@@ -258,6 +288,9 @@ case "$cmd" in
       ok) printf 'checked=5\ndone=ok\n' ;;
       # Completion claimed with no count: nothing in the answer says a single entry was looked at.
       nocount) printf 'done=ok\n' ;;
+      # Completion claimed having checked ZERO entries — a vacuous pass the caller must reject against
+      # a non-empty source (it binds `checked` to the source's own count).
+      zero) printf 'checked=0\ndone=ok\n' ;;
       type|digest|linktarget|mode|owner|mtime|hardlink)
         printf 'mismatch=%s/data/f:%s\n' "$dst" "$knob"
         printf 'checked=5\ndone=ok\n'

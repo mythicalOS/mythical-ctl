@@ -105,6 +105,29 @@ _mi_copy_stated() {
   return 0
 }
 
+# A uid PRINCIPAL is a bare decimal in the kernel's range — uid_t is 32-bit, so 0..4294967295.
+# Validated HERE, in the copy module, before EVERY helper call that carries a uid, and in ONE place
+# rather than per call site. The runtime adapter validates a `--user` value, but the runtime and
+# operator uids reach the helper as `arg=` values it does not type-check, and both are also written
+# into /dst ACL entries and named in every message below. A non-numeric or out-of-range principal
+# would have the ownership/ACL contract claimed for a uid no step ever ran as.
+#
+# Leading zeros are stripped before the range test so the digit count means what it says: on bash 3.2
+# `[` parses base 10, but a digit string too long for a machine integer makes it print "integer
+# expression expected" and return 2 — which an `if` reads as false, so a 20-digit "uid" would slip
+# past a bare `-gt`. The length bound refuses it first. (Same shape as lib/runtime.sh's port gate.)
+_mi_copy_uid_ok() {
+  local uid="$1" what="$2" n
+  case "$uid" in ''|*[!0-9]*) mi_warn "copy: $what '$uid' is not a numeric uid"; return 1 ;; esac
+  n="$uid"
+  while [ "${#n}" -gt 1 ] && [ "${n:0:1}" = 0 ]; do n="${n:1}"; done
+  if [ "${#n}" -gt 10 ] || [ "$n" -gt 4294967295 ]; then
+    mi_warn "copy: $what '$uid' is out of range — a uid is 0..4294967295"
+    return 1
+  fi
+  return 0
+}
+
 # Run one closed command in the pinned copy container.
 #
 # `--network none`: the copy needs no network, and a privileged container reading every byte of a
@@ -130,6 +153,8 @@ _mi_copy_helper() {
 mi_copy_preflight() {
   if [ "$#" -ne 4 ]; then mi_warn "copy: mi_copy_preflight needs <index> <staging> <runtime-uid> <operator-uid>"; return 1; fi
   local idx="$1" stage="$2" ruid="$3" ouid="$4" out rc k v ep
+  _mi_copy_uid_ok "$ruid" "the product's runtime uid" || return 1
+  _mi_copy_uid_ok "$ouid" "the operator uid" || return 1
   mi_copy_available "$idx" || return 1
 
   # §4.5 residual 2 / D60: Docker Desktop translates ownership at the file-sharing layer, so group and
@@ -198,6 +223,38 @@ mi_copy_preflight() {
   return 0
 }
 
+# The staging destination must be EMPTY before the copy runs. The copy MERGES the source's entries
+# over whatever is already in staging, and verification compares only the SOURCE — so a file, a
+# symlink or a special entry that was already there survives inside the migrated tree, unexamined,
+# with `done=ok` still reported. (A pre-existing ESCAPING symlink in the destination is that hole
+# wearing the symlink refusal's hat.) It is a HOST-side check: staging is the operator's own bind
+# path, so no container is needed to see into it, and refusing here — before the pull and the helper
+# — is the cheapest place to catch it.
+#
+# Called at the start of mi_copy_run. The EMPIRICAL preflight writes probe files into this same
+# destination and MUST remove them before it returns, or the copy that follows would read them as a
+# non-empty staging: a preflight that leaves droppings has corrupted the tree it was validating.
+mi_copy_stage_empty_check() {
+  if [ "$#" -ne 1 ]; then mi_warn "copy: mi_copy_stage_empty_check needs a <staging>"; return 1; fi
+  local stage="$1" listing
+  [ -d "$stage" ] || { mi_warn "copy: the staging destination '$stage' is not a directory"; return 1; }
+  # `ls -A`: dotfiles included, `.`/`..` excluded. Any entry at all — regular, dot, symlink or special
+  # — makes the destination non-empty. Read inside the `if` condition so an unreadable directory is a
+  # refusal (cannot prove emptiness) rather than an errexit abort.
+  if ! listing="$(ls -A -- "$stage" 2>/dev/null)"; then
+    mi_warn "copy: the staging destination '$stage' could not be read to confirm it is empty."
+    return 1
+  fi
+  if [ -n "$listing" ]; then
+    mi_warn "copy: the staging destination '$stage' is not empty. The copy would MERGE the source over"
+    mi_warn "  its existing entries, and verification checks only the source, so anything already here"
+    mi_warn "  would survive inside the migrated tree unexamined. Refusing: migrate into an empty"
+    mi_warn "  staging directory."
+    return 1
+  fi
+  return 0
+}
+
 # The copy itself. Entry types and metadata are a stated contract, not a tool's defaults:
 #
 #   regular file, directory   copied; mtime preserved; ownership and mode per the policy below
@@ -227,6 +284,9 @@ mi_copy_run() {
       *) mi_warn "copy: unknown option '$1'"; return 1 ;;
     esac
   done
+  _mi_copy_uid_ok "$ruid" "the product's runtime uid" || return 1
+  _mi_copy_uid_ok "$ouid" "the operator uid" || return 1
+  mi_copy_stage_empty_check "$stage" || return 1
   mi_copy_available "$idx" || return 1
 
   local -a cspecs
@@ -237,8 +297,8 @@ mi_copy_run() {
   if out="$(_mi_copy_helper "$idx" copy "${cspecs[@]}" "srcvol=${srcvol}" "staging=${stage}")"; then rc=0; else rc=$?; fi
 
   # Report the contract observations BEFORE deciding, so a refusal still tells the operator what the
-  # copier saw.
-  local v
+  # copier saw. `refused` is declared up here because an unrequested mapping (below) sets it too.
+  local v refused=0 seen="" reason detail path
   while IFS= read -r v; do
     [ -n "$v" ] || continue
     mi_log "  symlink preserved verbatim: ${v}"
@@ -248,12 +308,23 @@ mi_copy_run() {
     mi_log "  privileged bits stripped: ${v}"
     mi_log "    Nothing a product legitimately stores needs setuid/setgid/sticky on the host."
   done <<< "$(_mi_copy_fields "$out" stripped)"
+  # A `mapped=` observation is honoured ONLY when the operator opted in with
+  # --map-foreign-to-operator. The flag changes the helper's argv, but a regressed or hostile helper
+  # can report a mapping on a DEFAULT invocation — and folding foreign ownership into the operator's
+  # is exactly the decision the opt-in exists to gate. So an UNREQUESTED mapping is REFUSED, never
+  # logged-and-accepted; a requested one is reported with its numeric value preserved.
   while IFS= read -r v; do
     [ -n "$v" ] || continue
-    mi_log "  foreign uid mapped to the operator: ${v} (the numeric value is preserved here in text)"
+    if [ "$mapforeign" -eq 0 ]; then
+      mi_warn "copy: REFUSED ${v} — the copier reports folding a foreign uid into the operator's on a"
+      mi_warn "  copy that did NOT request it. Mapping foreign ownership is opt-in: re-run with"
+      mi_warn "  --map-foreign-to-operator if that is your intent, or investigate the foreign uid"
+      mi_warn "  first. An unrequested mapping is refused, never applied silently."
+      refused=1
+    else
+      mi_log "  foreign uid mapped to the operator: ${v} (the numeric value is preserved here in text)"
+    fi
   done <<< "$(_mi_copy_fields "$out" mapped)"
-
-  local refused=0 seen="" reason detail path
   while IFS= read -r v; do
     [ -n "$v" ] || continue
     # `refused=<path>:<reason>`, parsed with the REASON LAST and taken from a CLOSED vocabulary, so a
@@ -270,6 +341,7 @@ mi_copy_run() {
         if [ -n "$path" ]; then reason=foreign-uid; else reason=unreadable; path="$v"; fi ;;
       *:special-entry) reason=special-entry; path="${v%:*}" ;;
       *:escaped-write) reason=escaped-write; path="${v%:*}" ;;
+      *:escaping-symlink) reason=escaping-symlink; path="${v%:*}" ;;
       *) reason=unreadable; path="$v" ;;
     esac
     # One path, one message: the two sources of a refusal (an explicit `refused=` line and an `entry=`
@@ -289,12 +361,17 @@ mi_copy_run() {
       escaped-write)
         mi_warn "copy: REFUSED $path — the copier reported a write that would land outside the"
         mi_warn "  destination. This is the escape §5.1 exists to prevent; the copy is abandoned." ;;
+      escaping-symlink)
+        mi_warn "copy: REFUSED $path — its stored symlink target escapes the migrated tree (it is an"
+        mi_warn "  absolute path, or climbs above the root with '..'). The copy preserves a target"
+        mi_warn "  verbatim and does not resolve it, so carrying this one would point outside the tree"
+        mi_warn "  the moment any later product or container followed it. Refused rather than kept." ;;
       *)
         mi_warn "copy: REFUSED — the copier stated a refusal in a form this core cannot read: '$v'."
         mi_warn "  It is treated as a refusal rather than skipped: an unreadable refusal is still one." ;;
     esac
     refused=1
-  done <<< "$(_mi_copy_refusals "$out")"
+  done <<< "$(_mi_copy_refusals "$out" /src)"
 
   [ "$refused" -eq 0 ] || return 1
   [ "$rc" -eq 0 ] || { mi_warn "copy: the copy did not complete."; return 1; }
@@ -307,17 +384,61 @@ mi_copy_run() {
   return 0
 }
 
-# EVERY REFUSAL THE ANSWER STATES, from both things that can state one, in ONE place.
+# Does a symlink at <linkpath> whose stored target is <target> point OUTSIDE the tree rooted at
+# <root>? Purely LEXICAL — the target is never resolved on disk, because following it is exactly the
+# escape this refuses (the host-side walk deliberately does not follow links either). A target
+# escapes when it is ABSOLUTE, or when its `..` components climb above the root from the directory the
+# symlink sits in. A verbatim intra-tree relative target (`../sibling/f`) is NOT an escape.
+#
+# The strings are walked one `/`-separated component at a time by parameter expansion, never by
+# `set -- $target`: under IFS=/ that both DROPS empty fields and GLOB-EXPANDS a component like `*`,
+# and a symlink target may legally contain either. rc 0 escapes · 1 stays inside.
+_mi_copy_link_escapes() {
+  local linkpath="$1" target="$2" root="$3" rel dir rest comp depth
+  case "$target" in /*) return 0 ;; esac              # absolute → outside the tree by definition
+  case "$linkpath" in
+    "$root"/*) rel="${linkpath#"$root"/}" ;;
+    *) return 0 ;;                                     # not under the root we were handed — refuse, don't guess
+  esac
+  # Depth of the symlink's PARENT directory below root = rel minus its last (basename) component.
+  case "$rel" in */*) dir="${rel%/*}" ;; *) dir="" ;; esac
+  depth=0; rest="$dir"
+  while [ -n "$rest" ]; do
+    comp="${rest%%/*}"
+    case "$rest" in */*) rest="${rest#*/}" ;; *) rest="" ;; esac
+    case "$comp" in ''|.) continue ;; esac
+    depth=$((depth + 1))
+  done
+  rest="$target"
+  while [ -n "$rest" ]; do
+    comp="${rest%%/*}"
+    case "$rest" in */*) rest="${rest#*/}" ;; *) rest="" ;; esac
+    case "$comp" in
+      ''|.) : ;;
+      ..) depth=$((depth - 1)); if [ "$depth" -lt 0 ]; then return 0; fi ;;
+      *)  depth=$((depth + 1)) ;;
+    esac
+  done
+  return 1
+}
+
+# EVERY REFUSAL THE ANSWER STATES, from every thing that can state one, in ONE place.
 #
 #   `refused=<path>:<reason>`   the copier's own refusal
 #   `entry=special:<path>`      an entry it ENUMERATED as a device, socket or FIFO
+#   `linktarget=<path>:<t>`     a symlink it enumerated whose target ESCAPES the tree (<root>)
 #
-# The second is folded in here rather than checked beside the loop because it is the same decision: a
-# special entry is a refusal whether or not the copier remembered to say so, and a copier that
-# enumerated one and then exited 0 must not be believed. Two separate checks would be two verdicts that
-# can drift, and the one that drifts is the one nobody re-reads.
+# The last two are folded in here rather than checked beside the loop because they are the same
+# decision: a special entry, or an escaping symlink, is a refusal whether or not the copier remembered
+# to say so — a copier that enumerated one and then exited 0 must not be believed. Two separate checks
+# would be two verdicts that can drift, and the one that drifts is the one nobody re-reads.
+#
+# For the symlink fold the authoritative, colon-robust refusal is the copier's own
+# `refused=<path>:escaping-symlink` (reason LAST); this backstop splits `linktarget=<path>:<target>`
+# on the FIRST colon, so a colon INSIDE the link's own path degrades only the backstop, never the
+# reason-last refusal.
 _mi_copy_refusals() {
-  local blob="$1" v
+  local blob="$1" root="$2" v lp tg
   _mi_copy_fields "$blob" refused
   while IFS= read -r v; do
     [ -n "$v" ] || continue
@@ -325,6 +446,11 @@ _mi_copy_refusals() {
     # contain colons of its own.
     case "$v" in special:*) printf '%s:special-entry\n' "${v#*:}" ;; esac
   done <<< "$(_mi_copy_fields "$blob" entry)"
+  while IFS= read -r v; do
+    [ -n "$v" ] || continue
+    lp="${v%%:*}"; tg="${v#*:}"
+    if _mi_copy_link_escapes "$lp" "$tg" "$root"; then printf '%s:escaping-symlink\n' "$lp"; fi
+  done <<< "$(_mi_copy_fields "$blob" linktarget)"
 }
 
 # VERIFICATION IS OVER THE CONTRACT, NOT A BYTE COUNT: every source entry has a counterpart of the same
@@ -335,8 +461,14 @@ _mi_copy_refusals() {
 # The destination is mounted READ-ONLY here (`dstro=`): a verifier that can repair what it finds cannot
 # report it.
 mi_copy_verify() {
-  if [ "$#" -ne 3 ]; then mi_warn "copy: mi_copy_verify needs <index> <source volume> <destination>"; return 1; fi
-  local idx="$1" srcvol="$2" dst="$3" out rc bad=0 v n
+  if [ "$#" -ne 4 ]; then mi_warn "copy: mi_copy_verify needs <index> <source volume> <destination> <expected-entries>"; return 1; fi
+  local idx="$1" srcvol="$2" dst="$3" expect="$4" out rc bad=0 v n
+  # <expected-entries> is the source's entry count, derived by the CALLER from the copy step's own
+  # `entry=` enumeration — an INDEPENDENT, source-derived number the verifier is measured against, and
+  # the thing that binds `checked` to the source. Without it `checked=0 done=ok` is a completion claim
+  # over no evidence, and `checked=<a large number> done=ok` is a claim to have compared entries that
+  # were never there. Neither the count nor the verdict may come from the verifier alone.
+  case "$expect" in ''|*[!0-9]*) mi_warn "copy: mi_copy_verify's <expected-entries> '$expect' is not a count"; return 1 ;; esac
   mi_copy_available "$idx" || return 1
   if out="$(_mi_copy_helper "$idx" verify "arg=/src" "arg=/dst" "srcvol=${srcvol}" "dstro=${dst}")"; then rc=0; else rc=$?; fi
   while IFS= read -r v; do
@@ -364,6 +496,17 @@ mi_copy_verify() {
       mi_warn "  Refusing: a completion claim with no count is not evidence that anything was compared."
       return 1 ;;
   esac
+  # BIND THE COUNT TO THE SOURCE. The verifier must have checked EXACTLY the source's entries — not
+  # zero of them (a vacuous pass over a non-empty source), and not a fabricated surplus. A count that
+  # differs from the source's own means the per-entry walk did not cover the source the copy read, so
+  # the copy is not verified. Compared as STRINGS: both are validated `[0-9]+`, and string equality
+  # sidesteps `[`'s integer-overflow trap on an absurd stated count.
+  if [ "$n" != "$expect" ]; then
+    mi_warn "copy: the verifier checked $n entries but the source has $expect — the per-entry walk did"
+    mi_warn "  not cover exactly the source the copy read, so the copy is NOT verified. (A count of"
+    mi_warn "  zero against a non-empty source is this failure's most important shape.)"
+    return 1
+  fi
   mi_log "copy: verified $n entries against the source over the per-entry contract."
   return 0
 }
@@ -382,7 +525,7 @@ mi_copy_access_check() {
   local idx="$1" dst="$2" ruid="$3" out rc k v
   # Checked HERE as well as in the runtime adapter, because the value is also printed in every message
   # below and a non-numeric one would name a uid this check never ran as.
-  case "$ruid" in ''|*[!0-9]*) mi_warn "copy: '$ruid' is not a numeric uid"; return 1 ;; esac
+  _mi_copy_uid_ok "$ruid" "the runtime uid" || return 1
   mi_copy_available "$idx" || return 1
   if out="$(MI_COPY_RUNAS="$ruid" _mi_copy_helper "$idx" access "arg=/dst" "staging=${dst}")"; then rc=0; else rc=$?; fi
   for k in traverse read write; do
