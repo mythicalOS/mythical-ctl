@@ -739,7 +739,15 @@ mi_netmig_run() {
       done <<< "$cs"
       ;;
     3)
-      _mi_netmig_record 3 "$src" "$tgt" "$cs" || return 1
+      # THE phase=3 MARKER IS WRITTEN AT THE END OF THIS PHASE, NOT ITS START — mirroring phase 5,
+      # which records its success only after verifying. Phase 4's gate admits a recorded phase of {3,4}
+      # and detaches the source; if phase 3 recorded `phase=3` on ENTRY, then any phase-3 failure left
+      # that marker behind, and a subsequent bare `mi_netmig_run <idx> <src> <tgt> 4` would detach the
+      # source on the strength of a phase 3 that never actually verified anything. "Phase 3 was entered"
+      # is not "phase 3 succeeded". The snapshot phase 4 needs is written by phase 2's own record, so
+      # deferring this one costs phase 4 nothing; a failed phase 3 simply leaves the marker at 2, which
+      # phase 4 refuses. Phase 3 has no admits gate of its own precisely because it is non-destructive
+      # and freely re-runnable, so nothing is lost by recording its completion rather than its entry.
       # IS THE SOURCE STILL PRESENT? A forward-only migration — the operator deleted the old network —
       # cannot be verified against {source,target}: the containers are on the target alone, and demanding
       # the source would wedge the migration forever (nothing could ever satisfy the check, the intent
@@ -873,6 +881,10 @@ mi_netmig_run() {
           mi_warn "  attaching the target moved the route despite the lower gateway priority. Stopping."
           return 1; }
       fi
+      # ONLY NOW: every container is connected to the target and verified there, and egress is intact.
+      # This is the proof phase 4 is admitted on. Written last, so a failure anywhere above leaves the
+      # marker at phase 2 and phase 4 stays refused.
+      _mi_netmig_record 3 "$src" "$tgt" "$cs" || return 1
       ;;
     4)
       # PROOF BEFORE DETACH. Phase 4 is the one destructive phase, and it may run only when the

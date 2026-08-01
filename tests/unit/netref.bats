@@ -454,6 +454,29 @@ probe_answers() { HELPER_RESOLVE_ADDR="$1"; export HELPER_RESOLVE_ADDR; }
   assert_contains "$src"
 }
 
+@test "a FAILED phase 3 does not leave a marker that lets a later phase 4 detach" {
+  # "Phase 3 was entered" is not "phase 3 succeeded". The phase=3 marker used to be written on ENTRY,
+  # so a phase 3 that then failed its verification left the marker behind — and a subsequent bare
+  # phase-4 call, whose gate admits a recorded phase of {3,4}, would detach the source on the strength
+  # of a verification that never happened. The marker is now written only after phase 3 succeeds.
+  src="$(mi_rt_network_create s "" x)"; tgt="$(mi_rt_network_create t "" y)"
+  c="$(a_sibling p1 "$src")"                       # on the SOURCE only — never connected to the target
+  # Phase 3 with no phase 2 first: it must FAIL (the container is not on the target).
+  run mi_netmig_run "$IDX" "$src" "$tgt" 3
+  [ "$status" -ne 0 ]
+  # STATE: the recorded phase is NOT 3 (it is absent, since phase 2 never ran) — so phase 4 is refused.
+  run mi_led_find netmig key family
+  # either no record at all, or a record whose phase is not 3
+  if [ "$status" -eq 0 ]; then
+    case "$output" in *"phase=3"*) echo "a failed phase 3 left a phase=3 marker: $output" >&2; return 1 ;; esac
+  fi
+  # And the operative proof: a phase 4 now REFUSES and the source stays attached.
+  run mi_netmig_run "$IDX" "$src" "$tgt" 4
+  [ "$status" -ne 0 ]
+  run mi_rt_inspect container c.nets "$c"
+  assert_contains "$src"
+}
+
 @test "a bare phase 6 with no verified migration REFUSES to commit-and-clear" {
   src="$(mi_rt_network_create s "" x)"; tgt="$(mi_rt_network_create t "" y)"
   c="$(a_sibling p1 "$src")"
