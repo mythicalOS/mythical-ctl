@@ -476,6 +476,47 @@ _mi_netmig_containers() {
   mi_rt_find_by_label container installation "$ident"
 }
 
+# THE FLEET THIS INVOCATION ACTS ON — FIXED AT INTENT-OPEN, never re-enumerated. §6a's rule that a
+# name (or a set) can be reassigned while the RECORDED identity is the truth, applied to the fleet: once
+# the intent records containers=<snapshot>, THAT snapshot is the migration's fleet and every later phase
+# reads it back. Re-enumerating the live label set at phase 2/3/4/5 instead lets a container that
+# appeared AFTER the intent opened — one phase 2 never connected and phase 3 never verified — be swept
+# into phase 4's detach, stranding it on nothing while the ledger records the migration complete and its
+# detach goes unprovenanced. A container that appears mid-migration is not part of THIS migration; it is
+# §6b.2's unaccounted same-identity case the other paths already handle, not a member to move or detach.
+#
+# Only when NO intent is recorded yet does this OPEN one, snapshotting the live set — that is
+# intent-open (phase 1, or a direct single-phase call that opens its own intent). An unreadable ledger
+# is a THIRD answer and stops: it is not "no intent recorded", and enumerating past it would re-derive
+# the very live set this exists to avoid.
+#
+# rc 0 prints the fleet (one container per line, possibly empty) · 1 refused (reported).
+_mi_netmig_fleet() {
+  local rec rc list
+  if rec="$(mi_led_find "$MI_NETMIG_KIND" key family)"; then rc=0; else rc=$?; fi
+  case "$rc" in
+    0)
+      if list="$(mi_led_field "$rec" containers)"; then :; else
+        mi_warn "netref: the recorded migration names no container set, so the fleet it opened against"
+        mi_warn "  is unknown. It is PRESERVED and reported. Run 'mythical-ctl state repair'."
+        return 1
+      fi
+      # _mi_netmig_record stores the set comma-joined; restore the newline form the phase loops read.
+      # An empty value is legal (an intent opened against a fleet with no containers) and yields nothing.
+      printf '%s' "$list" | tr ',' '\n'
+      ;;
+    3)
+      _mi_netmig_containers || return 1
+      ;;
+    *)
+      mi_warn "netref: whether a migration is already recorded could not be read from the ledger, so the"
+      mi_warn "  fleet this phase must act on cannot be established. Re-enumerating the live set could"
+      mi_warn "  sweep in a container this migration never connected. Nothing is done."
+      return 1
+      ;;
+  esac
+}
+
 # THE ONE WRITER of the migration intent, so the three phases that record one cannot disagree about
 # what it holds. The container list is built and CHECKED before it reaches the record: interpolating
 # `$( … )` straight into the argument would publish an empty list on a failed `tr` and the recovering
@@ -669,7 +710,9 @@ mi_netmig_run() {
     return 1
   fi
 
-  cs="$(_mi_netmig_containers)" || return 1
+  # THE FLEET IS THE RECORDED SNAPSHOT, not a live re-enumeration — see _mi_netmig_fleet. This is what
+  # keeps phase 4 from detaching a container that appeared after the intent opened.
+  cs="$(_mi_netmig_fleet)" || return 1
 
   case "$phase" in
     1)
@@ -703,8 +746,23 @@ mi_netmig_run() {
       # could never clear). When the source is gone, the correct assertion is exactly {target}, which is
       # phase 5's check, borrowed here. When it is present, verification goes through bring-up's door,
       # where the permitted set during a recorded migration is {source,target}.
-      local src3
-      if mi_rt_inspect network n.id "$src" >/dev/null 2>&1; then src3=present; else src3=absent; fi
+      local src3 s3rc
+      # ONLY rc 3 IS ABSENT. mi_rt_inspect answers 3 when the daemon replied and the network is
+      # genuinely gone (a forward-only migration), and 1 when the daemon could not be asked at all.
+      # "COULD NOT ASK" IS NOT "ABSENT": folding 1 into absent drops the source-egress assertion below
+      # and switches to the forward-only verifier on the strength of a question the runtime never
+      # answered — the exact fail-open mi_netmig_resume already refuses at its own source inspect. So
+      # the three answers are kept apart here too, and rc 1 STOPS without detaching.
+      if mi_rt_inspect network n.id "$src" >/dev/null; then s3rc=0; else s3rc=$?; fi
+      case "$s3rc" in
+        0) src3=present ;;
+        3) src3=absent ;;
+        *) mi_warn "netref: phase 3 could not inspect the source network ($src), so whether this is a"
+           mi_warn "  forward-only migration or a source that is genuinely gone cannot be told apart."
+           mi_warn "  'Could not ask' is not 'absent' — stopping without detaching. Run 'mythical-ctl"
+           mi_warn "  state repair'."
+           return 1 ;;
+      esac
       # The probe is the PRIMARY verifier for every container, not a fallback for stopped ones — it is
       # the one participant whose toolchain the core controls (D48). If it cannot be obtained,
       # verification CANNOT BE PERFORMED, so the migration STOPS HERE and does not detach.

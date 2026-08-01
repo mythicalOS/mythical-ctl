@@ -487,3 +487,58 @@ probe_answers() { HELPER_RESOLVE_ADDR="$1"; export HELPER_RESOLVE_ADDR; }
   run mi_net_ref_get
   [ "$output" = "$tgt" ]
 }
+
+# --- fix wave 2: the fleet is FIXED at intent-open, and phase 3's source inspect keeps 1 apart from 3 --
+
+# CRITICAL — every phase acts on the RECORDED containers= snapshot, never a live re-enumeration. A
+# container that appears mid-migration was never connected in phase 2 or verified in phase 3, so phase 4
+# must not detach it.
+
+@test "phase 4 detaches only the RECORDED fleet, never a container that appeared mid-migration" {
+  src="$(mi_rt_network_create s "" x)"; tgt="$(mi_rt_network_create t "" y)"
+  a="$(a_sibling p1 "$src")"
+  # A is in the migration and, as phase 2 left it, attached to BOTH networks.
+  mi_rt_network_connect "$tgt" "$a" "$(mi_name_alias p1)" -1 >/dev/null
+  # The intent, opened when only A existed, sits at phase 3 (verified) ready for the phase-4 detach.
+  mi_led_put netmig key family "key=family" "phase=3" "source=$src" "target=$tgt" "containers=$a"
+  # B appears AFTER intent-open: same installation label, on the source only — never connected in
+  # phase 2, never verified in phase 3. It is NOT part of this migration.
+  b="$(a_sibling p2 "$src")"
+  run mi_netmig_run "$IDX" "$src" "$tgt" 4
+  [ "$status" -eq 0 ]
+  # STATE: A (recorded) is detached from the source — it now holds the target alone.
+  run mi_rt_inspect container c.nets "$a"
+  run grep -a "$src" <<<"$output"
+  [ "$status" -ne 0 ]
+  # STATE: B (appeared mid-migration) is UNTOUCHED — still on the source. Re-enumerating the live label
+  # set would have swept B into the detach, stranding it on nothing; the recorded snapshot did not.
+  run mi_rt_inspect container c.nets "$b"
+  assert_contains "$src"
+  # RECORD: the migration still names only the fleet it opened against — B was never written into it.
+  run mi_led_find netmig key family
+  run grep -a "$b" <<<"$output"
+  [ "$status" -ne 0 ]
+}
+
+# MAJOR fail-open — phase 3 must accept only rc 3 (genuinely gone) as an absent source. rc 1 (the
+# daemon could not be asked) is not absence, and folding it in would switch to the forward-only verifier
+# and skip the source-egress assertion on the strength of an unanswered question.
+
+@test "phase 3 STOPS when the source network cannot be inspected — could-not-ask is not absent" {
+  src="$(mi_rt_network_create s "" x)"; tgt="$(mi_rt_network_create t "" y)"
+  c="$(a_sibling p1 "$src")"
+  # As phase 2 left it: c on both networks, the intent recorded at phase 3.
+  mi_rt_network_connect "$tgt" "$c" "$(mi_name_alias p1)" -1 >/dev/null
+  mi_led_put netmig key family "key=family" "phase=3" "source=$src" "target=$tgt" "containers=$c"
+  # The daemon cannot answer the source-presence question: every runtime call during the run dies,
+  # `version` included, so mi_rt_inspect reports rc 1 (could not ask), NOT rc 3 (genuinely gone). The
+  # source inspect is the FIRST runtime call phase 3 makes — the fleet is read from the record — so
+  # DOWN_AFTER=0 targets exactly it.
+  FAKE_DOCKER_DOWN_AFTER=0 run mi_netmig_run "$IDX" "$src" "$tgt" 3
+  [ "$status" -ne 0 ]
+  assert_contains "could not inspect the source"
+  # STATE: nothing was detached — c is still on the source. A fail-open would have read "source gone",
+  # taken the forward-only path, and proceeded on a question the runtime never answered.
+  run mi_rt_inspect container c.nets "$c"
+  assert_contains "$src"
+}
