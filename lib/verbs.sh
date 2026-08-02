@@ -183,8 +183,14 @@ mi_product_ctx() {
   printf '\tcontainer=%s' "$container"
   printf '\talias=%s' "$(mi_name_alias "$product")"
   printf '\timage=%s' "$(mi_manifest_image "$mrec")"
-  printf '\tmanifest_records=%s' "$(printf '%s' "$mrec" | tr '\n\t' '\036\037')"
-  printf '\tpolicy_records=%s\n' "$(printf '%s' "$prec" | tr '\n\t' '\036\037')"
+  # Encode the record blobs, CHECKING the transform: a failed tr yields empty output while the printf
+  # around it succeeds, so a caller would decode an empty manifest as "no volumes, mounts or secrets" and
+  # launch an incomplete container. Capture and check before printing.
+  local _menc _penc
+  _menc="$(printf '%s' "$mrec" | tr '\n\t' '\036\037')" || { mi_warn "verbs: could not encode the manifest records for '$product'."; return 1; }
+  _penc="$(printf '%s' "$prec" | tr '\n\t' '\036\037')" || { mi_warn "verbs: could not encode the policy records for '$product'."; return 1; }
+  printf '\tmanifest_records=%s' "$_menc"
+  printf '\tpolicy_records=%s\n' "$_penc"
   return "$rc"
 }
 
@@ -203,7 +209,7 @@ mi_bringup_specs() {
   if [ "$#" -ne 3 ]; then mi_warn "verbs: mi_bringup_specs needs <product> <manifest-records> <policy-records>"; return 1; fi
   local product="$1" mrec="$2" prec="$3" ident up v role target vol port
   ident="$(mi_ident_get)" || return 1
-  up="$(printf '%s' "$product" | tr 'a-z-' 'A-Z_')"
+  up="$(printf '%s' "$product" | tr 'a-z-' 'A-Z_')" || { mi_warn "verbs: could not derive the port env-var name for '$product' — refusing rather than reading the wrong key."; return 1; }
 
   # Volume roles the manifest declares.
   local -a vroles
@@ -453,9 +459,9 @@ _mi_verb_install_locked() {
   # Read then transform — a pipeline's status under `pipefail` is the LEFT side's, so `… | tr` would
   # abort on a missing field rather than report it.
   mrec="$(mi_led_field "$ctx" manifest_records)" || { mi_warn "verbs: context has no manifest records"; return 1; }
-  mrec="$(printf '%s' "$mrec" | tr '\036\037' '\n\t')"
+  mrec="$(printf '%s' "$mrec" | tr '\036\037' '\n\t')" || { mi_warn "verbs: could not decode the manifest records — refusing rather than launching an incomplete container."; return 1; }
   prec="$(mi_led_field "$ctx" policy_records)"   || { mi_warn "verbs: context has no policy records"; return 1; }
-  prec="$(printf '%s' "$prec" | tr '\036\037' '\n\t')"
+  prec="$(printf '%s' "$prec" | tr '\036\037' '\n\t')" || { mi_warn "verbs: could not decode the policy records — refusing rather than launching an incomplete container."; return 1; }
   local container alias image
   container="$(mi_led_field "$ctx" container)" || return 1
   # On a FORCED not-launched install on a brand-new machine, the context was assembled before the
@@ -794,21 +800,26 @@ _mi_verb_recreate_locked() {
   mi_state_desired_get "$c" >/dev/null || { mi_warn "verbs: '$product' is not installed"; return 1; }
 
   if ctx="$(mi_product_ctx "$idx" "$pol" "$man" "$product")"; then rc=0; else rc=$?; fi
-  # NORMALIZE to the verb contract (§7.3: only 0/1/2/3 may leave a verb). mi_product_ctx can return 4
-  # ("no trust anchor"), which a bare `return "$rc"` would leak as an undefined exit code. The product is
-  # already confirmed installed above, so ANY context failure here — refused (1), a manifest withdrawn to
-  # not-launched (3), or an unauthenticated one (4) — is an operational failure for a recreate, not a
-  # clean "not launched yet": recreate has no fresh not-launched path (only install does), and mi_ex_worst
-  # treats 3 as benign, which this is not. So it maps to 1, exactly as install maps its non-0/3 codes.
+  # NORMALIZE to the verb contract (§7.3: only 0/1/2/3 may leave a verb), and HONOR a recorded force-install.
+  # rc 3 = the manifest says not-launched. recreate normally refuses (unlike install it has no FRESH
+  # not-launched path, and mi_ex_worst treats 3 as benign, which this is not — so it maps to 1). BUT if the
+  # operator force-installed this product, they asserted the image is published, and recreate honors that
+  # exactly as it honors a recorded --image override: it rebuilds the container they explicitly stood up.
+  # Any OTHER non-zero code (refused 1, an undefined 4 mi_product_ctx can return, …) maps to operational 1.
+  if [ "$rc" -eq 3 ] && mi_led_find forced key "${product}:force-install" >/dev/null 2>&1; then
+    mi_warn "verbs: '$product' was force-installed against a not-launched manifest; recreate honors that"
+    mi_warn "  override and rebuilds the container the operator explicitly stood up."
+    rc=0
+  fi
   [ "$rc" -eq 0 ] || { mi_warn "verbs: cannot build the context to recreate '$product' — its manifest or"
     mi_warn "  policy could not be authenticated, or has been withdrawn. Nothing was changed."; return 1; }
   # `mi_led_field … | tr` under a `pipefail` caller carries the LEFT side's status, so a missing field
   # aborts instead of being reported. Read the field, then transform it.
   local mrec prec netid alias image envfile
   mrec="$(mi_led_field "$ctx" manifest_records)" || { mi_warn "verbs: context has no manifest records"; return 1; }
-  mrec="$(printf '%s' "$mrec" | tr '\036\037' '\n\t')"
+  mrec="$(printf '%s' "$mrec" | tr '\036\037' '\n\t')" || { mi_warn "verbs: could not decode the manifest records — refusing rather than launching an incomplete container."; return 1; }
   prec="$(mi_led_field "$ctx" policy_records)"   || { mi_warn "verbs: context has no policy records"; return 1; }
-  prec="$(printf '%s' "$prec" | tr '\036\037' '\n\t')"
+  prec="$(printf '%s' "$prec" | tr '\036\037' '\n\t')" || { mi_warn "verbs: could not decode the policy records — refusing rather than launching an incomplete container."; return 1; }
   image="$(mi_led_field "$ctx" image)" || { mi_warn "verbs: context names no image"; return 1; }
   # PRESERVE a recorded image override. install may have been given `--image X`, which it recorded as a
   # `forced` ledger entry and which `status` reports as the running image. recreate takes no --image of
@@ -1240,9 +1251,17 @@ mi_verb_status() {
   local mig mgrc
   if mig="$(mi_led_find netmig key family 2>/dev/null)"; then mgrc=0; else mgrc=$?; fi
   if [ "$mgrc" -eq 0 ]; then
-    mi_log "NETWORK MIGRATION IN PROGRESS — phase $(mi_led_field "$mig" phase)"
-    mi_log "  source $(mi_led_field "$mig" source) → target $(mi_led_field "$mig" target)"
-    mi_log "  Containers are on both networks; family DNS resolves on either. Resume with 'net rebind'."
+    # A checksum-valid netmig record can still be missing semantic fields; printing blank phase/source/
+    # target reads as a usable migration. Require all three, else report it unreadable.
+    local _mph _msrc _mtgt
+    if _mph="$(mi_led_field "$mig" phase)" && _msrc="$(mi_led_field "$mig" source)" && _mtgt="$(mi_led_field "$mig" target)"; then
+      mi_log "NETWORK MIGRATION IN PROGRESS — phase $_mph"
+      mi_log "  source $_msrc → target $_mtgt"
+      mi_log "  Containers are on both networks; family DNS resolves on either. Resume with 'net rebind'."
+    else
+      mi_log "NETWORK MIGRATION record UNREADABLE — a migration is recorded but is missing fields, so its"
+      mi_log "  state cannot be trusted. Run 'mythical-ctl state repair'."
+    fi
   elif [ "$mgrc" -ne 3 ]; then
     mi_log "NETWORK MIGRATION record UNREADABLE — a migration is recorded but its record could not be"
     mi_log "  read. Status of the network cannot be trusted. Run 'mythical-ctl state repair'."

@@ -820,3 +820,21 @@ EOF
   run mi_rt_inspect container c.running "$C"
   [ "$output" = true ]
 }
+
+@test "recreate HONORS a recorded force-install on a still-not-launched manifest, rather than refusing it" {
+  write_fixture_product p1 launched=false
+  mi_verb_install "$IDX" "$POL" "$MYTHICAL_HOME/p1.manifest" p1 --force-install >/dev/null   # recorded
+  # the manifest is STILL not-launched; recreate must honor the force-install and rebuild, not refuse,
+  # just as it honors a recorded --image override (sibling parity).
+  run mi_verb_recreate "$IDX" "$POL" "$MYTHICAL_HOME/p1.manifest" p1
+  [ "$status" -eq 0 ]
+}
+
+@test "status reports a netmig record missing fields as UNREADABLE, not a blank migration" {
+  mi_lock_acquire
+  { mi_ledger_read; printf 'netmig\tkey=family\n'; } | mi_ledger_write   # recorded, but no phase/source/target
+  mi_lock_release
+  run mi_verb_status "$IDX"
+  [ "$status" -eq 0 ]
+  assert_contains "MIGRATION record UNREADABLE"
+}
