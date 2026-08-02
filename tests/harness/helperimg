@@ -364,6 +364,10 @@ case "$cmd" in
       # A well-formed key=value line whose KEY is not in this command's vocabulary — also refused.
       unknown-key)
         printf 'surprise=whatever\n' ;;
+      # A BLANK LINE between records — a truncated continuation of a newline-bearing value looks exactly
+      # like this, so the record grammar is no longer reliable.
+      blank-line)
+        printf 'entry=file:%s/a\n\ndone=ok\n' "$src"; fin 0 ;;
       # An EMPTY linktarget= — a disclosed symlink target that names nothing; the value pass skips it.
       empty-lt)
         printf 'linktarget=\n' ;;

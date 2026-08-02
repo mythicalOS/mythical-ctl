@@ -158,6 +158,13 @@ teardown() { rm -rf "$DST" "$STAGE"; mi_lock_release; teardown_test_env; }
 # than `special:`, then exited 0 with done=ok, would otherwise have that entry COUNTED toward the total
 # and the copy reported verified. The exact hostile transcript — a `fifo:` entry alongside `done=ok` and
 # a zero exit — must be REFUSED.
+@test "a BLANK line in the transcript is REFUSED — it can be a truncated continuation" {
+  mkdir -p "$STAGE"
+  HELPER_COPY=blank-line run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000
+  [ "$status" -ne 0 ]
+  assert_contains "blank line"
+}
+
 @test "a transcript line that is not a key=value record is REFUSED — closed grammar" {
   mkdir -p "$STAGE"
   HELPER_COPY=junk-line run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000

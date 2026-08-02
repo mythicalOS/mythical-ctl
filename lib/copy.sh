@@ -119,8 +119,23 @@ _mi_copy_has_empty() {
 _mi_copy_grammar_ok() {
   local blob="$1"; shift
   local line key ok k
+  # A WHOLLY-EMPTY transcript is not this function's to refuse: it is the "the helper reported nothing"
+  # case, which the absent-observation readers (_mi_copy_stated) already refuse with a message that
+  # tells the operator WHICH observation was missing. Deferring it here keeps that diagnostic. A blank
+  # line only matters as an INTERIOR one, amid real content — that is the truncated-continuation shape.
+  local hascontent=0
+  while IFS= read -r line; do [ -n "$line" ] && { hascontent=1; break; }; done <<< "$blob"
+  [ "$hascontent" -eq 1 ] || return 0
   while IFS= read -r line; do
-    [ -n "$line" ] || continue
+    # A BLANK LINE IS NOT SKIPPED. Command substitution strips a trailing newline, so a clean
+    # transcript yields no empty read — an interior blank line is genuine, and it can be the truncated
+    # continuation of a value that contained a newline, at which point the record boundaries are no
+    # longer trustworthy. It is refused as outside the grammar, not passed over.
+    if [ -z "$line" ]; then
+      mi_warn "copy: the helper's transcript contains a blank line. A blank line can be the truncated"
+      mi_warn "  continuation of a value, so the record grammar is no longer reliable — refused."
+      return 1
+    fi
     key="${line%%=*}"
     case "$line" in *=*) : ;; *)
       mi_warn "copy: the helper emitted a line that is not a key=value record: '${line}'. The transcript"
