@@ -617,3 +617,52 @@ EOF
   [ "$status" -ne 0 ]
   assert_contains "probe"
 }
+
+@test "family uninstall REFUSES and does NOT reset the ledger when the object listing is unreadable" {
+  # THE HIGH: `done <<< "$(mi_led_all object)"` took the loop's status, not the listing's — so a
+  # malformed (but checksum-valid) object record read as an EMPTY listing, removed nothing, left
+  # `preserved` at 0, and the ledger was reset over containers still standing. It must fail closed.
+  mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
+  mi_lock_acquire
+  { mi_ledger_read; printf 'object\tmalformed-no-equals\n'; } | mi_ledger_write
+  mi_lock_release
+  MI_CONFIRM=yes run mi_verb_uninstall_family     # confirmed, so it is the ENUMERATION guard that stops it
+  [ "$status" -ne 0 ]
+  # the ledger was NOT wiped — the installation identity is still recorded
+  run mi_ident_get
+  [ "$status" -eq 0 ]
+}
+
+@test "product uninstall --purge REFUSES on an unreadable object listing rather than silently skipping volumes" {
+  mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
+  mi_lock_acquire
+  { mi_ledger_read; printf 'object\tmalformed-no-equals\n'; } | mi_ledger_write
+  mi_lock_release
+  run mi_verb_uninstall p1 --purge
+  [ "$status" -ne 0 ]
+}
+
+@test "install REFUSES to create a volume when its provenance record is unreadable (rc 1 is not rc 3)" {
+  # only rc 3 (no such record) authorizes opening an intent and creating a volume; an ambiguous
+  # provenance record (rc 1) must fail closed, never create a second volume under the same name.
+  mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
+  IDENT="$(mi_ident_get)"; vol="mythical-${IDENT}-p1-state"
+  # a second provenance record for the same volume key → mi_prov_find is ambiguous (rc 1)
+  mi_lock_acquire
+  { mi_ledger_read
+    printf 'object\tkey=volume:%s\tclass=volume\tname=%s\tnonce=x\tgen=1\n' "$vol" "$vol"
+  } | mi_ledger_write
+  mi_lock_release
+  run mi_verb_install "$IDX" "$POL" "$MAN" p1
+  [ "$status" -ne 0 ]
+}
+
+@test "status reports an UNREADABLE object listing as UNREADABLE, never as an empty fleet (rc 1 is not rc 3)" {
+  mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
+  mi_lock_acquire
+  { mi_ledger_read; printf 'object\tmalformed-no-equals\n'; } | mi_ledger_write
+  mi_lock_release
+  run mi_verb_status "$IDX"
+  [ "$status" -eq 0 ]                              # read-only: never gated by its own findings
+  assert_contains "UNREADABLE"
+}

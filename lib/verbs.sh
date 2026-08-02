@@ -52,6 +52,24 @@ _mi_verb_container() {   # <product> → the container name, or rc 1
   mi_name_container "$ident" "$1"
 }
 
+# Fully read one kind of ledger record for a MUTATING verb, FAILING CLOSED if the listing is not
+# complete. `done <<< "$(mi_led_all <kind>)"` takes the WHILE loop's status, not the listing's — so
+# mi_led_all's rc 1 (a record could not be read) is discarded and reads as an EMPTY listing. A verb that
+# loops over an empty listing then skips every object it should have acted on: family uninstall would
+# reset the ledger over containers it never removed; uninstall --purge would leave volumes behind and
+# still exit 0. rc 0 (records, possibly none) and rc 3 (no ledger yet) both proceed; rc 1 refuses.
+# Callers MUST capture this and check its status BEFORE the loop — never inline it into `done <<<`.
+_mi_verb_objects() {
+  if [ "$#" -ne 1 ]; then mi_warn "verbs: _mi_verb_objects needs <kind>"; return 1; fi
+  local kind="$1" recs rc
+  if recs="$(mi_led_all "$kind")"; then rc=0; else rc=$?; fi
+  if [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ]; then printf '%s' "$recs"; return 0; fi
+  mi_warn "verbs: the ledger's '${kind}' records could not be fully read, so this operation cannot see"
+  mi_warn "  every object it must act on. Refusing rather than acting on a partial view of the ledger."
+  mi_warn "  Run 'mythical-ctl state repair'."
+  return 1
+}
+
 # The core-fixed user-data mount points (§4.1a): ~/.mythical/transcripts and ~/.mythical/logs.
 # mi_ensure_layout deliberately leaves these "to appear when a product binds them" — they are the
 # user-data ownership class, not installer state — and binding them is exactly what a launch does. So
@@ -448,8 +466,24 @@ _mi_verb_install_locked() {
     [ -n "$v" ] || continue
     role="${v%%:*}"
     vol="$(mi_name_volume "$(mi_ident_get)" "$product" "$role")" || return 1
-    if mi_prov_find volume "$vol" >/dev/null 2>&1; then continue
-    elif mi_intent_find volume "$vol" >/dev/null 2>&1; then mi_intent_reconcile volume "$vol" || return 1
+    # rc 3 (no such record) is the ONLY status that authorizes opening a new intent and creating a
+    # volume. rc 0 means it already exists (skip); rc 1 (ambiguous/unreadable) must fail CLOSED — a
+    # ledger that cannot say whether the volume is already recorded must not be answered by creating a
+    # second one. Same split for the intent lookup. (>/dev/null keeps a matched record off stdout; the
+    # rc-1 warning from the reader is left on stderr deliberately.)
+    local pfrc ifrc
+    if mi_prov_find volume "$vol" >/dev/null; then pfrc=0; else pfrc=$?; fi
+    if [ "$pfrc" -eq 0 ]; then continue
+    elif [ "$pfrc" -ne 3 ]; then
+      mi_warn "verbs: the provenance record for volume '$vol' could not be read; refusing to create a"
+      mi_warn "  second volume under the same name on an unreadable ledger."
+      return 1
+    fi
+    if mi_intent_find volume "$vol" >/dev/null; then ifrc=0; else ifrc=$?; fi
+    if [ "$ifrc" -eq 0 ]; then mi_intent_reconcile volume "$vol" || return 1
+    elif [ "$ifrc" -ne 3 ]; then
+      mi_warn "verbs: the intent record for volume '$vol' could not be read; refusing to open a second."
+      return 1
     else
       nonce="$(mi_nonce_new)" || return 1
       mi_intent_open volume "$vol" "$nonce" "product=${product}" "role=${role}" || return 1
@@ -745,6 +779,13 @@ _mi_verb_uninstall_locked() {
   local product="$1" purge="$2"
   _mi_verb_prepare || return 1
 
+  # Read the object and image listings ONCE, up front, failing closed if either cannot be fully read —
+  # before any removal, so an unreadable ledger refuses the uninstall rather than removing the container
+  # and then silently skipping the volumes it could not enumerate.
+  local _objs _imgrecs
+  _objs="$(_mi_verb_objects object)" || return 1
+  _imgrecs="$(_mi_verb_objects image)" || return 1
+
   local c rc=0
   c="$(_mi_verb_container "$product")" || return 1
   if mi_prov_authority container "$c"; then rc=0; else rc=$?; fi
@@ -796,7 +837,7 @@ _mi_verb_uninstall_locked() {
       mi_log "  PRESERVED volume $name — see the reason above."
       rc=1
     fi
-  done <<< "$(mi_led_all object)"
+  done <<< "$_objs"
 
   # IMAGES ARE NEVER REMOVED AUTOMATICALLY (D37) — not by uninstall, not by --purge. `--purge` may only
   # OFFER it, naming the digests and stating plainly that they may be in use elsewhere.
@@ -807,7 +848,7 @@ _mi_verb_uninstall_locked() {
       _mi_led_record_matches "$rec" product "$product" || continue
       iref="$(mi_led_field "$rec" ref)" || continue
       imgs="${imgs}    ${iref}"$'\n'
-    done <<< "$(mi_led_all image)"
+    done <<< "$_imgrecs"
     if [ -n "$imgs" ]; then
       mi_log "  Images acquired for $product are NOT removed:"
       printf '%s' "$imgs"
@@ -860,6 +901,14 @@ _mi_verb_uninstall_family_locked() {
   mi_warn "  transcripts/, logs/ and any host binds are never touched by any verb."
   mi_confirm "verbs: uninstall the whole family?" || { mi_warn "verbs: not confirmed."; return 1; }
 
+  # Read the object and image listings ONCE, up front, failing closed if either cannot be fully read.
+  # This is the guard on the ledger reset below: an unreadable 'object' listing must not read as an
+  # empty one, which would remove nothing, leave `preserved` at 0, and let the reset wipe the ledger
+  # over containers and volumes it never touched — stripping their provenance while they still exist.
+  local _objs _imgrecs
+  _objs="$(_mi_verb_objects object)" || return 1
+  _imgrecs="$(_mi_verb_objects image)" || return 1
+
   # Containers first, then volumes, then the network — a network cannot be removed while a container is
   # attached. `preserved` is what stops the ledger reset at the end: wiping the ledger while an object
   # it describes is still there would strip that object's provenance, making it permanently
@@ -887,7 +936,7 @@ _mi_verb_uninstall_family_locked() {
       mi_log "  PRESERVED container $name — see the reason above. Its record is kept."
       preserved=1
     fi
-  done <<< "$(mi_led_all object)"
+  done <<< "$_objs"
 
   if [ "$purge" -eq 0 ]; then
     # Volumes are LEFT IN PLACE without --purge (your data). The family reset still happens — §6c gates
@@ -902,7 +951,7 @@ _mi_verb_uninstall_family_locked() {
       name="$(mi_led_field "$rec" name)" || continue
       mi_log "  keeping volume $name (your data). After the reset it is orphaned; remove it by hand with"
       mi_log "    'docker volume rm $name', or re-run with --purge instead of keeping it."
-    done <<< "$(mi_led_all object)"
+    done <<< "$_objs"
   else
     while IFS= read -r rec; do
       [ -n "$rec" ] || continue
@@ -923,7 +972,7 @@ _mi_verb_uninstall_family_locked() {
         mi_log "  PRESERVED volume $name — see the reason above. Its record is kept."
         preserved=1
       fi
-    done <<< "$(mi_led_all object)"
+    done <<< "$_objs"
   fi
 
   # The network, and ONLY if this installer created it. A non-owned reference (D41) is attach-only and
@@ -948,7 +997,7 @@ _mi_verb_uninstall_family_locked() {
       mi_log "  PRESERVED network $name — see the reason above. Its record is kept."
       preserved=1
     fi
-  done <<< "$(mi_led_all object)"
+  done <<< "$_objs"
   if mi_net_ref_get >/dev/null 2>&1; then
     mi_log "  the operator-supplied network is LEFT ALONE — it was never this installer's to remove."
   fi
@@ -960,7 +1009,7 @@ _mi_verb_uninstall_family_locked() {
     [ -n "$rec" ] || continue
     iref="$(mi_led_field "$rec" ref)" || continue
     imgs="${imgs}    ${iref}"$'\n'
-  done <<< "$(mi_led_all image)"
+  done <<< "$_imgrecs"
   if [ -n "$imgs" ]; then
     mi_log "  Images are NOT removed, by this verb or any other:"
     printf '%s' "$imgs"
@@ -1062,6 +1111,21 @@ mi_verb_status() {
     mi_log "  read. Status of the network cannot be trusted. Run 'mythical-ctl state repair'."
   fi
 
+  # Objects and their forced-record annotations, read with the same rc distinction. status REPORTS an
+  # unreadable listing rather than failing on it (it is never gated by its own findings), but must not
+  # render a corrupt ledger as an EMPTY fleet — a monitor reading "no products" off it is worse than one
+  # reading "UNREADABLE". rc 0/3 proceed; rc 1 says so and shows no products rather than none-because-empty.
+  local _sobjs sorc _sforced sfrc
+  if _sobjs="$(mi_led_all object)"; then sorc=0; else sorc=$?; fi
+  if _sforced="$(mi_led_all forced)"; then sfrc=0; else sfrc=$?; fi
+  if [ "$sfrc" -ne 0 ] && [ "$sfrc" -ne 3 ]; then
+    mi_log "note:         the override / force-install annotations could not be read — repair advised."
+    _sforced=""
+  fi
+  if [ "$sorc" -ne 0 ] && [ "$sorc" -ne 3 ]; then
+    mi_log "products:     UNREADABLE — the installed-object records could not be fully read, so this"
+    mi_log "  listing would omit products. Run 'mythical-ctl state repair'."
+  else
   while IFS= read -r rec; do
     [ -n "$rec" ] || continue
     _mi_led_record_matches "$rec" class container || continue
@@ -1093,15 +1157,22 @@ mi_verb_status() {
         image-override) mi_log "  image override in effect — running $(mi_led_field "$fr" ref) instead of the manifest's pinned image" ;;
         force-install)  mi_log "  installed with --force-install (the manifest said not launched)" ;;
       esac
-    done <<< "$(mi_led_all forced)"
-  done <<< "$(mi_led_all object)"
+    done <<< "$_sforced"
+  done <<< "$_sobjs"
+  fi
 
-  # Live intents, so a wedge is visible rather than mysterious.
-  local irec
-  while IFS= read -r irec; do
-    [ -n "$irec" ] || continue
-    mi_log "PENDING: $(mi_led_field "$irec" class) $(mi_led_field "$irec" name) — created and not yet confirmed"
-  done <<< "$(mi_intent_all)"
+  # Live intents, so a wedge is visible rather than mysterious. Same rc distinction: an unreadable intent
+  # listing is REPORTED, not shown as "no pending intents".
+  local irec _sint sirc
+  if _sint="$(mi_intent_all)"; then sirc=0; else sirc=$?; fi
+  if [ "$sirc" -ne 0 ] && [ "$sirc" -ne 3 ]; then
+    mi_log "PENDING:      UNREADABLE — the intent records could not be read. Run 'mythical-ctl state repair'."
+  else
+    while IFS= read -r irec; do
+      [ -n "$irec" ] || continue
+      mi_log "PENDING: $(mi_led_field "$irec" class) $(mi_led_field "$irec" name) — created and not yet confirmed"
+    done <<< "$_sint"
+  fi
 
   # §6b.1/§6b.2's unattributed and unrecorded classes, reported, never actioned.
   local ln cls kind name
