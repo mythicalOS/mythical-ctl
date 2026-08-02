@@ -25,7 +25,7 @@ _MCTL_BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # everything between these two sentinels with the modules inlined verbatim, so the published
 # artifact is a single self-contained file with no ../lib to resolve.
 _MCTL_LIB="${_MCTL_BIN}/../lib"
-for _m in common layout config lock ledger doc trust policy manifest detect runtime preflight exit prov intent state probe bringup netref verbs copy; do
+for _m in common layout config lock ledger doc trust policy manifest detect runtime preflight exit prov intent state probe bringup netref verbs repair copy; do
   if [ -f "${_MCTL_LIB}/${_m}.sh" ]; then
     # shellcheck disable=SC1090
     source "${_MCTL_LIB}/${_m}.sh"
@@ -117,7 +117,9 @@ selftest() {
                 mi_copy_access_check mi_copy_host_access_check \
                 mi_product_ctx mi_bringup_specs mi_conf_product_ensure mi_confirm \
                 mi_verb_install mi_verb_start mi_verb_stop mi_verb_restart mi_verb_recreate \
-                mi_verb_status mi_verb_uninstall mi_verb_uninstall_family mi_verb_batch; do
+                mi_verb_status mi_verb_uninstall mi_verb_uninstall_family mi_verb_batch \
+                mi_schema_migrate mi_repair_candidates mi_repair_run \
+                mi_verb_state_repair mi_verb_abandon_intent mi_verb_net_rebind; do
         if ! declare -F "$_f" >/dev/null 2>&1; then
           printf 'mythical-ctl: missing library function: %s\n' "$_f" >&2
           exit 1
