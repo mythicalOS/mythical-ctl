@@ -763,3 +763,40 @@ EOF
   run mi_ident_get                                  # not reset over an unreadable operator-network ref
   [ "$status" -eq 0 ]
 }
+
+@test "start/stop/restart REFUSE a foreign container that reuses our name (nonce authority, not just a record)" {
+  mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
+  IDENT="$(mi_ident_get)"; C="mythical-${IDENT}-p1"
+  # a container stands under OUR name but belongs to another installation (foreign label + nonce), as if
+  # ours were deleted out of band and the name reused. The unaccounted gate treats a foreign-LABELLED
+  # object as 'unattributed' and permits the verb — so the nonce-authority check is what must stop it.
+  printf 'labels=mythicalos.installation=OTHERINSTALL;mythicalos.nonce=OTHER;\nstate=running\nnets=\n' \
+    > "$FAKE_DOCKER_STATE/containers/$C"
+  run mi_verb_start "$IDX" p1
+  [ "$status" -ne 0 ]
+  run mi_verb_stop p1
+  [ "$status" -ne 0 ]
+  run mi_verb_restart "$IDX" p1
+  [ "$status" -ne 0 ]
+  [ -e "$FAKE_DOCKER_STATE/containers/$C" ]         # the foreign container was NOT acted on
+}
+
+@test "status reports an installer-owned network record with no id as UNREADABLE, not empty" {
+  IDENT="$(mi_ident_get)"; nname="$(mi_name_network "$IDENT")"
+  mi_lock_acquire
+  { mi_ledger_read; printf 'object\tkey=network:%s\tclass=network\tname=%s\n' "$nname" "$nname"; } | mi_ledger_write
+  mi_lock_release
+  run mi_verb_status "$IDX"
+  [ "$status" -eq 0 ]
+  assert_contains "UNREADABLE"
+}
+
+@test "status reports a container record with no name as UNREADABLE, never hiding it" {
+  mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
+  mi_lock_acquire
+  { mi_ledger_read; printf 'object\tkey=container:nameless\tclass=container\tnonce=n\tgen=1\n'; } | mi_ledger_write
+  mi_lock_release
+  run mi_verb_status "$IDX"
+  [ "$status" -eq 0 ]
+  assert_contains "UNREADABLE"
+}

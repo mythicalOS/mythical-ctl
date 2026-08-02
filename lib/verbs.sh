@@ -84,6 +84,22 @@ _mi_verb_rec_name() {
   return 1
 }
 
+# Prove the container standing under our name is OURS before a start/stop/restart acts on it. A provenance
+# RECORD existing is not enough: after our container was deleted out of band, another installation could
+# stand a container under the same name, and starting/stopping/committing state for it would act on someone
+# else's object. mi_prov_authority checks the running object's nonce against the record — rc 0 = ours
+# (proceed); rc 3 = absent (nothing foreign is there, the verb rebuilds or no-ops); anything else = a
+# container stands under our name that is NOT ours — refuse. Install, recreate and uninstall already gate
+# on this (§6a); start/stop/restart must too.
+_mi_verb_authority_ok() {
+  local arc
+  if mi_prov_authority container "$1"; then arc=0; else arc=$?; fi
+  if [ "$arc" -eq 0 ] || [ "$arc" -eq 3 ]; then return 0; fi
+  mi_warn "verbs: a container stands under this product's name that is not this installation's — refusing"
+  mi_warn "  to start, stop or restart another installation's object. Run 'mythical-ctl state repair'."
+  return 1
+}
+
 # The core-fixed user-data mount points (§4.1a): ~/.mythical/transcripts and ~/.mythical/logs.
 # mi_ensure_layout deliberately leaves these "to appear when a product binds them" — they are the
 # user-data ownership class, not installer state — and binding them is exactly what a launch does. So
@@ -642,6 +658,7 @@ _mi_verb_start_locked() {
     mi_warn "  as not installed. Run 'mythical-ctl state repair'."
     return 1
   fi
+  _mi_verb_authority_ok "$c" || return 1
   netid="$(mi_net_target "$idx")" || return 1
   alias="$(mi_name_alias "$product")" || return 1
   # ONE atomic write: desired=running AND the outstanding alias check it owes. Splitting them leaves a
@@ -679,6 +696,7 @@ _mi_verb_stop_locked() {
     mi_warn "  as not installed. Run 'mythical-ctl state repair'."
     return 1
   fi
+  _mi_verb_authority_ok "$c" || return 1
   mi_state_commit "$c" stopped || return 1
   # The stop must actually HAPPEN. `mi_rt_container_stop … || true` folded a daemon/permission/runtime
   # failure into success, logged "stopped", and exited 0 — leaving the product RUNNING while the CLI
@@ -714,6 +732,7 @@ _mi_verb_restart_locked() {
   _mi_verb_prepare || return 1
   c="$(_mi_verb_container "$product")" || return 1
   want="$(mi_state_desired_get "$c")" || { mi_warn "verbs: '$product' is not installed"; return 1; }
+  _mi_verb_authority_ok "$c" || return 1
   if [ "$want" = stopped ]; then
     mi_warn "verbs: '$product' is stopped, so there is nothing to restart."
     mi_warn "  Refusing rather than starting it: 'restart' preserves what you asked for, and you asked"
@@ -1178,7 +1197,13 @@ mi_verb_status() {
     nname="$(mi_name_network "$ident")"
     if rec="$(mi_prov_find network "$nname")"; then prc=0; else prc=$?; fi
     if [ "$prc" -eq 0 ]; then
-      mi_log "network:      $(mi_led_field "$rec" id) ($nname, created by this installer)"
+      local _nid
+      if _nid="$(mi_led_field "$rec" id)" && [ -n "$_nid" ]; then
+        mi_log "network:      $_nid ($nname, created by this installer)"
+      else
+        mi_log "network:      UNREADABLE — the record for '$nname' exists but carries no id. Run"
+        mi_log "  'mythical-ctl state repair'."
+      fi
     elif [ "$prc" -eq 3 ]; then
       mi_log "network:      not created yet"
     else
@@ -1219,7 +1244,13 @@ mi_verb_status() {
   while IFS= read -r rec; do
     [ -n "$rec" ] || continue
     _mi_led_record_matches "$rec" class container || continue
-    c="$(mi_led_field "$rec" name)" || continue
+    # A container record with no readable name is corrupt, not absent: REPORT it rather than `continue`
+    # past it, which would let status show no product while its provenance stands and needs repair.
+    if ! c="$(mi_led_field "$rec" name)"; then
+      mi_log "product:      UNREADABLE — an installed-container record carries no name. Run 'mythical-ctl"
+      mi_log "  state repair'."
+      continue
+    fi
     # The container's provenance record does not carry the product — bring-up opens its write-ahead
     # intent before the product name is in scope, so the confirmation writes no `product` field. Derive
     # it from the installation-scoped container name (mythical-<ident>-<product>), which is the same
