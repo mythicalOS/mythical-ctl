@@ -217,6 +217,11 @@ main() {
       # The rebind verb lands in a later task; the mechanism (mi_net_ref_rebind) is present, the CLI
       # wrapper is not yet, so this degrades cleanly rather than calling an undefined function.
       [ "${products[0]:-}" = rebind ] || { printf 'mythical-ctl: net takes "rebind"\n' >&2; exit "$MI_EX_USAGE"; }
+      # EXACTLY ONE OPERAND ("rebind") — a surplus one must not be silently dropped and acted on
+      # anyway: with MI_CONFIRM=yes set (a non-interactive operator, or a script) this moves the whole
+      # fleet's network attachment, so a malformed invocation is a usage error with NOTHING done, the
+      # same discipline already applied to state repair / state abandon-intent above.
+      [ "${#products[@]}" -eq 1 ] || { printf 'mythical-ctl: net rebind takes no further operands\n' >&2; exit "$MI_EX_USAGE"; }
       if declare -F mi_verb_net_rebind >/dev/null 2>&1; then mi_verb_net_rebind "$idx"; exit $?; fi
       printf 'mythical-ctl: net rebind is not available in this build yet\n' >&2; exit "$MI_EX_FAIL" ;;
     state)

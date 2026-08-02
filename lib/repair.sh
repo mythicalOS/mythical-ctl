@@ -103,7 +103,7 @@ _mi_repair_nonce_of() {
 # adopts the wrong identity, or offers reinitialization, when a real candidate exists but its label
 # could not be read.
 mi_repair_candidates() {
-  local kind name id idrc seen="" out="" names rc
+  local kind name id idrc seen=$'\n' out="" names rc
   for kind in container volume network; do
     if names="$(_mi_prov_list_all "$kind")"; then rc=0; else rc=$?; fi
     if [ "$rc" -ne 0 ]; then
@@ -123,8 +123,16 @@ mi_repair_candidates() {
         return 1
       fi
       [ -n "$id" ] || continue
-      case " $seen " in *" $id "*) continue ;; esac
-      seen="${seen} ${id}"
+      # NEWLINE-ANCHORED, NOT SPACE-PADDED. An installation identity read straight off a label is not
+      # constrained to lib/doc.sh's `ident` charset the way a MINTED one always is (_mi_ident_mint is
+      # always `i`+10 hex digits, but this reads whatever string is actually on the object) — so a
+      # space-padded `case " $seen " in *" $id "*)` can match a PREFIX: seeing "A B" first and then
+      # asking about "A" finds " A " inside " A B " and treats "A" as already counted, silently
+      # collapsing two DISTINCT identities into one candidate. A newline can appear in neither $seen
+      # nor $id (both are single values `_mi_repair_install_of` already split on TAB-delimited label
+      # output, which has no embedded newline), so anchoring on it instead is exact.
+      case "$seen" in *$'\n'"$id"$'\n'*) continue ;; esac
+      seen="${seen}${id}"$'\n'
       out="${out}${id}"$'\n'
     done <<< "$names"
   done
@@ -176,7 +184,7 @@ _mi_repair_show() {
 # The <index file> is accepted (as $1) for the uniform call shape every entry point into this area
 # takes; nothing in this function reads it — same as lib/netref.sh's mi_net_target.
 _mi_repair_netref() {
-  local ident="$2" name resolved common="" c nets pair ids first="" disagree=0 rc
+  local ident="$2" name resolved common="" c nets pair ids first="" disagree=0 rc fleet=""
 
   if name="$(mi_conf_get "$(mi_conf_family_path)" MYTHICAL_NET)"; then rc=0; else rc=$?; fi
   [ "$rc" -eq 3 ] && return 0                    # no override: the installer's own network, nothing to rebuild
@@ -204,6 +212,12 @@ _mi_repair_netref() {
       return 1
     fi
     [ "$lid" = "$ident" ] || continue
+    # THE FLEET THIS RECONSTRUCTED MIGRATION WILL ACT ON — every container carrying this identity's
+    # label, unconditionally, matching lib/netref.sh's _mi_netmig_containers exactly (by label, not
+    # filtered by network attachment: a container with zero attachments still needs phase 2 to connect
+    # it). Recorded BEFORE the network-agreement check below so a container with no attachments at all
+    # (which `continue`s out of that check) is still part of the fleet a migration would move.
+    fleet="${fleet}${c}"$'\n'
     if nets="$(mi_rt_inspect container c.nets "$c")"; then netsrc=0; else netsrc=$?; fi
     if [ "$netsrc" -eq 3 ]; then continue; fi   # gone since the label read a moment ago
     if [ "$netsrc" -ne 0 ]; then
@@ -218,12 +232,21 @@ _mi_repair_netref() {
     for pair in $nets; do [ -n "$pair" ] && ids="${ids} ${pair%%=*}"; done
     unset IFS
     # One container's set may legitimately be {old,new} mid-migration; for this comparison take the
-    # first, which is enough to detect disagreement between containers.
-    # `grep -a .` exits 1 on empty input, and under the entrypoint's `pipefail` that becomes the
-    # assignment's status — which aborts the CLI mid-repair, AFTER the ledger has been reset and only
-    # partially rebuilt. A container with no attachments is ordinary here, not an error.
-    local one
-    one="$(printf '%s' "$ids" | tr ' ' '\n' | grep -a . | head -n1 || true)"
+    # FIRST NON-EMPTY token, which is enough to detect disagreement between containers. A pure-shell
+    # walk rather than `printf | tr | grep | head`: `head -n1` closes its stdin the instant it has its
+    # line, and if `$ids` holds more than one token the upstream `printf` can be signalled SIGPIPE —
+    # under THIS process's ambient options (this library sets none, but bin/mythical-ctl's caller-level
+    # `set -euo pipefail` still governs, since sourced functions run in the SAME shell) that can fail
+    # the assignment and abort mid-repair, AFTER the ledger has already been reset. `ids` always has a
+    # single leading space and single-space separators by construction above, but the walk still skips
+    # a blank token defensively (an empty `${pair%%=*}` from a malformed `nets` entry).
+    local one="" rest="$ids" tok
+    while [ -n "$rest" ]; do
+      rest="${rest# }"
+      tok="${rest%% *}"
+      if [ "$tok" = "$rest" ]; then rest=""; else rest="${rest#* }"; fi
+      if [ -n "$tok" ]; then one="$tok"; break; fi
+    done
     [ -n "$one" ] || continue
     if [ -z "$first" ]; then first="$one"; common="$one"
     elif [ "$one" != "$first" ]; then disagree=1; fi
@@ -254,6 +277,21 @@ _mi_repair_netref() {
   mi_confirm "repair: enter the phased network migration ($common → $resolved)?" || {
     mi_warn "repair: not confirmed. Nothing recorded."; return 1; }
 
+  # THE MIGRATION MUST NOT CLAIM AN EMPTY FLEET. `$fleet` was accumulated above from every container
+  # matching this identity, so it is structurally non-empty whenever `$common` is (both come out of the
+  # same loop iteration) — but this is checked explicitly rather than trusted implicitly: a migration
+  # record with `containers=` empty is one lib/netref.sh's mi_netmig_resume can never finish, because
+  # its own fleet is read straight back FROM this field (_mi_netmig_fleet), never re-enumerated. Writing
+  # one anyway would look like a resumable migration and be permanently stuck.
+  local flist
+  flist="$(printf '%s' "${fleet%$'\n'}" | tr '\n' ',')"
+  if [ -z "$flist" ]; then
+    mi_warn "repair: the fleet for this migration could not be enumerated as non-empty, so recording a"
+    mi_warn "  migration intent that claims one would leave 'net rebind' nothing to actually move."
+    mi_warn "  Nothing recorded."
+    return 1
+  fi
+
   # BOTH WRITES, IN ONE ATOMIC STEP is what §6b.1 requires — the reference set to the OBSERVED ID, and a
   # D45 intent naming that same ID as SOURCE and the resolved ID as target. Recording only the resolved
   # target would leave the ledger claiming a network the containers are not on, with no source recorded
@@ -268,7 +306,7 @@ _mi_repair_netref() {
     out="${out}${line}"$'\n'
   done <<< "$recs"
   out="${out}${MI_NETREF_KIND}"$'\t'"key=family"$'\t'"id=${common}"$'\t'"name=${name}"$'\t'"owned=no"$'\n'
-  out="${out}${MI_NETMIG_KIND}"$'\t'"key=family"$'\t'"phase=1"$'\t'"source=${common}"$'\t'"target=${resolved}"$'\t'"containers="$'\n'
+  out="${out}${MI_NETMIG_KIND}"$'\t'"key=family"$'\t'"phase=1"$'\t'"source=${common}"$'\t'"target=${resolved}"$'\t'"containers=${flist}"$'\n'
   printf '%s' "$out" | mi_ledger_write || return 1
   mi_warn "repair: recorded the observed network as the reference and a migration intent to move the"
   mi_warn "  fleet onto '$name'. Resume it with 'mythical-ctl net rebind'."
@@ -483,7 +521,7 @@ _mi_repair_run_locked() {
       continue
     fi
     [ "$obs2" = running ] || continue
-    local alias netid2 product aliasesraw blob seg
+    local alias netid2 product prc aliasesraw alrc blob seg
     # THE PIPELINE'S STATUS IS THE LAST COMMAND'S (`cut`), which hides mi_state_outstanding's own rc —
     # without pipefail (this is a pure library; bin/mythical-ctl's pipefail does not reach here) a
     # failed reader piped into `head|cut` still prints nothing and the pipeline still exits 0. Captured
@@ -496,23 +534,49 @@ _mi_repair_run_locked() {
       mi_warn "  cannot be established. Left running; not live-verified this run."
       continue
     fi
-    netid2="$(printf '%s' "$outst" | head -n1 | cut -f2)"
-    [ -n "$netid2" ] || continue
+    # PURE PARAMETER EXPANSION, NOT `head|cut`. `head -n1` closes its stdin the moment it has its line;
+    # if `$outst` holds more than one row, the upstream `printf` can be signalled SIGPIPE, and under
+    # THIS process's ambient shell options (this library sets none, but bin/mythical-ctl's caller-level
+    # `set -euo pipefail` still governs — sourced functions run in the SAME shell, not a subshell) that
+    # can fail the assignment and abort mid-repair, AFTER the ledger has already been reset. The FIRST
+    # row is everything up to the first newline; its param is everything after the first tab.
+    local firstrow="${outst%%$'\n'*}"
+    netid2="${firstrow#*$'\t'}"
+    [ -n "$netid2" ] && [ "$netid2" != "$firstrow" ] || continue
     # Prefer the canonical family alias derived from the container's own product label (the value a
     # normal bring-up would have used); fall back to whatever alias the container actually carries on
     # this network — a repaired object may carry no product label at all (D37: images carry no
     # installation-specific label either, and this codebase does not require every recovered object to
     # be reachable through the manifest to be live-verified).
-    product="$(mi_rt_inspect container c.product "$c" 2>/dev/null || true)"
-    case "$product" in '<no value>') product="" ;; esac
+    if product="$(mi_rt_inspect container c.product "$c")"; then prc=0; else prc=$?; fi
+    if [ "$prc" -eq 3 ]; then continue; fi   # the container itself is gone
+    if [ "$prc" -ne 0 ]; then
+      # Could not ask. NOT read as "no product label" (that would still try mi_name_alias on empty and
+      # then need to fall through anyway) — set it empty and fall straight to the aliases-based
+      # reconstruction below, which is independently guarded on ITS OWN read a few lines down.
+      product=""
+    else
+      case "$product" in '<no value>') product="" ;; esac
+    fi
     alias=""
     if [ -n "$product" ]; then alias="$(mi_name_alias "$product" 2>/dev/null || true)"; fi
     if [ -z "$alias" ]; then
+      # THE ALIAS READ ITSELF MUST FAIL CLOSED — a container whose network aliases could not be asked
+      # about is not "carries no alias on this network" (which `continue`s harmlessly below, leaving
+      # the check outstanding for a legitimate reason); it is "this run could not attempt live
+      # verification at all", and the difference is worth saying so the operator does not read silence
+      # as "nothing was owed".
+      if aliasesraw="$(mi_rt_inspect container c.aliases "$c")"; then alrc=0; else alrc=$?; fi
+      if [ "$alrc" -eq 3 ]; then continue; fi   # gone since the observation a moment ago
+      if [ "$alrc" -ne 0 ]; then
+        mi_warn "repair: '$c' is running, but its network aliases could not be read, so live"
+        mi_warn "  verification cannot be attempted this run. Left running, still outstanding."
+        continue
+      fi
       # Anchored on a LEADING ';' — same construction lib/bringup.sh's _mi_bringup_attach_ok uses — so a
       # netid that merely ENDS with the expected one cannot answer for it, and so the prefix strip below
       # actually removes the "<netid>:" it is meant to (without the leading ';' the pattern can only
       # match mid-string, never anchor at position 0, and the strip silently leaves the netid in place).
-      aliasesraw="$(mi_rt_inspect container c.aliases "$c" 2>/dev/null || true)"
       blob=";${aliasesraw}"
       case "$blob" in
         *";${netid2}":*) : ;;
@@ -571,8 +635,50 @@ _mi_repair_report_residual() {
 # reconstructed from anything outside the ledger being repaired — that is the real rollback window this
 # repair opens, stated to the operator above — and dropping them does not touch what the anchor protects:
 # an attacker still cannot swap the index itself for a different one without failing digest verification.
+#
+# "mi_ledger_read failed" IS NOT ONE FACT. It calls mi_die for every non-absent failure — a checksum
+# mismatch, a truncated file, a malformed header, AND a schema NEWER than this build understands — so a
+# subshelled `! ( mi_ledger_read … )` reports the SAME exit status (the subshell's own `exit 1`) for all
+# of them, with no way to tell "genuinely corrupt" from "this file is fine, this binary is old" from its
+# rc alone. Reading the newer-schema case as corruption is the worst of the four: `mi_schema_migrate`'s
+# own header already says the refusal there "must stay" a refusal — "an older CLI that MISREADS a newer
+# ledger deletes objects it misidentifies" — and renaming a STILL-VALID, merely-newer ledger to
+# `.corrupt.$$` and replacing it with an empty one is exactly that deletion, reached through the repair
+# door instead of the read door. So the header is peeked at FIRST, without going through mi_ledger_read
+# at all (it refuses before telling us the number), and a newer schema is refused outright — never
+# repaired over.
 _mi_repair_reset_ledger() {
   local f; f="$(_mi_ledger_path)"
+
+  if [ -f "$f" ] && [ ! -r "$f" ]; then
+    # A permissions problem is an OPERATIONAL fact about this process, not evidence about the ledger's
+    # CONTENT — the bytes underneath may be perfectly valid. Refusing (never touching, never moving)
+    # is the only honest answer to a question we structurally cannot ask.
+    mi_warn "repair: the ledger exists but is not readable by this process. That is a permissions or"
+    mi_warn "  ownership problem, not evidence the ledger's content is corrupt — nothing here has been"
+    mi_warn "  touched or moved. Fix the permission (or re-run as the user that owns ~/.mythical) and"
+    mi_warn "  re-run."
+    return 1
+  fi
+
+  if [ -f "$f" ]; then
+    local hschema hgt
+    if hschema="$(_mi_repair_ledger_schema_of "$f")"; then
+      if _mi_num_gt "$hschema" "$MI_LEDGER_SCHEMA"; then hgt=0; else hgt=1; fi
+      if [ "$hgt" -eq 0 ]; then
+        mi_warn "repair: this ledger's schema ($hschema) is newer than this build of mythical-ctl"
+        mi_warn "  understands ($MI_LEDGER_SCHEMA). That is not corruption — it is D35's own gate doing"
+        mi_warn "  its job — and repairing over it would rename a STILL-VALID ledger aside and replace"
+        mi_warn "  it with an empty one, discarding everything a newer mythical-ctl already recorded."
+        mi_warn "  Install the current mythical-ctl release and re-run. Nothing here has been touched."
+        return 1
+      fi
+    fi
+    # hschema unreadable as a header at all (empty file, no header line, non-numeric schema, …) falls
+    # through to the ordinary corrupt-ledger path below, which is the right answer for those: none of
+    # them is "valid, just newer".
+  fi
+
   if [ -f "$f" ] && ! ( mi_ledger_read >/dev/null 2>&1 ); then
     local aside="${f}.corrupt.$$"
     mv -f "$f" "$aside" || { mi_warn "repair: cannot move the corrupt ledger aside"; return 1; }
@@ -595,6 +701,26 @@ _mi_repair_reset_ledger() {
     return "$rc"
   fi
   printf '%s' "$kept" | mi_ledger_write
+}
+
+# Peek at the ledger's header WITHOUT going through mi_ledger_read's fail-closed die — repair's whole
+# point is to recover from files mi_ledger_read refuses, and the one thing it must not do is treat
+# "refused because it is NEWER" the same as "refused because it is corrupt" (see the note above). This
+# reads and validates ONLY the header line's schema number; it says nothing about the checksum or the
+# body, and a caller MUST NOT treat its success as "the ledger is valid" — only mi_ledger_read decides
+# that.
+#
+# rc 0 the schema number is printed (proven all-digit, safe for _mi_num_gt) · 1 the file has no header
+# this function recognises as one (missing, empty, malformed, non-numeric schema) — the caller's cue to
+# fall through to the ordinary corrupt-ledger handling, since none of those is "valid, merely newer".
+_mi_repair_ledger_schema_of() {
+  local f="$1" header schema
+  [ -f "$f" ] || return 1
+  header="$(head -n1 "$f" 2>/dev/null)" || return 1
+  case "$header" in '#mythical-ctl-ledger schema='*) : ;; *) return 1 ;; esac
+  schema="${header#\#mythical-ctl-ledger schema=}"
+  case "$schema" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s\n' "$schema"
 }
 
 # --- the verbs -------------------------------------------------------------------------------------
@@ -636,17 +762,33 @@ _mi_verb_net_rebind_locked() {
   if mi_led_find "$MI_NETMIG_KIND" key family >/dev/null 2>&1; then migrc=0; else migrc=$?; fi
   case "$migrc" in
     0) mi_log "verbs: resuming the recorded network migration."
-       mi_netmig_resume "$idx"
-       return $? ;;
+       # NORMALIZE TO THE VERB CONTRACT (0/1/2 only leave this function — 3 has no meaning at this
+       # verb, "not launched" is a manifest concept). mi_netmig_resume itself re-reads the migration
+       # record it was just told exists; if it vanished in the window between OUR mi_led_find above and
+       # its own internal mi_led_find (the daemon completing something under the lock is not the same
+       # as another mythical-ctl process, which the lock DOES exclude), that inner read answers 3 —
+       # "absent" — and a bare `return $?` would leak that unchanged. 3 here would mean an operational
+       # race during an ALREADY-launched rebind, not "not launched"; mapped to 1.
+       local mrc
+       if mi_netmig_resume "$idx"; then mrc=0; else mrc=$?; fi
+       case "$mrc" in 0|1|2) return "$mrc" ;; *) return 1 ;; esac ;;
     3) : ;;
     *) mi_warn "verbs: whether a network migration is already recorded could not be read from the"
        mi_warn "  ledger. Starting a fresh rebind now could write over an in-flight migration's intent"
        mi_warn "  — the only record of where the fleet came from. Nothing is started."
        return 1 ;;
   esac
-  name="$(mi_conf_get "$(mi_conf_family_path)" MYTHICAL_NET)" || {
+  local nrc
+  if name="$(mi_conf_get "$(mi_conf_family_path)" MYTHICAL_NET)"; then nrc=0; else nrc=$?; fi
+  if [ "$nrc" -eq 3 ]; then
     mi_warn "verbs: MYTHICAL_NET is not set, so there is no operator-supplied network to rebind onto."
-    return 1; }
+    return 1
+  fi
+  if [ "$nrc" -ne 0 ]; then
+    mi_warn "verbs: mythical.conf could not be read, so whether MYTHICAL_NET is set cannot be"
+    mi_warn "  established — this is not the same as it being unset. Nothing is started."
+    return 1
+  fi
   id="$(mi_net_ref_resolve "$name")" || return 1
   mi_warn "verbs: rebinding this installation onto network '$name' ($id)."
   mi_warn "  Every existing container will be connected to it and verified BEFORE any is detached from"

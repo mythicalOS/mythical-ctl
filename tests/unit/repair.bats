@@ -370,3 +370,72 @@ teardown() { teardown_test_env; }
   run mi_intent_find network net1
   [ "$status" -eq 0 ]
 }
+
+# --- codex round 2: 3 more HIGH findings + the net-rebind surplus-operand CLI bug ------------------
+
+@test "a ledger with a NEWER schema is refused by repair, never renamed aside as if corrupt" {
+  mi_lock_acquire; mi_ident_ensure >/dev/null; mi_lock_release
+  ledger="$MYTHICAL_HOME/.state/ledger"
+  sed 's/schema=1/schema=99/' "$ledger" > "$MYTHICAL_HOME/.state/l2"
+  mv "$MYTHICAL_HOME/.state/l2" "$ledger"
+  before="$(cat "$ledger")"
+  # Before the fix, `_mi_repair_reset_ledger` could tell only "mi_ledger_read failed", never WHY — a
+  # checksum mismatch, a truncated file, and a schema NEWER than this build understands all produce
+  # the identical subshell exit status. Reached through the zero-candidates reinitialize path (no
+  # runtime object carries a label here), it would have renamed this STILL-VALID, merely-newer ledger
+  # to `.corrupt.$$` and replaced it with an empty one — discarding whatever a newer mythical-ctl had
+  # already recorded, through the repair door instead of the read door mi_ledger_read itself guards.
+  run mi_repair_run "$IDX" --reinitialize
+  [ "$status" -ne 0 ]
+  assert_contains "newer than this build"
+  # The file is untouched: same path, same bytes, and no `.corrupt.*` sibling was created.
+  [ -f "$ledger" ]
+  [ "$(cat "$ledger")" = "$before" ]
+  corrupt_count=0
+  for f in "$MYTHICAL_HOME/.state/"ledger.corrupt.*; do [ -e "$f" ] && corrupt_count=$((corrupt_count + 1)); done
+  [ "$corrupt_count" -eq 0 ]
+}
+
+@test "candidate discovery keeps DISTINCT identities distinct even when one is a prefix of another" {
+  # "A B" and "A": a space-padded `case " $seen " in *" $id "*)` dedup treats "A" as already counted
+  # once "A B" is in the set, because " A " is a literal substring of " A B ". Before the fix, "A"
+  # vanished from the candidate list entirely — two distinct installations collapsed into one, which
+  # is exactly what the exactly-one-candidate adoption rule depends on never happening.
+  mi_rt_volume_create v1 n1 "A B"
+  mi_rt_volume_create v2 n2 "A"
+  run mi_repair_candidates
+  [ "$(printf '%s\n' "$output" | grep -ac .)" = 2 ]
+  assert_contains "A B"
+}
+
+@test "a repair-reconstructed network migration never records an empty fleet" {
+  src="$(mi_rt_network_create oldnet "" x)"
+  mi_rt_image_pull "$(a_digestref p1)" >/dev/null
+  mi_rt_container_create c1 "$(a_digestref p1)" "$src" p1 - label=installation=instA label=nonce=nc1 >/dev/null
+  mi_rt_container_start c1 >/dev/null
+  mi_rt_network_create opnet "" y >/dev/null
+  printf 'MYTHICAL_NET=opnet\n' > "$MYTHICAL_HOME/mythical.conf"
+  # Before the fix, the migration record this writes hardcoded `containers=` with nothing after the
+  # `=` — ALWAYS, regardless of how many containers were actually found — so 'net rebind' would read
+  # an empty fleet back from the very record that is supposed to describe it and have nothing to move.
+  run mi_repair_run "$IDX" instA
+  [ "$status" -eq 0 ]
+  load_mctl
+  run mi_led_find netmig key family
+  [ "$status" -eq 0 ]
+  assert_contains "containers=c1"
+}
+
+@test "CLI: 'net rebind <extra>' is a usage error, nothing done" {
+  mi_rt_network_create opnet "" x >/dev/null
+  printf 'MYTHICAL_NET=opnet\n' > "$MYTHICAL_HOME/mythical.conf"
+  # Before the fix, main()'s "net" case checked only that products[0] was "rebind" and never the
+  # count — a surplus operand was silently dropped and the rebind performed anyway, which (with
+  # MI_CONFIRM=yes, a non-interactive operator or a script) moves the whole fleet's network attachment
+  # on a malformed invocation.
+  MI_CONFIRM=yes run_mctl net rebind extra-garbage --index "$IDX"
+  assert_fail "$MI_EX_USAGE"
+  load_mctl
+  run mi_net_ref_get
+  [ "$status" -eq 3 ]
+}
