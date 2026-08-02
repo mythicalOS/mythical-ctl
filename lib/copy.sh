@@ -396,12 +396,20 @@ mi_copy_run() {
       mi_log "  foreign uid mapped to the operator: ${v} (the numeric value is preserved here in text)"
     fi
   done <<< "$(_mi_copy_fields "$out" mapped)"
-  # An EMPTY `mapped=` on a copy that did not opt in is still a reported mapping — the value loop above
-  # skips it, so its presence is caught here. A mapping the operator did not request is refused whether
-  # or not it names a uid.
-  if [ "$mapforeign" -eq 0 ] && _mi_copy_has_empty "$out" mapped; then
-    mi_warn "copy: the copier reported a foreign-uid mapping (an empty 'mapped=' record) on a copy that"
-    mi_warn "  did not request one. An unrequested mapping is refused whether or not it names the uid."
+  # An EMPTY `mapped=` is MALFORMED whether or not mapping was requested — it reports a mapping that
+  # names no uid, which the value loop above skips. Refused regardless: on a copy that did not opt in it
+  # is an unrequested mapping, and on one that did it is a mapping record with nothing to preserve. The
+  # non-empty unrequested case is already refused in the value loop above.
+  if _mi_copy_has_empty "$out" mapped; then
+    mi_warn "copy: the copier reported a foreign-uid mapping that names no uid (an empty 'mapped='"
+    mi_warn "  record). A mapping is refused whether or not it names the uid — an empty one is malformed."
+    refused=1
+  fi
+  # An EMPTY `stripped=` names no path whose privileged bits were removed — a stripped-bits observation
+  # of nothing. Malformed like the others, and caught by presence.
+  if _mi_copy_has_empty "$out" stripped; then
+    mi_warn "copy: the copier reported a 'stripped=' record that names no path. A privileged-bits"
+    mi_warn "  observation of nothing is malformed — refused rather than logged."
     refused=1
   fi
   while IFS= read -r v; do

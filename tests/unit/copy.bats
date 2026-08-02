@@ -229,11 +229,25 @@ teardown() { rm -rf "$DST" "$STAGE"; mi_lock_release; teardown_test_env; }
   assert_contains "MISMATCH"
 }
 
+@test "an EMPTY mapped= is REFUSED even when mapping WAS requested — a mapping naming no uid" {
+  mkdir -p "$STAGE"
+  HELPER_COPY=empty-mapped-req run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000 --map-foreign-to-operator
+  [ "$status" -ne 0 ]
+  assert_contains "names no uid"
+}
+
+@test "an EMPTY stripped= record is REFUSED — a privileged-bits observation of nothing" {
+  mkdir -p "$STAGE"
+  HELPER_COPY=empty-stripped run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000
+  [ "$status" -ne 0 ]
+  assert_contains "names no path"
+}
+
 @test "an EMPTY mapped= on a copy that did not opt in is REFUSED — presence is the problem" {
   mkdir -p "$STAGE"
   HELPER_COPY=empty-mapped run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000
   [ "$status" -ne 0 ]
-  assert_contains "unrequested mapping"
+  assert_contains "names no uid"
 }
 
 @test "a copier padding the count with a DUPLICATE source path is REFUSED" {

@@ -367,6 +367,12 @@ case "$cmd" in
       # An EMPTY linktarget= — a disclosed symlink target that names nothing; the value pass skips it.
       empty-lt)
         printf 'linktarget=\n' ;;
+      # An EMPTY mapped= — a mapping record that names no uid; malformed whether or not opt-in was set.
+      empty-mapped-req)
+        printf 'mapped=\n' ;;
+      # An EMPTY stripped= — a privileged-bits observation of nothing.
+      empty-stripped)
+        printf 'stripped=\n' ;;
       # A linktarget disclosed for a path that was NOT enumerated as a symlink entry — a contradiction
       # (the relation is one-to-one), and a way to disclose a target for something never enumerated.
       unassociated-lt)
