@@ -551,6 +551,8 @@ case "$cmd" in
       # is the case that makes "ACL presence is not effective access" more than a slogan.
       mask) printf 'traverse=ok\nread=fail\nwrite=fail\n'; fin 1 ;;
       notraverse) printf 'traverse=fail\nread=fail\nwrite=fail\n'; fin 1 ;;
+      # A stray done= in an access transcript — access has no such key and does not act on one.
+      straydone) printf 'traverse=ok\nread=ok\nwrite=ok\ndone=fail\n' ;;
       *) printf 'helperimg: unknown HELPER_ACCESS setting: %s\n' "$knob" >&2; exit 2 ;;
     esac
     ;;

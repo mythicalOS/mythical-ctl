@@ -913,7 +913,7 @@ mi_copy_access_check() {
   _mi_copy_uid_ok "$ruid" "the runtime uid" || return 1
   mi_copy_available "$idx" || return 1
   if out="$(MI_COPY_RUNAS="$ruid" _mi_copy_helper "$idx" access "arg=/dst" "staging=${dst}")"; then rc=0; else rc=$?; fi
-  _mi_copy_grammar_ok "$out" traverse read write "done" || return 1
+  _mi_copy_grammar_ok "$out" traverse read write || return 1
   for k in traverse read write; do
     v="$(_mi_copy_stated "$out" "$k" access)" || return 1
     if [ "$v" != ok ]; then
