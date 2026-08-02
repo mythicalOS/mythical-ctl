@@ -126,6 +126,14 @@ selftest() {
       printf 'ok\n'
 }
 
+# A value-taking option with no value is a USAGE error (exit 2, nothing attempted), not the exit-1 an
+# unchecked `shift 2` produces under this entrypoint's `set -e` when only the flag itself remains
+# ($# is 1, `shift 2` returns non-zero, and errexit turns that into an operational failure). $2 is the
+# remaining count at the option; anything below 2 means the value is missing.
+_need_val() {
+  [ "$2" -ge 2 ] || { printf 'mythical-ctl: option %s requires a value\n' "$1" >&2; exit "$MI_EX_USAGE"; }
+}
+
 main() {
   [ "$#" -ne 0 ] || { usage; exit 0; }
 
@@ -135,10 +143,10 @@ main() {
   products=()
   while [ "$#" -gt 0 ]; do
     case "$1" in
-      --index)        idx="${2:-}"; shift 2 ;;
-      --policy)       pol="${2:-}"; shift 2 ;;
-      --manifest-dir) mdir="${2:-}"; shift 2 ;;
-      --image)        image="${2:-}"; shift 2 ;;
+      --index)        _need_val "$1" "$#"; idx="$2"; shift 2 ;;
+      --policy)       _need_val "$1" "$#"; pol="$2"; shift 2 ;;
+      --manifest-dir) _need_val "$1" "$#"; mdir="$2"; shift 2 ;;
+      --image)        _need_val "$1" "$#"; image="$2"; shift 2 ;;
       --purge)        purge=1; shift ;;
       --family)       family=1; shift ;;
       --force-install) forced=1; shift ;;

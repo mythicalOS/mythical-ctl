@@ -122,6 +122,31 @@ teardown() { teardown_test_env; }
   [ "$output" = stopped ]
 }
 
+@test "stop FAILS (1) when the runtime stop did not happen — a swallowed failure is not success" {
+  mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
+  IDENT="$(mi_ident_get)"; C="mythical-${IDENT}-p1"
+  # The stop is attempted and dies (a daemon/permission/runtime failure). Reporting 0 here would leave
+  # the product RUNNING while the CLI says it stopped — the §7.3 breach this pins.
+  FAKE_DOCKER_INTERRUPT_AFTER='container stop' run mi_verb_stop p1
+  [ "$status" -eq 1 ]
+  # Intent was still committed FIRST (D43), but the container is still present and running because the
+  # stop never took effect.
+  run mi_state_desired_get "$C"
+  [ "$output" = stopped ]
+  run mi_rt_inspect container c.running "$C"
+  [ "$output" = true ]
+}
+
+@test "install does NOT pull when the image-presence check could not be asked (rc1 is not absence)" {
+  # The daemon answers through preflight, the gate and net setup, then goes unreachable FROM the image
+  # inspect on — so both the presence check and the adapter's follow-up ping are unanswerable. A daemon
+  # that could not be asked must STOP, not fold "could not ask" into "absent" and pull.
+  FAKE_DOCKER_DOWN_FROM='image inspect' run mi_verb_install "$IDX" "$POL" "$MAN" p1
+  [ "$status" -eq 1 ]
+  run grep -a 'image pull' "$FAKE_DOCKER_STATE/calls.log"
+  [ "$status" -ne 0 ]        # NO pull was attempted on an unanswerable presence check
+}
+
 @test "restart is REFUSED on a stopped product rather than silently starting it" {
   mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
   mi_verb_stop p1
@@ -220,15 +245,16 @@ teardown() { teardown_test_env; }
   [ "$status" -ne 0 ]
 }
 
-@test "FAMILY uninstall removes every container and resets the ledger entirely (§6c)" {
+@test "FAMILY uninstall resets the ledger entirely WITHOUT --purge, and leaves the volumes (§6c)" {
   mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
   IDENT="$(mi_ident_get)"
   printf 'note\n' > "$MYTHICAL_HOME/transcripts/x"
-  # A FULL reset needs --purge: a no-purge family uninstall deliberately RETAINS named volumes, and
-  # retaining them keeps the ledger (their provenance is the only record of what they are — without it
-  # they become unremovable, unrecorded same-identity objects). So "resets the ledger entirely" is the
-  # --purge path; the no-purge / keeps-volumes path is exercised separately below.
-  MI_CONFIRM=yes run mi_verb_uninstall_family --purge
+  # §6c: the family reset is UNCONDITIONAL — identity, membership, every floor and the anchor go whether
+  # or not --purge is given. Only the VOLUMES' fate depends on --purge: without it they are left in
+  # place (orphaned but preserved), which is asserted here alongside the reset. Keeping the ledger to
+  # "protect" retained volumes would leave a fresh machine still carrying the old identity — a contract
+  # violation, not a safety feature.
+  MI_CONFIRM=yes run mi_verb_uninstall_family
   [ "$status" -eq 0 ]
   run mi_rt_inspect container c.running "mythical-${IDENT}-p1"
   [ "$status" -eq 3 ]
@@ -238,6 +264,8 @@ teardown() { teardown_test_env; }
   [ "$status" -ne 0 ]
   run mi_trust_floor_get manifest:p1
   [ "$status" -ne 0 ]
+  run mi_rt_inspect volume v.nonce "mythical-${IDENT}-p1-state"
+  [ "$status" -eq 0 ]                         # the volume SURVIVES the no-purge reset (your data)
   [ -f "$MYTHICAL_HOME/transcripts/x" ]      # user data is never touched, by any verb
 }
 

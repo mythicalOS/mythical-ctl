@@ -65,6 +65,35 @@ teardown() { teardown_test_env; }
   assert_contains "p2: not launched yet"
 }
 
+@test "a first-ever not-launched install mints NO identity or product state (§10a: no product state)" {
+  # On a brand-new machine (this suite's setup mints no identity), a not-launched install must create
+  # NO installer state: no identity, no membership, no product. Learning from an authentic manifest
+  # that a product is unpublished cannot be the act that turns a fresh machine into an installation.
+  # The trust floor IS still recorded (§7.3-exempt, pinned in verbs.bats), so the ledger file exists
+  # for that reason — what must be absent is the IDENTITY and any product state.
+  write_fixture_product p1 launched=false
+  run_mctl install p1 --index "$MYTHICAL_HOME/index" --policy "$MYTHICAL_HOME/policy" \
+                      --manifest-dir "$MYTHICAL_HOME"
+  [ "$status" -eq 3 ]
+  assert_contains "has not launched yet"
+  load_mctl
+  run mi_ident_get
+  [ "$status" -eq 3 ]        # NO installation identity was minted
+  run mi_member_has p1
+  [ "$status" -ne 0 ]        # NO membership
+}
+
+@test "CLI: a value-taking option with no value is a usage error (2), not an operational failure (1)" {
+  run_mctl install p1 --index
+  [ "$status" -eq 2 ]
+  run_mctl install p1 --policy
+  [ "$status" -eq 2 ]
+  run_mctl install p1 --manifest-dir
+  [ "$status" -eq 2 ]
+  run_mctl install p1 --image
+  [ "$status" -eq 2 ]
+}
+
 @test "an interrupted install converges on a re-run, with no half-state" {
   # Interrupt AFTER the volume intent is written but before the container exists.
   FAKE_DOCKER_INTERRUPT_AFTER='container create' run_mctl install p1 \

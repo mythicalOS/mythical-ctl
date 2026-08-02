@@ -48,7 +48,7 @@
 # real daemon's mouth. The `--flag=value` spelling is implemented only where a caller uses it
 # (`--label=`, `--driver=`); elsewhere it is refused rather than accepted and ignored.
 #
-# Knobs: FAKE_DOCKER_DOWN, FAKE_DOCKER_DOWN_AFTER, FAKE_DOCKER_INSPECT_MISSING,
+# Knobs: FAKE_DOCKER_DOWN, FAKE_DOCKER_DOWN_AFTER, FAKE_DOCKER_DOWN_FROM, FAKE_DOCKER_INSPECT_MISSING,
 #        FAKE_DOCKER_INFO_FAIL, FAKE_DOCKER_SERVER_VERSION,
 #        FAKE_DOCKER_CLIENT_VERSION, FAKE_DOCKER_ROOTLESS,
 #        FAKE_DOCKER_CONTEXT_HOST, FAKE_DOCKER_PULL, FAKE_DOCKER_NET_DUPLICATE,
@@ -123,6 +123,21 @@ fi
 # A down daemon fails EVERY command, including version — that is what makes the adapter's
 # absent-vs-unreachable split observable.
 [ -z "${FAKE_DOCKER_DOWN:-}" ] || die "Cannot connect to the Docker daemon. Is the docker daemon running?"
+
+# FAKE_DOCKER_DOWN_FROM=<subcommand> — the daemon answers normally until a call whose "$1 $2" equals
+# the value; from THAT call onward every command dies exactly as FAKE_DOCKER_DOWN does, `version`
+# included. Unlike DOWN_AFTER (which counts calls), this latches the daemon's failure to a SPECIFIC
+# operation, so a test that must make one named step — and the adapter's own follow-up ping about
+# it — unanswerable does not depend on counting every call that preceded it. A marker file latches it
+# so the later calls, which no longer match the subcommand, die too. Inert unless set; a fabricated
+# failure like FAKE_DOCKER_DOWN/CONNECT_FAIL, never reachable on a real daemon.
+if [ -n "${FAKE_DOCKER_DOWN_FROM:-}" ]; then
+  df_marker="$STATE/down-from.latched"
+  if [ -e "$df_marker" ] || [ "${1:-} ${2:-}" = "$FAKE_DOCKER_DOWN_FROM" ]; then
+    : > "$df_marker"
+    die "Cannot connect to the Docker daemon. Is the docker daemon running?"
+  fi
+fi
 
 # The daemon goes down PART WAY THROUGH an operation: the first <n> calls answer, the rest do not.
 # Counted in a file that only exists while the knob is set, so the count is the operation's own.

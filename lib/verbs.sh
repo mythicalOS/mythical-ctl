@@ -88,7 +88,7 @@ mi_confirm() {
 # straight through from Plan 3's mi_accept_manifest).
 mi_product_ctx() {
   if [ "$#" -ne 4 ]; then mi_warn "verbs: mi_product_ctx needs <index> <policy> <manifest> <product>"; return 1; fi
-  local idx="$1" pol="$2" man="$3" product="$4" mrec prec rc ident
+  local idx="$1" pol="$2" man="$3" product="$4" mrec prec rc
 
   # ONE door (Plan 3): index vouches → digest verified → parse → product identity → freshness →
   # entitlements → min_core → launch state. Nothing here re-implements any of it.
@@ -97,7 +97,29 @@ mi_product_ctx() {
   # the trust floor has already been recorded (§7.3's enumerated exempt side effects).
   if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then return "$rc"; fi
   prec="$(mi_accept_policy "$idx" "$pol")" || return 1
-  ident="$(mi_ident_ensure)" || return 1
+
+  local launched=true
+  [ "$rc" -ne 3 ] || launched=false
+
+  # IDENTITY IS INSTALLATION STATE, AND A NOT-LAUNCHED RESULT MINTS NONE OF IT. §10a's not-launched row
+  # is "message, no product state, no pull" — so learning from an authentic manifest that a product is
+  # unpublished must not be the act that turns a fresh machine into an installation (which is what
+  # mi_ident_ensure does: it is where the ledger itself comes into existence). On the LAUNCHED path we
+  # mint; on the not-launched path we only READ whatever identity already exists — a fresh machine has
+  # none — and the container name, which needs it, is left empty. The trust floor is still recorded by
+  # mi_accept_manifest above; that is §7.3-exempt and unchanged. An explicit --force-install IS a real
+  # install and mints its own identity, loudly, where that choice is made.
+  local ident=""
+  if [ "$launched" = true ]; then
+    ident="$(mi_ident_ensure)" || return 1
+  else
+    local irc
+    if ident="$(mi_ident_get)"; then irc=0; else irc=$?; fi
+    if [ "$irc" -eq 3 ]; then ident=""
+    elif [ "$irc" -ne 0 ]; then return "$irc"; fi
+  fi
+  local container=""
+  if [ -n "$ident" ]; then container="$(mi_name_container "$ident" "$product")" || return 1; fi
 
   # ONE TAB-SEPARATED LINE, because mi_led_field splits on TAB. Emitting one `key=value` per LINE and
   # then reading it with mi_led_field — which sets IFS to TAB — sees the whole blob as a single token
@@ -105,11 +127,9 @@ mi_product_ctx() {
   # The multi-line records blobs carry TABs of their own (they are `key<TAB>value` lines), so they are
   # folded: newline → RS (\036), tab → US (\037); the caller reverses both. Nothing carrying either
   # byte is ever written to the ledger — this record is in-process only.
-  local launched=true
-  [ "$rc" -ne 3 ] || launched=false
   printf 'product=%s' "$product"
   printf '\tlaunched=%s' "$launched"
-  printf '\tcontainer=%s' "$(mi_name_container "$ident" "$product")"
+  printf '\tcontainer=%s' "$container"
   printf '\talias=%s' "$(mi_name_alias "$product")"
   printf '\timage=%s' "$(mi_manifest_image "$mrec")"
   printf '\tmanifest_records=%s' "$(printf '%s' "$mrec" | tr '\n\t' '\036\037')"
@@ -289,6 +309,11 @@ _mi_verb_install_locked() {
     fi
     mi_warn "verbs: FORCED install of '$product', whose manifest says it has not launched."
     mi_warn "  You are asserting the image is published. This is recorded and reported by 'status'."
+    # A forced install IS a real install — it pulls and creates a container — so it legitimately
+    # establishes the installation identity here. This is the ONE not-launched path that may mint one,
+    # and only on the operator's explicit override; the unforced path above returned without minting,
+    # and mi_product_ctx did not mint on the not-launched path either.
+    mi_ident_ensure >/dev/null || return 1
     mi_led_put forced key "${product}:force-install" "key=${product}:force-install" \
       "product=${product}" "kind=force-install" || return 1
   fi
@@ -301,6 +326,10 @@ _mi_verb_install_locked() {
   prec="$(printf '%s' "$prec" | tr '\036\037' '\n\t')"
   local container alias image
   container="$(mi_led_field "$ctx" container)" || return 1
+  # On a FORCED not-launched install on a brand-new machine, the context was assembled before the
+  # identity existed, so it carries no container name. The forced branch above has now minted the
+  # identity, so derive the name through its one owner rather than launching with an empty one.
+  if [ -z "$container" ]; then container="$(mi_name_container "$(mi_ident_get)" "$product")" || return 1; fi
   alias="$(mi_led_field "$ctx" alias)" || return 1
   image="$(mi_led_field "$ctx" image)" || return 1
 
@@ -323,7 +352,24 @@ _mi_verb_install_locked() {
 
   # The pull. EVERY failure is loud and distinguishable (§7.3) and exits 1 — never folded into the
   # pre-launch message, whatever status the runtime reports it as.
-  if ! mi_rt_image_present "$image"; then
+  #
+  # PULL ONLY ON CONFIRMED ABSENCE. mi_rt_image_present answers present/not-present but cannot tell "the
+  # image is absent" from "the daemon could not answer" — and sending the second to a pull is the
+  # rc-1→rc-3 fold this plan refuses everywhere else. So a not-present answer is disambiguated the way
+  # mi_rt_inspect does it, by asking a question that does not depend on the image (mi_rt_ping): a daemon
+  # that answers means the image is genuinely absent and we pull; a daemon that does NOT answer stops,
+  # it does not pull. (Not `mi_rt_inspect image i.digest`: {{index .RepoDigests 0}} errors on a
+  # local-build override with no repo digests (D22/§13), which would misread a present local image as
+  # absent and pull over it.)
+  local present=0
+  if mi_rt_image_present "$image"; then present=1; fi
+  if [ "$present" -eq 0 ]; then
+    if ! mi_rt_ping; then
+      mi_warn "verbs: could not determine whether the image for '$product' is already present — the"
+      mi_warn "  container runtime did not answer. Refusing rather than pulling on a question that"
+      mi_warn "  could not be asked."
+      return 1
+    fi
     local perr
     if ! perr="$(mi_rt_image_pull "$image" 2>&1)"; then
       mi_warn "verbs: the image for '$product' could not be pulled:"
@@ -358,9 +404,18 @@ _mi_verb_install_locked() {
       nonce="$(mi_nonce_new)" || return 1
       mi_intent_open volume "$vol" "$nonce" "product=${product}" "role=${role}" || return 1
       mi_rt_volume_create "$vol" "$nonce" "$(mi_ident_get)" >/dev/null || return 1
-      # RE-INSPECT: `volume create` against an existing name succeeds WITHOUT applying the labels.
-      local an
-      an="$(mi_rt_inspect volume v.nonce "$vol" 2>/dev/null || true)"
+      # RE-INSPECT: `volume create` against an existing name succeeds WITHOUT applying the labels, so a
+      # create is never evidence of creation — the nonce label is. Capture the STATUS, not just the
+      # value: a daemon that could not answer (rc 1) is not the same fact as a volume carrying a
+      # different nonce (rc 0), and the `|| true` that discarded it reported "already existed and does
+      # not carry our nonce" for a daemon that was simply unreachable.
+      local an arc
+      if an="$(mi_rt_inspect volume v.nonce "$vol" 2>/dev/null)"; then arc=0; else arc=$?; fi
+      if [ "$arc" -eq 1 ]; then
+        mi_warn "verbs: could not verify volume '$vol' — the container runtime did not answer. The"
+        mi_warn "  intent is retained so a re-run converges once the runtime is reachable."
+        return 1
+      fi
       if [ "$an" != "$nonce" ]; then
         mi_warn "verbs: volume '$vol' already existed and does not carry our nonce. Not adopted, not"
         mi_warn "  removed. The intent is retained."
@@ -473,10 +528,27 @@ _mi_verb_stop_locked() {
   c="$(_mi_verb_container "$product")" || return 1
   mi_prov_find container "$c" >/dev/null 2>&1 || { mi_warn "verbs: '$product' is not installed"; return 1; }
   mi_state_commit "$c" stopped || return 1
-  # No live check: nothing is running to verify.
-  mi_rt_container_stop "$c" >/dev/null 2>&1 || true
-  mi_log "$product: stopped."
-  return 0
+  # The stop must actually HAPPEN. `mi_rt_container_stop … || true` folded a daemon/permission/runtime
+  # failure into success, logged "stopped", and exited 0 — leaving the product RUNNING while the CLI
+  # reported completion (§7.3: 0 means it completed). An already-stopped container makes `container
+  # stop` an idempotent no-op that still exits 0, and a container that is not present is nothing to
+  # stop either — both are genuinely stopped. Only a stop that was ATTEMPTED and could not complete is
+  # a failure.
+  if mi_rt_container_stop "$c" >/dev/null 2>&1; then
+    mi_log "$product: stopped."
+    return 0
+  fi
+  # The stop did not succeed. Distinguish "there is nothing there to stop" (rc 3, fine) from "it is
+  # still present and the stop did not complete" (rc 0/1 — it may still be running, a failure).
+  local src
+  if mi_rt_inspect container c.status "$c" >/dev/null 2>&1; then src=0; else src=$?; fi
+  if [ "$src" -eq 3 ]; then
+    mi_log "$product: already stopped (its container is not present)."
+    return 0
+  fi
+  mi_warn "verbs: '$product' could not be stopped — its container is still present and the runtime did"
+  mi_warn "  not complete the stop, so it may still be running. Reported as a failure (§7.3)."
+  return 1
 }
 
 # --- restart (desired state: PRESERVED; refused on a stopped product) -----------------------------
@@ -704,7 +776,7 @@ _mi_verb_uninstall_family_locked() {
   # attached. `preserved` is what stops the ledger reset at the end: wiping the ledger while an object
   # it describes is still there would strip that object's provenance, making it permanently
   # unauthorized for deletion and an unrecorded same-identity object that stops every later operation.
-  local rec name arc preserved=0 retained=0
+  local rec name arc preserved=0
   while IFS= read -r rec; do
     [ -n "$rec" ] || continue
     _mi_led_record_matches "$rec" class container || continue
@@ -730,12 +802,18 @@ _mi_verb_uninstall_family_locked() {
   done <<< "$(mi_led_all object)"
 
   if [ "$purge" -eq 0 ]; then
-    # Volumes are RETAINED without --purge — so their provenance must be too, and that means the ledger
-    # cannot be reset. This is the same consequence as a preservation, reached by the INTENDED path
-    # rather than a refusal.
+    # Volumes are LEFT IN PLACE without --purge (your data). The family reset still happens — §6c gates
+    # only the VOLUMES' fate on --purge, never the identity/membership/floor/anchor reset — so after the
+    # reset below they carry an identity that no longer exists and read as another installation's on any
+    # later operation: orphaned but PRESERVED, which is what "any mismatch preserves" produces for them.
+    # They are NAMED here while the ledger still records them, because the reset drops those records and
+    # this installer will then have no authority to remove them again.
     while IFS= read -r rec; do
       [ -n "$rec" ] || continue
-      if _mi_led_record_matches "$rec" class volume; then retained=1; break; fi
+      _mi_led_record_matches "$rec" class volume || continue
+      name="$(mi_led_field "$rec" name)" || continue
+      mi_log "  keeping volume $name (your data). After the reset it is orphaned; remove it by hand with"
+      mi_log "    'docker volume rm $name', or re-run with --purge instead of keeping it."
     done <<< "$(mi_led_all object)"
   else
     while IFS= read -r rec; do
@@ -801,22 +879,28 @@ _mi_verb_uninstall_family_locked() {
     mi_log "  Reclaim the space yourself with: docker image prune"
   fi
 
-  # Reset the ledger LAST, and ONLY if nothing was preserved.
+  # Reset the ledger LAST, and ONLY if nothing that should have been removed was PRESERVED. The reset is
+  # UNCONDITIONAL with respect to --purge: identity, membership, every trust floor and the family-index
+  # anchor go regardless — §6c resets the family state and gates only the volumes' fate on --purge. A
+  # preservation (an object this installer could not prove is still its own) is the one thing that holds
+  # the reset back, because wiping the ledger while such an object stands would strip the only record of
+  # what it is; a volume DELIBERATELY kept without --purge is not that case — it is orphaned on purpose.
   if [ "$preserved" -eq 1 ]; then
     mi_warn "family: some objects could not be removed (see above), so the ledger is NOT reset — it is"
     mi_warn "  the only record of what they are. Resolve them, then re-run."
     return 1
   fi
-  if [ "$retained" -eq 1 ]; then
-    mi_log "family: containers and the network are gone. The ledger is KEPT because your named volumes"
-    mi_log "  are still here and it is the only record of what they are — without it they could never"
-    mi_log "  be removed by this installer again."
-    mi_log "  'uninstall --family --purge' removes them and then resets the ledger."
-    return 0
-  fi
   printf '' | mi_ledger_write || return 1
-  mi_log "family: uninstalled. ~/.mythical/ still holds your transcripts, logs and config files;"
-  mi_log "  remove the directory by hand if you want them gone too."
+  if [ "$purge" -eq 0 ]; then
+    mi_log "family: uninstalled. Identity, membership, every rollback floor and the network are gone;"
+    mi_log "  this machine is a fresh installation again. Your named volumes were KEPT (your data) and"
+    mi_log "  are now orphaned but preserved — a later installation sees them as another's and never"
+    mi_log "  touches them. ~/.mythical/ still holds your transcripts, logs and config files; remove the"
+    mi_log "  directory by hand to clear those too."
+  else
+    mi_log "family: uninstalled. ~/.mythical/ still holds your transcripts, logs and config files;"
+    mi_log "  remove the directory by hand if you want them gone too."
+  fi
   return 0
 }
 
