@@ -34,7 +34,115 @@
 #                                the caller can tell an answer to its question from an answer to
 #                                another one.
 #   egress                     → egress=ok
-#   preflight|copy|verify|acl|access  → Part B's commands (D54/D58), stubbed here.
+#
+# PART B — THE COPY CONTAINER (D54/D58). The host cannot read a named volume, so everything below runs
+# HERE, inside the pinned image, with /src mounted read-only and /dst the only writable mount. In
+# particular the ownership mapping and the ACLs are applied here and NEVER by the host CLI: `setfacl`
+# is not on the dependency floor and does not exist on macOS at all, while this image is ours, so the
+# tool is present by construction.
+#
+#   preflight <dst> <runtime-uid> <operator-uid>
+#                              EMPIRICAL, not inferred from the filesystem's name: create a file,
+#                              chown it, create a symlink, stat it back, set DEFAULT ACL entries
+#                              naming BOTH principals, then create a child AS EACH uid and read it as
+#                              the other. Report what was OBSERVED:
+#                                ownership=ok|fail  permissions=ok|fail  symlink=ok|fail
+#                                acl=ok|fail|skipped   inherit=ok|fail
+#                              `acl=skipped` is legitimate ONLY when the two uids are equal, where the
+#                              step is genuinely a no-op. `inherit` is the cross-read result — the
+#                              child created as one uid, read as the other — and is the observation
+#                              that says the DEFAULT entries actually carry.
+#                              It writes probe files into /dst and MUST remove them before returning:
+#                              the copy that follows shares this staging and refuses a non-empty one,
+#                              so a preflight that leaves droppings breaks the very copy it validated.
+#                              exit 0 when every observation is ok (or acl=skipped); 1 otherwise.
+#   copy <src> <dst> <runtime-uid> <operator-uid> [--map-foreign]
+#                              STAGING (/dst) MUST BE EMPTY when this runs — it is the copy's own
+#                              precondition, checked HERE, inside the container, on the writable mount,
+#                              atomically with the copy (never by a host-side `ls -A` that races the
+#                              mount and mangles untrusted names). A non-empty /dst is refused,
+#                              `refused=<entry>:staging-nonempty`, naming the offending entry.
+#                              The entry-type and metadata contract, reported as it goes:
+#                                entry=<type>:<path>        type ∈ file|dir|symlink|hardlink|special.
+#                                                           The caller checks EVERY entry's type against
+#                                                           that closed set and refuses one outside it
+#                                                           (a `fifo:`/`socket:`) or a line with no path.
+#                                                           A `symlink` entry MUST be accompanied by a
+#                                                           `linktarget=` record for the SAME path; the
+#                                                           caller refuses a symlink whose target was
+#                                                           never disclosed (missing-linktarget).
+#                                linktarget=<path><target>:<pathlen>   LENGTH-DELIMITED: the path and the
+#                                                           verbatim target are concatenated, and the
+#                                                           trailing colon-free field is the path's BYTE
+#                                                           length. This is unambiguous even when the
+#                                                           path OR the target contains a colon; a
+#                                                           first-colon `<path>:<target>` split is not.
+#                                stripped=<path>:<bits>     setuid/setgid/sticky removed
+#                                mapped=<path>:<olduid>     a foreign uid folded into the operator's,
+#                                                           ONLY under --map-foreign
+#                                refused=<path>:<reason>    reason ∈ special-entry | escaped-write |
+#                                                           escaping-symlink | staging-nonempty
+#                                refused=<path>:foreign-uid:<uid>
+#                                done=ok                    printed ONLY on a completed copy
+#                              exit 0 when nothing was refused; 1 otherwise.
+#                              Every `entry=` line is one source entry the copier read; their COUNT is
+#                              the source-derived number the verify half is measured against, so the
+#                              caller refuses a `done=ok` reported with ZERO `entry=` lines — a
+#                              completed copy that measured nothing is a vacuous success over what may
+#                              be a non-empty source.
+#                              A symlink whose target is ABSOLUTE or climbs above the tree root with
+#                              `..` MUST be refused (escaping-symlink), never carried as text — the
+#                              caller ALSO derives this from the linktarget it logged (parsed via the
+#                              length-delimited shape above, so a colon in the link's own path or
+#                              target does not defeat the check), so a copier that only logged it is
+#                              caught. A linktarget the caller cannot parse (a missing or non-numeric
+#                              length) is itself refused, never guessed. A foreign uid is refused unless
+#                              --map-foreign was given; a `mapped=` reported without it is refused by
+#                              the caller as an unrequested mapping.
+#   verify <src> <dst> <runtime-uid> <operator-uid>
+#                              PER-ENTRY over that same contract, never a byte count:
+#                                mismatch=<path>:type|digest|linktarget|mode|owner|mtime|hardlink|default-acl
+#                                acl=ok|fail|skipped
+#                                checked=<n>   done=ok
+#                              exit 0 when there is no mismatch; 1 otherwise. `checked=<n>` is the
+#                              number of source entries compared and MUST equal the source's own entry
+#                              count: the caller supplies that count (source-derived, from the copy
+#                              step's `entry=` lines) and refuses a `checked` that differs — a count
+#                              of zero against a non-empty source is a vacuous pass.
+#                              `acl` is the DUAL-PRINCIPAL DEFAULT ACL APPLICATION result, checked
+#                              EMPIRICALLY on the copied tree against the two uids passed in — capability
+#                              at preflight is not proof of application. A copied directory missing the
+#                              default entries naming both principals is reported as
+#                              `mismatch=<dir>:default-acl` AND `acl=fail`; the caller REQUIRES the
+#                              positive `acl` observation (absent is a refusal — a verifier that never
+#                              looked emits no mismatch and would otherwise pass on no evidence).
+#                              `acl=skipped` is legitimate ONLY when the two uids are equal.
+#   acl <dst> <runtime-uid> <operator-uid>
+#                              RESERVED, and deliberately separate: re-apply the dual-principal
+#                              default entries WITHOUT re-copying, for a repair path. The copy itself
+#                              applies them inline, so the core does not call this today.
+#                                acl=ok|fail
+#   access <dst>               EFFECTIVE ACCESS, exercised rather than inferred — this one is run with
+#                              `--user <runtime uid>`, so it answers as the product would: traverse
+#                              the tree, read a file, write a probe file and remove it.
+#                                traverse=ok|fail  read=ok|fail  write=ok|fail
+#                              exit 0 when all three are ok; 1 otherwise.
+#
+# THE FIELD SHAPES ARE PARSED, so their layout is part of the contract, and both of the two-part ones
+# put the FIXED-SHAPE component where a path's own bytes cannot reach it:
+#
+#   `entry=<type>:<path>`   — TYPE first. A path may legally contain a colon, so the path is
+#                             everything after the FIRST one and the type is bounded.
+#   `refused=<path>:<reason>` — REASON last, from the closed vocabulary above, so the path is
+#                             everything before the LAST colon. `foreign-uid` carries the numeric uid
+#                             after it (`…:foreign-uid:<uid>`), because a refusal that cannot say
+#                             WHICH uid is a refusal an operator cannot act on.
+#   `linktarget=<path><target>:<pathlen>` — LENGTH-DELIMITED. Both the path and the target may contain
+#                             colons, so neither a first- nor a last-colon split can separate them; the
+#                             trailing colon-free BYTE length of the path does, unambiguously.
+#
+# Splitting the first two on the first colon, or the linktarget on any colon at all, reports the wrong
+# path or target for one containing a colon — in the one message the operator acts on.
 #
 # WHY selfcheck TAKES AN ALIAS, since this is the property the whole probe exists for. `selfcheck=ok`
 # on its own is a claim no broken DNS can falsify: an image that printed it unconditionally, or that
@@ -64,6 +172,24 @@ lookup() {
     case "$pair" in "${n}="*) printf '%s' "${pair#*=}"; return 0 ;; esac
   done
   return 1
+}
+
+# AN EXIT STATUS IS NOT A RESULT, and this is the knob that says so. With HELPER_EXIT0 set, the image
+# reports its findings exactly as it otherwise would and then exits 0 anyway — a pinned image that
+# regressed that way is the failure the caller has to survive by reading the STATED result rather than
+# the status beside it. Every Part B arm below ends through here, so no arm can be the one that is
+# still only pinned by its status.
+fin() { if [ -n "${HELPER_EXIT0:-}" ]; then exit 0; fi; exit "$1"; }
+
+# Emit one `linktarget=` line in the LENGTH-DELIMITED contract shape: `<path><target>:<pathlen>`, where
+# <pathlen> is the path's BYTE length. The path and the target are concatenated with no separator; the
+# trailing colon-free length tells the caller where the path ends, so a colon inside EITHER the path or
+# the target no longer breaks the split (the old `<path>:<target>` first-colon form did). See
+# _mi_copy_linktarget_split in lib/copy.sh.
+emit_linktarget() {
+  local path="$1" target="$2"
+  local LC_ALL=C            # byte length, matching the caller's byte-wise slice
+  printf 'linktarget=%s%s:%s\n' "$path" "$target" "${#path}"
 }
 
 cmd="${1:-}"; shift || true
@@ -102,9 +228,333 @@ case "$cmd" in
     if [ "${HELPER_EGRESS:-ok}" = fail ]; then printf 'egress=fail\n'; exit 1; fi
     printf 'egress=ok\n'
     ;;
-  preflight|copy|verify|acl|access)
-    # Part B's commands. Implemented in Task 11; a stub here keeps the closed command set honest.
-    printf '%s=stub\n' "$cmd"
+  preflight)
+    dst="${1:-}"; ruid="${2:-}"; ouid="${3:-}"
+    if [ -z "$dst" ] || [ -z "$ruid" ] || [ -z "$ouid" ]; then
+      printf 'helperimg: preflight needs <destination> <runtime-uid> <operator-uid>\n' >&2
+      exit 1
+    fi
+    knob="${HELPER_PREFLIGHT:-ok}"
+    # `silent`: the image ran, exited 0 and said nothing. It is a knob rather than an accident because
+    # the CALLER's handling of it is the property under test — an absent observation is a refusal, not
+    # a pass, and that is the fail-open this whole file is shaped to make visible.
+    [ "$knob" != silent ] || exit 0
+    own=ok; perm=ok; link=ok; inherit=ok
+    # The ACL step is a genuine no-op when the product's runtime uid IS the operator's: there is one
+    # principal, and a default entry naming it twice grants nothing new.
+    if [ "$ruid" = "$ouid" ]; then acl=skipped; else acl=ok; fi
+    case "$knob" in
+      ok)        : ;;
+      noown)     own=fail ;;
+      noperm)    perm=fail ;;
+      nolink)    link=fail ;;
+      noacl)     acl=fail ;;
+      noinherit) inherit=fail ;;
+      # A conforming image never does this: it reports the step SKIPPED where the two uids differ and
+      # skipping is therefore not a no-op. The caller has to catch it.
+      aclskip)   acl=skipped ;;
+      # A stray refused= in a preflight transcript — preflight has no such key, so it must be refused
+      # as outside this command's grammar, not passed over while every positive observation is read.
+      strayrefused) printf 'refused=%s/x:special-entry\n' "$dst" ;;
+      *) printf 'helperimg: unknown HELPER_PREFLIGHT setting: %s\n' "$knob" >&2; exit 2 ;;
+    esac
+    printf 'ownership=%s\npermissions=%s\nsymlink=%s\nacl=%s\ninherit=%s\n' \
+           "$own" "$perm" "$link" "$acl" "$inherit"
+    case "${own}${perm}${link}${inherit}${acl}" in *fail*) fin 1 ;; esac
+    ;;
+  copy)
+    src="${1:-}"; dst="${2:-}"; ruid="${3:-}"; ouid="${4:-}"; mapf="${5:-}"
+    if [ -z "$src" ] || [ -z "$dst" ] || [ -z "$ruid" ] || [ -z "$ouid" ]; then
+      printf 'helperimg: copy needs <source> <destination> <runtime-uid> <operator-uid>\n' >&2
+      exit 1
+    fi
+    knob="${HELPER_COPY:-ok}"
+    [ "$knob" != silent ] || exit 0
+    # `empty`: a copy that COMPLETED having enumerated ZERO source entries. `done=ok` over no entries
+    # is a vacuous completion the caller must refuse — a copier that measured nothing cannot be
+    # distinguished from one that lied — so it is a knob, not an accident. It skips the ordinary tree
+    # precisely so the enumeration is empty.
+    [ "$knob" != empty ] || { printf 'done=ok\n'; fin 0; }
+    # `stage-nonempty`: the copy container found its one writable mount (/dst, the staging bind) NOT
+    # empty when it reached it. Emptiness is the copy's OWN precondition, established HERE — inside the
+    # container, on the mount it is about to write, atomically with the copy — never by a host-side
+    # glance that races the mount and mangles untrusted names. The offending entry is named; `done=ok`
+    # is NOT printed.
+    if [ "$knob" = stage-nonempty ]; then
+      printf 'refused=%s/leftover:staging-nonempty\n' "$dst"
+      fin 1
+    fi
+    # `count3`: a completed copy that enumerated exactly THREE source entries — a DIFFERENT count from
+    # the ordinary five. It exists so a test can prove the count that binds verification TRACKS the
+    # copy's own enumeration and is not a constant: no single hard-coded number satisfies both a
+    # five-entry and a three-entry copy (round-2 finding 1).
+    if [ "$knob" = count3 ]; then
+      printf 'entry=dir:%s/data\n'    "$src"
+      printf 'entry=file:%s/data/a\n' "$src"
+      printf 'entry=file:%s/data/b\n' "$src"
+      printf 'done=ok\n'
+      fin 0
+    fi
+    # `dup-entry`: a copier PADDING the entry count — it enumerates one valid file THREE times and omits
+    # a dangerous entry it also copied. The count would still be three, matching a `checked=3` the
+    # verifier could state without having compared the omitted one. The caller must refuse a repeated
+    # source path, so the count is a count of DISTINCT things.
+    if [ "$knob" = dup-entry ]; then
+      printf 'entry=dir:%s/data\n'    "$src"
+      printf 'entry=file:%s/data/a\n' "$src"
+      printf 'entry=file:%s/data/a\n' "$src"
+      printf 'done=ok\n'
+      fin 0
+    fi
+    # `noncanon-pad`: the same file under two spellings — a copier padding the count without adding a
+    # distinct source object, so a `checked=` total can cover a spelling while an omitted entry is not.
+    if [ "$knob" = noncanon-pad ]; then
+      printf 'entry=dir:%s/data\n'      "$src"
+      printf 'entry=file:%s/data/a\n'   "$src"
+      printf 'entry=file:%s/data/./a\n' "$src"
+      printf 'done=ok\n'
+      fin 0
+    fi
+    # `empty-entry`: a claimed entry that names nothing.
+    if [ "$knob" = empty-entry ]; then
+      printf 'entry=dir:%s/data\n'    "$src"
+      printf 'entry=\n'
+      printf 'done=ok\n'
+      fin 0
+    fi
+    # `emptytarget-lt`: a symlink whose disclosed linktarget PARSES but whose target suffix is EMPTY —
+    # pathlen equals the whole body, so the symlink points at nothing. emit_linktarget with an empty
+    # target produces exactly that.
+    if [ "$knob" = emptytarget-lt ]; then
+      printf 'entry=dir:%s/data\n'         "$src"
+      printf 'entry=symlink:%s/data/link\n' "$src"
+      emit_linktarget "$src/data/link" ""
+      printf 'done=ok\n'
+      fin 0
+    fi
+    # The ordinary tree, reported on EVERY setting, so the contract observations are present in the
+    # plain case too and a caller cannot pass its symlink assertions only on a knobbed fixture. FIVE
+    # `entry=` lines: the copy's own source enumeration, and the count the verify half is measured
+    # against (its conforming `checked=5` matches — round-2 finding 1). `linktarget=` is not an entry.
+    printf 'entry=dir:%s/data\n'      "$src"
+    printf 'entry=file:%s/data/f\n'   "$src"
+    printf 'entry=file:%s/data/f3\n'  "$src"
+    printf 'entry=symlink:%s/data/link\n' "$src"
+    emit_linktarget "$src/data/link" "../data/f"
+    printf 'entry=hardlink:%s/data/f2\n' "$src"
+    rc=0
+    case "$knob" in
+      ok) : ;;
+      special)
+        printf 'entry=special:%s/dev/thing\n' "$src"
+        printf 'refused=%s/dev/thing:special-entry\n' "$src"; rc=1 ;;
+      # The copier ENUMERATED a device node and then did not refuse it — a one-line omission in a real
+      # image, and one the caller must not accept on the strength of the exit status.
+      special-unrefused)
+        printf 'entry=special:%s/dev/thing\n' "$src" ;;
+      # A copier that reports a MISMATCH during the copy — as fatal as a refusal, but the copy step
+      # read only refused= before.
+      copy-mismatch)
+        printf 'mismatch=%s/data/f:digest\n' "$src" ;;
+      # An EMPTY mapped= on a copy that did NOT opt in — a reported mapping whose presence is the
+      # problem; the value loop skips it.
+      empty-mapped)
+        printf 'mapped=\n' ;;
+      # A line that is not a key=value record at all — silently ignored before. An unparsed line means
+      # the transcript is no longer a reliable record grammar, so it fails closed.
+      junk-line)
+        printf 'not-a-key-value-record\n' ;;
+      # A well-formed key=value line whose KEY is not in this command's vocabulary — also refused.
+      unknown-key)
+        printf 'surprise=whatever\n' ;;
+      # A BLANK LINE between records — a truncated continuation of a newline-bearing value looks exactly
+      # like this, so the record grammar is no longer reliable.
+      blank-line)
+        printf 'entry=file:%s/a\n\ndone=ok\n' "$src"; fin 0 ;;
+      # An EMPTY linktarget= — a disclosed symlink target that names nothing; the value pass skips it.
+      empty-lt)
+        printf 'linktarget=\n' ;;
+      # An EMPTY mapped= — a mapping record that names no uid; malformed whether or not opt-in was set.
+      empty-mapped-req)
+        printf 'mapped=\n' ;;
+      # An EMPTY stripped= — a privileged-bits observation of nothing.
+      empty-stripped)
+        printf 'stripped=\n' ;;
+      # A linktarget disclosed for a path that was NOT enumerated as a symlink entry — a contradiction
+      # (the relation is one-to-one), and a way to disclose a target for something never enumerated.
+      unassociated-lt)
+        emit_linktarget "$src/data/ghost" "../data/f" ;;
+      # TWO linktargets for one symlink — a contradiction that also lets a benign target be shown beside
+      # an escaping one. The extra one here is a plain second target for the same symlink.
+      dup-lt)
+        emit_linktarget "$src/data/link" "../data/other" ;;
+      # A type OUTSIDE the closed set (file|dir|symlink|hardlink|special): a copier that met a FIFO or
+      # a socket and enumerated it as `fifo:`/`socket:` rather than `special:`, then exited 0 with
+      # done=ok. It counts toward the total and the copy "verifies" unless every entry's type is
+      # checked. The caller must refuse it. (Finding 1.)
+      unknown-type)
+        printf 'entry=fifo:%s/data/q\n' "$src" ;;
+      unknown-socket)
+        printf 'entry=socket:%s/data/s\n' "$src" ;;
+      # A malformed entry line with no path at all — likewise outside the contract and refused.
+      entry-malformed)
+        printf 'entry=bogus-no-path\n' ;;
+      # A path containing a colon, so the caller's parse of `<path>:<reason>` is exercised on the shape
+      # that breaks a first-colon split.
+      colon)
+        printf 'entry=special:%s/od:d/dev/thing\n' "$src"
+        printf 'refused=%s/od:d/dev/thing:special-entry\n' "$src"; rc=1 ;;
+      # A copier that ENUMERATED an escaping symlink (relative `..` climb) and then did NOT refuse it —
+      # a one-line omission in a real image. It exits 0 with done=ok; the caller must catch the escape
+      # from the linktarget it logged, exactly as it does the enumerated-but-unrefused special entry.
+      escape)
+        printf 'entry=symlink:%s/data/evil\n' "$src"
+        emit_linktarget "$src/data/evil" "../../../../etc/passwd" ;;
+      # The same omission for an ABSOLUTE target, which escapes regardless of where the link sits.
+      escape-abs)
+        printf 'entry=symlink:%s/data/evil\n' "$src"
+        emit_linktarget "$src/data/evil" "/etc/passwd" ;;
+      # Finding 2: a symlink whose own PATH contains a colon, with an ABSOLUTE (escaping) target, logged
+      # but NOT refused. The OLD first-colon split of `<path>:<target>` mis-split the path here and read
+      # the target as a non-absolute string, MISSING the escape while the copy succeeded. The
+      # length-delimited encoding isolates the target regardless of the colon, so the caller catches it.
+      escape-colon-path)
+        printf 'entry=symlink:%s/data/od:d/evil\n' "$src"
+        emit_linktarget "$src/data/od:d/evil" "/etc/passwd" ;;
+      # Finding 2, the literal wording: a symlink whose TARGET contains a colon and climbs above the
+      # root (escapes), logged but NOT refused. The trailing length field keeps the colon inside the
+      # target from being read as the path/target separator.
+      escape-colon-target)
+        printf 'entry=symlink:%s/data/evil\n' "$src"
+        emit_linktarget "$src/data/evil" "../../../../a:b/etc" ;;
+      # A linktarget whose trailing length field is NOT a number — an unparseable target. The caller
+      # refuses it rather than guessing where the path ends: an unreadable target could conceal one
+      # that escapes.
+      linktarget-badlen)
+        printf 'entry=symlink:%s/data/evil\n' "$src"
+        printf 'linktarget=%s/data/evil../x:notanum\n' "$src" ;;
+      # A symlink entry with NO linktarget record and NO refused= line: the copier discloses the entry
+      # but withholds its target, so the escape backstop has nothing to run on. It exits 0 with done=ok;
+      # the caller must refuse the symlink for its MISSING required companion (an escaping symlink could
+      # be smuggled this way otherwise). Required-companion cross-check.
+      symlink-no-linktarget)
+        printf 'entry=symlink:%s/data/evil\n' "$src" ;;
+      # A CONFORMING copier that refuses the escaping symlink itself, in the reason-last grammar the
+      # caller reads for its clear message.
+      escape-refused)
+        printf 'entry=symlink:%s/data/evil\n' "$src"
+        emit_linktarget "$src/data/evil" "../../../../etc/passwd"
+        printf 'refused=%s/data/evil:escaping-symlink\n' "$src"; rc=1 ;;
+      escaped-write)
+        printf 'refused=%s/data/../outside:escaped-write\n' "$src"; rc=1 ;;
+      setuid)
+        printf 'entry=file:%s/bin/tool\n' "$src"
+        printf 'stripped=%s/bin/tool:4755\n' "$src" ;;
+      foreign)
+        if [ "$mapf" = --map-foreign ]; then
+          printf 'mapped=%s/data/alien:4242\n' "$src"
+        else
+          printf 'refused=%s/data/alien:foreign-uid:4242\n' "$src"; rc=1
+        fi ;;
+      # A regressed or hostile copier that folds a foreign uid into the operator's and reports the
+      # mapping on a DEFAULT invocation — one that never received --map-foreign. It exits 0 with
+      # done=ok; the caller must refuse the unrequested mapping rather than log it.
+      foreign-mapped-unrequested)
+        printf 'mapped=%s/data/alien:4242\n' "$src" ;;
+      *) printf 'helperimg: unknown HELPER_COPY setting: %s\n' "$knob" >&2; exit 2 ;;
+    esac
+    # `done=ok` states COMPLETION, so it is printed only on a copy that completed. A refusal that also
+    # claimed completion would be two contradictory answers in one response.
+    [ "$rc" -ne 0 ] || printf 'done=ok\n'
+    fin "$rc"
+    ;;
+  verify)
+    src="${1:-}"; dst="${2:-}"; ruid="${3:-}"; ouid="${4:-}"
+    if [ -z "$src" ] || [ -z "$dst" ] || [ -z "$ruid" ] || [ -z "$ouid" ]; then
+      printf 'helperimg: verify needs <source> <destination> <runtime-uid> <operator-uid>\n' >&2
+      exit 1
+    fi
+    knob="${HELPER_VERIFY:-ok}"
+    [ "$knob" != silent ] || exit 0
+    # The DEFAULT-ACL APPLICATION result on the COPIED tree: capability was proven at preflight, this
+    # is proof it was actually applied. Checked against the uids the caller passed, so it is the
+    # dual-principal default ACL specifically. `skipped` is a genuine no-op ONLY when the two
+    # principals are one uid — a default entry naming it twice grants nothing new.
+    if [ "$ruid" = "$ouid" ]; then acl=skipped; else acl=ok; fi
+    case "$knob" in
+      ok) printf 'checked=5\nacl=%s\ndone=ok\n' "$acl" ;;
+      # Completion claimed with no count: nothing in the answer says a single entry was looked at.
+      nocount) printf 'acl=%s\ndone=ok\n' "$acl" ;;
+      # Completion claimed having checked ZERO entries — a vacuous pass the caller must reject against
+      # a non-empty source (it binds `checked` to the source's own count).
+      zero) printf 'checked=0\nacl=%s\ndone=ok\n' "$acl" ;;
+      # Fewer entries checked than the copy enumerated: an UNDERSTATED count. The real copy->verify
+      # path threads the copy's own source count (5) in, so 3 checked is caught (round-2 finding 1).
+      understate) printf 'checked=3\nacl=%s\ndone=ok\n' "$acl" ;;
+      # A verifier that HONESTLY checked three entries — the conforming partner of the copy's `count3`,
+      # so the end-to-end path passes when the copy also enumerated three, and no constant count works.
+      count3) printf 'checked=3\nacl=%s\ndone=ok\n' "$acl" ;;
+      type|digest|linktarget|mode|owner|mtime|hardlink)
+        printf 'mismatch=%s/data/f:%s\n' "$dst" "$knob"
+        printf 'checked=5\nacl=%s\ndone=ok\n' "$acl"
+        fin 1 ;;
+      # The verifier REFUSED an entry (it met a device it could not compare, say) — a refusal is as
+      # fatal in verification as in the copy, but this function used to read only `mismatch=`. An
+      # otherwise-conforming transcript alongside a refused= must still fail.
+      verify-refused)
+        printf 'refused=%s/data/dev:special-entry\n' "$dst"
+        printf 'checked=5\nacl=%s\ndone=ok\n' "$acl" ;;
+      # An EMPTY problem record — `refused=` / `mismatch=` with no value. Its PRESENCE is the problem;
+      # a value-iterating check skips it. The verifier states a problem and names nothing.
+      verify-empty-refused)
+        printf 'refused=\n'
+        printf 'checked=5\nacl=%s\ndone=ok\n' "$acl" ;;
+      verify-empty-mismatch)
+        printf 'mismatch=\n'
+        printf 'checked=5\nacl=%s\ndone=ok\n' "$acl" ;;
+      # A copied DIRECTORY missing the dual-principal default ACL — reported as a mismatch like any
+      # other attribute (capability at preflight is not proof of application — round-2 finding 3).
+      default-acl)
+        printf 'mismatch=%s/data:default-acl\n' "$dst"
+        printf 'checked=5\nacl=fail\ndone=ok\n'
+        fin 1 ;;
+      # The ACL application was never CHECKED: the answer omits the acl observation entirely. The
+      # caller must refuse it — an unmeasured ACL is not a measured-clean one — the same vacuity one
+      # level down.
+      acl-absent) printf 'checked=5\ndone=ok\n' ;;
+      # `skipped` reported where the two principals DIFFER: the ACL step is load-bearing there, so a
+      # skip is a step that did not run. The caller must catch it, exactly as preflight does.
+      acl-skip-differ) printf 'checked=5\nacl=skipped\ndone=ok\n' ;;
+      *) printf 'helperimg: unknown HELPER_VERIFY setting: %s\n' "$knob" >&2; exit 2 ;;
+    esac
+    ;;
+  acl)
+    dst="${1:-}"; ruid="${2:-}"; ouid="${3:-}"
+    if [ -z "$dst" ] || [ -z "$ruid" ] || [ -z "$ouid" ]; then
+      printf 'helperimg: acl needs <destination> <runtime-uid> <operator-uid>\n' >&2
+      exit 1
+    fi
+    printf 'acl=%s\n' "${HELPER_ACL:-ok}"
+    [ "${HELPER_ACL:-ok}" = ok ] || fin 1
+    ;;
+  access)
+    dst="${1:-}"
+    if [ -z "$dst" ]; then
+      printf 'helperimg: access needs <destination>\n' >&2
+      exit 1
+    fi
+    knob="${HELPER_ACCESS:-ok}"
+    [ "$knob" != silent ] || exit 0
+    case "$knob" in
+      ok)   printf 'traverse=ok\nread=ok\nwrite=ok\n' ;;
+      # A PRESENT ACL entry limited by a restrictive mask: the entry is there, the access is not. This
+      # is the case that makes "ACL presence is not effective access" more than a slogan.
+      mask) printf 'traverse=ok\nread=fail\nwrite=fail\n'; fin 1 ;;
+      notraverse) printf 'traverse=fail\nread=fail\nwrite=fail\n'; fin 1 ;;
+      # A stray done= in an access transcript — access has no such key and does not act on one.
+      straydone) printf 'traverse=ok\nread=ok\nwrite=ok\ndone=fail\n' ;;
+      *) printf 'helperimg: unknown HELPER_ACCESS setting: %s\n' "$knob" >&2; exit 2 ;;
+    esac
     ;;
   *) printf 'helperimg: unsupported command: %s\n' "$cmd" >&2; exit 2 ;;
 esac

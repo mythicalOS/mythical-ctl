@@ -279,6 +279,7 @@ expect are simply absent from the grammar below; their absence is the enforcemen
 | `port` | `int:1:65535` | many | A port this product's container listens on. |
 | `probe` | `str:256` | opt | An optional health-check path. |
 | `min_core` | `coreversion` | one | The minimum `mythical-ctl` version this manifest requires. Required — an unstated minimum would silently mean "any core will do," which is never a safe default for a document this privileged. |
+| `runtime_uid` | `int:0:4294967295` | one | The uid this product's container runs as. Required, because migration **maps** ownership rather than preserving it, and this is the principal it maps to. Guessing it, or preserving uid/gid raw, is the dual-owner problem at directory scale: a preserved `0600` file owned by the operator is unreadable by a container still running as uid 900 — and a wrong value here does not fail loudly, it produces a migrated tree the product cannot read, discovered on the first start after the source has already been retired. |
 
 ### Keys that do not exist, and why
 
