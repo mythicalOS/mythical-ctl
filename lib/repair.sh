@@ -260,7 +260,24 @@ _mi_repair_netref() {
   fi
 
   if [ -z "$common" ]; then
-    # No containers yet: record it; there is nothing to migrate.
+    # `$common` empty is NOT ONE FACT. It means "no containers carry this identity" ONLY when `$fleet`
+    # is ALSO empty — `$fleet` is recorded unconditionally for every matching container, before the
+    # per-container attachment check that sets `$common`, so a container that exists but is
+    # UNATTACHED (or whose attachment could not be resolved to a single common network) leaves
+    # `$fleet` non-empty while `$common` stays empty. Recording '$name' as a clean reference in THAT
+    # case would make it the family network while the recovered containers are not attached to it at
+    # all — the exact split state D46 exists to prevent, arrived at from the empty-fleet branch
+    # instead of the disagreement branch a few lines above.
+    if [ -n "$fleet" ]; then
+      mi_warn "repair: identity '$ident' has containers, but none of them share a single attached"
+      mi_warn "  network — each is either unattached, or its attachments could not be resolved to one."
+      mi_warn "  Recording '$name' as a clean reference here would make it the family network while"
+      mi_warn "  the recovered containers are not attached to it — a split state repair must not create."
+      mi_warn "  Attach them to a network with the container runtime (or start them — bring-up attaches"
+      mi_warn "  at creation) and re-run."
+      return 1
+    fi
+    # Genuinely no containers carry this identity at all: record it; there is nothing to migrate.
     mi_led_put "$MI_NETREF_KIND" key family "key=family" "id=${resolved}" "name=${name}" "owned=no"
     return $?
   fi
@@ -277,14 +294,26 @@ _mi_repair_netref() {
   mi_confirm "repair: enter the phased network migration ($common → $resolved)?" || {
     mi_warn "repair: not confirmed. Nothing recorded."; return 1; }
 
-  # THE MIGRATION MUST NOT CLAIM AN EMPTY FLEET. `$fleet` was accumulated above from every container
-  # matching this identity, so it is structurally non-empty whenever `$common` is (both come out of the
-  # same loop iteration) — but this is checked explicitly rather than trusted implicitly: a migration
-  # record with `containers=` empty is one lib/netref.sh's mi_netmig_resume can never finish, because
-  # its own fleet is read straight back FROM this field (_mi_netmig_fleet), never re-enumerated. Writing
-  # one anyway would look like a resumable migration and be permanently stuck.
-  local flist
-  flist="$(printf '%s' "${fleet%$'\n'}" | tr '\n' ',')"
+  # THE MIGRATION MUST NOT CLAIM AN EMPTY FLEET, AND MUST NOT CLAIM A PARTIAL ONE EITHER. `$fleet` was
+  # accumulated above from every container matching this identity, so it is structurally non-empty
+  # whenever `$common` is (both come out of the same loop iteration) — but a migration record with
+  # `containers=` empty, or holding only SOME of the fleet, is one lib/netref.sh's mi_netmig_resume can
+  # never finish correctly: its own fleet is read straight back FROM this field (_mi_netmig_fleet),
+  # never re-enumerated, so 'net rebind' would migrate only the containers this field happens to name
+  # and leave the rest on the source network while still committing the new reference as if the move
+  # were complete.
+  #
+  # PURE SHELL, NOT `printf | tr`. `tr` is an external process: a partial write before a signal or an
+  # internal failure is captured by `$( … )` verbatim, and unless its own exit status is captured and
+  # checked, a TRUNCATED `c1,` (only the first entry) is indistinguishable from the complete list. A
+  # walk that never leaves this shell has no such window — there is no separate process whose failure
+  # could truncate what was written, so "did every fleet line make it into $flist" does not need to be
+  # asked at all, only answered by construction.
+  local flist="" fline
+  while IFS= read -r fline; do
+    [ -n "$fline" ] || continue
+    if [ -n "$flist" ]; then flist="${flist},${fline}"; else flist="$fline"; fi
+  done <<< "$fleet"
   if [ -z "$flist" ]; then
     mi_warn "repair: the fleet for this migration could not be enumerated as non-empty, so recording a"
     mi_warn "  migration intent that claims one would leave 'net rebind' nothing to actually move."
@@ -326,8 +355,21 @@ _mi_repair_run_locked() {
   local idx="$1" choice="${2:-}" cands count
 
   cands="$(mi_repair_candidates)" || return 1
-  count="$(printf '%s\n' "$cands" | grep -ac . || true)"
-  count="${count:-0}"
+  # PURE SHELL, NOT `grep -ac . || true`. `grep`'s own "no match" (rc 1) and an actual grep ERROR
+  # (rc 2 — this project's own "grep here is ugrep with -I hard-coded, a NUL byte in the input skips
+  # silently" hazard is exactly this class) are BOTH swallowed by `|| true` into the same outcome:
+  # count stays unset, defaults to 0. `$cands` already succeeded above (mi_repair_candidates' own
+  # contract is 0/1, no rc 3 to lose), so this is not a reader-failure question — but "zero" here is
+  # the single most consequential answer in this function: with MI_CONFIRM=yes it takes the
+  # reinitialize branch, resetting the ledger and minting a brand-new identity over whatever a REAL
+  # candidate's objects were. A count that cannot silently misreport is worth having even though the
+  # input is a local string, not a live read — counting non-empty lines with a bare loop has no
+  # external process and no rc to lose in the first place.
+  count=0
+  local _cand_line
+  while IFS= read -r _cand_line; do
+    [ -n "$_cand_line" ] && count=$((count + 1))
+  done <<< "$cands"
 
   if [ "$count" -eq 0 ]; then
     # ZERO CANDIDATES IS NOT "NOTHING TO REPAIR": host state can exist with no labelled runtime objects

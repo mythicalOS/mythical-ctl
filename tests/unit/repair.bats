@@ -439,3 +439,66 @@ teardown() { teardown_test_env; }
   run mi_net_ref_get
   [ "$status" -eq 3 ]
 }
+
+# --- codex round 3: 3 more HIGH findings, same class, plus a mechanical $(/pipe/|| true audit --------
+
+@test "containers that exist but share no attached network are NOT recorded as a clean reference" {
+  # A container with zero network attachments at all: c.nets reads back successfully (rc 0) but
+  # EMPTY, which is a different fact from "no containers carry this identity" — $fleet is non-empty
+  # (the container exists and carries the label) while $common stays empty (nothing to agree on).
+  # Before the fix, `[ -z "$common" ]` alone took the "no containers yet" branch and recorded 'opnet'
+  # as a clean family-network reference anyway — the recovered container is not attached to it at
+  # all, the exact split state D46 exists to prevent, reached from the empty-fleet branch instead of
+  # the disagreement branch a few lines above it.
+  net="$(mi_rt_network_create netA "" x)"
+  mi_rt_image_pull "$(a_digestref p1)" >/dev/null
+  mi_rt_container_create c1 "$(a_digestref p1)" "$net" p1 - label=installation=instA label=nonce=nc1 >/dev/null
+  mi_rt_network_disconnect "$net" c1 >/dev/null
+  mi_rt_network_create opnet "" y >/dev/null
+  printf 'MYTHICAL_NET=opnet\n' > "$MYTHICAL_HOME/mythical.conf"
+  run mi_repair_run "$IDX" instA
+  [ "$status" -ne 0 ]
+  assert_contains "none of them share a single attached"
+  load_mctl
+  run mi_net_ref_get
+  [ "$status" -eq 3 ]
+}
+
+@test "a real candidate is never treated as zero and silently reinitialized" {
+  # The count that decides between "found N, choose one" and "found none, offer to reinitialize" is
+  # derived from mi_repair_candidates' own output by counting non-empty lines in pure shell — never a
+  # `grep` pipeline whose own failure (this environment's own ugrep-vs-NUL-byte hazard is exactly this
+  # class: a silent no-match that is indistinguishable from a genuine zero) could collapse a real
+  # candidate down to a count of zero and, with MI_CONFIRM=yes already set here, mint a brand-new
+  # identity and reset the ledger over it instead of asking which one to choose.
+  mi_rt_volume_create v1 n1 instA
+  run mi_repair_run "$IDX"
+  [ "$status" -ne 0 ]
+  assert_contains instA
+  assert_contains "found 1 installation identity"
+  case "$output" in *reinitializ*) echo "unexpectedly took the reinitialize path" >&2; false ;; esac
+  load_mctl
+  run mi_ident_get
+  [ "$status" -eq 3 ]
+}
+
+@test "a reconstructed migration's fleet list names EVERY container, never a truncated prefix" {
+  # Two containers on the source network, so the migration's containers= field has to hold both. The
+  # historical risk this pins: `flist="$(printf … | tr '\n' ',')"` was an unchecked external-process
+  # transform — a partial write before a failure is captured by `$( … )` verbatim, and a TRUNCATED
+  # `c1,` (only the first entry) looks like a complete, valid list to everything downstream. The fleet
+  # is now joined in pure shell, which has no separate process whose failure could truncate it.
+  src="$(mi_rt_network_create oldnet "" x)"
+  mi_rt_image_pull "$(a_digestref p1)" >/dev/null
+  mi_rt_image_pull "$(a_digestref p2)" >/dev/null
+  mi_rt_container_create c1 "$(a_digestref p1)" "$src" p1 - label=installation=instA label=nonce=nc1 >/dev/null
+  mi_rt_container_create c2 "$(a_digestref p2)" "$src" p2 - label=installation=instA label=nonce=nc2 >/dev/null
+  mi_rt_network_create opnet "" y >/dev/null
+  printf 'MYTHICAL_NET=opnet\n' > "$MYTHICAL_HOME/mythical.conf"
+  run mi_repair_run "$IDX" instA
+  [ "$status" -eq 0 ]
+  load_mctl
+  run mi_led_find netmig key family
+  [ "$status" -eq 0 ]
+  assert_contains "containers=c1,c2"
+}
