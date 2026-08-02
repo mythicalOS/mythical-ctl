@@ -253,6 +253,9 @@ case "$cmd" in
       # A conforming image never does this: it reports the step SKIPPED where the two uids differ and
       # skipping is therefore not a no-op. The caller has to catch it.
       aclskip)   acl=skipped ;;
+      # A stray refused= in a preflight transcript — preflight has no such key, so it must be refused
+      # as outside this command's grammar, not passed over while every positive observation is read.
+      strayrefused) printf 'refused=%s/x:special-entry\n' "$dst" ;;
       *) printf 'helperimg: unknown HELPER_PREFLIGHT setting: %s\n' "$knob" >&2; exit 2 ;;
     esac
     printf 'ownership=%s\npermissions=%s\nsymlink=%s\nacl=%s\ninherit=%s\n' \

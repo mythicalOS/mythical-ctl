@@ -281,7 +281,7 @@ mi_copy_preflight() {
 
   if out="$(_mi_copy_helper "$idx" preflight "arg=/dst" "arg=${ruid}" "arg=${ouid}" \
              "staging=${stage}")"; then rc=0; else rc=$?; fi
-  _mi_copy_grammar_ok "$out" ownership permissions symlink acl inherit refused "done" || return 1
+  _mi_copy_grammar_ok "$out" ownership permissions symlink acl inherit "done" || return 1
 
   for k in ownership permissions symlink inherit; do
     v="$(_mi_copy_stated "$out" "$k" preflight)" || return 1

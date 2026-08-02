@@ -128,6 +128,13 @@ teardown() { rm -rf "$DST" "$STAGE"; mi_lock_release; teardown_test_env; }
 
 # rc 3 (absent) is not rc 0 (measured clean). A helper that ran, exited 0 and printed nothing must not
 # satisfy five contract checks on no evidence at all.
+@test "a stray refused= in a PREFLIGHT transcript is REFUSED — not a preflight key" {
+  mkdir -p "$STAGE"
+  HELPER_PREFLIGHT=strayrefused run mi_copy_preflight "$IDX" "$STAGE" 900 1000
+  [ "$status" -ne 0 ]
+  assert_contains "unexpected key"
+}
+
 @test "a preflight that reports nothing is REFUSED — a missing observation is not a passing one" {
   mkdir -p "$STAGE"
   HELPER_PREFLIGHT=silent run mi_copy_preflight "$IDX" "$STAGE" 900 1000
