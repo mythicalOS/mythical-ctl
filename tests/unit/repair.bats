@@ -249,3 +249,124 @@ teardown() { teardown_test_env; }
   MI_CONFIRM=no MI_INTENT_GRACE=0 run mi_verb_abandon_intent network net1
   [ "$status" -ne 0 ]
 }
+
+# --- codex round 1: unchecked reads / rc-3-vs-rc-1 conflation, fail-closed pins ---------------------
+# Each of these makes ONE specific inspect/ledger read fail with "the runtime could not answer" (rc 1
+# — never "gone", rc 3), by counting invocations under FAKE_DOCKER_DOWN_AFTER the same way
+# tests/unit/intent.bats and tests/unit/probe.bats already do. Before the fix each of these silently
+# read the failure as an empty value — "no label", "no identity", "nothing owed" — and proceeded; each
+# must now FAIL CLOSED and say so, never quietly drop or adopt installation state.
+
+@test "candidate discovery FAILS CLOSED when an object's installation label cannot be read" {
+  mi_rt_volume_create v1 n1 instA
+  # Call 1: container ls · call 2: volume ls · call 3: the volume's install-label inspect — the one
+  # this pins. Before the fix, `2>/dev/null || true` turned that failure into an empty label, v1 was
+  # silently omitted, and discovery could report zero or one candidate with an object it never asked
+  # about left out entirely.
+  FAKE_DOCKER_DOWN_AFTER=2 run mi_repair_candidates
+  [ "$status" -ne 0 ]
+  assert_contains "could not be asked for its installation label"
+  assert_contains "cannot prove which identities are present"
+}
+
+@test "the post-reset rebuild loop FAILS CLOSED when an object's installation label cannot be read" {
+  mi_rt_volume_create v1 n1 instA
+  # The ledger has already been reset for identity instA by the time this fails (calibrated: the 11th
+  # runtime call under the knob is v1's install-label read inside the rebuild loop, AFTER candidate
+  # discovery already succeeded once against it). Before the fix this silently skipped v1 — the ledger
+  # ends up with an identity and no provenance for the object that identity was chosen for, reported
+  # as a completed repair.
+  FAKE_DOCKER_DOWN_AFTER=10 run mi_repair_run "$IDX" instA
+  [ "$status" -ne 0 ]
+  assert_contains "could not be asked for its installation label"
+  assert_contains "already been reset"
+  load_mctl
+  run mi_prov_find volume v1
+  [ "$status" -eq 3 ]
+}
+
+@test "network reconstruction FAILS CLOSED when a container's installation label cannot be read" {
+  net="$(mi_rt_network_create netA instA nA)"
+  mi_rt_image_pull "$(a_digestref p1)" >/dev/null
+  mi_rt_container_create c1 "$(a_digestref p1)" "$net" p1 - label=installation=instA label=nonce=nc1 >/dev/null
+  mi_rt_network_create opnet "" x >/dev/null
+  printf 'MYTHICAL_NET=opnet\n' > "$MYTHICAL_HOME/mythical.conf"
+  # Calibrated to land on _mi_repair_netref's OWN read of c1's install label (after candidate discovery
+  # and the whole rebuild loop have already succeeded once against every object). Before the fix this
+  # silently skipped c1 from the "do the containers agree" comparison, so repair could record a clean
+  # non-owned reference even though c1 might still be on the OLD network — a split fleet the ledger
+  # would then report as healthy.
+  FAKE_DOCKER_DOWN_AFTER=24 run mi_repair_run "$IDX" instA
+  [ "$status" -ne 0 ]
+  assert_contains "could not be asked for its installation label"
+  assert_contains "fleet agrees"
+  load_mctl
+  run mi_net_ref_get
+  [ "$status" -eq 3 ]
+}
+
+@test "'+none' is never recorded from an unread network-attachment state" {
+  net="$(mi_rt_network_create netA instA nA)"
+  mi_rt_image_pull "$(a_digestref p1)" >/dev/null
+  mi_rt_container_create c1 "$(a_digestref p1)" "$net" p1 - label=installation=instA label=nonce=nc1 >/dev/null
+  # Calibrated to land on c1's c.nets read inside the desired-state block, after its provenance record
+  # has already been written. Before the fix, a failed read here defaulted to empty and was recorded as
+  # "+none" — asserting NO live verification is owed for a container that may well be attached and
+  # running, the opposite of the honest "outstanding" default this whole module exists to keep.
+  FAKE_DOCKER_DOWN_AFTER=18 run mi_repair_run "$IDX" instA
+  [ "$status" -ne 0 ]
+  assert_contains "'+none' from an unread state"
+  load_mctl
+  run mi_state_desired_get c1
+  [ "$status" -eq 3 ]
+}
+
+@test "net rebind FAILS CLOSED on an unreadable/ambiguous migration record instead of starting fresh" {
+  mi_lock_acquire
+  mi_ident_ensure >/dev/null
+  # A second raw `netmig key=family` row, written directly rather than through mi_led_put (which would
+  # replace the first), makes the key AMBIGUOUS — mi_led_find's rc 1, never rc 3. Before the fix, a bare
+  # `if mi_led_find …; then resume; fi` with no else treated rc 1 exactly like rc 3 (no migration) and
+  # fell through to starting a brand-new rebind, discarding the only record of an in-flight one.
+  mi_led_put netmig key family "key=family" "phase=2" "source=srcid" "target=tgtid" "containers="
+  { mi_ledger_read; printf 'netmig\tkey=family\tphase=2\tsource=srcid\ttarget=other\tcontainers=\n'; } | mi_ledger_write
+  mi_lock_release
+  printf 'MYTHICAL_NET=whatever\n' > "$MYTHICAL_HOME/mythical.conf"
+  run mi_verb_net_rebind "$IDX"
+  [ "$status" -ne 0 ]
+  assert_contains "could not be read from the"
+  assert_contains "ledger"
+}
+
+# --- codex round 1: the two CLI dispatch bugs (bin/mythical-ctl) ------------------------------------
+# These go through run_mctl — the REAL entrypoint as a subprocess — because the bug is in main()'s own
+# argument handling, not in the library functions repair.bats calls directly everywhere else.
+
+@test "CLI: 'state repair <identity>' threads the chosen identity through to the library" {
+  mi_rt_volume_create v1 n1 instA
+  # Before the fix, main() parsed products[1] (the identity) but called mi_verb_state_repair "$idx"
+  # WITHOUT it, so the library saw no choice at all and printed the "choose one explicitly" refusal
+  # even though the operator DID choose — the one documented safe recovery path was unusable from the
+  # CLI.
+  run_mctl state repair instA --index "$IDX"
+  assert_ok
+  load_mctl
+  run mi_ident_get
+  [ "$output" = instA ]
+}
+
+@test "CLI: 'state abandon-intent <class> <name> <extra>' is a usage error, nothing attempted" {
+  mi_lock_acquire
+  mi_ident_ensure >/dev/null
+  n="$(mi_nonce_new)"
+  mi_intent_open network net1 "$n"
+  mi_lock_release
+  # Before the fix, main() read only products[1]/products[2] and silently dropped a third operand,
+  # so this ran exactly as "state abandon-intent network net1" — a malformed invocation that still
+  # confirmed and performed the state-deleting action.
+  MI_CONFIRM=yes MI_INTENT_GRACE=0 run_mctl state abandon-intent network net1 extra-garbage --index "$IDX"
+  assert_fail "$MI_EX_USAGE"
+  load_mctl
+  run mi_intent_find network net1
+  [ "$status" -eq 0 ]
+}

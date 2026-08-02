@@ -51,14 +51,59 @@ mi_schema_migrate() {
 # authority, so a corrupt one leaves "which of the labelled objects are mine?" unanswerable by the very
 # record being repaired — and several installations may share the daemon.
 
+# THE ONE READER of an object's installation label, for every caller in this module that decides
+# something from it (candidate discovery, the show listing, the post-reset rebuild loop). One
+# implementation rather than the `2>/dev/null || true` idiom repeated at each site — that idiom folds
+# rc 1 (the runtime could not answer) into an empty value indistinguishable from "no label", which is
+# the exact silent-miss class this module exists to close: a second installation's object goes missing
+# from candidate discovery instead of making discovery refuse to say "exactly one".
+#
+# rc 0 the label is printed — EMPTY is a real answer, an unlabelled object that is still present ·
+# 3 the object is gone (a listing/inspect race — a later run, or this same run's next step, can act on
+# it) · 1 the runtime could not answer. EVERY CALLER MUST FAIL CLOSED ON 1 — never read it as "no
+# label", "a different identity", or "nothing to record".
+_mi_repair_install_of() {
+  if [ "$#" -ne 2 ]; then mi_warn "repair: _mi_repair_install_of needs <kind> <name>"; return 1; fi
+  local kind="$1" name="$2" v rc
+  case "$kind" in
+    container) if v="$(mi_rt_inspect container c.install "$name")"; then rc=0; else rc=$?; fi ;;
+    volume)    if v="$(mi_rt_inspect volume    v.install "$name")"; then rc=0; else rc=$?; fi ;;
+    network)   if v="$(mi_rt_inspect network    n.install "$name")"; then rc=0; else rc=$?; fi ;;
+    *) mi_warn "repair: '$kind' has no installation label this module reads"; return 1 ;;
+  esac
+  [ "$rc" -eq 3 ] && return 3
+  [ "$rc" -eq 0 ] || return 1
+  case "$v" in '<no value>') v="" ;; esac
+  printf '%s\n' "$v"
+}
+
+# THE ONE READER of an object's nonce label — the other half of provenance, and the same rc split for
+# the same reason: a nonce read that could not be answered must never be recorded as an empty or
+# missing nonce, which is exactly the misidentification a nonce exists to prevent (§6a).
+_mi_repair_nonce_of() {
+  if [ "$#" -ne 2 ]; then mi_warn "repair: _mi_repair_nonce_of needs <kind> <name>"; return 1; fi
+  local kind="$1" name="$2" v rc
+  case "$kind" in
+    container) if v="$(mi_rt_inspect container c.nonce "$name")"; then rc=0; else rc=$?; fi ;;
+    volume)    if v="$(mi_rt_inspect volume    v.nonce "$name")"; then rc=0; else rc=$?; fi ;;
+    network)   if v="$(mi_rt_inspect network    n.nonce "$name")"; then rc=0; else rc=$?; fi ;;
+    *) mi_warn "repair: '$kind' has no nonce label this module reads"; return 1 ;;
+  esac
+  [ "$rc" -eq 3 ] && return 3
+  [ "$rc" -eq 0 ] || return 1
+  case "$v" in '<no value>') v="" ;; esac
+  printf '%s\n' "$v"
+}
+
 # The distinct installation identities present in object labels, one per line.
 #
 # rc 0 the listing is complete (possibly empty) · 1 the runtime could not be asked about one of the
-# three kinds — REFUSED rather than silently reporting a partial candidate set: a fewer-candidates
-# answer here is how a repair adopts the wrong identity or offers reinitialization when a real
-# candidate exists but could not be listed.
+# three kinds, OR could not be asked for one particular object's installation label — REFUSED rather
+# than silently reporting a partial candidate set: a fewer-candidates answer here is how a repair
+# adopts the wrong identity, or offers reinitialization, when a real candidate exists but its label
+# could not be read.
 mi_repair_candidates() {
-  local kind name id seen="" out="" names rc
+  local kind name id idrc seen="" out="" names rc
   for kind in container volume network; do
     if names="$(_mi_prov_list_all "$kind")"; then rc=0; else rc=$?; fi
     if [ "$rc" -ne 0 ]; then
@@ -68,12 +113,16 @@ mi_repair_candidates() {
     fi
     while IFS= read -r name; do
       [ -n "$name" ] || continue
-      case "$kind" in
-        container) id="$(mi_rt_inspect container c.install "$name" 2>/dev/null || true)" ;;
-        volume)    id="$(mi_rt_inspect volume    v.install "$name" 2>/dev/null || true)" ;;
-        network)   id="$(mi_rt_inspect network    n.install "$name" 2>/dev/null || true)" ;;
-      esac
-      case "$id" in ''|'<no value>') continue ;; esac
+      if id="$(_mi_repair_install_of "$kind" "$name")"; then idrc=0; else idrc=$?; fi
+      if [ "$idrc" -eq 3 ]; then continue; fi   # gone since the listing was taken — nothing to count
+      if [ "$idrc" -ne 0 ]; then
+        mi_warn "repair: '$name' ($kind) could not be asked for its installation label, so candidate"
+        mi_warn "  discovery cannot prove which identities are present on this daemon, or that there is"
+        mi_warn "  only one. Refusing rather than silently omitting it — start the container runtime (or"
+        mi_warn "  otherwise make it answer) and re-run."
+        return 1
+      fi
+      [ -n "$id" ] || continue
       case " $seen " in *" $id "*) continue ;; esac
       seen="${seen} ${id}"
       out="${out}${id}"$'\n'
@@ -83,10 +132,11 @@ mi_repair_candidates() {
 }
 
 # Show a candidate with its objects, ports and observed state, so the operator can tell which is theirs.
-# Best-effort display: a listing failure for one kind is reported and skipped rather than aborting the
-# whole report (the caller has already refused the operation itself via mi_repair_candidates).
+# Best-effort display: a listing or label-read failure for one kind/object is reported and skipped
+# rather than aborting the whole report — the caller has already refused the operation itself via
+# mi_repair_candidates, which applies the fail-closed rule this function does not need to repeat.
 _mi_repair_show() {
-  local id="$1" kind name names rc
+  local id="$1" kind name names rc lid lidrc
   mi_log "  identity $id"
   for kind in container volume network; do
     if names="$(_mi_prov_list_all "$kind")"; then rc=0; else rc=$?; fi
@@ -97,12 +147,13 @@ _mi_repair_show() {
     fi
     while IFS= read -r name; do
       [ -n "$name" ] || continue
-      local lid
-      case "$kind" in
-        container) lid="$(mi_rt_inspect container c.install "$name" 2>/dev/null || true)" ;;
-        volume)    lid="$(mi_rt_inspect volume    v.install "$name" 2>/dev/null || true)" ;;
-        network)   lid="$(mi_rt_inspect network    n.install "$name" 2>/dev/null || true)" ;;
-      esac
+      if lid="$(_mi_repair_install_of "$kind" "$name")"; then lidrc=0; else lidrc=$?; fi
+      if [ "$lidrc" -eq 3 ]; then continue; fi
+      if [ "$lidrc" -ne 0 ]; then
+        mi_warn "repair: '$name' ($kind) could not be asked for its installation label; it may or may"
+        mi_warn "  not belong to identity '$id' and is left out of this listing."
+        continue
+      fi
       [ "$lid" = "$id" ] || continue
       if [ "$kind" = container ]; then
         mi_log "    $kind $name  ($(mi_state_observed "$name" 2>/dev/null || printf '?'), ports: $(mi_rt_inspect container c.ports "$name" 2>/dev/null || printf '?'))"
@@ -142,10 +193,25 @@ _mi_repair_netref() {
   fi
   while IFS= read -r c; do
     [ -n "$c" ] || continue
-    local lid
-    lid="$(mi_rt_inspect container c.install "$c" 2>/dev/null || true)"
+    local lid lidrc netsrc
+    if lid="$(_mi_repair_install_of container "$c")"; then lidrc=0; else lidrc=$?; fi
+    if [ "$lidrc" -eq 3 ]; then continue; fi   # gone since the listing — not a vote either way
+    if [ "$lidrc" -ne 0 ]; then
+      mi_warn "repair: '$c' could not be asked for its installation label, so whether the fleet agrees"
+      mi_warn "  about its network cannot be established. Recording a reference on an incomplete answer"
+      mi_warn "  is how the ledger ends up naming a network a container may still be split from."
+      mi_warn "  Nothing recorded."
+      return 1
+    fi
     [ "$lid" = "$ident" ] || continue
-    nets="$(mi_rt_inspect container c.nets "$c" 2>/dev/null || true)"
+    if nets="$(mi_rt_inspect container c.nets "$c")"; then netsrc=0; else netsrc=$?; fi
+    if [ "$netsrc" -eq 3 ]; then continue; fi   # gone since the label read a moment ago
+    if [ "$netsrc" -ne 0 ]; then
+      mi_warn "repair: '$c' carries this identity's label, but its network attachments could not be"
+      mi_warn "  read. A container that may still be on a DIFFERENT network cannot be ruled out on an"
+      mi_warn "  unanswered question. Nothing recorded."
+      return 1
+    fi
     ids=""
     local IFS=';'
     # shellcheck disable=SC2206
@@ -302,18 +368,42 @@ _mi_repair_run_locked() {
     fi
     while IFS= read -r name; do
       [ -n "$name" ] || continue
-      local lid lnonce
-      case "$kind" in
-        container) lid="$(mi_rt_inspect container c.install "$name" 2>/dev/null || true)"
-                   lnonce="$(mi_rt_inspect container c.nonce "$name" 2>/dev/null || true)" ;;
-        volume)    lid="$(mi_rt_inspect volume    v.install "$name" 2>/dev/null || true)"
-                   lnonce="$(mi_rt_inspect volume    v.nonce "$name" 2>/dev/null || true)" ;;
-        network)   lid="$(mi_rt_inspect network    n.install "$name" 2>/dev/null || true)"
-                   lnonce="$(mi_rt_inspect network    n.nonce "$name" 2>/dev/null || true)" ;;
-      esac
+      local lid lidrc lnonce lnrc
+      # THIS RUNS AFTER _mi_repair_reset_ledger. A read that cannot be answered here is more serious
+      # than the same read failing during candidate discovery: the OLD ledger is already gone, so a
+      # silent skip does not leave provenance stale, it leaves it MISSING — permanently, unless the
+      # operator is told to re-run. FAIL CLOSED, always, never "skip this one and carry on".
+      if lid="$(_mi_repair_install_of "$kind" "$name")"; then lidrc=0; else lidrc=$?; fi
+      if [ "$lidrc" -eq 3 ]; then continue; fi   # gone since the listing was taken — nothing to rebuild
+      if [ "$lidrc" -ne 0 ]; then
+        mi_warn "repair: '$name' ($kind) could not be asked for its installation label. The ledger has"
+        mi_warn "  already been reset for identity '$choice', and this object's provenance would be"
+        mi_warn "  silently missing from the rebuild rather than merely stale. Stopping — re-run"
+        mi_warn "  'mythical-ctl state repair $choice' once the runtime answers for it."
+        return 1
+      fi
       [ "$lid" = "$choice" ] || continue
+      if lnonce="$(_mi_repair_nonce_of "$kind" "$name")"; then lnrc=0; else lnrc=$?; fi
+      if [ "$lnrc" -eq 3 ]; then continue; fi
+      if [ "$lnrc" -ne 0 ]; then
+        mi_warn "repair: '$name' ($kind) carries identity '$choice', but its nonce could not be read."
+        mi_warn "  Recording provenance with no nonce — or the wrong one — is exactly the"
+        mi_warn "  misidentification a nonce exists to prevent (§6a). Stopping."
+        return 1
+      fi
       local extra=""
-      if [ "$kind" = network ]; then extra="id=$(mi_rt_inspect network n.id "$name" 2>/dev/null || true)"; fi
+      if [ "$kind" = network ]; then
+        local nid nidrc
+        if nid="$(mi_rt_inspect network n.id "$name")"; then nidrc=0; else nidrc=$?; fi
+        if [ "$nidrc" -eq 3 ]; then continue; fi
+        if [ "$nidrc" -ne 0 ]; then
+          mi_warn "repair: '$name' (network) carries identity '$choice', but its id could not be read."
+          mi_warn "  A network is recorded BY its id (§6a), so there is nothing to record without one,"
+          mi_warn "  and recording an empty one would name a network that does not exist. Stopping."
+          return 1
+        fi
+        extra="id=${nid}"
+      fi
       if [ -n "$extra" ]; then mi_prov_record "$kind" "$name" "$lnonce" "$extra" || return 1
       else mi_prov_record "$kind" "$name" "$lnonce" || return 1; fi
 
@@ -329,13 +419,25 @@ _mi_repair_run_locked() {
         local obs want
         obs="$(mi_state_observed "$name")" || return 1
         case "$obs" in running) want=running ;; *) want=stopped ;; esac
-        local netid=""
-        netid="$(mi_rt_inspect container c.nets "$name" 2>/dev/null || true)"
+        local netid="" netidrc
+        # `+none` DECLARES NO LIVE VERIFICATION IS OWED. That is only true when the container genuinely
+        # HAS no network attachment, which requires having actually read its attachments — never a
+        # failed read defaulted to empty. Recording `+none` from a question that was never answered
+        # would assert nothing needs verifying for a container that may well be attached and running.
+        if netid="$(mi_rt_inspect container c.nets "$name")"; then netidrc=0; else netidrc=$?; fi
+        if [ "$netidrc" -eq 3 ]; then continue; fi   # gone since the label read a moment ago
+        if [ "$netidrc" -ne 0 ]; then
+          mi_warn "repair: '$name' is recorded, but its network attachments could not be read, so whether"
+          mi_warn "  it owes a live alias verification cannot be established."
+          mi_warn "  Recording '+none' from an unread state would assert no check is owed when one may be. Stopping."
+          return 1
+        fi
         netid="${netid%%=*}"
         if [ -n "$netid" ]; then
           mi_state_commit "$name" "$want" alias "$netid" || return 1
         else
-          # No network attachment at all — nothing this run can ever check, so nothing is declared owed.
+          # The attachment question WAS answered, and the answer was "none" — genuinely nothing to
+          # check, unlike the failed-read case above.
           mi_state_commit "$name" "$want" +none || return 1
         fi
         inferred="${inferred}    $name → $want (observed)"$'\n'
@@ -372,9 +474,29 @@ _mi_repair_run_locked() {
     [ -n "$rec" ] || continue
     _mi_led_record_matches "$rec" class container || continue
     c="$(mi_led_field "$rec" name)" || continue
-    [ "$(mi_state_observed "$c")" = running ] || continue
+    local obs2 obsrc2
+    if obs2="$(mi_state_observed "$c")"; then obsrc2=0; else obsrc2=$?; fi
+    if [ "$obsrc2" -ne 0 ]; then
+      mi_warn "repair: '$c' could not be asked whether it is running, so this run cannot live-verify it."
+      mi_warn "  Its outstanding alias check, if any, is left exactly as recorded — never cleared on an"
+      mi_warn "  unread state."
+      continue
+    fi
+    [ "$obs2" = running ] || continue
     local alias netid2 product aliasesraw blob seg
-    netid2="$(mi_state_outstanding "$c" | head -n1 | cut -f2)"
+    # THE PIPELINE'S STATUS IS THE LAST COMMAND'S (`cut`), which hides mi_state_outstanding's own rc —
+    # without pipefail (this is a pure library; bin/mythical-ctl's pipefail does not reach here) a
+    # failed reader piped into `head|cut` still prints nothing and the pipeline still exits 0. Captured
+    # and checked BEFORE the transform, so "could not determine what is owed" is never read as "nothing
+    # is owed" — the exact rc-3-vs-rc-1 conflation this module exists to close.
+    local outst outstrc
+    if outst="$(mi_state_outstanding "$c")"; then outstrc=0; else outstrc=$?; fi
+    if [ "$outstrc" -ne 0 ]; then
+      mi_warn "repair: '$c' is running, but its outstanding checks could not be read, so what it owes"
+      mi_warn "  cannot be established. Left running; not live-verified this run."
+      continue
+    fi
+    netid2="$(printf '%s' "$outst" | head -n1 | cut -f2)"
     [ -n "$netid2" ] || continue
     # Prefer the canonical family alias derived from the container's own product label (the value a
     # normal bring-up would have used); fall back to whatever alias the container actually carries on
@@ -504,14 +626,24 @@ mi_verb_net_rebind() {
   _mi_with_lock _mi_verb_net_rebind_locked "$1"
 }
 _mi_verb_net_rebind_locked() {
-  local idx="$1" name id
+  local idx="$1" name id migrc
 
-  # A recorded migration resumes rather than starting a new one.
-  if mi_led_find "$MI_NETMIG_KIND" key family >/dev/null 2>&1; then
-    mi_log "verbs: resuming the recorded network migration."
-    mi_netmig_resume "$idx"
-    return $?
-  fi
+  # A recorded migration resumes rather than starting a new one. `mi_led_find`'s rc split matters here:
+  # 0 found · 3 absent (genuinely nothing to resume) · 1 unreadable/ambiguous. A bare `if cmd; then …;
+  # fi` with no else treats 1 exactly like 3 and falls through to starting a FRESH rebind — writing
+  # phase 1 over an in-flight migration record nobody could read, discarding the only account of where
+  # the fleet came from. Mirrors lib/netref.sh's mi_net_ref_rebind, which makes this same check.
+  if mi_led_find "$MI_NETMIG_KIND" key family >/dev/null 2>&1; then migrc=0; else migrc=$?; fi
+  case "$migrc" in
+    0) mi_log "verbs: resuming the recorded network migration."
+       mi_netmig_resume "$idx"
+       return $? ;;
+    3) : ;;
+    *) mi_warn "verbs: whether a network migration is already recorded could not be read from the"
+       mi_warn "  ledger. Starting a fresh rebind now could write over an in-flight migration's intent"
+       mi_warn "  — the only record of where the fleet came from. Nothing is started."
+       return 1 ;;
+  esac
   name="$(mi_conf_get "$(mi_conf_family_path)" MYTHICAL_NET)" || {
     mi_warn "verbs: MYTHICAL_NET is not set, so there is no operator-supplied network to rebind onto."
     return 1; }

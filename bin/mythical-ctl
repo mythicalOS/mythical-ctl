@@ -222,11 +222,23 @@ main() {
     state)
       case "${products[0]:-}" in
         repair)
-          if declare -F mi_verb_state_repair >/dev/null 2>&1; then mi_verb_state_repair "$idx"; exit $?; fi
+          # At most ONE extra operand (the chosen identity, or --reinitialize) — a third operand is a
+          # malformed invocation and must be rejected outright, not silently dropped and acted on as if
+          # it named nothing.
+          [ "${#products[@]}" -le 2 ] || { printf 'mythical-ctl: state repair takes at most one identity (or --reinitialize)\n' >&2
+                                            exit "$MI_EX_USAGE"; }
+          if declare -F mi_verb_state_repair >/dev/null 2>&1; then
+            mi_verb_state_repair "$idx" "${products[1]:-}"; exit $?
+          fi
           printf 'mythical-ctl: state repair is not available in this build yet\n' >&2; exit "$MI_EX_FAIL" ;;
         abandon-intent)
+          # EXACTLY <class> <name> — a surplus operand must not be silently dropped: this command
+          # confirms and then performs a state-deleting action, so a malformed invocation is a usage
+          # error with NOTHING attempted, never "the first two words, whatever came after them".
+          [ "${#products[@]}" -eq 3 ] || { printf 'mythical-ctl: state abandon-intent needs exactly <class> <name>\n' >&2
+                                            exit "$MI_EX_USAGE"; }
           if declare -F mi_verb_abandon_intent >/dev/null 2>&1; then
-            mi_verb_abandon_intent "${products[1]:-}" "${products[2]:-}"; exit $?
+            mi_verb_abandon_intent "${products[1]}" "${products[2]}"; exit $?
           fi
           printf 'mythical-ctl: state abandon-intent is not available in this build yet\n' >&2; exit "$MI_EX_FAIL" ;;
         *) printf 'mythical-ctl: state takes "repair" or "abandon-intent"\n' >&2; exit "$MI_EX_USAGE" ;;
