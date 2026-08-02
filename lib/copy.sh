@@ -408,8 +408,35 @@ mi_copy_run() {
   # finding 1). A copy that reports done=ok having enumerated ZERO entries is a vacuous completion —
   # unmeasured is not measured-clean, and over a non-empty source it is exactly that fail-open — so it
   # is REFUSED here rather than recorded as a success measured on nothing.
-  local entries=0
-  while IFS= read -r v; do [ -n "$v" ] || continue; entries=$((entries + 1)); done <<< "$(_mi_copy_fields "$out" entry)"
+  # The count binds verification, so it must be a count of DISTINCT source entries — one line per path
+  # the copier read. A repeated path is refused, because otherwise a copier can pad the count: emit one
+  # valid entry N times and OMIT an escaping symlink or a special entry, and `checked=N` then matches a
+  # total that never included the dangerous one. The path is the identity of a source entry (a path is
+  # one filesystem object whatever type is claimed for it), so duplicates are detected on the path, not
+  # the raw line. This makes the count a count of things, not of claims about things — the internal
+  # consistency the verify half is measured against. (Whether the copier's per-entry COMPARISON is
+  # honest is the pinned image's responsibility, verified by its own build/CI against the release
+  # digest; the core's responsibility is confinement, refusing on any reported refusal/mismatch, and
+  # this internal consistency of the report.)
+  local entries=0 epath eseen=$'\n'
+  while IFS= read -r v; do
+    [ -n "$v" ] || continue
+    case "$v" in *:*) epath="${v#*:}" ;; *) epath="" ;; esac
+    if [ -z "$epath" ]; then
+      mi_warn "copy: the copier enumerated an entry line with no path ('${v}'). Refusing rather than"
+      mi_warn "  counting a claim that names nothing toward a completed copy."
+      return 1
+    fi
+    case "$eseen" in *$'\n'"${epath}"$'\n'*)
+      mi_warn "copy: the copier enumerated '${epath}' more than once. A repeated source path pads the"
+      mi_warn "  entry count without adding a distinct entry — and a padded count can match a 'checked='"
+      mi_warn "  total that omitted a dangerous entry. Refusing rather than binding verification to a"
+      mi_warn "  count of duplicated claims."
+      return 1 ;;
+    esac
+    eseen="${eseen}${epath}"$'\n'
+    entries=$((entries + 1))
+  done <<< "$(_mi_copy_fields "$out" entry)"
   if [ "$entries" -eq 0 ]; then
     mi_warn "copy: the copier reported done=ok having enumerated ZERO source entries. A completed copy"
     mi_warn "  that measured nothing is not evidence of a copy — refusing rather than recording a"

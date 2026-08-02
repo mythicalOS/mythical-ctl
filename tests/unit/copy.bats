@@ -158,6 +158,16 @@ teardown() { rm -rf "$DST" "$STAGE"; mi_lock_release; teardown_test_env; }
 # than `special:`, then exited 0 with done=ok, would otherwise have that entry COUNTED toward the total
 # and the copy reported verified. The exact hostile transcript — a `fifo:` entry alongside `done=ok` and
 # a zero exit — must be REFUSED.
+@test "a copier padding the count with a DUPLICATE source path is REFUSED" {
+  # Verification is bound to the entry count, so the count must be of DISTINCT source entries. A copier
+  # can otherwise emit one valid file N times and OMIT a dangerous entry it also copied — the count
+  # still reads N, and a `checked=N` matches a total that never included the dangerous one.
+  mkdir -p "$STAGE"
+  HELPER_COPY=dup-entry run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000
+  [ "$status" -ne 0 ]
+  assert_contains "more than once"
+}
+
 @test "an entry TYPE outside the closed set (a FIFO) is REFUSED even with done=ok" {
   mkdir -p "$STAGE"
   HELPER_COPY=unknown-type run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000

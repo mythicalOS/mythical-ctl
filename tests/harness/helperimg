@@ -292,6 +292,17 @@ case "$cmd" in
       printf 'done=ok\n'
       fin 0
     fi
+    # `dup-entry`: a copier PADDING the entry count — it enumerates one valid file THREE times and omits
+    # a dangerous entry it also copied. The count would still be three, matching a `checked=3` the
+    # verifier could state without having compared the omitted one. The caller must refuse a repeated
+    # source path, so the count is a count of DISTINCT things.
+    if [ "$knob" = dup-entry ]; then
+      printf 'entry=dir:%s/data\n'    "$src"
+      printf 'entry=file:%s/data/a\n' "$src"
+      printf 'entry=file:%s/data/a\n' "$src"
+      printf 'done=ok\n'
+      fin 0
+    fi
     # The ordinary tree, reported on EVERY setting, so the contract observations are present in the
     # plain case too and a caller cannot pass its symlink assertions only on a knobbed fixture. FIVE
     # `entry=` lines: the copy's own source enumeration, and the count the verify half is measured
