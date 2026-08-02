@@ -347,6 +347,9 @@ case "$cmd" in
       # problem; the value loop skips it.
       empty-mapped)
         printf 'mapped=\n' ;;
+      # An EMPTY linktarget= — a disclosed symlink target that names nothing; the value pass skips it.
+      empty-lt)
+        printf 'linktarget=\n' ;;
       # A linktarget disclosed for a path that was NOT enumerated as a symlink entry — a contradiction
       # (the relation is one-to-one), and a way to disclose a target for something never enumerated.
       unassociated-lt)

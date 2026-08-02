@@ -507,6 +507,14 @@ mi_copy_run() {
     mi_warn "  Refusing rather than counting it toward a completed copy."
     return 1
   fi
+  # An EMPTY `linktarget=` is the same malformed shape one key over — the value-iterating refusal pass
+  # skips it, so it is neither escape-checked nor association-checked. A disclosed target that discloses
+  # nothing is refused; it cannot be shown not to escape.
+  if _mi_copy_has_empty "$out" linktarget; then
+    mi_warn "copy: the copier disclosed an empty 'linktarget=' record — a symlink target that names"
+    mi_warn "  nothing. An undisclosed target cannot be shown not to escape the tree — refused."
+    return 1
+  fi
   local entries=0 epath eseen=$'\n'
   while IFS= read -r v; do
     [ -n "$v" ] || continue

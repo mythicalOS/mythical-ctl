@@ -158,6 +158,13 @@ teardown() { rm -rf "$DST" "$STAGE"; mi_lock_release; teardown_test_env; }
 # than `special:`, then exited 0 with done=ok, would otherwise have that entry COUNTED toward the total
 # and the copy reported verified. The exact hostile transcript — a `fifo:` entry alongside `done=ok` and
 # a zero exit — must be REFUSED.
+@test "an EMPTY linktarget= record is REFUSED — a disclosed target that names nothing" {
+  mkdir -p "$STAGE"
+  HELPER_COPY=empty-lt run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000
+  [ "$status" -ne 0 ]
+  assert_contains "names"
+}
+
 @test "a linktarget for a path that is NOT a symlink entry is REFUSED (unassociated)" {
   # The linktarget<->symlink relation is one-to-one. A target disclosed for a path never enumerated as
   # a symlink is a contradictory transcript — and a way to disclose a target for something the copier
