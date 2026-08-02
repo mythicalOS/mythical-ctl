@@ -265,6 +265,36 @@ mi_conf_product_ensure() {
   esac
 }
 
+# --- bootstrap secrets (ONE gate, shared by install and recreate) ---------------------------------
+# Collect the manifest's bootstrap secrets, EACH gated on the CURRENT policy grant, and stage them
+# into a 0600 env file (mi_secrets_envfile removes it — the caller does, on every exit path). Prints
+# the env file path, or `-` when the product declares none.
+#
+# THE ENTITLEMENT GATE LIVES HERE, IN ONE PLACE, because install and recreate both inject bootstrap
+# secrets and a second copy of the check is one that drifts: install carried this per-key
+# mi_policy_permits gate and recreate did not, so a secret install would refuse recreate would stage.
+# mi_accept_manifest already refuses a manifest that declares a policy-denied secret, so this is the
+# defence-in-depth layer behind that door — but it must be the SAME layer on both verbs, so it is
+# factored out rather than written twice. rc 0 (prints the path, or `-`) · 1 a declared secret is not
+# granted (reported), or staging failed.
+_mi_verb_secrets_envfile() {
+  if [ "$#" -ne 3 ]; then mi_warn "verbs: _mi_verb_secrets_envfile needs <product> <manifest-records> <policy-records>"; return 1; fi
+  local product="$1" mrec="$2" prec="$3" v
+  local -a wanted
+  wanted=()
+  while IFS= read -r v; do
+    [ -n "$v" ] || continue
+    mi_policy_permits "$prec" "$product" secret "$v" || {
+      mi_warn "verbs: '$product' asks for secret '$v', which the policy index does not grant it."; return 1; }
+    wanted+=("$v")
+  done <<< "$(mi_doc_values "$mrec" secret)"
+  if [ "${#wanted[@]}" -gt 0 ]; then
+    mi_secrets_envfile "$product" "${wanted[@]}" || return 1
+  else
+    printf '%s\n' "-"
+  fi
+}
+
 # --- install (desired state: running) -------------------------------------------------------------
 mi_verb_install() {
   if [ "$#" -lt 4 ]; then mi_warn "verbs: install needs <index> <policy> <manifest> <product> [--image REF] [--force-install]"; return 2; fi
@@ -446,20 +476,9 @@ _mi_verb_install_locked() {
   # though bash 3.2 errors on an empty array under `set -u`.
   specs+=("label=product=${product}")
 
-  # Bootstrap secrets, per-key, from the policy index's grant — never the whole file.
-  local -a wanted
-  wanted=()
-  while IFS= read -r v; do
-    [ -n "$v" ] || continue
-    mi_policy_permits "$prec" "$product" secret "$v" || {
-      mi_warn "verbs: '$product' asks for secret '$v', which the policy index does not grant it."; return 1; }
-    wanted+=("$v")
-  done <<< "$(mi_doc_values "$mrec" secret)"
-  if [ "${#wanted[@]}" -gt 0 ]; then
-    envfile="$(mi_secrets_envfile "$product" "${wanted[@]}")" || return 1
-  else
-    envfile="-"
-  fi
+  # Bootstrap secrets, per-key, from the policy index's grant — never the whole file. Collected AND
+  # entitlement-gated by the ONE helper recreate also calls, so the gate cannot drift between the verbs.
+  envfile="$(_mi_verb_secrets_envfile "$product" "$mrec" "$prec")" || return 1
 
   # INSTALL ALWAYS DECLARES `running` (§6b.3's verb table): install EXPRESSES intent, it never inherits
   # a prior generation's. Preserving is `recreate`'s job alone — only it carries a stopped product back
@@ -621,6 +640,23 @@ _mi_verb_recreate_locked() {
   prec="$(mi_led_field "$ctx" policy_records)"   || { mi_warn "verbs: context has no policy records"; return 1; }
   prec="$(printf '%s' "$prec" | tr '\036\037' '\n\t')"
   image="$(mi_led_field "$ctx" image)" || { mi_warn "verbs: context names no image"; return 1; }
+  # PRESERVE a recorded image override. install may have been given `--image X`, which it recorded as a
+  # `forced` ledger entry and which `status` reports as the running image. recreate takes no --image of
+  # its own and must NOT silently revert to the manifest's image — doing so runs an image `status` does
+  # not name (and, if the manifest's image was never pulled, tears the container down and cannot rebuild
+  # it). So recreate runs the SAME reference install selected: the running image and what `status`
+  # reports then agree. The manifest's digest pin does not apply to an overridden reference (D22/§13),
+  # exactly as at install.
+  local ov ovrc
+  if ov="$(mi_led_find forced key "${product}:image-override")"; then ovrc=0; else ovrc=$?; fi
+  if [ "$ovrc" -eq 0 ]; then
+    image="$(mi_led_field "$ov" ref)" || { mi_warn "verbs: the recorded image override for '$product' names no reference"; return 1; }
+    mi_warn "verbs: image override preserved — '$product' runs '$image' (recorded at install), not the"
+    mi_warn "  manifest's image. recreate does not change the image install selected."
+  elif [ "$ovrc" -ne 3 ]; then
+    mi_warn "verbs: could not read the image-override record for '$product' from the ledger."
+    return 1
+  fi
   alias="$(mi_led_field "$ctx" alias)" || { mi_warn "verbs: context names no alias"; return 1; }
   netid="$(mi_net_target "$idx")" || return 1
   # The core-fixed user-data mount points, before the mount check validates them (a recreate after a
@@ -636,11 +672,9 @@ _mi_verb_recreate_locked() {
     specs+=("$_line")
   done <<< "$_specs"
   specs+=("label=product=${product}")
-  local -a wanted; wanted=()
-  local v
-  while IFS= read -r v; do [ -n "$v" ] && wanted+=("$v"); done <<< "$(mi_doc_values "$mrec" secret)"
-  if [ "${#wanted[@]}" -gt 0 ]; then envfile="$(mi_secrets_envfile "$product" "${wanted[@]}")" || return 1
-  else envfile="-"; fi
+  # Bootstrap secrets through the SAME entitlement-gated helper install uses — the gate that used to be
+  # install-only, so recreate could no longer stage a secret the current policy denies.
+  envfile="$(_mi_verb_secrets_envfile "$product" "$mrec" "$prec")" || return 1
 
   # §6a: prove it is ours before removing it, on this path too.
   local arc

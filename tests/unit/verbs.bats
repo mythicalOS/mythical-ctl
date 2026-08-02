@@ -66,16 +66,29 @@ teardown() { teardown_test_env; }
 @test "install called as a library returns usage (2) on a value-less --image, never loops forever" {
   # The LIBRARY contract, not the CLI's guard: mi_verb_install must reject its own value-less option. A
   # bare `shift 2` past the end leaves $# unchanged and spins the option loop forever — a pure library
-  # has no errexit to abort it — taking the caller down too. Run under a timeout so a regression FAILS
-  # here (124) instead of hanging the suite; the fix returns 2 at once.
+  # has no errexit to abort it — taking the caller down too. The fix returns 2 at once.
   cat > "$BATS_TEST_TMPDIR/lib_call.sh" <<EOF
 for _m in common layout config lock ledger doc trust policy manifest detect runtime preflight exit prov intent state probe bringup netref verbs copy; do
   source "$_MCTL_ROOT/lib/\$_m.sh"
 done
 mi_verb_install "$IDX" "$POL" "$MAN" p1 --image
 EOF
-  run timeout 10 bash "$BATS_TEST_TMPDIR/lib_call.sh"
-  [ "$status" -eq 2 ]
+  # PORTABLE WATCHDOG, not GNU `timeout`: stock macOS/BSD has no `timeout` (only `gtimeout` after
+  # coreutils), and the Global Constraints require GNU AND BSD userland. Background the library call,
+  # poll up to ~10s with only shell builtins plus sleep, and SIGKILL a runaway — so a regression that
+  # spins the option loop is a clean FAILURE here (wrc≠2) instead of a hung suite. Verified under
+  # `env -i PATH=/usr/bin:/bin` (env.md trap #6), where `timeout` does not exist.
+  bash "$BATS_TEST_TMPDIR/lib_call.sh" > "$BATS_TEST_TMPDIR/lib_call.out" 2>&1 &
+  wpid=$!
+  waited=0
+  while kill -0 "$wpid" 2>/dev/null; do
+    waited=$((waited + 1))
+    if [ "$waited" -ge 100 ]; then kill -9 "$wpid" 2>/dev/null || true; break; fi
+    sleep 0.1
+  done
+  wrc=0; wait "$wpid" || wrc=$?
+  output="$(cat "$BATS_TEST_TMPDIR/lib_call.out")"
+  [ "$wrc" -eq 2 ]                              # usage, at once — NOT 137 (killed runaway), NOT a hang
   assert_contains "requires a value"
 }
 
@@ -415,6 +428,47 @@ EOF
   run mi_verb_status "$IDX" p1
   assert_contains "$ref"
   assert_contains "override"
+}
+
+@test "recreate PRESERVES an install-time --image override, so the running image and status agree (§13)" {
+  # install --image X records the override, runs X, and status reports X. recreate takes no --image of
+  # its own; before this fix it reverted to the manifest's image — tearing down the override container
+  # and, since the manifest image was never pulled, failing to rebuild it — while status still claimed
+  # the override active. The invariant: the running image and what status reports must agree.
+  ref="$(a_digestref localbuild)"
+  mi_verb_install "$IDX" "$POL" "$MAN" p1 --image "$ref" >/dev/null
+  IDENT="$(mi_ident_get)"; C="mythical-${IDENT}-p1"
+  run mi_verb_recreate "$IDX" "$POL" "$MAN" p1
+  [ "$status" -eq 0 ]
+  run mi_rt_inspect container c.image "$C"
+  [ "$output" = "$ref" ]                        # the RUNNING image is the override, not the manifest's
+  run mi_verb_status "$IDX" p1
+  assert_contains "$ref"                        # and status reports the same reference — they AGREE
+}
+
+@test "the shared bootstrap-secret gate refuses a secret the policy no longer grants (install+recreate share it)" {
+  # install and recreate stage bootstrap secrets through ONE helper, _mi_verb_secrets_envfile, which
+  # applies mi_policy_permits per key BEFORE staging anything — so the entitlement gate cannot drift
+  # between the two verbs (install carried this check; recreate did not). Exercised directly here,
+  # against the authenticated records both verbs derive. Accepting the documents records a trust floor,
+  # so it runs under the family lock.
+  mi_lock_acquire
+  mrec="$(mi_accept_manifest "$IDX" "$POL" "$MAN" p1)"
+  prec="$(mi_accept_policy "$IDX" "$POL")"
+  mi_lock_release
+  # GRANTED: the secret is staged into a real 0600 env file that actually carries it — positive
+  # evidence, not merely the absence of a refusal.
+  run _mi_verb_secrets_envfile p1 "$mrec" "$prec"
+  [ "$status" -eq 0 ]
+  [ -f "$output" ]
+  run grep -a '^MYTHICAL_TELEMETRY_KEY=tk$' "$output"
+  [ "$status" -eq 0 ]
+  rm -f "$output"
+  # REVOKED: the same manifest, but a policy with the grant stripped — refused, and nothing is staged.
+  prec_revoked="$(printf '%s' "$prec" | grep -av permitted_secret)"
+  run _mi_verb_secrets_envfile p1 "$mrec" "$prec_revoked"
+  [ "$status" -eq 1 ]
+  assert_contains "does not grant"
 }
 
 @test "--force-install is loud and reported by status" {
