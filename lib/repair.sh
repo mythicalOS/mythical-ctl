@@ -184,7 +184,7 @@ _mi_repair_show() {
 # The <index file> is accepted (as $1) for the uniform call shape every entry point into this area
 # takes; nothing in this function reads it — same as lib/netref.sh's mi_net_target.
 _mi_repair_netref() {
-  local ident="$2" name resolved common="" c nets pair ids first="" disagree=0 rc fleet=""
+  local ident="$2" name resolved common="" c nets pair ids first="" disagree=0 rc fleet="" saw_home=0
 
   if name="$(mi_conf_get "$(mi_conf_family_path)" MYTHICAL_NET)"; then rc=0; else rc=$?; fi
   [ "$rc" -eq 3 ] && return 0                    # no override: the installer's own network, nothing to rebuild
@@ -231,26 +231,67 @@ _mi_repair_netref() {
     # shellcheck disable=SC2206
     for pair in $nets; do [ -n "$pair" ] && ids="${ids} ${pair%%=*}"; done
     unset IFS
-    # One container's set may legitimately be {old,new} mid-migration; for this comparison take the
-    # FIRST NON-EMPTY token, which is enough to detect disagreement between containers. A pure-shell
-    # walk rather than `printf | tr | grep | head`: `head -n1` closes its stdin the instant it has its
-    # line, and if `$ids` holds more than one token the upstream `printf` can be signalled SIGPIPE —
-    # under THIS process's ambient options (this library sets none, but bin/mythical-ctl's caller-level
-    # `set -euo pipefail` still governs, since sourced functions run in the SAME shell) that can fail
-    # the assignment and abort mid-repair, AFTER the ledger has already been reset. `ids` always has a
-    # single leading space and single-space separators by construction above, but the walk still skips
-    # a blank token defensively (an empty `${pair%%=*}` from a malformed `nets` entry).
-    local one="" rest="$ids" tok
+    # THE CONTAINER'S FULL DISTINCT ATTACHMENT SET, NOT JUST ITS FIRST TOKEN. `c.nets` can legitimately
+    # list MULTIPLE networks — a container mid-migration (interrupted between D45 phases 2 and 4) is
+    # attached to BOTH the old network and the configured target at once. Taking only the first token
+    # (the prior form of this code) silently dropped the other one: if the target happened to be
+    # emitted first for every container — Docker does not guarantee attachment order — every
+    # container's "one" value was the target, `$common` came out equal to `$resolved`, and the branch
+    # below recorded a CLEAN reference with no migration intent. The old attachment then had no record
+    # anywhere: the ledger reported the migration complete while it had not even been recorded as
+    # started, and nothing would ever detach the containers from the source. A pure-shell walk, for the
+    # same SIGPIPE-safety reason the single-token version already was.
+    local cset="" rest="$ids" tok
     while [ -n "$rest" ]; do
       rest="${rest# }"
       tok="${rest%% *}"
       if [ "$tok" = "$rest" ]; then rest=""; else rest="${rest#* }"; fi
-      if [ -n "$tok" ]; then one="$tok"; break; fi
+      if [ -n "$tok" ]; then
+        case " $cset " in *" $tok "*) : ;; *) cset="${cset} ${tok}" ;; esac
+      fi
     done
-    [ -n "$one" ] || continue
-    if [ -z "$first" ]; then first="$one"; common="$one"
-    elif [ "$one" != "$first" ]; then disagree=1; fi
+    cset="${cset# }"
+    [ -n "$cset" ] || continue   # unattached — not a vote either way (unchanged from before)
+
+    # CLASSIFY THE SET AGAINST THE RESOLVED TARGET, rather than trusting whichever id happened to come
+    # first. Exactly {resolved} is "already home" and contributes no source signal (tracked via
+    # `saw_home` below, so an all-home fleet still reaches the clean "$common = $resolved" branch
+    # rather than being read as unattached). Exactly one OTHER id — alone, or alongside `resolved` — is
+    # this container's SOURCE signal, whether it has not been touched yet or is already mid-migration;
+    # either way `net rebind`'s own phase 2 is idempotent for a container already connected to the
+    # target, so both shapes are correctly handled by entering the SAME migration path with the SAME
+    # source. Anything else (two ids, neither `resolved`; or three or more ids at all) does not fit the
+    # single-source, single-target shape D45 assumes and is refused as a disagreement in its own right,
+    # not silently resolved by picking one.
+    local ccount=0 source_sig="" canom=0 ctok crest="$cset"
+    while [ -n "$crest" ]; do
+      ctok="${crest%% *}"
+      if [ "$ctok" = "$crest" ]; then crest=""; else crest="${crest#* }"; fi
+      [ -n "$ctok" ] || continue
+      ccount=$((ccount + 1))
+      if [ "$ctok" != "$resolved" ]; then
+        if [ -z "$source_sig" ]; then source_sig="$ctok"; else canom=1; fi
+      fi
+    done
+    if [ "$ccount" -gt 2 ]; then canom=1; fi
+
+    if [ "$canom" -eq 1 ]; then
+      disagree=1
+      continue
+    fi
+    if [ -z "$source_sig" ]; then
+      saw_home=1
+      continue
+    fi
+    if [ -z "$first" ]; then first="$source_sig"; common="$source_sig"
+    elif [ "$source_sig" != "$first" ]; then disagree=1; fi
   done <<< "$clist"
+
+  # AN ALL-HOME FLEET (every attached container's set was exactly {resolved}, so no container ever
+  # contributed a source signal) is the clean case, not "no attachments at all" — the empty-fleet-vs-
+  # unattached distinction the `[ -z "$common" ]` branch below already makes depends on `$common`
+  # meaning "nothing to compare", which is not true here.
+  if [ -z "$common" ] && [ "$saw_home" -eq 1 ]; then common="$resolved"; fi
 
   if [ "$disagree" -eq 1 ]; then
     mi_warn "repair: the containers do not agree about which network they are on. The fleet is already split"
@@ -916,7 +957,19 @@ _mi_verb_net_rebind_locked() {
   # the fleet came from. Mirrors lib/netref.sh's mi_net_ref_rebind, which makes this same check.
   if mi_led_find "$MI_NETMIG_KIND" key family >/dev/null 2>&1; then migrc=0; else migrc=$?; fi
   case "$migrc" in
-    0) mi_log "verbs: resuming the recorded network migration."
+    0) # CONFIRMATION COVERS RESUME TOO, NOT ONLY A FRESH REBIND. Resuming is not a read: depending on
+       # the recorded phase it can connect containers to the target, DETACH them from the source, and
+       # commit the new reference — the same destructive, fleet-mutating steps a fresh rebind performs,
+       # picked up partway through. Skipping the gate here let `MI_CONFIRM=no` (or an operator who
+       # answered "no" at a prompt) be silently overridden the moment a migration was already recorded:
+       # every OTHER destructive action in this module — the fresh-rebind branch a few lines below,
+       # repair's own trust-floor reset and its phased-migration entry, abandon-intent — asks first;
+       # this branch called mi_netmig_resume unconditionally, before this fix, without ever asking.
+       mi_warn "verbs: a network migration is already recorded and will be resumed from its saved phase."
+       mi_warn "  Depending on where it stopped, resuming can connect containers to the target network,"
+       mi_warn "  detach them from the source, and commit the new reference. This is never automatic."
+       mi_confirm "verbs: resume the recorded migration?" || { mi_warn "verbs: not confirmed."; return 1; }
+       mi_log "verbs: resuming the recorded network migration."
        # NORMALIZE TO THE VERB CONTRACT (0/1/2 only leave this function — 3 has no meaning at this
        # verb, "not launched" is a manifest concept). mi_netmig_resume itself re-reads the migration
        # record it was just told exists; if it vanished in the window between OUR mi_led_find above and

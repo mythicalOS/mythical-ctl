@@ -622,3 +622,57 @@ teardown() { teardown_test_env; }
   [ "$status" -ne 0 ]
   assert_contains "carries no readable name"
 }
+
+# --- codex round 6: 2 HIGH — a confirmation bypass and a multi-attachment mis-detection --------------
+
+@test "net rebind's RESUME branch respects MI_CONFIRM=no, exactly like a fresh rebind does" {
+  # A recorded migration (any phase) with MI_CONFIRM=no. Before the fix, the resume branch called
+  # mi_netmig_resume UNCONDITIONALLY — no mi_confirm anywhere on that path — so an explicit refusal
+  # was silently overridden the moment a migration was already recorded, even though resuming can
+  # detach containers from the source and commit the new reference, the same destructive steps a
+  # fresh rebind (which DOES confirm, a few lines below) performs. Pinned two ways: the verb must
+  # refuse, AND the recorded migration record must be untouched — proving nothing was attempted.
+  mi_lock_acquire
+  mi_ident_ensure >/dev/null
+  mi_led_put netmig key family "key=family" "phase=2" "source=srcid" "target=tgtid" "containers=c1"
+  mi_lock_release
+  before="$(mi_led_find netmig key family)"
+  MI_CONFIRM=no run mi_verb_net_rebind "$IDX"
+  [ "$status" -ne 0 ]
+  assert_contains "not confirmed"
+  case "$output" in *"resuming the recorded network migration"*)
+    echo "resumed despite refusing confirmation" >&2; false ;;
+  esac
+  load_mctl
+  run mi_led_find netmig key family
+  [ "$status" -eq 0 ]
+  [ "$output" = "$before" ]
+}
+
+@test "a container attached to BOTH old and target networks is detected as mid-migration, not clean" {
+  # opnet (the configured target) is created FIRST so it becomes c1's PRIMARY (first-attached)
+  # network; oldnet is connected SECOND. This fake runtime's c.nets lists attachments in the order a
+  # container joined them, so this reliably reproduces "the target happens to be emitted first" —
+  # exactly the ambiguity real Docker's unspecified map-iteration order can also produce for the
+  # identical underlying attachment state. Before the fix, the code took only the FIRST token in
+  # c.nets as "the" network: with the target first, every container's value was the target, `$common`
+  # came out equal to `$resolved`, and _mi_repair_netref recorded a clean target reference with NO
+  # migration intent — silently dropping all record of the still-live old attachment.
+  opnet="$(mi_rt_network_create opnet "" y)"
+  src="$(mi_rt_network_create oldnet "" x)"
+  mi_rt_image_pull "$(a_digestref p1)" >/dev/null
+  mi_rt_container_create c1 "$(a_digestref p1)" "$opnet" p1 - label=installation=instA label=nonce=nc1 >/dev/null
+  mi_rt_network_connect "$src" c1 p1 -1 >/dev/null
+  printf 'MYTHICAL_NET=opnet\n' > "$MYTHICAL_HOME/mythical.conf"
+  run mi_repair_run "$IDX" instA
+  [ "$status" -eq 0 ]
+  load_mctl
+  # A resumable migration intent was written, naming the OLD network as the source...
+  run mi_led_find netmig key family
+  [ "$status" -eq 0 ]
+  assert_contains "source=$src"
+  # ...and the reference names the OBSERVED (old) network, never the target, until the migration
+  # actually completes — recording the target here would be the exact split D46 exists to prevent.
+  run mi_net_ref_get
+  [ "$output" = "$src" ]
+}
