@@ -581,7 +581,18 @@ _mi_verb_install_locked() {
     if mi_prov_authority container "$container"; then arc=0; else arc=$?; fi
     case "$arc" in
       0) mi_rt_container_stop "$container" >/dev/null 2>&1 || true
-         mi_rt_container_rm "$container" >/dev/null 2>&1 || true ;;
+         # The removal must SUCCEED before bring-up creates the replacement under the same name. A discarded
+         # rm failure left the old container stopped-but-present, then mi_bringup failed on the name
+         # collision — taking a working installation DOWN for a replacement that could not happen. On an rm
+         # failure, restore the container we just stopped (best effort) and fail rather than proceed.
+         if ! mi_rt_container_rm "$container" >/dev/null 2>&1; then
+           mi_rt_container_start "$container" >/dev/null 2>&1 || true
+           [ "$envfile" = "-" ] || rm -f "$envfile"
+           mi_warn "verbs: could not remove the existing container for '$container' to replace it. It is"
+           mi_warn "  left in place (a restart was attempted) rather than taking your installation down."
+           mi_warn "  Resolve the removal failure — check the container runtime and permissions — then re-run."
+           return 1
+         fi ;;
       3) : ;;                       # already gone: nothing to remove, nothing to fear
       *) # A 0600 file of bootstrap secrets must not outlive the run on ANY path — including refusals.
          [ "$envfile" = "-" ] || rm -f "$envfile"
@@ -845,7 +856,18 @@ _mi_verb_recreate_locked() {
   if mi_prov_authority container "$c"; then arc=0; else arc=$?; fi
   case "$arc" in
     0) mi_rt_container_stop "$c" >/dev/null 2>&1 || true
-       mi_rt_container_rm "$c" >/dev/null 2>&1 || true ;;
+       # The removal must SUCCEED before bring-up creates the replacement under the same name. A discarded
+       # rm failure left the old container stopped-but-present and then mi_bringup failed on the name
+       # collision — taking a working installation DOWN for a replacement that could not happen. On an rm
+       # failure, restore the container we just stopped (best effort) and fail rather than proceed.
+       if ! mi_rt_container_rm "$c" >/dev/null 2>&1; then
+         mi_rt_container_start "$c" >/dev/null 2>&1 || true
+         [ "$envfile" = "-" ] || rm -f "$envfile"
+         mi_warn "verbs: could not remove the existing container for '$c' to replace it. It is left in"
+         mi_warn "  place (a restart was attempted) rather than taking your installation down. Resolve the"
+         mi_warn "  removal failure — check the container runtime and permissions — then re-run."
+         return 1
+       fi ;;
     3) : ;;
     *) [ "$envfile" = "-" ] || rm -f "$envfile"
        mi_warn "verbs: refusing to recreate '$c' (see above) — it is preserved."

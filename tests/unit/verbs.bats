@@ -800,3 +800,23 @@ EOF
   [ "$status" -eq 0 ]
   assert_contains "UNREADABLE"
 }
+
+@test "a re-install whose container removal FAILS does not proceed to bring-up and restores the container" {
+  mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
+  IDENT="$(mi_ident_get)"; C="mythical-${IDENT}-p1"
+  # the replacement's `container rm` fails → install must NOT proceed into mi_bringup (which would collide
+  # on the name and leave the product down); it restores the container it stopped and fails.
+  FAKE_DOCKER_INTERRUPT_AFTER='container rm' run mi_verb_install "$IDX" "$POL" "$MAN" p1
+  [ "$status" -eq 1 ]
+  run mi_rt_inspect container c.running "$C"     # still present and RUNNING — not left stopped or removed
+  [ "$output" = true ]
+}
+
+@test "a recreate whose container removal FAILS does not proceed to bring-up and restores the container" {
+  mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
+  IDENT="$(mi_ident_get)"; C="mythical-${IDENT}-p1"
+  FAKE_DOCKER_INTERRUPT_AFTER='container rm' run mi_verb_recreate "$IDX" "$POL" "$MAN" p1
+  [ "$status" -eq 1 ]
+  run mi_rt_inspect container c.running "$C"
+  [ "$output" = true ]
+}
