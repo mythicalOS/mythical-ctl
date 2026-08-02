@@ -547,3 +547,73 @@ EOF
   assert_contains "state repair"
   case "$output" in *"not created yet"*) echo "hid an unreadable operator network as not-created: $output" >&2; return 1 ;; esac
 }
+
+@test "a plain install CLEARS a prior --image override, so status reverts to the manifest image" {
+  # the override record must track the install that succeeded: after install --image X, a plain
+  # re-install runs the manifest image and must clear the override, or status/recreate keep naming X.
+  ref="$(a_digestref localbuild)"
+  mi_verb_install "$IDX" "$POL" "$MAN" p1 --image "$ref" >/dev/null
+  run mi_verb_status "$IDX" p1
+  assert_contains "image override"        # the override is in effect after the --image install
+  mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null   # plain re-install, no --image
+  run mi_verb_status "$IDX" p1
+  [ "$status" -eq 0 ]
+  case "$output" in *"image override"*) echo "plain install did not clear the override: $output" >&2; return 1 ;; esac
+}
+
+@test "a FAILED --image install records NO override, so a later plain install names none" {
+  # the override ledger record is written AFTER bring-up succeeds. A --image install that fails during
+  # the pull must leave no override behind for a later recreate to run or status to report.
+  ref="$(a_digestref abandoned)"
+  FAKE_DOCKER_PULL=neterr run mi_verb_install "$IDX" "$POL" "$MAN" p1 --image "$ref"
+  [ "$status" -eq 1 ]
+  mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null   # a clean manifest install afterwards
+  run mi_verb_status "$IDX" p1
+  [ "$status" -eq 0 ]
+  case "$output" in *"image override"*) echo "a failed --image install left a stale override: $output" >&2; return 1 ;; esac
+}
+
+@test "status reports an UNREADABLE installer-owned network record, not 'not created yet' (rc 1 is not rc 3)" {
+  # two provenance records answer for the same installer-owned network name → mi_prov_find is ambiguous
+  # (rc 1), NOT rc 3 (no record). Written through the ledger writer, checksum and all, the way a restore
+  # would — mi_led_put refuses to write a duplicate key directly. status must report it, not claim the
+  # network was never created.
+  IDENT="$(mi_ident_get)"; nname="$(mi_name_network "$IDENT")"
+  mi_lock_acquire
+  { mi_ledger_read
+    printf 'object\tkey=network:%s\tclass=network\tname=%s\tid=netid-a\n' "$nname" "$nname"
+    printf 'object\tkey=network:%s\tclass=network\tname=%s\tid=netid-b\n' "$nname" "$nname"
+  } | mi_ledger_write
+  mi_lock_release
+  run mi_verb_status "$IDX"
+  [ "$status" -eq 0 ]
+  assert_contains "UNREADABLE"
+  case "$output" in *"not created yet"*) echo "hid an ambiguous installer-network record as not-created: $output" >&2; return 1 ;; esac
+}
+
+@test "status reports an UNREADABLE network-migration record, not silence (rc 1 is not rc 3)" {
+  # two netmig records answer for key=family → mi_led_find is ambiguous (rc 1). A corrupt migration
+  # record must not be swallowed like rc 3 (no migration), which would let status claim a normal network
+  # while a migration is in an unrecoverable state.
+  mi_lock_acquire
+  { mi_ledger_read
+    printf 'netmig\tkey=family\tphase=1\tsource=neta\ttarget=netb\tcontainers=\n'
+    printf 'netmig\tkey=family\tphase=2\tsource=netc\ttarget=netd\tcontainers=\n'
+  } | mi_ledger_write
+  mi_lock_release
+  run mi_verb_status "$IDX"
+  [ "$status" -eq 0 ]
+  assert_contains "MIGRATION record UNREADABLE"
+}
+
+@test "a mutating verb STOPS when probe cleanup cannot complete — an unresolved probe is not stepped over" {
+  # probe cleanup runs first in _mi_verb_prepare. Make it fail: an ambiguous identity means it cannot say
+  # which probe container is ours, so it returns non-zero and the verb must not proceed to mutate state.
+  mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
+  mi_lock_acquire
+  mi_led_put identity id second "id=second"
+  mi_lock_release
+  run mi_verb_stop p1
+  [ "$status" -ne 0 ]
+  assert_contains "probe"
+}

@@ -38,7 +38,10 @@ _mi_with_lock() {
 # §6b.2 unaccounted-object gate that stops a verb before it touches anything.
 _mi_verb_prepare() {
   mi_ensure_layout || return 1
-  mi_probe_cleanup
+  # A probe cleanup that could not verify or remove a stale probe (rc != 0) leaves an unresolved probe
+  # intent. Proceeding to mutate installation state on top of it is exactly the "act on a question that
+  # could not be answered" this codebase refuses everywhere else — so a failed cleanup stops the verb.
+  mi_probe_cleanup || return 1
   mi_unaccounted_gate || return 1
   return 0
 }
@@ -362,7 +365,9 @@ _mi_verb_install_locked() {
   local fu
   if mi_first_use; then fu=0; else fu=$?; fi
   [ "$fu" -ne 1 ] || return 1
-  mi_probe_cleanup
+  # A stale probe that could not be verified or removed (rc != 0) stops the install before it mutates
+  # state, exactly as the other verbs do via _mi_verb_prepare.
+  mi_probe_cleanup || return 1
 
   local ctx rc mrec prec
   if ctx="$(mi_product_ctx "$idx" "$pol" "$man" "$product")"; then rc=0; else rc=$?; fi
@@ -406,15 +411,14 @@ _mi_verb_install_locked() {
   image="$(mi_led_field "$ctx" image)" || return 1
 
   if [ -n "$override" ]; then
-    # D22/§13: an override may name ANY reference, including a local build. Loud, recorded, reported.
+    # D22/§13: an override may name ANY reference, including a local build. Loud, and reported by status.
+    # The override LEDGER record is written AFTER bring-up succeeds (see the reconcile below), not here —
+    # a record written before the install completes would survive a failed --image install and be
+    # applied by a later recreate. Only `image` is set now, so this install runs the overridden image.
     mi_warn "verbs: IMAGE OVERRIDE — '$product' will run '$override' instead of the manifest's image."
-    mi_warn "  The manifest's digest pin does not apply to an overridden reference. Recorded, and"
-    mi_warn "  reported by 'status'."
+    mi_warn "  The manifest's digest pin does not apply to an overridden reference. It is reported by"
+    mi_warn "  'status' once the install succeeds."
     image="$override"
-    # Keyed by product AND kind: an install that is BOTH forced and image-overridden must record two
-    # facts, and a shared key made the second silently replace the first.
-    mi_led_put forced key "${product}:image-override" "key=${product}:image-override" \
-      "product=${product}" "kind=image-override" "ref=${override}" || return 1
   fi
 
   mi_unaccounted_gate || return 1
@@ -523,6 +527,19 @@ _mi_verb_install_locked() {
   # outlive the run that needed it.
   [ "$envfile" = "-" ] || rm -f "$envfile"
   [ "$rc" -eq 0 ] || return 1
+
+  # The image-override record reflects the install that SUCCEEDED, reconciled HERE — after bring-up, never
+  # before it. A failed --image install must leave no override for a later recreate to run (recreate runs
+  # the recorded override image) or status to report; and a plain install with no --image reverts to the
+  # manifest image, so it must CLEAR any override a prior install recorded — otherwise recreate and status
+  # would still name the old override while the container now runs the manifest image. mi_led_del is a
+  # no-op when there is nothing to clear.
+  if [ -n "$override" ]; then
+    mi_led_put forced key "${product}:image-override" "key=${product}:image-override" \
+      "product=${product}" "kind=image-override" "ref=${override}" || return 1
+  else
+    mi_led_del forced key "${product}:image-override" || return 1
+  fi
 
   mi_member_add "$product" || return 1
   mi_log "$product: installed and running."
@@ -1014,20 +1031,35 @@ mi_verb_status() {
     mi_log "network:      UNREADABLE — an operator network reference is recorded but could not be read"
     mi_log "  (see the warning above); this is not an absent network. Run 'mythical-ctl state repair'."
   else
-    local nname
+    # The installer-owned network. Same rc distinction one level in: mi_prov_find rc 3 is "no record —
+    # not created yet", but rc 1 is "a record exists and cannot be read", which must not be flattened
+    # into "not created yet" — that tells an operator with a corrupt network record that no network
+    # exists and invites a second one.
+    local nname prc
     nname="$(mi_name_network "$ident")"
-    if rec="$(mi_prov_find network "$nname")"; then
+    if rec="$(mi_prov_find network "$nname")"; then prc=0; else prc=$?; fi
+    if [ "$prc" -eq 0 ]; then
       mi_log "network:      $(mi_led_field "$rec" id) ($nname, created by this installer)"
-    else
+    elif [ "$prc" -eq 3 ]; then
       mi_log "network:      not created yet"
+    else
+      mi_log "network:      UNREADABLE — the record for '$nname' could not be read (see the warning"
+      mi_log "  above); this is not an absent network. Run 'mythical-ctl state repair'."
     fi
   fi
 
-  local mig
-  if mig="$(mi_led_find netmig key family 2>/dev/null)"; then
+  # rc 3 (no migration recorded) is the normal case and prints nothing; rc 1 (a netmig record exists but
+  # cannot be read) must NOT be silently swallowed like rc 3 — that would let status claim a normal
+  # network while a migration is in progress and its state is unrecoverably unclear.
+  local mig mgrc
+  if mig="$(mi_led_find netmig key family 2>/dev/null)"; then mgrc=0; else mgrc=$?; fi
+  if [ "$mgrc" -eq 0 ]; then
     mi_log "NETWORK MIGRATION IN PROGRESS — phase $(mi_led_field "$mig" phase)"
     mi_log "  source $(mi_led_field "$mig" source) → target $(mi_led_field "$mig" target)"
     mi_log "  Containers are on both networks; family DNS resolves on either. Resume with 'net rebind'."
+  elif [ "$mgrc" -ne 3 ]; then
+    mi_log "NETWORK MIGRATION record UNREADABLE — a migration is recorded but its record could not be"
+    mi_log "  read. Status of the network cannot be trusted. Run 'mythical-ctl state repair'."
   fi
 
   while IFS= read -r rec; do
