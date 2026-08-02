@@ -395,6 +395,8 @@ mi_copy_run() {
       *:unknown-entry-type) reason=unknown-entry-type; path="${v%:*}" ;;
       *:unreadable-linktarget) reason=unreadable-linktarget; path="${v%:*}" ;;
       *:missing-linktarget) reason=missing-linktarget; path="${v%:*}" ;;
+      *:unassociated-linktarget) reason=unassociated-linktarget; path="${v%:*}" ;;
+      *:duplicate-linktarget) reason=duplicate-linktarget; path="${v%:*}" ;;
       *) reason=unreadable; path="$v" ;;
     esac
     # One path, one message: the two sources of a refusal (an explicit `refused=` line and an `entry=`
@@ -439,6 +441,15 @@ mi_copy_run() {
         mi_warn "  for it, so its stored target was never shown and the escape backstop never ran on it. A"
         mi_warn "  symlink entry without a matching linktarget is refused: an undisclosed target cannot be"
         mi_warn "  shown not to escape the migrated tree." ;;
+      unassociated-linktarget)
+        mi_warn "copy: REFUSED $path — the copier disclosed a linktarget for a path it did NOT enumerate"
+        mi_warn "  as a symlink entry. A target with no symlink is a contradictory transcript — the"
+        mi_warn "  linktarget↔symlink relation is one-to-one — and is refused rather than trusted." ;;
+      duplicate-linktarget)
+        mi_warn "copy: REFUSED $path — the copier disclosed MORE THAN ONE linktarget for one symlink. A"
+        mi_warn "  symlink has exactly one stored target, so two is a contradiction (and lets a benign"
+        mi_warn "  target be shown beside an escaping one). Refused rather than reading whichever one"
+        mi_warn "  happens to be seen first." ;;
       *)
         mi_warn "copy: REFUSED — the copier stated a refusal in a form this core cannot read: '$v'."
         mi_warn "  It is treated as a refusal rather than skipped: an unreadable refusal is still one." ;;
@@ -660,21 +671,31 @@ _mi_copy_link_escapes() {
 # target no longer degrades it (the old first-colon split did). A linktarget it cannot parse is refused
 # (`:unreadable-linktarget`), never guessed.
 _mi_copy_refusals() {
-  local blob="$1" root="$2" v etype epath ltpaths="" p found
+  local blob="$1" root="$2" v etype epath ltpaths="" ltseen=$'\n' sympaths=$'\n' p found
   _mi_copy_fields "$blob" refused
-  # LINKTARGETS FIRST, so the entry pass below can cross-check every `symlink` against the set of paths
-  # that actually DISCLOSED a target. Each parsed linktarget is recorded in `ltpaths` (newline-delimited
-  # — a path may contain any byte but a newline, which the one-line format already forbids) and run
-  # through the escape backstop; an unparseable one is refused rather than guessed.
+  # THE SET OF `symlink` ENTRY PATHS, gathered first, so a `linktarget=` can be required to ASSOCIATE
+  # with exactly one symlink. One symlink has exactly one stored target, so the linktarget↔symlink
+  # relation is ONE-TO-ONE — and a transcript that violates it (a linktarget for a path that is not a
+  # symlink entry, or two linktargets for one symlink) is a contradiction the core can detect and must
+  # refuse, otherwise a copier can attach a benign target to a symlink while also emitting an escaping
+  # one, or disclose a target for something it did not enumerate.
   while IFS= read -r v; do
     [ -n "$v" ] || continue
-    if _mi_copy_linktarget_split "$v"; then
-      ltpaths="${ltpaths}${_MI_COPY_LT_PATH}"$'\n'
-      if _mi_copy_link_escapes "$_MI_COPY_LT_PATH" "$_MI_COPY_LT_TARGET" "$root"; then
-        printf '%s:escaping-symlink\n' "$_MI_COPY_LT_PATH"
-      fi
-    else
-      printf '%s:unreadable-linktarget\n' "$v"
+    case "$v" in symlink:*) sympaths="${sympaths}${v#*:}"$'\n' ;; esac
+  done <<< "$(_mi_copy_fields "$blob" entry)"
+  # LINKTARGETS: each must parse, ASSOCIATE with a symlink entry, occur EXACTLY ONCE for that symlink,
+  # and not escape. `ltpaths` records the associated ones so the entry pass can confirm every symlink
+  # disclosed a target; an unparseable, unassociated or duplicated one is refused rather than guessed.
+  while IFS= read -r v; do
+    [ -n "$v" ] || continue
+    if ! _mi_copy_linktarget_split "$v"; then printf '%s:unreadable-linktarget\n' "$v"; continue; fi
+    p="$_MI_COPY_LT_PATH"
+    case "$sympaths" in *$'\n'"${p}"$'\n'*) : ;; *) printf '%s:unassociated-linktarget\n' "$p"; continue ;; esac
+    case "$ltseen" in *$'\n'"${p}"$'\n'*) printf '%s:duplicate-linktarget\n' "$p"; continue ;; esac
+    ltseen="${ltseen}${p}"$'\n'
+    ltpaths="${ltpaths}${p}"$'\n'
+    if _mi_copy_link_escapes "$p" "$_MI_COPY_LT_TARGET" "$root"; then
+      printf '%s:escaping-symlink\n' "$p"
     fi
   done <<< "$(_mi_copy_fields "$blob" linktarget)"
   while IFS= read -r v; do

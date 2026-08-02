@@ -347,6 +347,14 @@ case "$cmd" in
       # problem; the value loop skips it.
       empty-mapped)
         printf 'mapped=\n' ;;
+      # A linktarget disclosed for a path that was NOT enumerated as a symlink entry — a contradiction
+      # (the relation is one-to-one), and a way to disclose a target for something never enumerated.
+      unassociated-lt)
+        emit_linktarget "$src/data/ghost" "../data/f" ;;
+      # TWO linktargets for one symlink — a contradiction that also lets a benign target be shown beside
+      # an escaping one. The extra one here is a plain second target for the same symlink.
+      dup-lt)
+        emit_linktarget "$src/data/link" "../data/other" ;;
       # A type OUTSIDE the closed set (file|dir|symlink|hardlink|special): a copier that met a FIFO or
       # a socket and enumerated it as `fifo:`/`socket:` rather than `special:`, then exited 0 with
       # done=ok. It counts toward the total and the copy "verifies" unless every entry's type is

@@ -158,6 +158,25 @@ teardown() { rm -rf "$DST" "$STAGE"; mi_lock_release; teardown_test_env; }
 # than `special:`, then exited 0 with done=ok, would otherwise have that entry COUNTED toward the total
 # and the copy reported verified. The exact hostile transcript — a `fifo:` entry alongside `done=ok` and
 # a zero exit — must be REFUSED.
+@test "a linktarget for a path that is NOT a symlink entry is REFUSED (unassociated)" {
+  # The linktarget<->symlink relation is one-to-one. A target disclosed for a path never enumerated as
+  # a symlink is a contradictory transcript — and a way to disclose a target for something the copier
+  # did not enumerate.
+  mkdir -p "$STAGE"
+  HELPER_COPY=unassociated-lt run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000
+  [ "$status" -ne 0 ]
+  assert_contains "did NOT enumerate"
+}
+
+@test "TWO linktargets for one symlink is REFUSED (duplicate) — one symlink has one target" {
+  # A copier could otherwise show a benign target beside an escaping one and have the core read the
+  # benign one.
+  mkdir -p "$STAGE"
+  HELPER_COPY=dup-lt run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000
+  [ "$status" -ne 0 ]
+  assert_contains "MORE THAN ONE linktarget"
+}
+
 @test "a copier padding with a NON-CANONICAL spelling of one path is REFUSED" {
   # `/src/data/a` and `/src/data/./a` are the same source object. Counting both pads the entry count
   # that binds verification, so a checked= total can cover a spelling while a dangerous entry is omitted.
