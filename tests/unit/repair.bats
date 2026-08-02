@@ -26,42 +26,42 @@ teardown() { teardown_test_env; }
 }
 
 @test "repair candidates are the DISTINCT installation identities present in object labels" {
-  mi_rt_volume_create v1 n1 instA
-  mi_rt_volume_create v2 n2 instA
-  mi_rt_volume_create v3 n3 instB
+  mi_rt_volume_create v1 n1 insta
+  mi_rt_volume_create v2 n2 insta
+  mi_rt_volume_create v3 n3 instb
   run mi_repair_candidates
   [ "$(printf '%s\n' "$output" | grep -ac .)" = 2 ]
-  assert_contains instA
-  assert_contains instB
+  assert_contains insta
+  assert_contains instb
 }
 
 @test "EXACTLY ONE candidate is still shown and still confirmed — never silently adopted" {
-  mi_rt_volume_create v1 n1 instA
+  mi_rt_volume_create v1 n1 insta
   MI_CONFIRM=no run mi_repair_run "$IDX"
   [ "$status" -ne 0 ]
-  assert_contains instA
+  assert_contains insta
   assert_contains "choose"
 }
 
 @test "two candidates: both shown, no action until one is chosen, the other's objects untouched" {
-  mi_rt_volume_create v1 n1 instA
-  mi_rt_volume_create v3 n3 instB
+  mi_rt_volume_create v1 n1 insta
+  mi_rt_volume_create v3 n3 instb
   MI_CONFIRM=no run mi_repair_run "$IDX"
   [ "$status" -ne 0 ]
-  assert_contains instA
-  assert_contains instB
+  assert_contains insta
+  assert_contains instb
   [ -e "$FAKE_DOCKER_STATE/volumes/v3" ]
 }
 
 @test "choosing an identity rebuilds provenance for containers, volumes and networks from labels" {
-  net="$(mi_rt_network_create netA instA nA)"
-  mi_rt_volume_create v1 n1 instA
+  net="$(mi_rt_network_create netA insta nA)"
+  mi_rt_volume_create v1 n1 insta
   # `container create` refuses an image that was never pulled, exactly as a real daemon does.
   mi_rt_image_pull "$(a_digestref p1)" >/dev/null
-  mi_rt_container_create c1 "$(a_digestref p1)" "$net" p1 - label=installation=instA label=nonce=nc1 >/dev/null
-  mi_repair_run "$IDX" instA
+  mi_rt_container_create c1 "$(a_digestref p1)" "$net" p1 - label=installation=insta label=nonce=nc1 >/dev/null
+  mi_repair_run "$IDX" insta
   run mi_ident_get
-  [ "$output" = instA ]
+  [ "$output" = insta ]
   run mi_prov_find volume v1
   [ "$status" -eq 0 ]
   run mi_prov_find network netA
@@ -71,8 +71,8 @@ teardown() { teardown_test_env; }
 }
 
 @test "repair NEVER rebuilds image provenance and never claims to enumerate images" {
-  mi_rt_volume_create v1 n1 instA
-  run mi_repair_run "$IDX" instA
+  mi_rt_volume_create v1 n1 insta
+  run mi_repair_run "$IDX" insta
   assert_contains "no image is deleted"
   assert_contains "cannot say which"
   load_mctl
@@ -81,10 +81,10 @@ teardown() { teardown_test_env; }
 }
 
 @test "outstanding checks are initialized to {alias} for EVERY recovered container" {
-  net="$(mi_rt_network_create netA instA nA)"
+  net="$(mi_rt_network_create netA insta nA)"
   mi_rt_image_pull "$(a_digestref p1)" >/dev/null
-  mi_rt_container_create c1 "$(a_digestref p1)" "$net" p1 - label=installation=instA label=nonce=nc1 >/dev/null
-  mi_repair_run "$IDX" instA
+  mi_rt_container_create c1 "$(a_digestref p1)" "$net" p1 - label=installation=insta label=nonce=nc1 >/dev/null
+  mi_repair_run "$IDX" insta
   run mi_state_outstanding c1
   assert_contains alias
 }
@@ -92,7 +92,7 @@ teardown() { teardown_test_env; }
 @test "a RUNNING recovered container is verified IN THE SAME REPAIR RUN" {
   # A live verification names the probe container `mythical-<identity>-probe-<nonce>`, validating the
   # identity as a doc.sh `ident` (lowercase letter, then [a-z0-9-]) exactly as a minted identity always
-  # is — so this fixture's chosen identity must actually be one, unlike the "instA" spelling other
+  # is — so this fixture's chosen identity must actually be one, unlike the "insta" spelling other
   # repair tests use for identities that never reach probe naming.
   net="$(mi_rt_network_create netA insta nA)"
   mi_rt_image_pull "$(a_digestref p1)" >/dev/null
@@ -105,13 +105,13 @@ teardown() { teardown_test_env; }
 }
 
 @test "desired state is set from OBSERVATION and reported as inferred, listing each container" {
-  net="$(mi_rt_network_create netA instA nA)"
+  net="$(mi_rt_network_create netA insta nA)"
   mi_rt_image_pull "$(a_digestref p1)" >/dev/null
   mi_rt_image_pull "$(a_digestref p2)" >/dev/null
-  mi_rt_container_create c1 "$(a_digestref p1)" "$net" p1 - label=installation=instA label=nonce=nc1 >/dev/null
-  mi_rt_container_create c2 "$(a_digestref p2)" "$net" p2 - label=installation=instA label=nonce=nc2 >/dev/null
+  mi_rt_container_create c1 "$(a_digestref p1)" "$net" p1 - label=installation=insta label=nonce=nc1 >/dev/null
+  mi_rt_container_create c2 "$(a_digestref p2)" "$net" p2 - label=installation=insta label=nonce=nc2 >/dev/null
   mi_rt_container_start c2 >/dev/null
-  run mi_repair_run "$IDX" instA
+  run mi_repair_run "$IDX" insta
   assert_contains "inferred from observation"
   assert_contains c1
   assert_contains c2
@@ -123,11 +123,11 @@ teardown() { teardown_test_env; }
 }
 
 @test "trust floors are RESET, with the rollback window stated and confirmed" {
-  mi_rt_volume_create v1 n1 instA
-  MI_CONFIRM=no run mi_repair_run "$IDX" instA
+  mi_rt_volume_create v1 n1 insta
+  MI_CONFIRM=no run mi_repair_run "$IDX" insta
   [ "$status" -ne 0 ]
   assert_contains "rollback"
-  run mi_repair_run "$IDX" instA
+  run mi_repair_run "$IDX" insta
   [ "$status" -eq 0 ]
 }
 
@@ -143,7 +143,7 @@ teardown() { teardown_test_env; }
 }
 
 @test "reinitialization is REFUSED when candidates were found — then the answer is to choose one" {
-  mi_rt_volume_create v1 n1 instA
+  mi_rt_volume_create v1 n1 insta
   run mi_repair_run "$IDX" --reinitialize
   [ "$status" -ne 0 ]
   assert_contains "choose"
@@ -151,21 +151,21 @@ teardown() { teardown_test_env; }
 
 @test "repair refuses while a LIVE lock is held" {
   mi_lock_acquire
-  run mi_repair_run "$IDX" instA
+  run mi_repair_run "$IDX" insta
   [ "$status" -ne 0 ]
   mi_lock_release
 }
 
 @test "repair states plainly that it cannot prove nothing is in flight" {
-  mi_rt_volume_create v1 n1 instA
-  run mi_repair_run "$IDX" instA
+  mi_rt_volume_create v1 n1 insta
+  run mi_repair_run "$IDX" insta
   assert_contains "cannot prove"
 }
 
 @test "an object arriving AFTER a repair that RETAINED the identity is unrecorded same-identity" {
-  mi_rt_volume_create v1 n1 instA
-  mi_repair_run "$IDX" instA
-  mi_rt_volume_create late n9 instA
+  mi_rt_volume_create v1 n1 insta
+  mi_repair_run "$IDX" insta
+  mi_rt_volume_create late n9 insta
   load_mctl; mi_lock_acquire
   run mi_unaccounted_gate
   [ "$status" -ne 0 ]
@@ -174,13 +174,13 @@ teardown() { teardown_test_env; }
 }
 
 @test "an object arriving after a REINITIALIZING repair is foreign-identity, listed, never touched" {
-  # instOLD's object must arrive AFTER the reinitializing repair, not before it: were it created first
+  # instold's object must arrive AFTER the reinitializing repair, not before it: were it created first
   # it would be a genuine candidate, and mi_repair_run --reinitialize correctly REFUSES to reinitialize
   # over an existing candidate (see "reinitialization is REFUSED when candidates were found" above) —
   # reinitializing anyway would strand it silently instead of reporting it.
   printf 'X=1\n' > "$MYTHICAL_HOME/brokkr.conf"
   mi_repair_run "$IDX" --reinitialize || true
-  mi_rt_volume_create old n1 instOLD
+  mi_rt_volume_create old n1 instold
   load_mctl; mi_lock_acquire
   run mi_unaccounted_gate
   [ "$status" -eq 0 ]
@@ -193,8 +193,8 @@ teardown() { teardown_test_env; }
 @test "the non-owned reference is reconstructed from mythical.conf, not from the ledger" {
   mi_rt_network_create opnet "" x >/dev/null
   printf 'MYTHICAL_NET=opnet\n' > "$MYTHICAL_HOME/mythical.conf"
-  mi_rt_volume_create v1 n1 instA
-  mi_repair_run "$IDX" instA
+  mi_rt_volume_create v1 n1 insta
+  mi_repair_run "$IDX" insta
   load_mctl
   run mi_net_ref_get
   [ "$status" -eq 0 ]
@@ -205,11 +205,11 @@ teardown() { teardown_test_env; }
 @test "reconstruction that finds a DIFFERENT network than the containers' stops and enters the migration" {
   src="$(mi_rt_network_create oldnet "" x)"
   mi_rt_image_pull "$(a_digestref p1)" >/dev/null
-  mi_rt_container_create c1 "$(a_digestref p1)" "$src" p1 - label=installation=instA label=nonce=nc1 >/dev/null
+  mi_rt_container_create c1 "$(a_digestref p1)" "$src" p1 - label=installation=insta label=nonce=nc1 >/dev/null
   mi_rt_container_start c1 >/dev/null
   mi_rt_network_create opnet "" y >/dev/null
   printf 'MYTHICAL_NET=opnet\n' > "$MYTHICAL_HOME/mythical.conf"
-  run mi_repair_run "$IDX" instA
+  run mi_repair_run "$IDX" insta
   assert_contains "differs"
   load_mctl
   run mi_led_find netmig key family
@@ -225,11 +225,11 @@ teardown() { teardown_test_env; }
   a="$(mi_rt_network_create na "" x)"; b="$(mi_rt_network_create nb "" y)"
   mi_rt_image_pull "$(a_digestref p1)" >/dev/null
   mi_rt_image_pull "$(a_digestref p2)" >/dev/null
-  mi_rt_container_create c1 "$(a_digestref p1)" "$a" p1 - label=installation=instA label=nonce=n1 >/dev/null
-  mi_rt_container_create c2 "$(a_digestref p2)" "$b" p2 - label=installation=instA label=nonce=n2 >/dev/null
+  mi_rt_container_create c1 "$(a_digestref p1)" "$a" p1 - label=installation=insta label=nonce=n1 >/dev/null
+  mi_rt_container_create c2 "$(a_digestref p2)" "$b" p2 - label=installation=insta label=nonce=n2 >/dev/null
   mi_rt_network_create opnet "" z >/dev/null
   printf 'MYTHICAL_NET=opnet\n' > "$MYTHICAL_HOME/mythical.conf"
-  run mi_repair_run "$IDX" instA
+  run mi_repair_run "$IDX" insta
   [ "$status" -ne 0 ]
   assert_contains "already split"
 }
@@ -258,7 +258,7 @@ teardown() { teardown_test_env; }
 # must now FAIL CLOSED and say so, never quietly drop or adopt installation state.
 
 @test "candidate discovery FAILS CLOSED when an object's installation label cannot be read" {
-  mi_rt_volume_create v1 n1 instA
+  mi_rt_volume_create v1 n1 insta
   # Call 1: container ls · call 2: volume ls · call 3: the volume's install-label inspect — the one
   # this pins. Before the fix, `2>/dev/null || true` turned that failure into an empty label, v1 was
   # silently omitted, and discovery could report zero or one candidate with an object it never asked
@@ -270,13 +270,13 @@ teardown() { teardown_test_env; }
 }
 
 @test "the post-reset rebuild loop FAILS CLOSED when an object's installation label cannot be read" {
-  mi_rt_volume_create v1 n1 instA
-  # The ledger has already been reset for identity instA by the time this fails (calibrated: the 11th
+  mi_rt_volume_create v1 n1 insta
+  # The ledger has already been reset for identity insta by the time this fails (calibrated: the 11th
   # runtime call under the knob is v1's install-label read inside the rebuild loop, AFTER candidate
   # discovery already succeeded once against it). Before the fix this silently skipped v1 — the ledger
   # ends up with an identity and no provenance for the object that identity was chosen for, reported
   # as a completed repair.
-  FAKE_DOCKER_DOWN_AFTER=10 run mi_repair_run "$IDX" instA
+  FAKE_DOCKER_DOWN_AFTER=10 run mi_repair_run "$IDX" insta
   [ "$status" -ne 0 ]
   assert_contains "could not be asked for its installation label"
   assert_contains "already been reset"
@@ -286,9 +286,9 @@ teardown() { teardown_test_env; }
 }
 
 @test "network reconstruction FAILS CLOSED when a container's installation label cannot be read" {
-  net="$(mi_rt_network_create netA instA nA)"
+  net="$(mi_rt_network_create netA insta nA)"
   mi_rt_image_pull "$(a_digestref p1)" >/dev/null
-  mi_rt_container_create c1 "$(a_digestref p1)" "$net" p1 - label=installation=instA label=nonce=nc1 >/dev/null
+  mi_rt_container_create c1 "$(a_digestref p1)" "$net" p1 - label=installation=insta label=nonce=nc1 >/dev/null
   mi_rt_network_create opnet "" x >/dev/null
   printf 'MYTHICAL_NET=opnet\n' > "$MYTHICAL_HOME/mythical.conf"
   # Calibrated to land on _mi_repair_netref's OWN read of c1's install label (after candidate discovery
@@ -296,7 +296,7 @@ teardown() { teardown_test_env; }
   # silently skipped c1 from the "do the containers agree" comparison, so repair could record a clean
   # non-owned reference even though c1 might still be on the OLD network — a split fleet the ledger
   # would then report as healthy.
-  FAKE_DOCKER_DOWN_AFTER=24 run mi_repair_run "$IDX" instA
+  FAKE_DOCKER_DOWN_AFTER=24 run mi_repair_run "$IDX" insta
   [ "$status" -ne 0 ]
   assert_contains "could not be asked for its installation label"
   assert_contains "fleet agrees"
@@ -306,14 +306,14 @@ teardown() { teardown_test_env; }
 }
 
 @test "'+none' is never recorded from an unread network-attachment state" {
-  net="$(mi_rt_network_create netA instA nA)"
+  net="$(mi_rt_network_create netA insta nA)"
   mi_rt_image_pull "$(a_digestref p1)" >/dev/null
-  mi_rt_container_create c1 "$(a_digestref p1)" "$net" p1 - label=installation=instA label=nonce=nc1 >/dev/null
+  mi_rt_container_create c1 "$(a_digestref p1)" "$net" p1 - label=installation=insta label=nonce=nc1 >/dev/null
   # Calibrated to land on c1's c.nets read inside the desired-state block, after its provenance record
   # has already been written. Before the fix, a failed read here defaulted to empty and was recorded as
   # "+none" — asserting NO live verification is owed for a container that may well be attached and
   # running, the opposite of the honest "outstanding" default this whole module exists to keep.
-  FAKE_DOCKER_DOWN_AFTER=18 run mi_repair_run "$IDX" instA
+  FAKE_DOCKER_DOWN_AFTER=18 run mi_repair_run "$IDX" insta
   [ "$status" -ne 0 ]
   assert_contains "'+none' from an unread state"
   load_mctl
@@ -343,16 +343,16 @@ teardown() { teardown_test_env; }
 # argument handling, not in the library functions repair.bats calls directly everywhere else.
 
 @test "CLI: 'state repair <identity>' threads the chosen identity through to the library" {
-  mi_rt_volume_create v1 n1 instA
+  mi_rt_volume_create v1 n1 insta
   # Before the fix, main() parsed products[1] (the identity) but called mi_verb_state_repair "$idx"
   # WITHOUT it, so the library saw no choice at all and printed the "choose one explicitly" refusal
   # even though the operator DID choose — the one documented safe recovery path was unusable from the
   # CLI.
-  run_mctl state repair instA --index "$IDX"
+  run_mctl state repair insta --index "$IDX"
   assert_ok
   load_mctl
   run mi_ident_get
-  [ "$output" = instA ]
+  [ "$output" = insta ]
 }
 
 @test "CLI: 'state abandon-intent <class> <name> <extra>' is a usage error, nothing attempted" {
@@ -397,28 +397,33 @@ teardown() { teardown_test_env; }
 }
 
 @test "candidate discovery keeps DISTINCT identities distinct even when one is a prefix of another" {
-  # "A B" and "A": a space-padded `case " $seen " in *" $id "*)` dedup treats "A" as already counted
-  # once "A B" is in the set, because " A " is a literal substring of " A B ". Before the fix, "A"
-  # vanished from the candidate list entirely — two distinct installations collapsed into one, which
-  # is exactly what the exactly-one-candidate adoption rule depends on never happening.
-  mi_rt_volume_create v1 n1 "A B"
-  mi_rt_volume_create v2 n2 "A"
+  # "abc-x" and "abc": "abc" is a literal string prefix of "abc-x". Round 3's original form of this
+  # test used space-containing identities ("A B" and "A") to pin a space-padded
+  # `case " $seen " in *" $id "*)` dedup bug directly — that specific exploit is now unreachable
+  # (round 7's identity-format validation rejects a space-containing label before dedup ever sees it),
+  # but the newline-anchored matching that replaced it is worth pinning on its own terms: a naive,
+  # un-anchored `case "$seen" in *"$id"*)` would ALSO treat "abc" as already counted once "abc-x" is
+  # in the set, for the same prefix reason, just one delimiter over. Two distinct identities must
+  # remain two candidates either way.
+  mi_rt_volume_create v1 n1 "abc-x"
+  mi_rt_volume_create v2 n2 "abc"
   run mi_repair_candidates
   [ "$(printf '%s\n' "$output" | grep -ac .)" = 2 ]
-  assert_contains "A B"
+  assert_contains "abc-x"
+  assert_contains "abc"
 }
 
 @test "a repair-reconstructed network migration never records an empty fleet" {
   src="$(mi_rt_network_create oldnet "" x)"
   mi_rt_image_pull "$(a_digestref p1)" >/dev/null
-  mi_rt_container_create c1 "$(a_digestref p1)" "$src" p1 - label=installation=instA label=nonce=nc1 >/dev/null
+  mi_rt_container_create c1 "$(a_digestref p1)" "$src" p1 - label=installation=insta label=nonce=nc1 >/dev/null
   mi_rt_container_start c1 >/dev/null
   mi_rt_network_create opnet "" y >/dev/null
   printf 'MYTHICAL_NET=opnet\n' > "$MYTHICAL_HOME/mythical.conf"
   # Before the fix, the migration record this writes hardcoded `containers=` with nothing after the
   # `=` — ALWAYS, regardless of how many containers were actually found — so 'net rebind' would read
   # an empty fleet back from the very record that is supposed to describe it and have nothing to move.
-  run mi_repair_run "$IDX" instA
+  run mi_repair_run "$IDX" insta
   [ "$status" -eq 0 ]
   load_mctl
   run mi_led_find netmig key family
@@ -452,11 +457,11 @@ teardown() { teardown_test_env; }
   # the disagreement branch a few lines above it.
   net="$(mi_rt_network_create netA "" x)"
   mi_rt_image_pull "$(a_digestref p1)" >/dev/null
-  mi_rt_container_create c1 "$(a_digestref p1)" "$net" p1 - label=installation=instA label=nonce=nc1 >/dev/null
+  mi_rt_container_create c1 "$(a_digestref p1)" "$net" p1 - label=installation=insta label=nonce=nc1 >/dev/null
   mi_rt_network_disconnect "$net" c1 >/dev/null
   mi_rt_network_create opnet "" y >/dev/null
   printf 'MYTHICAL_NET=opnet\n' > "$MYTHICAL_HOME/mythical.conf"
-  run mi_repair_run "$IDX" instA
+  run mi_repair_run "$IDX" insta
   [ "$status" -ne 0 ]
   assert_contains "none of them share a single attached"
   load_mctl
@@ -471,10 +476,10 @@ teardown() { teardown_test_env; }
   # class: a silent no-match that is indistinguishable from a genuine zero) could collapse a real
   # candidate down to a count of zero and, with MI_CONFIRM=yes already set here, mint a brand-new
   # identity and reset the ledger over it instead of asking which one to choose.
-  mi_rt_volume_create v1 n1 instA
+  mi_rt_volume_create v1 n1 insta
   run mi_repair_run "$IDX"
   [ "$status" -ne 0 ]
-  assert_contains instA
+  assert_contains insta
   assert_contains "found 1 installation identity"
   case "$output" in *reinitializ*) echo "unexpectedly took the reinitialize path" >&2; false ;; esac
   load_mctl
@@ -491,11 +496,11 @@ teardown() { teardown_test_env; }
   src="$(mi_rt_network_create oldnet "" x)"
   mi_rt_image_pull "$(a_digestref p1)" >/dev/null
   mi_rt_image_pull "$(a_digestref p2)" >/dev/null
-  mi_rt_container_create c1 "$(a_digestref p1)" "$src" p1 - label=installation=instA label=nonce=nc1 >/dev/null
-  mi_rt_container_create c2 "$(a_digestref p2)" "$src" p2 - label=installation=instA label=nonce=nc2 >/dev/null
+  mi_rt_container_create c1 "$(a_digestref p1)" "$src" p1 - label=installation=insta label=nonce=nc1 >/dev/null
+  mi_rt_container_create c2 "$(a_digestref p2)" "$src" p2 - label=installation=insta label=nonce=nc2 >/dev/null
   mi_rt_network_create opnet "" y >/dev/null
   printf 'MYTHICAL_NET=opnet\n' > "$MYTHICAL_HOME/mythical.conf"
-  run mi_repair_run "$IDX" instA
+  run mi_repair_run "$IDX" insta
   [ "$status" -eq 0 ]
   load_mctl
   run mi_led_find netmig key family
@@ -512,10 +517,10 @@ teardown() { teardown_test_env; }
   # as provenance verbatim (`nonce=`), and every later authority check (mi_prov_authority) refuses an
   # empty-nonce record outright — so the object repair had just claimed to recover became permanently
   # unownable: no deletion, no state commit, nothing could act on it through this installer again.
-  net="$(mi_rt_network_create netA instA nA)"
+  net="$(mi_rt_network_create netA insta nA)"
   mi_rt_image_pull "$(a_digestref p1)" >/dev/null
-  mi_rt_container_create c1 "$(a_digestref p1)" "$net" p1 - label=installation=instA >/dev/null
-  run mi_repair_run "$IDX" instA
+  mi_rt_container_create c1 "$(a_digestref p1)" "$net" p1 - label=installation=insta >/dev/null
+  run mi_repair_run "$IDX" insta
   [ "$status" -ne 0 ]
   assert_contains "no nonce label at all"
   load_mctl
@@ -525,18 +530,18 @@ teardown() { teardown_test_env; }
 
 @test "the PUBLIC verb rejects a surplus operand itself, at the library boundary, nothing attempted" {
   # Before the fix, mi_repair_run and mi_verb_state_repair checked only a LOWER bound ($# -lt 1), so a
-  # surplus third operand passed straight through: mi_verb_state_repair "$IDX" instA stray silently
+  # surplus third operand passed straight through: mi_verb_state_repair "$IDX" insta stray silently
   # used only the first two and, with MI_CONFIRM=yes already set here, would have reset the ledger and
-  # adopted instA rather than returning usage. bin/mythical-ctl's own argument parser already rejects
+  # adopted insta rather than returning usage. bin/mythical-ctl's own argument parser already rejects
   # this at the CLI, but the operator-verb contract (wrong arity -> rc 2, nothing attempted) has to
   # hold for a caller of the library verb directly too, not only through the CLI in front of it.
-  mi_rt_volume_create v1 n1 instA
-  run mi_verb_state_repair "$IDX" instA stray
+  mi_rt_volume_create v1 n1 insta
+  run mi_verb_state_repair "$IDX" insta stray
   [ "$status" -eq 2 ]
   load_mctl
   run mi_ident_get
   [ "$status" -eq 3 ]
-  run mi_repair_run "$IDX" instA stray
+  run mi_repair_run "$IDX" insta stray
   [ "$status" -ne 0 ]
 }
 
@@ -661,10 +666,10 @@ teardown() { teardown_test_env; }
   opnet="$(mi_rt_network_create opnet "" y)"
   src="$(mi_rt_network_create oldnet "" x)"
   mi_rt_image_pull "$(a_digestref p1)" >/dev/null
-  mi_rt_container_create c1 "$(a_digestref p1)" "$opnet" p1 - label=installation=instA label=nonce=nc1 >/dev/null
+  mi_rt_container_create c1 "$(a_digestref p1)" "$opnet" p1 - label=installation=insta label=nonce=nc1 >/dev/null
   mi_rt_network_connect "$src" c1 p1 -1 >/dev/null
   printf 'MYTHICAL_NET=opnet\n' > "$MYTHICAL_HOME/mythical.conf"
-  run mi_repair_run "$IDX" instA
+  run mi_repair_run "$IDX" insta
   [ "$status" -eq 0 ]
   load_mctl
   # A resumable migration intent was written, naming the OLD network as the source...
@@ -675,4 +680,46 @@ teardown() { teardown_test_env; }
   # actually completes — recording the target here would be the exact split D46 exists to prevent.
   run mi_net_ref_get
   [ "$output" = "$src" ]
+}
+
+# --- codex round 7: 1 HIGH — label injection into candidate discovery ---------------------------------
+
+@test "a newline-bearing installation label is never split into forged candidates, nor adoptable" {
+  # Docker label VALUES can contain arbitrary bytes, including a newline — this fake runtime's own
+  # storage cannot represent that (tests/harness/docker: "Records are key=value lines. Values never
+  # contain a newline in any fixture."), so the forged label is injected by wrapping mi_rt_inspect
+  # rather than through the normal create path, which is the only way to exercise what a real daemon
+  # could actually hand back. v2's REAL label is irrelevant here; only what the wrapped read answers
+  # for it matters. Before the fix, mi_repair_candidates appended each label's raw value, newline-
+  # terminated, with no validation — so `installation=$'foreign\nvictim'` was reported as TWO
+  # candidates, "foreign" AND "victim", and "victim" passed mi_repair_run's exact-line membership
+  # test for an operator's choice even though no real object's actual label is the bare string
+  # "victim". Selecting it reset the ledger and adopted an identity that owned nothing.
+  mi_rt_volume_create v1 n1 real-id
+  mi_rt_volume_create v2 n2 placeholder
+  eval "$(declare -f mi_rt_inspect | sed '1s/^mi_rt_inspect/_orig_mi_rt_inspect/')"
+  mi_rt_inspect() {
+    if [ "$1" = volume ] && [ "$2" = v.install ] && [ "$3" = v2 ]; then
+      printf 'foreign\nvictim\n'
+      return 0
+    fi
+    _orig_mi_rt_inspect "$@"
+  }
+  run mi_repair_candidates
+  # NOT a line count: mi_warn's multi-line malformed-label diagnostic and mi_repair_candidates' own
+  # candidate output share $output (bats merges stdout and stderr), so counting non-empty lines would
+  # count the warning's own lines as if they were candidates. Assert on content instead: the real
+  # candidate is present, and NEITHER forged half of the injected label is, anywhere in $output.
+  [ "$status" -eq 0 ]
+  assert_contains real-id
+  case "$output" in *victim*|*foreign*)
+    echo "a forged half of the injected label was reported as a candidate" >&2; false ;;
+  esac
+  assert_contains "not a single"
+  run mi_repair_run "$IDX" victim
+  [ "$status" -ne 0 ]
+  assert_contains "not one of the identities found"
+  load_mctl
+  run mi_ident_get
+  [ "$status" -eq 3 ]
 }

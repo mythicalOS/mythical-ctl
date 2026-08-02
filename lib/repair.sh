@@ -123,14 +123,37 @@ mi_repair_candidates() {
         return 1
       fi
       [ -n "$id" ] || continue
-      # NEWLINE-ANCHORED, NOT SPACE-PADDED. An installation identity read straight off a label is not
-      # constrained to lib/doc.sh's `ident` charset the way a MINTED one always is (_mi_ident_mint is
-      # always `i`+10 hex digits, but this reads whatever string is actually on the object) — so a
-      # space-padded `case " $seen " in *" $id "*)` can match a PREFIX: seeing "A B" first and then
-      # asking about "A" finds " A " inside " A B " and treats "A" as already counted, silently
-      # collapsing two DISTINCT identities into one candidate. A newline can appear in neither $seen
-      # nor $id (both are single values `_mi_repair_install_of` already split on TAB-delimited label
-      # output, which has no embedded newline), so anchoring on it instead is exact.
+      # VALIDATE BEFORE TREATING IT AS A CANDIDATE — A DOCKER LABEL VALUE CAN CONTAIN A NEWLINE.
+      # `_mi_repair_install_of` reads the label verbatim and constrains nothing about its charset,
+      # only that it successfully answered. This list is built by APPENDING each `$id`,
+      # newline-terminated, so an unvalidated value is a direct injection: an object labelled
+      # `installation=$'foreign\nvictim'` would otherwise be reported as TWO candidates, "foreign"
+      # AND "victim" — and "victim" then passes `mi_repair_run`'s exact-line membership test for an
+      # operator's choice (`case $'\n'"$cands" in *$'\n'"$choice"$'\n'*)`), even though no real
+      # object's actual label is the bare string "victim". Choosing the forged half resets the ledger
+      # and records that identity — and the rebuild loop, which compares the SAME raw, unmangled
+      # label against the choice, then finds no object whose label equals it: state reset, and an
+      # identity adopted that owns nothing.
+      #
+      # `_mi_name_part_ok` is the SAME `ident`-charset validator every minted identity, product name,
+      # role and volume name already passes through (lib/manifest.sh) — reused rather than a second
+      # rule, and its charset (`[a-z][a-z0-9-]*`, no newline, no tab, no space) rejects the injection
+      # at its source rather than merely in this one caller's dedup. A minted identity (`_mi_ident_mint`:
+      # `i` + 10 lowercase hex) always passes it; anything a forged or hand-edited label could carry
+      # that is not itself one clean identity does not.
+      if ! _mi_name_part_ok "$id"; then
+        mi_warn "repair: '$name' ($kind) carries an installation label that is not a single"
+        mi_warn "  well-formed identity. It is not reported as a candidate — a label that does not"
+        mi_warn "  parse as exactly one identity cannot be trusted as one, forged or not. This object"
+        mi_warn "  needs manual attention: inspect and relabel or remove it with the container"
+        mi_warn "  runtime directly."
+        continue
+      fi
+      # NEWLINE-ANCHORED, NOT SPACE-PADDED. Kept as defense in depth alongside the validation above —
+      # a space-padded `case " $seen " in *" $id "*)` can match a PREFIX (seeing "A B" first and then
+      # asking about "A" finds " A " inside " A B "), silently collapsing two DISTINCT identities into
+      # one candidate. `$id` is now proven to contain no newline at all (the validation above already
+      # excludes one), so anchoring on it is exact rather than merely safer.
       case "$seen" in *$'\n'"$id"$'\n'*) continue ;; esac
       seen="${seen}${id}"$'\n'
       out="${out}${id}"$'\n'
