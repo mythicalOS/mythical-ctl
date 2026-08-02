@@ -319,6 +319,16 @@ case "$cmd" in
       printf 'done=ok\n'
       fin 0
     fi
+    # `emptytarget-lt`: a symlink whose disclosed linktarget PARSES but whose target suffix is EMPTY —
+    # pathlen equals the whole body, so the symlink points at nothing. emit_linktarget with an empty
+    # target produces exactly that.
+    if [ "$knob" = emptytarget-lt ]; then
+      printf 'entry=dir:%s/data\n'         "$src"
+      printf 'entry=symlink:%s/data/link\n' "$src"
+      emit_linktarget "$src/data/link" ""
+      printf 'done=ok\n'
+      fin 0
+    fi
     # The ordinary tree, reported on EVERY setting, so the contract observations are present in the
     # plain case too and a caller cannot pass its symlink assertions only on a knobbed fixture. FIVE
     # `entry=` lines: the copy's own source enumeration, and the count the verify half is measured

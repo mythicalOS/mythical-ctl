@@ -631,7 +631,10 @@ _mi_copy_linktarget_split() {
   body="${v%:*}"
   # The path is at least one byte and cannot be longer than the body it prefixes. Length-bounded before
   # the arithmetic so an absurd stated length cannot trip `[`'s integer-expression path (bash 3.2).
-  if [ "${#pathlen}" -gt 10 ] || [ "$pathlen" -lt 1 ] || [ "$pathlen" -gt "${#body}" ]; then return 1; fi
+  # `-ge`, not `-gt`: the path length must be STRICTLY LESS than the body, so the target suffix has at
+  # least one byte. `pathlen == ${#body}` would leave an EMPTY target — a symlink pointing at nothing,
+  # which is not a real disclosed target and cannot be shown not to escape. Refused, not read as clean.
+  if [ "${#pathlen}" -gt 10 ] || [ "$pathlen" -lt 1 ] || [ "$pathlen" -ge "${#body}" ]; then return 1; fi
   _MI_COPY_LT_PATH="${body:0:pathlen}"
   _MI_COPY_LT_TARGET="${body:pathlen}"
   return 0

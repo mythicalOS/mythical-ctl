@@ -172,6 +172,14 @@ teardown() { rm -rf "$DST" "$STAGE"; mi_lock_release; teardown_test_env; }
   assert_contains "unexpected key"
 }
 
+@test "a linktarget whose TARGET suffix is empty is REFUSED — a symlink pointing at nothing" {
+  # The length-delimited split with pathlen == body length leaves an empty target: a symlink to the
+  # empty string, which cannot be shown not to escape and is not a real disclosed target.
+  mkdir -p "$STAGE"
+  HELPER_COPY=emptytarget-lt run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000
+  [ "$status" -ne 0 ]
+}
+
 @test "an EMPTY linktarget= record is REFUSED — a disclosed target that names nothing" {
   mkdir -p "$STAGE"
   HELPER_COPY=empty-lt run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000
