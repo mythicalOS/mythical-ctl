@@ -295,6 +295,42 @@ _mi_verb_secrets_envfile() {
   fi
 }
 
+# Ensure the selected image is present, and record it. PULL ONLY ON CONFIRMED ABSENCE: mi_rt_image_present
+# answers present/not-present but cannot tell "absent" from "the daemon could not answer", and sending the
+# second to a pull is the rc-1→rc-3 fold this plan refuses everywhere — so a not-present answer is
+# disambiguated with mi_rt_ping (a question that does not depend on the image): a daemon that answers means
+# the image is genuinely absent and we pull; a daemon that does NOT answer stops rather than pulling.
+#
+# Both install AND recreate call this BEFORE they stop or remove any existing container, so an image that
+# cannot be made available fails the verb (rc 1) with the working installation PRESERVED, rather than torn
+# down and then un-rebuildable. It used to be install-only; a manifest that advanced to an unpulled image
+# then let recreate destroy the container and fail to recreate it, leaving the operator with nothing.
+_mi_verb_ensure_image() {
+  if [ "$#" -ne 2 ]; then mi_warn "verbs: _mi_verb_ensure_image needs <image> <product>"; return 1; fi
+  local image="$1" product="$2"
+  local present=0
+  if mi_rt_image_present "$image"; then present=1; fi
+  if [ "$present" -eq 0 ]; then
+    if ! mi_rt_ping; then
+      mi_warn "verbs: could not determine whether the image for '$product' is already present — the"
+      mi_warn "  container runtime did not answer. Refusing rather than pulling on a question that"
+      mi_warn "  could not be asked."
+      return 1
+    fi
+    local perr
+    if ! perr="$(mi_rt_image_pull "$image" 2>&1)"; then
+      mi_warn "verbs: the image for '$product' could not be pulled:"
+      mi_warn "    $image"
+      mi_warn "  The runtime said:"
+      mi_warn "    $perr"
+      mi_warn "  The manifest declares this product LAUNCHED, so this is a release or registry problem,"
+      mi_warn "  not a pre-launch state. It is reported as a failure deliberately."
+      return 1
+    fi
+  fi
+  mi_prov_image_record "$image" "$product" || return 1
+}
+
 # --- install (desired state: running) -------------------------------------------------------------
 mi_verb_install() {
   if [ "$#" -lt 4 ]; then mi_warn "verbs: install needs <index> <policy> <manifest> <product> [--image REF] [--force-install]"; return 2; fi
@@ -386,38 +422,12 @@ _mi_verb_install_locked() {
   local netid
   netid="$(mi_net_target "$idx")" || return 1
 
-  # The pull. EVERY failure is loud and distinguishable (§7.3) and exits 1 — never folded into the
-  # pre-launch message, whatever status the runtime reports it as.
-  #
-  # PULL ONLY ON CONFIRMED ABSENCE. mi_rt_image_present answers present/not-present but cannot tell "the
-  # image is absent" from "the daemon could not answer" — and sending the second to a pull is the
-  # rc-1→rc-3 fold this plan refuses everywhere else. So a not-present answer is disambiguated the way
-  # mi_rt_inspect does it, by asking a question that does not depend on the image (mi_rt_ping): a daemon
-  # that answers means the image is genuinely absent and we pull; a daemon that does NOT answer stops,
-  # it does not pull. (Not `mi_rt_inspect image i.digest`: {{index .RepoDigests 0}} errors on a
-  # local-build override with no repo digests (D22/§13), which would misread a present local image as
-  # absent and pull over it.)
-  local present=0
-  if mi_rt_image_present "$image"; then present=1; fi
-  if [ "$present" -eq 0 ]; then
-    if ! mi_rt_ping; then
-      mi_warn "verbs: could not determine whether the image for '$product' is already present — the"
-      mi_warn "  container runtime did not answer. Refusing rather than pulling on a question that"
-      mi_warn "  could not be asked."
-      return 1
-    fi
-    local perr
-    if ! perr="$(mi_rt_image_pull "$image" 2>&1)"; then
-      mi_warn "verbs: the image for '$product' could not be pulled:"
-      mi_warn "    $image"
-      mi_warn "  The runtime said:"
-      mi_warn "    $perr"
-      mi_warn "  The manifest declares this product LAUNCHED, so this is a release or registry problem,"
-      mi_warn "  not a pre-launch state. It is reported as a failure deliberately."
-      return 1
-    fi
-  fi
-  mi_prov_image_record "$image" "$product" || return 1
+  # The pull, through the SAME entitlement-independent gate recreate uses (so the two cannot drift):
+  # present/absent is disambiguated with a ping, a genuinely-absent image is pulled, an unanswerable
+  # daemon stops rather than pulls, and the image is recorded. Every failure is loud, distinguishable
+  # (§7.3) and exits 1. This is BEFORE the container replacement below, so a missing image never tears
+  # down a working container.
+  _mi_verb_ensure_image "$image" "$product" || return 1
 
   # <product>.conf, created if absent, additive thereafter (§6/D9), 0660 with the policy index's
   # canonical family gid (D60/§4.5).
@@ -657,6 +667,11 @@ _mi_verb_recreate_locked() {
     mi_warn "verbs: could not read the image-override record for '$product' from the ledger."
     return 1
   fi
+  # Ensure the selected image is available BEFORE removing the running container — install's gate, which
+  # recreate previously skipped. A manifest that advanced to an unpulled image (or an unreachable
+  # registry) must fail the recreate here with the working container INTACT, not after it has been torn
+  # down and cannot be rebuilt. Runs before secrets are staged and before any stop/remove below.
+  _mi_verb_ensure_image "$image" "$product" || return 1
   alias="$(mi_led_field "$ctx" alias)" || { mi_warn "verbs: context names no alias"; return 1; }
   netid="$(mi_net_target "$idx")" || return 1
   # The core-fixed user-data mount points, before the mount check validates them (a recreate after a
@@ -969,15 +984,35 @@ mi_verb_status() {
   local idx="$1"; shift
   local ident rec c product
 
-  if ! ident="$(mi_ident_get)"; then
+  # rc 3 (absent) is NOT rc 1 (the identity record is present but unreadable — corrupt, ambiguous, or an
+  # empty id). Reporting "nothing installed" for the second tells an operator whose objects are actually
+  # orphaned that they are clean; distinguish them so they are sent to 'state repair' instead. status
+  # still exits 0 either way — it is never gated by its own findings (mi_ident_get already warned to
+  # stderr; this is the stdout line the operator's monitor reads).
+  local irc
+  if ident="$(mi_ident_get)"; then irc=0; else irc=$?; fi
+  if [ "$irc" -eq 3 ]; then
     mi_log "No installation state found. Nothing has been installed yet."
+    return 0
+  elif [ "$irc" -ne 0 ]; then
+    mi_log "installation: UNREADABLE — an identity is recorded but could not be read (see the warning"
+    mi_log "  above). This is NOT 'nothing installed'; objects this installation named may be orphaned."
+    mi_log "  Run 'mythical-ctl state repair'."
     return 0
   fi
   mi_log "installation: $ident"
 
-  local nref
-  if nref="$(mi_net_ref_get)"; then
+  # Same rc distinction for the operator-network reference: rc 3 is "no operator network configured"
+  # (fall through to the installer-owned network below), but rc 1 is "an operator network IS configured
+  # and its record is unreadable" — which must be reported as such, never hidden behind "not created
+  # yet", which would tell the operator to create a network they already pointed the installation at.
+  local nref nrc
+  if nref="$(mi_net_ref_get)"; then nrc=0; else nrc=$?; fi
+  if [ "$nrc" -eq 0 ]; then
     mi_log "network:      $nref (operator-supplied, attach-only — this installer will never remove it)"
+  elif [ "$nrc" -ne 3 ]; then
+    mi_log "network:      UNREADABLE — an operator network reference is recorded but could not be read"
+    mi_log "  (see the warning above); this is not an absent network. Run 'mythical-ctl state repair'."
   else
     local nname
     nname="$(mi_name_network "$ident")"

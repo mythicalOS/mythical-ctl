@@ -500,3 +500,50 @@ EOF
   assert_contains "in progress"
   mi_lock_release
 }
+
+@test "recreate ENSURES the selected image before removing the container — an unpullable image preserves it" {
+  # install had an image-presence/pull gate BEFORE it replaced the container; recreate did not, so a
+  # manifest that advanced to an unpulled image (or an unreachable registry) let recreate tear the
+  # container down and then fail to rebuild it — leaving the operator with nothing. recreate now shares
+  # install's gate and must fail with the running container INTACT.
+  mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
+  IDENT="$(mi_ident_get)"; C="mythical-${IDENT}-p1"
+  run mi_state_observed "$C"
+  [ "$output" = running ]
+  # the selected image is now absent (a GC, or a manifest advanced to a digest never pulled) and the
+  # registry cannot be reached, so it cannot be made present again
+  rm -rf "${FAKE_DOCKER_STATE:?}/images"/*
+  FAKE_DOCKER_PULL=neterr run mi_verb_recreate "$IDX" "$POL" "$MAN" p1
+  [ "$status" -eq 1 ]
+  # the container was NOT stopped or removed — it is still there and still running
+  run mi_state_observed "$C"
+  [ "$output" = running ]
+}
+
+@test "status reports an UNREADABLE identity, not 'nothing installed' (rc 1 is not rc 3)" {
+  # setup already minted one identity. A SECOND identity record makes mi_ident_get AMBIGUOUS (rc 1),
+  # which is NOT rc 3 (genuinely absent). Reporting "nothing installed" for a corrupt ledger tells an
+  # operator whose objects are orphaned that the machine is clean; status must send them to repair.
+  mi_lock_acquire
+  mi_led_put identity id second "id=second"
+  mi_lock_release
+  run mi_verb_status "$IDX"
+  [ "$status" -eq 0 ]
+  assert_contains "UNREADABLE"
+  assert_contains "state repair"
+  case "$output" in *"No installation state found"*) echo "misreported a corrupt identity as absent: $output" >&2; return 1 ;; esac
+}
+
+@test "status reports an UNREADABLE operator network, not 'not created yet' (rc 1 is not rc 3)" {
+  # an operator network reference recorded without an id is unreadable (rc 1), NOT rc 3 (no operator
+  # network configured at all). status must not hide it behind the installer-owned "not created yet",
+  # which would tell the operator to create a network they already pointed the installation at.
+  mi_lock_acquire
+  mi_led_put netref key family "key=family" "name=opnet" "owned=no"
+  mi_lock_release
+  run mi_verb_status "$IDX"
+  [ "$status" -eq 0 ]
+  assert_contains "UNREADABLE"
+  assert_contains "state repair"
+  case "$output" in *"not created yet"*) echo "hid an unreadable operator network as not-created: $output" >&2; return 1 ;; esac
+}
