@@ -144,3 +144,36 @@ teardown() { teardown_test_env; }
   done
   [ "$any" -eq 1 ]
 }
+
+@test "CLI: install rejects --purge (an uninstall-only option) and installs nothing" {
+  run_mctl install p1 --purge --index "$MYTHICAL_HOME/index" --policy "$MYTHICAL_HOME/policy" \
+                      --manifest-dir "$MYTHICAL_HOME"
+  [ "$status" -eq 2 ]
+  load_mctl
+  run mi_member_has p1
+  [ "$status" -ne 0 ]        # the stray option was refused BEFORE any install work
+}
+
+@test "CLI: start rejects --family (an uninstall-only option) even for a valid product" {
+  run_mctl install p1 --index "$MYTHICAL_HOME/index" --policy "$MYTHICAL_HOME/policy" \
+                      --manifest-dir "$MYTHICAL_HOME"
+  [ "$status" -eq 0 ]
+  run_mctl start p1 --family --index "$MYTHICAL_HOME/index"
+  [ "$status" -eq 2 ]
+}
+
+@test "CLI: uninstall <product> --family is a usage error, not a silent family wipe that drops the product" {
+  run_mctl install p1 --index "$MYTHICAL_HOME/index" --policy "$MYTHICAL_HOME/policy" \
+                      --manifest-dir "$MYTHICAL_HOME"
+  [ "$status" -eq 0 ]
+  # Before the fix, --family was honoured and the p1 argument ignored — a materially more destructive
+  # operation than asked. MI_CONFIRM=yes would have let that wipe run to completion; it must be refused
+  # as a usage error FIRST, leaving the installation intact.
+  MI_CONFIRM=yes run_mctl uninstall p1 --family
+  [ "$status" -eq 2 ]
+  load_mctl
+  run mi_ident_get
+  [ "$status" -eq 0 ]        # identity NOT wiped
+  run mi_member_has p1
+  [ "$status" -eq 0 ]        # p1 NOT dropped
+}

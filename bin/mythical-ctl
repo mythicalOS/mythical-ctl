@@ -164,6 +164,11 @@ main() {
     -h|--help)    usage ;;
     __selftest)   selftest ;;
     install|start|stop|restart|recreate)
+      # --purge and --family belong to uninstall ONLY. Silently ignoring a misplaced option is how
+      # `install p1 --purge` returns 0 having quietly done something other than what was written.
+      # (--image/--force-install are install-only and are enforced per-product below.)
+      [ -z "$purge" ]  || { printf 'mythical-ctl: --purge applies to uninstall only\n' >&2; exit "$MI_EX_USAGE"; }
+      [ -z "$family" ] || { printf 'mythical-ctl: --family applies to uninstall only\n' >&2; exit "$MI_EX_USAGE"; }
       [ "${#products[@]}" -gt 0 ] || { printf 'mythical-ctl: %s needs at least one product\n\n' "$verb" >&2
                                        usage >&2; exit "$MI_EX_USAGE"; }
       local -a extra; extra=()
@@ -182,9 +187,22 @@ main() {
                                     exit "$MI_EX_USAGE"; }
       mi_verb_batch "$verb" "$idx" "$pol" "$mdir" "${products[@]}"
       exit $? ;;
-    status)    mi_verb_status "$idx" "${products[@]+"${products[@]}"}"; exit $? ;;
+    status)
+      # status reads; it accepts only --index and product filters. A stray mutating option is a usage
+      # error, not something to accept and ignore.
+      [ -z "$image$forced$purge$family" ] || { printf 'mythical-ctl: status takes no options other than --index\n' >&2
+                                               exit "$MI_EX_USAGE"; }
+      mi_verb_status "$idx" "${products[@]+"${products[@]}"}"; exit $? ;;
     uninstall)
+      # uninstall does not install: --image/--force-install are refused, not ignored.
+      [ -z "$image$forced" ] || { printf 'mythical-ctl: --image/--force-install apply to install only\n' >&2
+                                  exit "$MI_EX_USAGE"; }
       if [ -n "$family" ]; then
+        # --family removes the WHOLE family; a product argument alongside it is contradictory. Silently
+        # honouring --family while dropping the product would run a materially MORE destructive
+        # operation than the one written (`uninstall p1 --family` is not "uninstall p1").
+        [ "${#products[@]}" -eq 0 ] || { printf 'mythical-ctl: uninstall --family takes no product\n' >&2
+                                         exit "$MI_EX_USAGE"; }
         if [ -n "$purge" ]; then mi_verb_uninstall_family --purge; else mi_verb_uninstall_family; fi
         exit $?
       fi

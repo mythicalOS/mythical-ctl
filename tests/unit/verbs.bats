@@ -44,6 +44,41 @@ teardown() { teardown_test_env; }
   [ "$g" = "$(mi_digest "$MYTHICAL_HOME/mythical.conf")" ]
 }
 
+@test "install always declares running — re-installing a stopped product brings it back up (§6b.3)" {
+  # install EXPRESSES intent and it is always `running`; only recreate preserves. Before this fix a
+  # re-install read the prior generation's desired state and rebuilt the container STOPPED, returning 0
+  # and even logging "installed and running" over a product that was not.
+  mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
+  IDENT="$(mi_ident_get)"; C="mythical-${IDENT}-p1"
+  mi_verb_stop p1
+  run mi_state_observed "$C"
+  [ "$output" = stopped ]
+  run mi_verb_install "$IDX" "$POL" "$MAN" p1
+  [ "$status" -eq 0 ]
+  run mi_state_desired_get "$C"
+  [ "$output" = running ]
+  run mi_state_observed "$C"
+  [ "$output" = running ]
+  run mi_state_outstanding "$C"
+  [ -z "$output" ]
+}
+
+@test "install called as a library returns usage (2) on a value-less --image, never loops forever" {
+  # The LIBRARY contract, not the CLI's guard: mi_verb_install must reject its own value-less option. A
+  # bare `shift 2` past the end leaves $# unchanged and spins the option loop forever — a pure library
+  # has no errexit to abort it — taking the caller down too. Run under a timeout so a regression FAILS
+  # here (124) instead of hanging the suite; the fix returns 2 at once.
+  cat > "$BATS_TEST_TMPDIR/lib_call.sh" <<EOF
+for _m in common layout config lock ledger doc trust policy manifest detect runtime preflight exit prov intent state probe bringup netref verbs copy; do
+  source "$_MCTL_ROOT/lib/\$_m.sh"
+done
+mi_verb_install "$IDX" "$POL" "$MAN" p1 --image
+EOF
+  run timeout 10 bash "$BATS_TEST_TMPDIR/lib_call.sh"
+  [ "$status" -eq 2 ]
+  assert_contains "requires a value"
+}
+
 @test "installing a SECOND product leaves the first's config and data untouched" {
   mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
   IDENT="$(mi_ident_get)"
@@ -156,6 +191,19 @@ teardown() { teardown_test_env; }
   IDENT="$(mi_ident_get)"
   run mi_state_observed "mythical-${IDENT}-p1"
   [ "$output" = stopped ]
+}
+
+@test "restart FAILS (1) on a swallowed stop — a container that never went down is not a restart" {
+  # The sibling of the stop fix: restart's `container stop` is a MEANS, and a swallowed failure leaves
+  # the container RUNNING. mi_bringup_reconcile then sees it live with a resolving alias and returns 0 —
+  # a restart that never restarted. The interrupt knob fabricates the failed stop.
+  mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
+  IDENT="$(mi_ident_get)"; C="mythical-${IDENT}-p1"
+  FAKE_DOCKER_INTERRUPT_AFTER='container stop' run mi_verb_restart "$IDX" p1
+  [ "$status" -eq 1 ]
+  # It is still present and running — the stop did not take.
+  run mi_rt_inspect container c.running "$C"
+  [ "$output" = true ]
 }
 
 @test "recreate of a STOPPED product stays stopped" {

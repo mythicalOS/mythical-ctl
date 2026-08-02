@@ -272,7 +272,13 @@ mi_verb_install() {
   local override="" forced=0
   while [ "$#" -gt 0 ]; do
     case "$1" in
-      --image) override="${2:-}"; shift 2 ;;
+      # GUARD THE VALUE, AND NEVER `shift 2` PAST THE END. As a pure library this loop runs without
+      # errexit, so a failed `shift 2` (only the flag left, $# unchanged) would spin forever and hang
+      # the caller — the CLI's own parser guard cannot save a direct library call. A missing value is
+      # this verb's own usage error (rc 2), not something to fold into the caller's control flow.
+      --image)
+        [ "$#" -ge 2 ] || { mi_warn "verbs: install option '--image' requires a value"; return 2; }
+        override="$2"; shift 2 ;;
       --force-install) forced=1; shift ;;
       *) mi_warn "verbs: unknown install option '$1'"; return 2 ;;
     esac
@@ -455,7 +461,10 @@ _mi_verb_install_locked() {
     envfile="-"
   fi
 
-  # A previously-installed container is replaced, preserving desired state; a fresh one is `running`.
+  # INSTALL ALWAYS DECLARES `running` (§6b.3's verb table): install EXPRESSES intent, it never inherits
+  # a prior generation's. Preserving is `recreate`'s job alone — only it carries a stopped product back
+  # to stopped. So a previously-installed container is REPLACED (removed and rebuilt), but the desired
+  # state it is rebuilt into stays `running`, never the `stopped` a prior `stop` may have left behind.
   local desired=running arc
   if mi_prov_find container "$container" >/dev/null 2>&1; then
     # §6a applies to a REPLACEMENT exactly as it applies to an uninstall: prove the container carries
@@ -471,7 +480,6 @@ _mi_verb_install_locked() {
          mi_warn "  install stops rather than creating a second container under the same name."
          return 1 ;;
     esac
-    desired=preserve
   fi
 
   # if/else, NOT `mi_bringup …; rc=$?`: a bare call is a simple command, so a failed bring-up aborts a
@@ -571,7 +579,21 @@ _mi_verb_restart_locked() {
   netid="$(mi_net_target "$idx")" || return 1
   alias="$(mi_name_alias "$product")" || return 1
   mi_state_commit "$c" running alias "$netid" || return 1
-  mi_rt_container_stop "$c" >/dev/null 2>&1 || true
+  # The stop is a MEANS here (restart brings the container down in order to bring it back up), but it
+  # must actually HAPPEN — the same rule mi_verb_stop enforces on its own stop. A swallowed `container
+  # stop` leaves the container RUNNING; mi_bringup_reconcile then sees a live container whose alias
+  # still resolves, clears the outstanding check and returns 0 — a restart that never restarted (§7.3:
+  # 0 means it completed). Only "there is nothing there to stop" (rc 3 on a follow-up status inspect)
+  # is not a failure: the reconciler's `start verify` plan then creates and starts it.
+  if ! mi_rt_container_stop "$c" >/dev/null 2>&1; then
+    local src
+    if mi_rt_inspect container c.status "$c" >/dev/null 2>&1; then src=0; else src=$?; fi
+    if [ "$src" -ne 3 ]; then
+      mi_warn "verbs: '$product' could not be restarted — its container could not be stopped and is"
+      mi_warn "  still present, so it may still be running. Reported as a failure (§7.3)."
+      return 1
+    fi
+  fi
   mi_bringup_reconcile "$idx" "$c" "$netid" "$alias"
 }
 
