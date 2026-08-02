@@ -70,6 +70,20 @@ _mi_verb_objects() {
   return 1
 }
 
+# The name of a class-matched object record, or rc 1 if it has none. A record that passes the listing's
+# field-format check (so _mi_verb_objects accepts it) can still be missing a SEMANTIC field like `name=`
+# — and `name="$(mi_led_field … name)" || continue` silently SKIPPED such a record. In a mutating family
+# verb that meant the object was neither removed nor counted as preserved, so the ledger reset wiped its
+# provenance while it still stood. Callers fail closed on rc 1 (set preserved / rc and continue), never
+# skip. (This is distinct from _mi_verb_objects, which fails on an unreadable LISTING.)
+_mi_verb_rec_name() {
+  local nm
+  if nm="$(mi_led_field "$1" name)"; then printf '%s\n' "$nm"; return 0; fi
+  mi_warn "verbs: an object record carries no readable name — it cannot be acted on. The ledger is not"
+  mi_warn "  reset over it. Run 'mythical-ctl state repair'."
+  return 1
+}
+
 # The core-fixed user-data mount points (§4.1a): ~/.mythical/transcripts and ~/.mythical/logs.
 # mi_ensure_layout deliberately leaves these "to appear when a product binds them" — they are the
 # user-data ownership class, not installer state — and binding them is exactly what a launch does. So
@@ -410,14 +424,14 @@ _mi_verb_install_locked() {
       return 3
     fi
     mi_warn "verbs: FORCED install of '$product', whose manifest says it has not launched."
-    mi_warn "  You are asserting the image is published. This is recorded and reported by 'status'."
+    mi_warn "  You are asserting the image is published. It is reported by 'status' once the install"
+    mi_warn "  succeeds — the force-install record, like the image-override record, is written AFTER"
+    mi_warn "  bring-up, so a forced install that fails leaves no false annotation behind."
     # A forced install IS a real install — it pulls and creates a container — so it legitimately
     # establishes the installation identity here. This is the ONE not-launched path that may mint one,
     # and only on the operator's explicit override; the unforced path above returned without minting,
     # and mi_product_ctx did not mint on the not-launched path either.
     mi_ident_ensure >/dev/null || return 1
-    mi_led_put forced key "${product}:force-install" "key=${product}:force-install" \
-      "product=${product}" "kind=force-install" || return 1
   fi
 
   # Read then transform — a pipeline's status under `pipefail` is the LEFT side's, so `… | tr` would
@@ -592,6 +606,16 @@ _mi_verb_install_locked() {
   else
     mi_led_del forced key "${product}:image-override" || return 1
   fi
+  # The force-install record has the SAME post-bring-up lifecycle as the override: written only when the
+  # install SUCCEEDED under --force-install, cleared otherwise. Writing it early (in the not-launched
+  # branch) meant a forced install that failed the pull left a record a later NORMAL install never
+  # cleared, so status falsely reported "installed with --force-install".
+  if [ "$forced" -eq 1 ]; then
+    mi_led_put forced key "${product}:force-install" "key=${product}:force-install" \
+      "product=${product}" "kind=force-install" || return 1
+  else
+    mi_led_del forced key "${product}:force-install" || return 1
+  fi
 
   mi_member_add "$product" || return 1
   mi_log "$product: installed and running."
@@ -623,7 +647,15 @@ _mi_verb_start_locked() {
   # ONE atomic write: desired=running AND the outstanding alias check it owes. Splitting them leaves a
   # window where a crash produces a container recovery starts and then considers fully reconciled (D50).
   mi_state_commit "$c" running alias "$netid" || return 1
-  mi_bringup_reconcile "$idx" "$c" "$netid" "$alias"
+  # NORMALIZE to the verb contract (§7.3 defines only 0/1/2/3): mi_bringup_reconcile returns 4 ("needs a
+  # rebuild") on a plan only install/recreate can carry out. A bare return would leak that undefined code
+  # from a start/restart. Map it — and anything else non-zero — to operational failure 1, naming recovery.
+  local brc
+  if mi_bringup_reconcile "$idx" "$c" "$netid" "$alias"; then brc=0; else brc=$?; fi
+  [ "$brc" -eq 0 ] && return 0
+  [ "$brc" -eq 4 ] && { mi_warn "verbs: '$product' needs a rebuild that start/restart cannot perform — run"
+    mi_warn "  'mythical-ctl recreate $product'."; }
+  return 1
 }
 
 # --- stop (desired state: stopped) ----------------------------------------------------------------
@@ -706,7 +738,15 @@ _mi_verb_restart_locked() {
       return 1
     fi
   fi
-  mi_bringup_reconcile "$idx" "$c" "$netid" "$alias"
+  # NORMALIZE to the verb contract (§7.3 defines only 0/1/2/3): mi_bringup_reconcile returns 4 ("needs a
+  # rebuild") on a plan only install/recreate can carry out. A bare return would leak that undefined code
+  # from a start/restart. Map it — and anything else non-zero — to operational failure 1, naming recovery.
+  local brc
+  if mi_bringup_reconcile "$idx" "$c" "$netid" "$alias"; then brc=0; else brc=$?; fi
+  [ "$brc" -eq 0 ] && return 0
+  [ "$brc" -eq 4 ] && { mi_warn "verbs: '$product' needs a rebuild that start/restart cannot perform — run"
+    mi_warn "  'mythical-ctl recreate $product'."; }
+  return 1
 }
 
 # --- recreate (desired state: PRESERVED) ----------------------------------------------------------
@@ -851,7 +891,9 @@ _mi_verb_uninstall_locked() {
     [ -n "$rec" ] || continue
     _mi_led_record_matches "$rec" class volume || continue
     _mi_led_record_matches "$rec" product "$product" || continue
-    name="$(mi_led_field "$rec" name)" || continue
+    name="$(mi_led_field "$rec" name)" || { mi_warn "verbs: a volume record for '$product' carries no"
+      mi_warn "  readable name; --purge cannot act on it and it is left in place. Run 'state repair'."
+      rc=1; continue; }
     role="$(mi_led_field "$rec" role)" || role="?"
     if [ "$purge" -eq 0 ]; then
       mi_log "  keeping volume $name (role $role) — your data. 'uninstall --purge' removes it."
@@ -956,7 +998,7 @@ _mi_verb_uninstall_family_locked() {
   while IFS= read -r rec; do
     [ -n "$rec" ] || continue
     _mi_led_record_matches "$rec" class container || continue
-    name="$(mi_led_field "$rec" name)" || continue
+    name="$(_mi_verb_rec_name "$rec")" || { preserved=1; continue; }
     if mi_prov_authority container "$name"; then arc=0; else arc=$?; fi
     if [ "$arc" -eq 0 ]; then
       mi_rt_container_stop "$name" >/dev/null 2>&1 || true
@@ -987,7 +1029,7 @@ _mi_verb_uninstall_family_locked() {
     while IFS= read -r rec; do
       [ -n "$rec" ] || continue
       _mi_led_record_matches "$rec" class volume || continue
-      name="$(mi_led_field "$rec" name)" || continue
+      name="$(_mi_verb_rec_name "$rec")" || { preserved=1; continue; }
       mi_log "  keeping volume $name (your data). After the reset it is orphaned; remove it by hand with"
       mi_log "    'docker volume rm $name', or re-run with --purge instead of keeping it."
     done <<< "$_objs"
@@ -995,7 +1037,7 @@ _mi_verb_uninstall_family_locked() {
     while IFS= read -r rec; do
       [ -n "$rec" ] || continue
       _mi_led_record_matches "$rec" class volume || continue
-      name="$(mi_led_field "$rec" name)" || continue
+      name="$(_mi_verb_rec_name "$rec")" || { preserved=1; continue; }
       local varc
       if mi_prov_authority volume "$name"; then varc=0; else varc=$?; fi
       if [ "$varc" -eq 0 ]; then
@@ -1020,7 +1062,7 @@ _mi_verb_uninstall_family_locked() {
   while IFS= read -r rec; do
     [ -n "$rec" ] || continue
     _mi_led_record_matches "$rec" class network || continue
-    name="$(mi_led_field "$rec" name)" || continue
+    name="$(_mi_verb_rec_name "$rec")" || { preserved=1; continue; }
     local narc
     if mi_prov_authority network "$name"; then narc=0; else narc=$?; fi
     if [ "$narc" -eq 0 ]; then
@@ -1037,8 +1079,17 @@ _mi_verb_uninstall_family_locked() {
       preserved=1
     fi
   done <<< "$_objs"
-  if mi_net_ref_get >/dev/null 2>&1; then
+  # rc 0: an operator network is attached (left alone — never ours to remove). rc 3: none configured. rc 1
+  # (a netref record exists but is unreadable) must NOT be flattened into rc 3 — the reset would then wipe
+  # the ledger that records the attachment while unable to read it. Fail closed: block the reset until repair.
+  local nrc
+  if mi_net_ref_get >/dev/null; then nrc=0; else nrc=$?; fi
+  if [ "$nrc" -eq 0 ]; then
     mi_log "  the operator-supplied network is LEFT ALONE — it was never this installer's to remove."
+  elif [ "$nrc" -ne 3 ]; then
+    mi_warn "family: an operator-network reference is recorded but could not be read; the ledger is NOT"
+    mi_warn "  reset over it. Run 'mythical-ctl state repair', then re-run."
+    preserved=1
   fi
 
   # IMAGES ARE STILL NEVER REMOVED (D37). Family uninstall is not an exemption: the ledger proves

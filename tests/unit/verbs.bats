@@ -720,3 +720,46 @@ EOF
   [ "$status" -ne 0 ]
   case "$output" in *"is not installed"*) echo "reported ambiguous provenance as not-installed: $output" >&2; return 1 ;; esac
 }
+
+@test "family --purge does NOT reset the ledger when a volume record has no readable name (fail closed)" {
+  # a checksum-valid volume record missing name= passes the listing check but cannot be acted on. A
+  # `name || continue` would skip it silently, leaving `preserved` clear and letting the reset wipe its
+  # provenance while the volume stands. It must block the reset instead.
+  mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
+  mi_lock_acquire
+  { mi_ledger_read; printf 'object\tkey=volume:nameless\tclass=volume\tnonce=n\tgen=1\n'; } | mi_ledger_write
+  mi_lock_release
+  MI_CONFIRM=yes run mi_verb_uninstall_family --purge
+  [ "$status" -ne 0 ]
+  run mi_ident_get                                  # the ledger was NOT reset
+  [ "$status" -eq 0 ]
+}
+
+@test "start returns operational failure (1), never undefined 4, when the container needs a rebuild" {
+  mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
+  IDENT="$(mi_ident_get)"; C="mythical-${IDENT}-p1"
+  mi_rt_container_rm "$C" >/dev/null 2>&1            # removed out of band → start's plan becomes 'rebuild'
+  run mi_verb_start "$IDX" p1
+  [ "$status" -eq 1 ]
+}
+
+@test "a FAILED forced install leaves no force-install record, so a later normal install is not falsely annotated" {
+  write_fixture_product p1 launched=false
+  FAKE_DOCKER_PULL=neterr run mi_verb_install "$IDX" "$POL" "$MYTHICAL_HOME/p1.manifest" p1 --force-install
+  [ "$status" -ne 0 ]                               # the forced pull failed
+  write_fixture_product p1 launched=true            # the product is now released
+  mi_verb_install "$IDX" "$POL" "$MYTHICAL_HOME/p1.manifest" p1 >/dev/null   # a normal install succeeds
+  run mi_verb_status "$IDX" p1
+  case "$output" in *"force-install"*) echo "a failed forced install left a stale force-install record: $output" >&2; return 1 ;; esac
+}
+
+@test "family uninstall does NOT reset the ledger when the operator-network reference is unreadable" {
+  mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
+  mi_lock_acquire
+  mi_led_put netref key family "key=family" "name=opnet" "owned=no"    # recorded, but no id → unreadable
+  mi_lock_release
+  MI_CONFIRM=yes run mi_verb_uninstall_family
+  [ "$status" -ne 0 ]
+  run mi_ident_get                                  # not reset over an unreadable operator-network ref
+  [ "$status" -eq 0 ]
+}
