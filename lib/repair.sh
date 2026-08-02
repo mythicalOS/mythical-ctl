@@ -346,7 +346,16 @@ _mi_repair_netref() {
 #
 # Usage: mi_repair_run <index> [<identity> | --reinitialize]
 mi_repair_run() {
-  if [ "$#" -lt 1 ]; then mi_warn "repair: mi_repair_run needs an <index file> [identity|--reinitialize]"; return 1; fi
+  # UPPER-BOUNDED, NOT JUST LOWER. `[ "$#" -lt 1 ]` alone accepts any arity from 1 upward — a surplus
+  # third operand (`mi_repair_run "$idx" instA stray`) passed the check, and `_mi_repair_run_locked`
+  # reads only `$1`/`$2`, silently discarding `stray`. With MI_CONFIRM=yes already set, that is a
+  # malformed call that still resets the ledger and adopts an identity rather than being refused. The
+  # operator-verb contract (a wrong argument count is refused, nothing attempted) holds at this
+  # library boundary, not only at bin/mythical-ctl's argument parser above it.
+  if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+    mi_warn "repair: mi_repair_run needs an <index file> [identity|--reinitialize]"
+    return 1
+  fi
   mi_preflight_daemon || return 1
   _mi_with_lock _mi_repair_run_locked "$@"
 }
@@ -469,6 +478,27 @@ _mi_repair_run_locked() {
         mi_warn "repair: '$name' ($kind) carries identity '$choice', but its nonce could not be read."
         mi_warn "  Recording provenance with no nonce — or the wrong one — is exactly the"
         mi_warn "  misidentification a nonce exists to prevent (§6a). Stopping."
+        return 1
+      fi
+      # PRESENT-BUT-EMPTY IS NOT THE SAME ANSWER AS UNREADABLE, AND NEITHER MAY BE ADOPTED.
+      # _mi_repair_nonce_of returns rc 0 with an EMPTY value for an object whose nonce label was
+      # successfully asked about and simply is not set (Docker's own `<no value>`, already normalized
+      # to "" by that reader) — a real, reachable case for an object this installer's own create path
+      # never labelled, or one whose label was stripped. Recording provenance for it anyway writes
+      # `nonce=` (empty) — a record every later reader treats as unowned: mi_prov_authority refuses an
+      # empty-nonce record outright ("carries no nonce — preserving it and reporting"), so the object
+      # this repair just claimed to recover becomes permanently unownable — no deletion, no state
+      # commit, nothing can ever act on it through this installer again. An object without a PRESENT,
+      # NON-EMPTY nonce cannot be proven ours, so it is refused here rather than adopted with a record
+      # that would only wedge the next command that reads it.
+      if [ -z "$lnonce" ]; then
+        mi_warn "repair: '$name' ($kind) carries identity '$choice', but no nonce label at all — the"
+        mi_warn "  question was answered, and the answer was empty. A nonce is the only thing that"
+        mi_warn "  distinguishes this object from a different one that happens to carry the same"
+        mi_warn "  installation label, so an object without one cannot be proven ours. Recording"
+        mi_warn "  provenance for it would write a record every later authority check refuses to use —"
+        mi_warn "  it would be adopted and then permanently unownable. Resolve it with the container"
+        mi_warn "  runtime directly (re-create it under this installer, or remove it), then re-run."
         return 1
       fi
       local extra=""
@@ -730,17 +760,56 @@ _mi_repair_reset_ledger() {
     printf '' | mi_ledger_write
     return $?
   fi
-  local records rc kept="" line
+  local records rc kept="" line anchor_count=0 anchor_row=""
   if records="$(mi_ledger_read)"; then rc=0; else rc=$?; fi
   if [ "$rc" -eq 0 ]; then
     while IFS= read -r line; do
       [ -n "$line" ] || continue
-      case "$line" in "${MI_TRUST_ANCHOR_KIND}"$'\t'*) kept="${kept}${line}"$'\n' ;; esac
+      case "$line" in
+        "${MI_TRUST_ANCHOR_KIND}"$'\t'*) anchor_count=$((anchor_count + 1)); anchor_row="$line" ;;
+      esac
     done <<< "$records"
   elif [ "$rc" -ne 3 ]; then
     # Unreachable in practice — the guard above already proved a present ledger reads clean — but a
     # library function refuses on an unrecognised code rather than assuming it means "empty".
     return "$rc"
+  fi
+
+  # VALIDATE, DON'T JUST COPY. The whole-ledger checksum proves the bytes were not altered after they
+  # were written; it proves nothing about whether the ROW ITSELF is one this codebase's own writer
+  # (mi_trust_anchor_set validates 64 lowercase hex before it ever writes one) produced. A restored or
+  # hand-assembled ledger can carry TWO trust-anchor rows (checksum-valid, still ambiguous — the exact
+  # shape mi_trust_anchor_get's own _mi_trust_single_value refuses on) or ONE whose digest field is
+  # empty or malformed. Blindly copying every matching raw line through — the prior form of this code
+  # — preserved either shape into the rebuilt ledger and reported the repair a success; the FIRST later
+  # trust read (mi_accept_index, at the very next probe or install) would then refuse the ambiguous or
+  # unusable anchor, wedging an installation this repair had just claimed to fix.
+  local anchor_ok=0
+  if [ "$anchor_count" -eq 1 ]; then
+    local afields adig adrc
+    afields="${anchor_row#"${MI_TRUST_ANCHOR_KIND}"$'\t'}"
+    if adig="$(mi_led_field "$afields" digest)"; then adrc=0; else adrc=$?; fi
+    if [ "$adrc" -eq 0 ] && _mi_trust_hex64_ok "$adig"; then anchor_ok=1; fi
+  fi
+
+  if [ "$anchor_count" -gt 1 ]; then
+    mi_warn "repair: this ledger recorded ${anchor_count} trust anchors, not one — an ambiguous record"
+    mi_warn "  a later trust read would refuse to guess between (mi_trust_anchor_get itself refuses"
+    mi_warn "  rather than pick one). Dropping all of them rather than silently preserving a record"
+    mi_warn "  that would only wedge the next command that reads it."
+    mi_warn "  GUARANTEE LOST: the authenticated root of trust. This installation will need to be"
+    mi_warn "  online once to re-establish it — the same requirement a first install has."
+  elif [ "$anchor_count" -eq 1 ] && [ "$anchor_ok" -ne 1 ]; then
+    mi_warn "repair: this ledger's trust anchor is recorded but is not a usable digest (empty or"
+    mi_warn "  malformed) — the whole-ledger checksum proves the bytes were not altered after they"
+    mi_warn "  were written, not that this record is one this installer's own writer ever produced."
+    mi_warn "  Dropping it rather than preserving a record every later trust read would refuse."
+    mi_warn "  GUARANTEE LOST: the authenticated root of trust. This installation will need to be"
+    mi_warn "  online once to re-establish it — the same requirement a first install has."
+  fi
+
+  if [ "$anchor_count" -eq 1 ] && [ "$anchor_ok" -eq 1 ]; then
+    kept="${anchor_row}"$'\n'
   fi
   printf '%s' "$kept" | mi_ledger_write
 }
@@ -767,7 +836,14 @@ _mi_repair_ledger_schema_of() {
 
 # --- the verbs -------------------------------------------------------------------------------------
 mi_verb_state_repair() {
-  if [ "$#" -lt 1 ]; then mi_warn "verbs: state repair needs an <index>"; return 2; fi
+  # Same upper bound as mi_repair_run, and for the same reason — checked again here rather than
+  # trusted to the callee, because THIS is the function whose contract is the CLI's own 0/1/2/3
+  # (bin/mythical-ctl already rejects a surplus operand before ever calling this, but a caller of the
+  # library verb directly must get the identical refusal, not a different one two frames down).
+  if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+    mi_warn "verbs: state repair needs an <index> [identity|--reinitialize]"
+    return 2
+  fi
   mi_repair_run "$@"
 }
 

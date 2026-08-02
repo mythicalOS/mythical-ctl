@@ -502,3 +502,61 @@ teardown() { teardown_test_env; }
   [ "$status" -eq 0 ]
   assert_contains "containers=c1,c2"
 }
+
+# --- codex round 4: 2 HIGH + 1 MEDIUM recovery-SEMANTICS findings ------------------------------------
+
+@test "adoption REFUSES an object whose nonce label is present-but-empty, never writes empty-nonce provenance" {
+  # A container carrying the chosen identity's installation label, but no nonce label at all — the
+  # inspect answers successfully (rc 0) with an empty value, which is a DIFFERENT fact from "could not
+  # be asked" (already handled) or "the object is gone". Before the fix this empty value was recorded
+  # as provenance verbatim (`nonce=`), and every later authority check (mi_prov_authority) refuses an
+  # empty-nonce record outright — so the object repair had just claimed to recover became permanently
+  # unownable: no deletion, no state commit, nothing could act on it through this installer again.
+  net="$(mi_rt_network_create netA instA nA)"
+  mi_rt_image_pull "$(a_digestref p1)" >/dev/null
+  mi_rt_container_create c1 "$(a_digestref p1)" "$net" p1 - label=installation=instA >/dev/null
+  run mi_repair_run "$IDX" instA
+  [ "$status" -ne 0 ]
+  assert_contains "no nonce label at all"
+  load_mctl
+  run mi_prov_find container c1
+  [ "$status" -eq 3 ]
+}
+
+@test "the PUBLIC verb rejects a surplus operand itself, at the library boundary, nothing attempted" {
+  # Before the fix, mi_repair_run and mi_verb_state_repair checked only a LOWER bound ($# -lt 1), so a
+  # surplus third operand passed straight through: mi_verb_state_repair "$IDX" instA stray silently
+  # used only the first two and, with MI_CONFIRM=yes already set here, would have reset the ledger and
+  # adopted instA rather than returning usage. bin/mythical-ctl's own argument parser already rejects
+  # this at the CLI, but the operator-verb contract (wrong arity -> rc 2, nothing attempted) has to
+  # hold for a caller of the library verb directly too, not only through the CLI in front of it.
+  mi_rt_volume_create v1 n1 instA
+  run mi_verb_state_repair "$IDX" instA stray
+  [ "$status" -eq 2 ]
+  load_mctl
+  run mi_ident_get
+  [ "$status" -eq 3 ]
+  run mi_repair_run "$IDX" instA stray
+  [ "$status" -ne 0 ]
+}
+
+@test "an ambiguous or unusable trust anchor is dropped, not silently preserved, and the loss is named" {
+  # Two trust-anchor records in an otherwise checksum-valid ledger (crafted directly, bypassing
+  # mi_trust_anchor_set's own validation — a restored or hand-assembled ledger is the realistic
+  # source). Before the fix, _mi_repair_reset_ledger copied every raw line matching the trust-anchor
+  # kind straight into the rebuild, so both survived; mi_trust_anchor_get's own ambiguity check would
+  # then refuse every later trust read (mi_accept_index, at the very next probe or install) — wedging
+  # an installation this repair had just reported fixed.
+  mi_lock_acquire
+  mi_ident_ensure >/dev/null
+  d2="$(printf 'b%.0s' $(seq 1 64))"
+  { mi_ledger_read; printf 'trust-anchor\tdigest=%s\n' "$d2"; } | mi_ledger_write
+  mi_lock_release
+  run mi_repair_run "$IDX" --reinitialize
+  [ "$status" -eq 0 ]
+  assert_contains "GUARANTEE LOST"
+  assert_contains "trust anchors, not one"
+  load_mctl
+  run mi_trust_anchor_get
+  [ "$status" -eq 3 ]
+}
