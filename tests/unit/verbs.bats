@@ -666,3 +666,14 @@ EOF
   [ "$status" -eq 0 ]                              # read-only: never gated by its own findings
   assert_contains "UNREADABLE"
 }
+
+@test "recreate NORMALIZES a context failure to operational failure (1), never a raw or undefined exit code" {
+  # mi_product_ctx can propagate 4 ("no trust anchor"); a bare `return \$rc` would leak an exit code the
+  # §7.3 contract does not define. The product is already confirmed installed, so any context failure —
+  # here the manifest is withdrawn to not-launched — is an operational failure for a recreate (code 1),
+  # NOT a clean "not launched yet" (3, which mi_ex_worst treats as benign) and never an undefined 4.
+  mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
+  write_fixture_product p1 launched=false          # the installed product's manifest is withdrawn
+  run mi_verb_recreate "$IDX" "$POL" "$MYTHICAL_HOME/p1.manifest" p1
+  [ "$status" -eq 1 ]
+}

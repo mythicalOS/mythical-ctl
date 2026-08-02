@@ -692,7 +692,14 @@ _mi_verb_recreate_locked() {
   mi_state_desired_get "$c" >/dev/null || { mi_warn "verbs: '$product' is not installed"; return 1; }
 
   if ctx="$(mi_product_ctx "$idx" "$pol" "$man" "$product")"; then rc=0; else rc=$?; fi
-  [ "$rc" -eq 0 ] || return "$rc"
+  # NORMALIZE to the verb contract (§7.3: only 0/1/2/3 may leave a verb). mi_product_ctx can return 4
+  # ("no trust anchor"), which a bare `return "$rc"` would leak as an undefined exit code. The product is
+  # already confirmed installed above, so ANY context failure here — refused (1), a manifest withdrawn to
+  # not-launched (3), or an unauthenticated one (4) — is an operational failure for a recreate, not a
+  # clean "not launched yet": recreate has no fresh not-launched path (only install does), and mi_ex_worst
+  # treats 3 as benign, which this is not. So it maps to 1, exactly as install maps its non-0/3 codes.
+  [ "$rc" -eq 0 ] || { mi_warn "verbs: cannot build the context to recreate '$product' — its manifest or"
+    mi_warn "  policy could not be authenticated, or has been withdrawn. Nothing was changed."; return 1; }
   # `mi_led_field … | tr` under a `pipefail` caller carries the LEFT side's status, so a missing field
   # aborts instead of being reported. Read the field, then transform it.
   local mrec prec netid alias image envfile
