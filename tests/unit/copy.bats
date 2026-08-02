@@ -464,6 +464,26 @@ teardown() { rm -rf "$DST" "$STAGE"; mi_lock_release; teardown_test_env; }
   assert_contains "out of range"
 }
 
+@test "a verify transcript that REFUSES an entry fails, even with checked= and done=ok" {
+  # mi_copy_verify read only mismatch=, never refused=, so a verifier that refused an entry (a device
+  # it met, an entry it could not compare) while otherwise reporting a conforming transcript was
+  # accepted. A refusal is as fatal in verification as in the copy.
+  mkdir -p "$STAGE"
+  HELPER_VERIFY=verify-refused run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5 900 1000
+  [ "$status" -ne 0 ]
+  assert_contains "REFUSED"
+}
+
+@test "an EMPTY problem record (refused= / mismatch= with no value) fails — presence is the problem" {
+  # `[ -n "$v" ] || continue` over the field VALUES skips an empty problem record, so a stated problem
+  # that names nothing slipped through. It is caught by the key's presence instead.
+  mkdir -p "$STAGE"
+  HELPER_VERIFY=verify-empty-refused run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5 900 1000
+  [ "$status" -ne 0 ]
+  HELPER_VERIFY=verify-empty-mismatch run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5 900 1000
+  [ "$status" -ne 0 ]
+}
+
 @test "verification is PER-ENTRY over the contract, not a byte count" {
   mkdir -p "$STAGE"
   run mi_copy_verify "$IDX" srcvol1 "$STAGE" 5 900 1000

@@ -433,6 +433,20 @@ case "$cmd" in
         printf 'mismatch=%s/data/f:%s\n' "$dst" "$knob"
         printf 'checked=5\nacl=%s\ndone=ok\n' "$acl"
         fin 1 ;;
+      # The verifier REFUSED an entry (it met a device it could not compare, say) — a refusal is as
+      # fatal in verification as in the copy, but this function used to read only `mismatch=`. An
+      # otherwise-conforming transcript alongside a refused= must still fail.
+      verify-refused)
+        printf 'refused=%s/data/dev:special-entry\n' "$dst"
+        printf 'checked=5\nacl=%s\ndone=ok\n' "$acl" ;;
+      # An EMPTY problem record — `refused=` / `mismatch=` with no value. Its PRESENCE is the problem;
+      # a value-iterating check skips it. The verifier states a problem and names nothing.
+      verify-empty-refused)
+        printf 'refused=\n'
+        printf 'checked=5\nacl=%s\ndone=ok\n' "$acl" ;;
+      verify-empty-mismatch)
+        printf 'mismatch=\n'
+        printf 'checked=5\nacl=%s\ndone=ok\n' "$acl" ;;
       # A copied DIRECTORY missing the dual-principal default ACL — reported as a mismatch like any
       # other attribute (capability at preflight is not proof of application — round-2 finding 3).
       default-acl)

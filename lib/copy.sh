@@ -84,6 +84,19 @@ _mi_copy_fields() {
   done <<< "$blob"
 }
 
+# Is <key> STATED AT ALL, whatever its value — including an empty one? A problem record (`refused=`,
+# `mismatch=`) is a problem by its PRESENCE, so it must be detected by the key, not by iterating its
+# values: `_mi_copy_fields` hands back an empty string for `refused=` with no path, and a
+# value-iterating loop that does `[ -n "$v" ] || continue` then skips exactly the problem it was meant
+# to catch. rc 0 present · 1 absent.
+_mi_copy_has_key() {
+  local blob="$1" key="$2" line
+  while IFS= read -r line; do
+    case "$line" in "${key}="*) return 0 ;; esac
+  done <<< "$blob"
+  return 1
+}
+
 # THE VALUE OF ONE STATED OBSERVATION, or a refusal. rc 0 the value is printed (an empty value is a
 # real answer and is handed back as one) · 1 it was not stated at all, or was stated twice (REPORTED).
 #
@@ -393,6 +406,16 @@ mi_copy_run() {
     refused=1
   done <<< "$(_mi_copy_refusals "$out" /src)"
 
+  # An EMPTY `refused=` line (no path) is a stated refusal the loop above skips, because
+  # `_mi_copy_refusals` passes it through as an empty line and the consumer drops empties. Its presence
+  # is the problem, so it is caught here by the key — a copier that refuses without naming what is still
+  # a copier that refused.
+  if _mi_copy_has_key "$out" refused && [ "$refused" -eq 0 ]; then
+    mi_warn "copy: the copier stated a refusal that named nothing (an empty 'refused=' record). A"
+    mi_warn "  refusal is a refusal whether or not it says what — the copy is abandoned."
+    refused=1
+  fi
+
   [ "$refused" -eq 0 ] || return 1
   [ "$rc" -eq 0 ] || { mi_warn "copy: the copy did not complete."; return 1; }
   v="$(_mi_copy_stated "$out" "done" copy completion)" || return 1
@@ -652,6 +675,17 @@ mi_copy_verify() {
     mi_warn "copy: VERIFICATION MISMATCH ${v}"
     bad=1
   done <<< "$(_mi_copy_fields "$out" mismatch)"
+  # ANY refused= OR mismatch= LINE FAILS THE COPY, DETECTED BY PRESENCE. The verifier can report a
+  # refusal (`refused=`) exactly as the copy step can — a device it met while walking the destination,
+  # an entry it could not compare — and this function never read `refused=` at all, so a transcript of
+  # `refused=<anything> checked=<expected> acl=ok done=ok` was accepted. And an EMPTY problem record
+  # (`refused=` / `mismatch=` with no value) is a stated problem too: the value loop above skips it, so
+  # it is caught here by the key. A problem is a problem by being reported, whatever it says.
+  if _mi_copy_has_key "$out" refused; then
+    while IFS= read -r v; do mi_warn "copy: the verifier REFUSED ${v:-<an entry it did not name>}"; done <<< "$(_mi_copy_fields "$out" refused)"
+    bad=1
+  fi
+  if _mi_copy_has_key "$out" mismatch; then bad=1; fi
   if [ "$bad" -ne 0 ]; then
     mi_warn "copy: the copy does not match the source over the per-entry contract."
     return 1
