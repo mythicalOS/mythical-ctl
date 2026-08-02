@@ -257,6 +257,28 @@ teardown() { rm -rf "$DST" "$STAGE"; mi_lock_release; teardown_test_env; }
   assert_contains "could not read"
 }
 
+# Required-companion cross-check (round-3 final): a `symlink` entry MUST come with a matching
+# `linktarget=` record. A copier can otherwise copy an escaping symlink, emit `entry=symlink:<path>`
+# plus `done=ok`, and OMIT both `linktarget=` and `refused=` — the escape backstop then never runs (no
+# linktarget line to check), the entry counts, and verification accepts. The core cross-checks the set
+# of symlink entries against the set of disclosed linktarget paths and refuses any symlink whose target
+# was never disclosed.
+@test "a symlink entry WITHOUT a matching linktarget record is REFUSED" {
+  mkdir -p "$STAGE"
+  HELPER_COPY=symlink-no-linktarget run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000
+  [ "$status" -ne 0 ]
+  assert_contains "/src/data/evil"
+  assert_contains "no linktarget"
+}
+
+# The other half: a legitimate symlink (entry + a matching linktarget) is NOT refused — the companion
+# check is targeted at the missing case, not a blanket symlink refusal.
+@test "a symlink entry WITH its matching linktarget passes the companion check" {
+  mkdir -p "$STAGE"
+  run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000
+  [ "$status" -eq 0 ]
+}
+
 @test "a copier that reports writing OUTSIDE the destination is a hard failure" {
   mkdir -p "$STAGE"
   HELPER_COPY=escaped-write run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000

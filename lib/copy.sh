@@ -341,6 +341,7 @@ mi_copy_run() {
       *:staging-nonempty) reason=staging-nonempty; path="${v%:*}" ;;
       *:unknown-entry-type) reason=unknown-entry-type; path="${v%:*}" ;;
       *:unreadable-linktarget) reason=unreadable-linktarget; path="${v%:*}" ;;
+      *:missing-linktarget) reason=missing-linktarget; path="${v%:*}" ;;
       *) reason=unreadable; path="$v" ;;
     esac
     # One path, one message: the two sources of a refusal (an explicit `refused=` line and an `entry=`
@@ -380,6 +381,11 @@ mi_copy_run() {
         mi_warn "copy: REFUSED $path — the copier logged a symlink target this core could not read (its"
         mi_warn "  trailing length field is missing or not a number). A target we cannot parse might be"
         mi_warn "  concealing one that escapes the migrated tree, so it is refused rather than guessed." ;;
+      missing-linktarget)
+        mi_warn "copy: REFUSED $path — the copier enumerated a symlink but disclosed no linktarget record"
+        mi_warn "  for it, so its stored target was never shown and the escape backstop never ran on it. A"
+        mi_warn "  symlink entry without a matching linktarget is refused: an undisclosed target cannot be"
+        mi_warn "  shown not to escape the migrated tree." ;;
       *)
         mi_warn "copy: REFUSED — the copier stated a refusal in a form this core cannot read: '$v'."
         mi_warn "  It is treated as a refusal rather than skipped: an unreadable refusal is still one." ;;
@@ -509,8 +515,17 @@ _mi_copy_link_escapes() {
 # EVERY REFUSAL THE ANSWER STATES, from every thing that can state one, in ONE place.
 #
 #   `refused=<path>:<reason>`      the copier's own refusal
-#   `entry=<type>:<path>`          EVERY enumerated entry, checked against the closed type set
+#   `entry=<type>:<path>`          EVERY enumerated entry, checked against the closed type set AND for
+#                                  its required companion record (a `symlink` needs a `linktarget=`)
 #   `linktarget=<path><target>:<pathlen>`  a symlink it enumerated whose target ESCAPES the tree (<root>)
+#
+# REQUIRED COMPANIONS ARE CROSS-CHECKED, not assumed. A `symlink` entry whose path has no matching
+# `linktarget=` record is refused (`:missing-linktarget`): its target was never disclosed, so the
+# escape backstop below never ran on it, and a copier could otherwise smuggle an escaping symlink past
+# by omitting the linktarget (and any refused=) line while still counting the entry and reporting
+# done=ok. This is the CLASS — an entry whose type carries required companion data must have it present.
+# `file`/`dir` carry no core-required companion; a `hardlink`'s referent is a real in-tree inode, not
+# an escapable target string, so it needs none.
 #
 # The last two are folded in here rather than checked beside the loop because they are the same
 # decision: an unclassifiable entry, or an escaping symlink, is a refusal whether or not the copier
@@ -531,8 +546,23 @@ _mi_copy_link_escapes() {
 # target no longer degrades it (the old first-colon split did). A linktarget it cannot parse is refused
 # (`:unreadable-linktarget`), never guessed.
 _mi_copy_refusals() {
-  local blob="$1" root="$2" v etype epath
+  local blob="$1" root="$2" v etype epath ltpaths="" p found
   _mi_copy_fields "$blob" refused
+  # LINKTARGETS FIRST, so the entry pass below can cross-check every `symlink` against the set of paths
+  # that actually DISCLOSED a target. Each parsed linktarget is recorded in `ltpaths` (newline-delimited
+  # — a path may contain any byte but a newline, which the one-line format already forbids) and run
+  # through the escape backstop; an unparseable one is refused rather than guessed.
+  while IFS= read -r v; do
+    [ -n "$v" ] || continue
+    if _mi_copy_linktarget_split "$v"; then
+      ltpaths="${ltpaths}${_MI_COPY_LT_PATH}"$'\n'
+      if _mi_copy_link_escapes "$_MI_COPY_LT_PATH" "$_MI_COPY_LT_TARGET" "$root"; then
+        printf '%s:escaping-symlink\n' "$_MI_COPY_LT_PATH"
+      fi
+    else
+      printf '%s:unreadable-linktarget\n' "$v"
+    fi
+  done <<< "$(_mi_copy_fields "$blob" linktarget)"
   while IFS= read -r v; do
     [ -n "$v" ] || continue
     case "$v" in
@@ -542,23 +572,25 @@ _mi_copy_refusals() {
     if [ -n "$epath" ]; then
       case "$etype" in
         special) printf '%s:special-entry\n' "$epath"; continue ;;
-        file|dir|symlink|hardlink) continue ;;
+        # REQUIRED-COMPANION CROSS-CHECK. A `symlink` entry MUST come with a `linktarget=` record for
+        # the SAME path. Without it the target was never disclosed, the escape backstop above never saw
+        # it, and a copier could smuggle an escaping symlink past by simply OMITTING the linktarget (and
+        # any refused=) line while still counting the entry and reporting done=ok. Refuse it. This closes
+        # the CLASS "an entry whose type carries required companion data must have it": `file`/`dir`
+        # carry no core-required companion, and a `hardlink`'s referent is a real in-tree inode — not an
+        # arbitrary target string that can point outside — so it needs none.
+        symlink)
+          found=0
+          while IFS= read -r p; do [ "$p" = "$epath" ] && { found=1; break; }; done <<< "$ltpaths"
+          if [ "$found" -eq 0 ]; then printf '%s:missing-linktarget\n' "$epath"; fi
+          continue ;;
+        file|dir|hardlink) continue ;;
       esac
     fi
     # A type outside the closed set, or an entry line with no path: refused, carrying the raw entry so
     # the operator sees exactly what the copier emitted (reason last, colon-robust downstream).
     printf '%s:unknown-entry-type\n' "$v"
   done <<< "$(_mi_copy_fields "$blob" entry)"
-  while IFS= read -r v; do
-    [ -n "$v" ] || continue
-    if _mi_copy_linktarget_split "$v"; then
-      if _mi_copy_link_escapes "$_MI_COPY_LT_PATH" "$_MI_COPY_LT_TARGET" "$root"; then
-        printf '%s:escaping-symlink\n' "$_MI_COPY_LT_PATH"
-      fi
-    else
-      printf '%s:unreadable-linktarget\n' "$v"
-    fi
-  done <<< "$(_mi_copy_fields "$blob" linktarget)"
 }
 
 # VERIFICATION IS OVER THE CONTRACT, NOT A BYTE COUNT: every source entry has a counterpart of the same
