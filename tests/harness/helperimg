@@ -303,6 +303,22 @@ case "$cmd" in
       printf 'done=ok\n'
       fin 0
     fi
+    # `noncanon-pad`: the same file under two spellings — a copier padding the count without adding a
+    # distinct source object, so a `checked=` total can cover a spelling while an omitted entry is not.
+    if [ "$knob" = noncanon-pad ]; then
+      printf 'entry=dir:%s/data\n'      "$src"
+      printf 'entry=file:%s/data/a\n'   "$src"
+      printf 'entry=file:%s/data/./a\n' "$src"
+      printf 'done=ok\n'
+      fin 0
+    fi
+    # `empty-entry`: a claimed entry that names nothing.
+    if [ "$knob" = empty-entry ]; then
+      printf 'entry=dir:%s/data\n'    "$src"
+      printf 'entry=\n'
+      printf 'done=ok\n'
+      fin 0
+    fi
     # The ordinary tree, reported on EVERY setting, so the contract observations are present in the
     # plain case too and a caller cannot pass its symlink assertions only on a knobbed fixture. FIVE
     # `entry=` lines: the copy's own source enumeration, and the count the verify half is measured
@@ -323,6 +339,14 @@ case "$cmd" in
       # image, and one the caller must not accept on the strength of the exit status.
       special-unrefused)
         printf 'entry=special:%s/dev/thing\n' "$src" ;;
+      # A copier that reports a MISMATCH during the copy — as fatal as a refusal, but the copy step
+      # read only refused= before.
+      copy-mismatch)
+        printf 'mismatch=%s/data/f:digest\n' "$src" ;;
+      # An EMPTY mapped= on a copy that did NOT opt in — a reported mapping whose presence is the
+      # problem; the value loop skips it.
+      empty-mapped)
+        printf 'mapped=\n' ;;
       # A type OUTSIDE the closed set (file|dir|symlink|hardlink|special): a copier that met a FIFO or
       # a socket and enumerated it as `fifo:`/`socket:` rather than `special:`, then exited 0 with
       # done=ok. It counts toward the total and the copy "verifies" unless every entry's type is

@@ -97,6 +97,38 @@ _mi_copy_has_key() {
   return 1
 }
 
+# Does the transcript carry a `<key>=` line whose value is EMPTY? Distinct from `_mi_copy_has_key`
+# because an empty-valued record is the specific malformed shape a value-iterating loop drops (command
+# substitution also strips a trailing empty line, so `_mi_copy_fields` cannot be trusted to surface it)
+# — so it is detected on the raw lines, by the key followed immediately by end-of-line. rc 0 an empty
+# one exists · 1 none.
+_mi_copy_has_empty() {
+  local blob="$1" key="$2" line
+  while IFS= read -r line; do
+    [ "$line" = "${key}=" ] && return 0
+  done <<< "$blob"
+  return 1
+}
+
+# Is <path> a CANONICAL absolute path under /src — the only shape a source entry may name? A source
+# entry's identity is its canonical path, so `/src/a`, `/src/./a` and `/src/x/../a` are the SAME entry
+# and must not be countable as three: a copier could otherwise pad the entry count (which binds
+# verification) with spellings of one file while omitting a dangerous one. Purely lexical — the walk is
+# by `/`-separated component, and any `.`, `..`, empty (`//`) or non-`/src` component is refused. A
+# trailing slash is refused too (it is not how the copier names a leaf). rc 0 canonical · 1 not.
+_mi_copy_entry_path_ok() {
+  local p="$1" rest comp
+  case "$p" in /src|/src/*) : ;; *) return 1 ;; esac
+  case "$p" in */) return 1 ;; esac        # no trailing slash — `/src` itself has none
+  rest="${p#/}"                            # drop the leading slash; walk components
+  while [ -n "$rest" ]; do
+    comp="${rest%%/*}"
+    case "$comp" in ''|.|..) return 1 ;; esac
+    if [ "$rest" = "$comp" ]; then rest=""; else rest="${rest#*/}"; fi
+  done
+  return 0
+}
+
 # THE VALUE OF ONE STATED OBSERVATION, or a refusal. rc 0 the value is printed (an empty value is a
 # real answer and is handed back as one) · 1 it was not stated at all, or was stated twice (REPORTED).
 #
@@ -334,6 +366,14 @@ mi_copy_run() {
       mi_log "  foreign uid mapped to the operator: ${v} (the numeric value is preserved here in text)"
     fi
   done <<< "$(_mi_copy_fields "$out" mapped)"
+  # An EMPTY `mapped=` on a copy that did not opt in is still a reported mapping — the value loop above
+  # skips it, so its presence is caught here. A mapping the operator did not request is refused whether
+  # or not it names a uid.
+  if [ "$mapforeign" -eq 0 ] && _mi_copy_has_empty "$out" mapped; then
+    mi_warn "copy: the copier reported a foreign-uid mapping (an empty 'mapped=' record) on a copy that"
+    mi_warn "  did not request one. An unrequested mapping is refused whether or not it names the uid."
+    refused=1
+  fi
   while IFS= read -r v; do
     [ -n "$v" ] || continue
     # `refused=<path>:<reason>`, parsed with the REASON LAST and taken from a CLOSED vocabulary, so a
@@ -415,6 +455,13 @@ mi_copy_run() {
     mi_warn "  refusal is a refusal whether or not it says what — the copy is abandoned."
     refused=1
   fi
+  # A `mismatch=` from the COPY step is as fatal as a refusal — the copier saw an entry that does not
+  # match and said so. The copy step read only `refused=`; a `mismatch=` line (even empty) is caught
+  # here by presence, so a mismatch reported during the copy cannot be reached only in verify.
+  if _mi_copy_has_key "$out" mismatch; then
+    while IFS= read -r v; do mi_warn "copy: the copier reported a MISMATCH ${v:-<an entry it did not name>}"; done <<< "$(_mi_copy_fields "$out" mismatch)"
+    refused=1
+  fi
 
   [ "$refused" -eq 0 ] || return 1
   [ "$rc" -eq 0 ] || { mi_warn "copy: the copy did not complete."; return 1; }
@@ -441,6 +488,14 @@ mi_copy_run() {
   # honest is the pinned image's responsibility, verified by its own build/CI against the release
   # digest; the core's responsibility is confinement, refusing on any reported refusal/mismatch, and
   # this internal consistency of the report.)
+  # An EMPTY `entry=` line is a malformed entry the value loop below cannot see (command substitution
+  # strips a trailing empty, and `[ -n "$v" ]` drops the rest), so it is detected on the raw lines
+  # first: a copier that claims an entry naming nothing is refused, not counted.
+  if _mi_copy_has_empty "$out" entry; then
+    mi_warn "copy: the copier enumerated an empty 'entry=' record — a claimed entry that names nothing."
+    mi_warn "  Refusing rather than counting it toward a completed copy."
+    return 1
+  fi
   local entries=0 epath eseen=$'\n'
   while IFS= read -r v; do
     [ -n "$v" ] || continue
@@ -448,6 +503,15 @@ mi_copy_run() {
     if [ -z "$epath" ]; then
       mi_warn "copy: the copier enumerated an entry line with no path ('${v}'). Refusing rather than"
       mi_warn "  counting a claim that names nothing toward a completed copy."
+      return 1
+    fi
+    # The path must be CANONICAL under /src, so two spellings of one file cannot be counted as two
+    # entries — `/src/a`, `/src/./a` and `/src/x/../a` are the same source object, and a copier could
+    # otherwise pad the count that binds verification with spellings while omitting a dangerous entry.
+    if ! _mi_copy_entry_path_ok "$epath"; then
+      mi_warn "copy: the copier enumerated '${epath}', which is not a canonical path under /src (a '.',"
+      mi_warn "  '..', empty or trailing component, or a path outside /src). A non-canonical path lets one"
+      mi_warn "  source object be counted under several spellings — refused rather than counted."
       return 1
     fi
     case "$eseen" in *$'\n'"${epath}"$'\n'*)

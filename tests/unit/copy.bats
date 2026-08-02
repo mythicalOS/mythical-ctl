@@ -158,6 +158,36 @@ teardown() { rm -rf "$DST" "$STAGE"; mi_lock_release; teardown_test_env; }
 # than `special:`, then exited 0 with done=ok, would otherwise have that entry COUNTED toward the total
 # and the copy reported verified. The exact hostile transcript — a `fifo:` entry alongside `done=ok` and
 # a zero exit — must be REFUSED.
+@test "a copier padding with a NON-CANONICAL spelling of one path is REFUSED" {
+  # `/src/data/a` and `/src/data/./a` are the same source object. Counting both pads the entry count
+  # that binds verification, so a checked= total can cover a spelling while a dangerous entry is omitted.
+  mkdir -p "$STAGE"
+  HELPER_COPY=noncanon-pad run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000
+  [ "$status" -ne 0 ]
+  assert_contains "canonical path under /src"
+}
+
+@test "an EMPTY entry= record (a claimed entry naming nothing) is REFUSED" {
+  mkdir -p "$STAGE"
+  HELPER_COPY=empty-entry run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000
+  [ "$status" -ne 0 ]
+  assert_contains "names nothing"
+}
+
+@test "a MISMATCH reported during the COPY step fails, not only in verify" {
+  mkdir -p "$STAGE"
+  HELPER_COPY=copy-mismatch run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000
+  [ "$status" -ne 0 ]
+  assert_contains "MISMATCH"
+}
+
+@test "an EMPTY mapped= on a copy that did not opt in is REFUSED — presence is the problem" {
+  mkdir -p "$STAGE"
+  HELPER_COPY=empty-mapped run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000
+  [ "$status" -ne 0 ]
+  assert_contains "unrequested mapping"
+}
+
 @test "a copier padding the count with a DUPLICATE source path is REFUSED" {
   # Verification is bound to the entry count, so the count must be of DISTINCT source entries. A copier
   # can otherwise emit one valid file N times and OMIT a dangerous entry it also copied — the count
