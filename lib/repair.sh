@@ -583,7 +583,25 @@ _mi_repair_run_locked() {
   while IFS= read -r rec; do
     [ -n "$rec" ] || continue
     _mi_led_record_matches "$rec" class container || continue
-    c="$(mi_led_field "$rec" name)" || continue
+    # FAIL CLOSED, NOT `|| continue` — the same class round 4's nonce-absent fix closed, one field
+    # over. `_mi_led_record_matches` above already proved this row is well-formed, so `mi_led_field`
+    # can only fail here with rc 3 (no `name=` field on an otherwise-valid record) — a state
+    # `mi_prov_record` never writes (it always includes `name=`), but this loop runs over records
+    # `mi_led_all` just read BACK from the ledger this same run wrote, and silently skipping one here
+    # is silently skipping ITS observed-state and alias verification while the repair as a whole still
+    # reports success. That is exactly the same "reports success while skipping a container's
+    # verification" gap a missing name would leave in `status`, `stop`, `restart` — anything that
+    # walks this ledger by record — with no way to tell it apart from a container that was
+    # legitimately never checked.
+    local crc
+    if c="$(mi_led_field "$rec" name)"; then crc=0; else crc=$?; fi
+    if [ "$crc" -ne 0 ]; then
+      mi_warn "repair: a container-class record this run just wrote carries no readable name, so its"
+      mi_warn "  observed state and alias cannot be live-verified. The ledger rebuild otherwise"
+      mi_warn "  completed; this is reported rather than silently skipped. Run 'mythical-ctl state"
+      mi_warn "  repair $choice' again, and if it recurs, treat the ledger as damaged."
+      return 1
+    fi
     local obs2 obsrc2
     if obs2="$(mi_state_observed "$c")"; then obsrc2=0; else obsrc2=$?; fi
     if [ "$obsrc2" -ne 0 ]; then
@@ -631,7 +649,26 @@ _mi_repair_run_locked() {
       case "$product" in '<no value>') product="" ;; esac
     fi
     alias=""
-    if [ -n "$product" ]; then alias="$(mi_name_alias "$product" 2>/dev/null || true)"; fi
+    local anrc=0
+    if [ -n "$product" ]; then
+      if alias="$(mi_name_alias "$product" 2>/dev/null)"; then anrc=0; else anrc=$?; fi
+    fi
+    # A PRESENT BUT INVALID PRODUCT LABEL IS NOT THE SAME CASE AS NO PRODUCT LABEL AT ALL, AND MUST
+    # NOT SHARE ITS FALLBACK. `mi_name_alias` fails when `$product` does not parse as a valid
+    # identifier (mi_name_alias 2>/dev/null || true` used to swallow that and fall straight into the
+    # aliases-based reconstruction below — which then verifies WHATEVER alias the container happens to
+    # carry, not necessarily the canonical family one siblings actually resolve. If that happened to
+    # verify, the outstanding check was cleared as "confirmed" from a malformed label, without ever
+    # checking the alias that matters. The D37 fallback is legitimate only when there was no product to
+    # derive from in the first place (`$product` empty); a non-empty product that failed to derive an
+    # alias is a real error about THIS object and fails closed instead.
+    if [ -n "$product" ] && [ "$anrc" -ne 0 ]; then
+      mi_warn "repair: '$c' carries a product label ('$product') that is not a valid identifier, so the"
+      mi_warn "  canonical family alias cannot be derived from it. Falling back to whatever alias"
+      mi_warn "  happens to be registered would verify a different name than siblings actually resolve."
+      mi_warn "  Left running, still outstanding."
+      continue
+    fi
     if [ -z "$alias" ]; then
       # THE ALIAS READ ITSELF MUST FAIL CLOSED — a container whose network aliases could not be asked
       # about is not "carries no alias on this network" (which `continue`s harmlessly below, leaving
@@ -913,5 +950,16 @@ _mi_verb_net_rebind_locked() {
   mi_warn "  the old one, so no step leaves the family partitioned. This is never automatic: a silent"
   mi_warn "  rebind is how a container gets joined to a network you did not intend."
   mi_confirm "verbs: rebind onto '$name'?" || { mi_warn "verbs: not confirmed."; return 1; }
-  mi_net_ref_rebind "$idx" "$id"
+  # NORMALIZE TO THE VERB CONTRACT HERE TOO — the same reason the RESUME branch above does.
+  # mi_net_ref_rebind's own last step is mi_netmig_resume, which re-reads the migration record it
+  # just wrote under this same lock; a bare `mi_net_ref_rebind "$idx" "$id"` as the final statement
+  # would return WHATEVER that inner read answers, unchanged, and an operational race in that window
+  # (the daemon still completing something the lock does not exclude, not another mythical-ctl
+  # process, which it does) can make it 3 — "absent" — exactly as it can for the resume branch. 3
+  # means "not launched" at this CLI's contract boundary, which is the wrong meaning for a race during
+  # a rebind THIS call itself just started; automation reading it that way would think nothing
+  # happened when the fleet may already be partway migrated.
+  local rrc
+  if mi_net_ref_rebind "$idx" "$id"; then rrc=0; else rrc=$?; fi
+  case "$rrc" in 0|1|2) return "$rrc" ;; *) return 1 ;; esac
 }

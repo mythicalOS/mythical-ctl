@@ -560,3 +560,65 @@ teardown() { teardown_test_env; }
   run mi_trust_anchor_get
   [ "$status" -eq 3 ]
 }
+
+# --- codex round 5: 2 MEDIUM + 1 LOW, the last edges of the established classes ----------------------
+
+@test "net rebind's NEW-rebind branch normalizes a leaked rc 3 to operational failure 1" {
+  # The exact trigger (the migration record vanishing in the window between mi_net_ref_rebind's own
+  # phase-1 write and mi_netmig_resume's internal re-read of it, both under the lock this verb holds
+  # throughout) is not constructible from outside a single synchronous call, so this pins the
+  # NORMALIZATION directly: stub mi_net_ref_rebind to answer exactly as a raced call would (rc 3, "the
+  # record I was just told exists is gone") and confirm the verb maps it to 1 rather than leaking 3 —
+  # "not launched" is the wrong meaning for a race during a rebind this call itself just started.
+  mi_rt_network_create opnet "" x >/dev/null
+  printf 'MYTHICAL_NET=opnet\n' > "$MYTHICAL_HOME/mythical.conf"
+  mi_net_ref_rebind() { return 3; }
+  run mi_verb_net_rebind "$IDX"
+  [ "$status" -eq 1 ]
+}
+
+@test "live-verify FAILS CLOSED on a present-but-invalid product label, never clears from a fallback alias" {
+  # c1 carries a product label that is not a valid identifier (mi_name_alias itself refuses it), so the
+  # canonical family alias cannot be derived — a DIFFERENT fact from "no product label at all" (D37's
+  # legitimate fallback case). Before the fix, `mi_name_alias ... 2>/dev/null || true` swallowed that
+  # failure and fell straight into the aliases-based reconstruction, which verifies whatever alias the
+  # container actually carries (here, the same "p1" a normal bring-up would also have used) — so the
+  # outstanding check was cleared as "confirmed" without ever checking the alias that matters.
+  net="$(mi_rt_network_create netA insta nA)"
+  mi_rt_image_pull "$(a_digestref p1)" >/dev/null
+  mi_rt_container_create c1 "$(a_digestref p1)" "$net" p1 - label=installation=insta label=nonce=nc1 label=product=BadProduct >/dev/null
+  mi_rt_container_start c1 >/dev/null
+  run mi_repair_run "$IDX" insta
+  [ "$status" -eq 0 ]
+  assert_contains "not a valid identifier"
+  load_mctl
+  run mi_state_outstanding c1
+  assert_contains alias
+}
+
+@test "the post-repair verify loop FAILS CLOSED on a container record with no readable name" {
+  # A container-class record with no `name=` field is a state mi_prov_record itself never produces (it
+  # always includes one) — reached here by stubbing it to omit the field for containers only, standing
+  # in for a malformed record this same run just wrote reaching the live-verify loop. Before the fix,
+  # `mi_led_field "$rec" name" || continue` silently skipped it and the repair still reported success —
+  # the same "reports success while skipping a container's verification" gap round 4's nonce-absent
+  # fix closed one field over (the sibling that report flagged forward).
+  net="$(mi_rt_network_create netA insta nA)"
+  mi_rt_image_pull "$(a_digestref p1)" >/dev/null
+  mi_rt_container_create c1 "$(a_digestref p1)" "$net" p1 - label=installation=insta label=nonce=nc1 >/dev/null
+  mi_rt_container_start c1 >/dev/null
+  mi_prov_record() {
+    local class="$1" name="$2" nonce="$3"; shift 3
+    local gen
+    gen="$(mi_prov_gen "$class" "$name")" || return 1
+    gen=$((gen + 1))
+    if [ "$class" = container ]; then
+      mi_led_put object key "container:${name}" "key=container:${name}" "class=container" "nonce=${nonce}" "gen=${gen}" "$@"
+    else
+      mi_led_put object key "$(_mi_prov_key "$class" "$name")" "key=$(_mi_prov_key "$class" "$name")" "class=${class}" "name=${name}" "nonce=${nonce}" "gen=${gen}" "$@"
+    fi
+  }
+  run mi_repair_run "$IDX" insta
+  [ "$status" -ne 0 ]
+  assert_contains "carries no readable name"
+}
