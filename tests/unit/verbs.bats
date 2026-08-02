@@ -677,3 +677,46 @@ EOF
   run mi_verb_recreate "$IDX" "$POL" "$MYTHICAL_HOME/p1.manifest" p1
   [ "$status" -eq 1 ]
 }
+
+@test "install REFUSES to create a container when its provenance record is ambiguous (rc 1 fail-closed)" {
+  # two provenance records answer for the same container name → mi_prov_find is ambiguous (rc 1). Install
+  # must NOT read that as "no prior container" and create one over an unreadable ledger; recreate already
+  # fails closed here, and install must too.
+  IDENT="$(mi_ident_get)"; C="mythical-${IDENT}-p1"
+  mi_lock_acquire
+  { mi_ledger_read
+    printf 'object\tkey=container:%s\tclass=container\tname=%s\tnonce=a\tgen=1\n' "$C" "$C"
+    printf 'object\tkey=container:%s\tclass=container\tname=%s\tnonce=b\tgen=1\n' "$C" "$C"
+  } | mi_ledger_write
+  mi_lock_release
+  run mi_verb_install "$IDX" "$POL" "$MAN" p1
+  [ "$status" -ne 0 ]
+  run mi_rt_inspect container c.state "$C"          # no container was created over the ambiguous ledger
+  [ "$status" -ne 0 ]
+}
+
+@test "a REFUSED install (unaccounted object) does NOT advance the anti-rollback trust floor" {
+  # the unaccounted-object gate now runs BEFORE mi_product_ctx, which records the manifest's trust floor.
+  # A refused install must not advance the floor — otherwise a newer manifest fed to a refused install
+  # would permanently block a rollback for an install that never happened.
+  mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
+  IDENT="$(mi_ident_get)"
+  floor_before="$(mi_trust_floor_get manifest:p1)"
+  mi_rt_volume_create "mythical-${IDENT}-stray" nx "$IDENT"    # an unrecorded same-identity object → gate stops
+  write_fixture_product p1 version=99                          # a NEWER manifest
+  run mi_verb_install "$IDX" "$POL" "$MYTHICAL_HOME/p1.manifest" p1
+  [ "$status" -ne 0 ]
+  run mi_trust_floor_get manifest:p1
+  [ "$output" = "$floor_before" ]                             # the floor did NOT advance to 99
+}
+
+@test "start reports an ambiguous container provenance as unreadable, never 'not installed' (rc 1 is not rc 3)" {
+  mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
+  IDENT="$(mi_ident_get)"; C="mythical-${IDENT}-p1"
+  mi_lock_acquire
+  { mi_ledger_read; printf 'object\tkey=container:%s\tclass=container\tname=%s\tnonce=dup\tgen=1\n' "$C" "$C"; } | mi_ledger_write
+  mi_lock_release
+  run mi_verb_start "$IDX" p1
+  [ "$status" -ne 0 ]
+  case "$output" in *"is not installed"*) echo "reported ambiguous provenance as not-installed: $output" >&2; return 1 ;; esac
+}

@@ -387,6 +387,13 @@ _mi_verb_install_locked() {
   # state, exactly as the other verbs do via _mi_verb_prepare.
   mi_probe_cleanup || return 1
 
+  # THE UNACCOUNTED-OBJECT GATE RUNS BEFORE ANY AUTHENTICATED-STATE WRITE, matching recreate (which runs it
+  # first via _mi_verb_prepare). mi_product_ctx below advances the manifest's anti-rollback trust floor — a
+  # §7.3-exempt side effect — so running the gate AFTER it let a refused install (a stray same-identity
+  # object) still advance the floor, permanently blocking a rollback for an install that was never allowed.
+  # On a fresh machine there is no identity yet, so the scan finds nothing and the gate passes.
+  mi_unaccounted_gate || return 1
+
   local ctx rc mrec prec
   if ctx="$(mi_product_ctx "$idx" "$pol" "$man" "$product")"; then rc=0; else rc=$?; fi
   if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then return 1; fi
@@ -438,8 +445,6 @@ _mi_verb_install_locked() {
     mi_warn "  'status' once the install succeeds."
     image="$override"
   fi
-
-  mi_unaccounted_gate || return 1
 
   local netid
   netid="$(mi_net_target "$idx")" || return 1
@@ -532,8 +537,15 @@ _mi_verb_install_locked() {
   # a prior generation's. Preserving is `recreate`'s job alone — only it carries a stopped product back
   # to stopped. So a previously-installed container is REPLACED (removed and rebuilt), but the desired
   # state it is rebuilt into stays `running`, never the `stopped` a prior `stop` may have left behind.
-  local desired=running arc
-  if mi_prov_find container "$container" >/dev/null 2>&1; then
+  # rc 3 (no prior container record) is the ONLY status that proceeds straight to a fresh create. rc 0
+  # enters the replacement authority check; rc 1 (ambiguous/unreadable provenance) must fail CLOSED —
+  # treating it as "no prior container" would let bring-up CREATE a container over a ledger that cannot
+  # say what already exists (the record is ambiguous even though the container may be absent). recreate
+  # already fails closed here; install must too. (>/dev/null keeps a matched record off stdout; the
+  # rc-1 warning is left on stderr.)
+  local desired=running arc pfrc
+  if mi_prov_find container "$container" >/dev/null; then pfrc=0; else pfrc=$?; fi
+  if [ "$pfrc" -eq 0 ]; then
     # §6a applies to a REPLACEMENT exactly as it applies to an uninstall: prove the container carries
     # the nonce we recorded before removing it. "We are about to replace it" is not an exemption.
     if mi_prov_authority container "$container"; then arc=0; else arc=$?; fi
@@ -547,6 +559,12 @@ _mi_verb_install_locked() {
          mi_warn "  install stops rather than creating a second container under the same name."
          return 1 ;;
     esac
+  elif [ "$pfrc" -ne 3 ]; then
+    [ "$envfile" = "-" ] || rm -f "$envfile"
+    mi_warn "verbs: the provenance record for container '$container' is ambiguous or unreadable, so this"
+    mi_warn "  install cannot tell whether a container already stands under that name. Refusing to create"
+    mi_warn "  over it rather than adopt an unreadable ledger. Run 'mythical-ctl state repair'."
+    return 1
   fi
 
   # if/else, NOT `mi_bringup …; rc=$?`: a bare call is a simple command, so a failed bring-up aborts a
@@ -592,7 +610,14 @@ _mi_verb_start_locked() {
   local idx="$1" product="$2" c netid alias
   _mi_verb_prepare || return 1
   c="$(_mi_verb_container "$product")" || return 1
-  mi_prov_find container "$c" >/dev/null 2>&1 || { mi_warn "verbs: '$product' is not installed"; return 1; }
+  local pfrc
+  if mi_prov_find container "$c" >/dev/null; then pfrc=0; else pfrc=$?; fi
+  if [ "$pfrc" -eq 3 ]; then mi_warn "verbs: '$product' is not installed"; return 1
+  elif [ "$pfrc" -ne 0 ]; then
+    mi_warn "verbs: the container record for '$product' is ambiguous or unreadable — this is not the same"
+    mi_warn "  as not installed. Run 'mythical-ctl state repair'."
+    return 1
+  fi
   netid="$(mi_net_target "$idx")" || return 1
   alias="$(mi_name_alias "$product")" || return 1
   # ONE atomic write: desired=running AND the outstanding alias check it owes. Splitting them leaves a
@@ -614,7 +639,14 @@ _mi_verb_stop_locked() {
   local product="$1" c
   _mi_verb_prepare || return 1
   c="$(_mi_verb_container "$product")" || return 1
-  mi_prov_find container "$c" >/dev/null 2>&1 || { mi_warn "verbs: '$product' is not installed"; return 1; }
+  local pfrc
+  if mi_prov_find container "$c" >/dev/null; then pfrc=0; else pfrc=$?; fi
+  if [ "$pfrc" -eq 3 ]; then mi_warn "verbs: '$product' is not installed"; return 1
+  elif [ "$pfrc" -ne 0 ]; then
+    mi_warn "verbs: the container record for '$product' is ambiguous or unreadable — this is not the same"
+    mi_warn "  as not installed. Run 'mythical-ctl state repair'."
+    return 1
+  fi
   mi_state_commit "$c" stopped || return 1
   # The stop must actually HAPPEN. `mi_rt_container_stop … || true` folded a daemon/permission/runtime
   # failure into success, logged "stopped", and exited 0 — leaving the product RUNNING while the CLI
