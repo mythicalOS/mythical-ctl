@@ -110,6 +110,34 @@ _mi_copy_has_empty() {
   return 1
 }
 
+# THE TRANSCRIPT IS A CLOSED GRAMMAR: every non-empty line must be `<allowed-key>=<value>` for a key
+# this mode expects. A line that matches nothing was silently ignored before — and an ignored line is
+# not harmless: it could be an unparsed CONTINUATION of newline-bearing data, at which point the whole
+# `key=value` record grammar is no longer reliable and none of the per-key checks above can be trusted.
+# So a line outside the vocabulary FAILS CLOSED, naming the offending line. `<blob>` then the allowed
+# keys as the remaining arguments. rc 0 every line conforms · 1 one did not (reported).
+_mi_copy_grammar_ok() {
+  local blob="$1"; shift
+  local line key ok k
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    key="${line%%=*}"
+    case "$line" in *=*) : ;; *)
+      mi_warn "copy: the helper emitted a line that is not a key=value record: '${line}'. The transcript"
+      mi_warn "  must be a closed grammar — an unrecognised line is refused, not ignored."
+      return 1 ;;
+    esac
+    ok=0
+    for k in "$@"; do [ "$key" = "$k" ] && { ok=1; break; }; done
+    if [ "$ok" -eq 0 ]; then
+      mi_warn "copy: the helper emitted a line with an unexpected key: '${line}'. Only the keys this"
+      mi_warn "  command defines are accepted; an unrecognised one is refused rather than ignored."
+      return 1
+    fi
+  done <<< "$blob"
+  return 0
+}
+
 # Is <path> a CANONICAL absolute path under /src — the only shape a source entry may name? A source
 # entry's identity is its canonical path, so `/src/a`, `/src/./a` and `/src/x/../a` are the SAME entry
 # and must not be countable as three: a copier could otherwise pad the entry count (which binds
@@ -238,6 +266,7 @@ mi_copy_preflight() {
 
   if out="$(_mi_copy_helper "$idx" preflight "arg=/dst" "arg=${ruid}" "arg=${ouid}" \
              "staging=${stage}")"; then rc=0; else rc=$?; fi
+  _mi_copy_grammar_ok "$out" ownership permissions symlink acl inherit refused "done" || return 1
 
   for k in ownership permissions symlink inherit; do
     v="$(_mi_copy_stated "$out" "$k" preflight)" || return 1
@@ -332,6 +361,7 @@ mi_copy_run() {
 
   local out rc
   if out="$(_mi_copy_helper "$idx" copy "${cspecs[@]}" "srcvol=${srcvol}" "staging=${stage}")"; then rc=0; else rc=$?; fi
+  _mi_copy_grammar_ok "$out" entry linktarget stripped mapped refused mismatch "done" || return 1
 
   # Report the contract observations BEFORE deciding, so a refusal still tells the operator what the
   # copier saw. `refused` is declared up here because an unrequested mapping (below) sets it too.
@@ -763,6 +793,7 @@ mi_copy_verify() {
   # does not give (round-2 finding 3).
   _mi_copy_acl_context_note "the default-ACL application check"
   if out="$(_mi_copy_helper "$idx" verify "arg=/src" "arg=/dst" "arg=${ruid}" "arg=${ouid}" "srcvol=${srcvol}" "dstro=${dst}")"; then rc=0; else rc=$?; fi
+  _mi_copy_grammar_ok "$out" mismatch refused checked acl "done" || return 1
   while IFS= read -r v; do
     [ -n "$v" ] || continue
     mi_warn "copy: VERIFICATION MISMATCH ${v}"
@@ -856,6 +887,7 @@ mi_copy_access_check() {
   _mi_copy_uid_ok "$ruid" "the runtime uid" || return 1
   mi_copy_available "$idx" || return 1
   if out="$(MI_COPY_RUNAS="$ruid" _mi_copy_helper "$idx" access "arg=/dst" "staging=${dst}")"; then rc=0; else rc=$?; fi
+  _mi_copy_grammar_ok "$out" traverse read write "done" || return 1
   for k in traverse read write; do
     v="$(_mi_copy_stated "$out" "$k" access)" || return 1
     if [ "$v" != ok ]; then

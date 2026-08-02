@@ -158,6 +158,20 @@ teardown() { rm -rf "$DST" "$STAGE"; mi_lock_release; teardown_test_env; }
 # than `special:`, then exited 0 with done=ok, would otherwise have that entry COUNTED toward the total
 # and the copy reported verified. The exact hostile transcript — a `fifo:` entry alongside `done=ok` and
 # a zero exit — must be REFUSED.
+@test "a transcript line that is not a key=value record is REFUSED — closed grammar" {
+  mkdir -p "$STAGE"
+  HELPER_COPY=junk-line run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000
+  [ "$status" -ne 0 ]
+  assert_contains "not a key=value record"
+}
+
+@test "a transcript line with an unexpected KEY is REFUSED — only this command's keys are accepted" {
+  mkdir -p "$STAGE"
+  HELPER_COPY=unknown-key run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000
+  [ "$status" -ne 0 ]
+  assert_contains "unexpected key"
+}
+
 @test "an EMPTY linktarget= record is REFUSED — a disclosed target that names nothing" {
   mkdir -p "$STAGE"
   HELPER_COPY=empty-lt run mi_copy_run "$IDX" srcvol1 "$STAGE" 900 1000

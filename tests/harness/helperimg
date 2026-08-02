@@ -347,6 +347,13 @@ case "$cmd" in
       # problem; the value loop skips it.
       empty-mapped)
         printf 'mapped=\n' ;;
+      # A line that is not a key=value record at all — silently ignored before. An unparsed line means
+      # the transcript is no longer a reliable record grammar, so it fails closed.
+      junk-line)
+        printf 'not-a-key-value-record\n' ;;
+      # A well-formed key=value line whose KEY is not in this command's vocabulary — also refused.
+      unknown-key)
+        printf 'surprise=whatever\n' ;;
       # An EMPTY linktarget= — a disclosed symlink target that names nothing; the value pass skips it.
       empty-lt)
         printf 'linktarget=\n' ;;
