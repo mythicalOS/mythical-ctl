@@ -109,6 +109,17 @@ printf '%s\n' "$*" >> "$STATE/calls.log"
 
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 
+# FAKE_DOCKER_INTERRUPT_AFTER=<subcommand> fabricates the process dying AT a named step — the
+# `<verb> <sub>` pair (e.g. `container create`) is compared against "$1 $2", and when it matches the
+# command dies BEFORE doing its work, so the object it would have created never exists. It is a
+# fabricated-failure knob like FAKE_DOCKER_DOWN/CONNECT_FAIL, inert unless set, and it exists to build
+# the "an interrupted install converges on a re-run" acceptance case: the volume is already created and
+# the container intent is already open, but the container itself is not, which is precisely the
+# write-ahead window recovery must close.
+if [ -n "${FAKE_DOCKER_INTERRUPT_AFTER:-}" ] && [ "${1:-} ${2:-}" = "$FAKE_DOCKER_INTERRUPT_AFTER" ]; then
+  die "fake docker: interrupted at '${FAKE_DOCKER_INTERRUPT_AFTER}'"
+fi
+
 # A down daemon fails EVERY command, including version — that is what makes the adapter's
 # absent-vs-unreachable split observable.
 [ -z "${FAKE_DOCKER_DOWN:-}" ] || die "Cannot connect to the Docker daemon. Is the docker daemon running?"

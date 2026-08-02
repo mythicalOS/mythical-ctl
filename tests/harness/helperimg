@@ -218,11 +218,20 @@ case "$cmd" in
     printf 'selfcheck=ok\n'
     ;;
   resolve)
-    # `${HELPER_RESOLVE_ADDR-…}`, NOT `:-`: an explicitly EMPTY value must stay empty, because
-    # "did not resolve" is the answer it exists to produce. With `:-` the default would win and the
-    # non-resolving case would be unreachable.
+    # An EXPLICIT HELPER_RESOLVE_ADDR wins, and `+set` — not `:-`/`-` — is what makes an explicitly
+    # EMPTY value stay empty: "did not resolve" is an answer a test forces on purpose, and a default
+    # winning there would make the non-resolving case unreachable. With NOTHING set, the alias is
+    # resolved against the real network DNS view the runtime hands us (HELPER_NET_DNS), exactly as a
+    # probe against a live daemon would — so a bring-up whose fixture pins no answer verifies against
+    # the address the container ACTUALLY has, and several containers each resolve to their own.
     printf 'alias=%s\n' "${1:-}"
-    printf 'address=%s\n' "${HELPER_RESOLVE_ADDR-10.88.1.2}"
+    if [ "${HELPER_RESOLVE_ADDR+set}" = set ]; then
+      printf 'address=%s\n' "$HELPER_RESOLVE_ADDR"
+    elif raddr="$(lookup "${1:-}" "${HELPER_NET_DNS:-}")"; then
+      printf 'address=%s\n' "$raddr"
+    else
+      printf 'address=\n'
+    fi
     ;;
   egress)
     if [ "${HELPER_EGRESS:-ok}" = fail ]; then printf 'egress=fail\n'; exit 1; fi

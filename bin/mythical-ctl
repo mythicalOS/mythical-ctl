@@ -25,7 +25,7 @@ _MCTL_BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # everything between these two sentinels with the modules inlined verbatim, so the published
 # artifact is a single self-contained file with no ../lib to resolve.
 _MCTL_LIB="${_MCTL_BIN}/../lib"
-for _m in common layout config lock ledger doc trust policy manifest detect runtime preflight exit prov intent state probe bringup netref copy; do
+for _m in common layout config lock ledger doc trust policy manifest detect runtime preflight exit prov intent state probe bringup netref verbs copy; do
   if [ -f "${_MCTL_LIB}/${_m}.sh" ]; then
     # shellcheck disable=SC1090
     source "${_MCTL_LIB}/${_m}.sh"
@@ -39,36 +39,42 @@ usage() {
 mythical-ctl — install and manage mythicalOS products
 
 USAGE
-  mythical-ctl <command> [options]
+  mythical-ctl <command> [products...] [options]
 
 COMMANDS
-  (none yet — the lifecycle commands land with the implementation)
+  install <product>...     install (or converge) one or more products
+  start <product>...       start; sets desired state to running
+  stop <product>...        stop; sets desired state to stopped
+  restart <product>...     restart; refused on a product you have stopped
+  recreate <product>...    replace the container, preserving desired state
+  status [product...]      report desired vs actual, outstanding checks, unattributed objects
+  uninstall <product>      remove the container; keeps your data and the rollback floor
+                             --purge   also remove this product's named volumes
+  uninstall --family       remove EVERY product and reset the ledger entirely - identity,
+                           membership, every rollback floor, the family-index anchor
+                             --purge   also remove every named volume (your data)
 
 OPTIONS
-  -v, --version   print the version and exit
-  -h, --help      print this help and exit
+  --index PATH             the family index (default: ~/.mythical/.state/index)
+  --policy PATH            the family policy index
+  --manifest-dir PATH      where <product>.manifest files are
+  --image REF              run this image instead of the manifest's (loud, recorded)
+  --force-install          install a product whose manifest says it has not launched
+  -v, --version            print the version and exit
+  -h, --help               print this help and exit
 
-Products are not published yet. See https://github.com/mythicalOS/mythical-ctl
+EXIT CODES
+  0  completed      1  operational failure      2  usage error      3  not launched yet
+
+Documentation: https://docs.mythicalos.ai   Source: https://github.com/mythicalOS/mythical-ctl
 EOF
 }
 
-main() {
-  if [ "$#" -eq 0 ]; then
-    usage
-    exit 0
-  fi
-
-  case "$1" in
-    -v|--version)
-      printf 'mythical-ctl %s\n' "$VERSION"
-      ;;
-    -h|--help)
-      usage
-      ;;
-    __selftest)
-      # Hidden, undocumented, used by the tests: assert the shipped library surface is actually
-      # present. Meaningful in both modes — in the release bundle the modules are inlined, so
-      # "did it source" is unanswerable, but "are the functions defined" is the real contract.
+# Hidden, undocumented, used by the tests: assert the shipped library surface is actually present.
+# Meaningful in both modes — in the release bundle the modules are inlined, so "did it source" is
+# unanswerable, but "are the functions defined" is the real contract. Extracted into a function so
+# main() stays a readable dispatch; every new module appends its key functions to the list.
+selftest() {
       for _f in mi_log mi_warn mi_die mi_digest mi_home mi_ensure_layout mi_zone \
                 mi_conf_scan mi_conf_load mi_conf_get \
                 mi_conf_family_path mi_conf_family_spec mi_conf_family_load mi_conf_family_add \
@@ -108,21 +114,96 @@ main() {
                 mi_manifest_runtime_uid \
                 mi_copy_image mi_copy_available mi_copy_preflight \
                 mi_copy_run mi_copy_run_verify mi_copy_verify \
-                mi_copy_access_check mi_copy_host_access_check; do
+                mi_copy_access_check mi_copy_host_access_check \
+                mi_product_ctx mi_bringup_specs mi_conf_product_ensure mi_confirm \
+                mi_verb_install mi_verb_start mi_verb_stop mi_verb_restart mi_verb_recreate \
+                mi_verb_status mi_verb_uninstall mi_verb_uninstall_family mi_verb_batch; do
         if ! declare -F "$_f" >/dev/null 2>&1; then
           printf 'mythical-ctl: missing library function: %s\n' "$_f" >&2
           exit 1
         fi
       done
       printf 'ok\n'
-      ;;
-    *)
-      # Exit 2 for usage errors, distinct from 1 for operational failure, so a
-      # caller can tell "you typed it wrong" from "it tried and could not".
-      printf 'mythical-ctl: unknown command: %s\n\n' "$1" >&2
-      usage >&2
-      exit 2
-      ;;
+}
+
+main() {
+  [ "$#" -ne 0 ] || { usage; exit 0; }
+
+  local verb="$1"; shift
+  local idx="" pol="" mdir="" purge="" image="" forced="" family=""
+  local -a products
+  products=()
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --index)        idx="${2:-}"; shift 2 ;;
+      --policy)       pol="${2:-}"; shift 2 ;;
+      --manifest-dir) mdir="${2:-}"; shift 2 ;;
+      --image)        image="${2:-}"; shift 2 ;;
+      --purge)        purge=1; shift ;;
+      --family)       family=1; shift ;;
+      --force-install) forced=1; shift ;;
+      -*) printf 'mythical-ctl: unknown option: %s\n' "$1" >&2; exit "$MI_EX_USAGE" ;;
+      *) products+=("$1"); shift ;;
+    esac
+  done
+  # Defaults resolved AFTER parsing so an explicit flag always wins.
+  : "${idx:=$(mi_home)/.state/index}"
+  : "${pol:=$(mi_home)/.state/policy}"
+  : "${mdir:=$(mi_home)/.state}"
+
+  case "$verb" in
+    -v|--version) printf 'mythical-ctl %s\n' "$VERSION" ;;
+    -h|--help)    usage ;;
+    __selftest)   selftest ;;
+    install|start|stop|restart|recreate)
+      [ "${#products[@]}" -gt 0 ] || { printf 'mythical-ctl: %s needs at least one product\n\n' "$verb" >&2
+                                       usage >&2; exit "$MI_EX_USAGE"; }
+      local -a extra; extra=()
+      [ -z "$image" ]  || extra+=(--image "$image")
+      [ -z "$forced" ] || extra+=(--force-install)
+      if [ "${#products[@]}" -eq 1 ] && [ "${#extra[@]}" -gt 0 ]; then
+        # Per-product options only make sense for a single product; a batch would apply one override to
+        # all of them, which is never what an operator means.
+        case "$verb" in
+          install)  mi_verb_install "$idx" "$pol" "${mdir}/${products[0]}.manifest" "${products[0]}" "${extra[@]}" ;;
+          *) printf 'mythical-ctl: --image/--force-install apply to install only\n' >&2; exit "$MI_EX_USAGE" ;;
+        esac
+        exit $?
+      fi
+      [ "${#extra[@]}" -eq 0 ] || { printf 'mythical-ctl: --image/--force-install take exactly one product\n' >&2
+                                    exit "$MI_EX_USAGE"; }
+      mi_verb_batch "$verb" "$idx" "$pol" "$mdir" "${products[@]}"
+      exit $? ;;
+    status)    mi_verb_status "$idx" "${products[@]+"${products[@]}"}"; exit $? ;;
+    uninstall)
+      if [ -n "$family" ]; then
+        if [ -n "$purge" ]; then mi_verb_uninstall_family --purge; else mi_verb_uninstall_family; fi
+        exit $?
+      fi
+      [ "${#products[@]}" -eq 1 ] || { printf 'mythical-ctl: uninstall takes exactly one product\n' >&2
+                                       exit "$MI_EX_USAGE"; }
+      if [ -n "$purge" ]; then mi_verb_uninstall "${products[0]}" --purge
+      else mi_verb_uninstall "${products[0]}"; fi
+      exit $? ;;
+    net)
+      # The rebind verb lands in a later task; the mechanism (mi_net_ref_rebind) is present, the CLI
+      # wrapper is not yet, so this degrades cleanly rather than calling an undefined function.
+      [ "${products[0]:-}" = rebind ] || { printf 'mythical-ctl: net takes "rebind"\n' >&2; exit "$MI_EX_USAGE"; }
+      if declare -F mi_verb_net_rebind >/dev/null 2>&1; then mi_verb_net_rebind "$idx"; exit $?; fi
+      printf 'mythical-ctl: net rebind is not available in this build yet\n' >&2; exit "$MI_EX_FAIL" ;;
+    state)
+      case "${products[0]:-}" in
+        repair)
+          if declare -F mi_verb_state_repair >/dev/null 2>&1; then mi_verb_state_repair "$idx"; exit $?; fi
+          printf 'mythical-ctl: state repair is not available in this build yet\n' >&2; exit "$MI_EX_FAIL" ;;
+        abandon-intent)
+          if declare -F mi_verb_abandon_intent >/dev/null 2>&1; then
+            mi_verb_abandon_intent "${products[1]:-}" "${products[2]:-}"; exit $?
+          fi
+          printf 'mythical-ctl: state abandon-intent is not available in this build yet\n' >&2; exit "$MI_EX_FAIL" ;;
+        *) printf 'mythical-ctl: state takes "repair" or "abandon-intent"\n' >&2; exit "$MI_EX_USAGE" ;;
+      esac ;;
+    *) printf 'mythical-ctl: unknown command: %s\n\n' "$verb" >&2; usage >&2; exit "$MI_EX_USAGE" ;;
   esac
 }
 

@@ -297,6 +297,28 @@ EOF
   [ "$status" -ne 0 ]
 }
 
+# Plan 4 amendment: a KEYLESS create is legitimate — a fresh install writes a <product>.conf with NO
+# settings, because the product's own UI writes them (D3). It must produce a valid, marker-terminated,
+# 0660 file that mi_conf_product_load accepts.
+@test "a KEYLESS create produces a valid, marker-terminated, 0660 file that loads" {
+  local f; f="$(mi_conf_product_path brokkr)"
+  run mi_conf_product_add brokkr "$SPEC" "$TEST_GID"
+  [ "$status" -eq 0 ]
+  [ -f "$f" ]
+  # The last line is the integrity marker.
+  [ "$(tail -n1 "$f" | cut -c1-${#MI_CONF_MARKER_PREFIX})" = "$MI_CONF_MARKER_PREFIX" ]
+  # It loads cleanly with an EMPTY record set — no keys, and no complaint.
+  run mi_conf_product_load brokkr "$SPEC"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  # 0660, with TEST_GID a group this user is in, so chgrp succeeds (rc 0, not rc 5). Read the mode
+  # from `ls -l` (the same portable seam snapshot.sh uses) rather than `stat`: GNU stat shadows BSD on
+  # this PATH and reads `-f` as --file-system, so `stat -f '%Lp'` returns filesystem info, not the mode.
+  local perms
+  perms="$(ls -ld "$f" | awk 'NR==1{print $1}')"
+  [ "${perms:0:10}" = "-rw-rw----" ]
+}
+
 # D9: *.conf is user-owned, so adding a key must not destroy what this call did not write.
 @test "adding a key preserves comments, ordering and untouched keys" {
   local f; f="$(mi_conf_product_path brokkr)"

@@ -2,25 +2,23 @@
 
 The installer and lifecycle CLI for the **mythicalOS** family of local-first containers.
 
-> **Status: scaffolding — the lifecycle commands are not implemented yet.** `mythical-ctl` today
-> answers `--version` and `--help` and nothing else. What is built and tested is the foundation the
-> verbs will stand on: the `~/.mythical/` layout and its ownership rules, a single atomic
-> fail-closed state ledger, a family operation lock, the two-config-file layer with its
-> non-executing parser, the authenticated-document trust chain (family index, family policy index,
-> per-product manifests, and the `/detect` version contract), and a hermetic test harness.
-> Everything below describing `install`/`start`/`stop` is the **design**, not shipped behaviour —
-> read it as what this is for, not what it does today. The products themselves are not published
-> yet either.
+> **Status: the lifecycle verbs are implemented.** `mythical-ctl` installs, starts, stops, restarts,
+> recreates, reports the status of, and uninstalls mythicalOS products, on top of the foundation it
+> stands on: the `~/.mythical/` layout and its ownership rules, a single atomic fail-closed state
+> ledger, a family operation lock, the two-config-file layer with its non-executing parser, the
+> authenticated-document trust chain (family index, family policy index, per-product manifests, and
+> the `/detect` version contract), and a hermetic test harness. The products themselves are not
+> published yet, so installing one whose image has not shipped reports that it has not launched yet
+> and creates nothing — that is a recognised state, not a failure.
 >
-> The install command below **does** work — but it is served by
+> The `curl … | bash` install command below is served by
 > [get.mythicalos.ai](https://get.mythicalos.ai), which installs product containers directly; it
-> does not yet download or use `mythical-ctl`. Until a product's image publishes it will tell you
-> so and install nothing.
+> does not yet download or use `mythical-ctl`.
 
 It is designed to be **product-agnostic**: everything specific to a product (image reference,
-ports, volumes, environment) will arrive from a manifest that product ships, never from logic baked
-in here. One command will install a product, keep its configuration in a predictable place, and
-manage it afterwards — `install`, `start`, `stop`, `recreate`, `status`, `uninstall`.
+ports, volumes, environment) arrives from a manifest that product ships, never from logic baked
+in here. One command installs a product, keeps its configuration in a predictable place, and
+manages it afterwards — `install`, `start`, `stop`, `restart`, `recreate`, `status`, `uninstall`.
 
 ```sh
 # fetch, CHECK, run — deliberately not a one-liner (see below).
@@ -77,16 +75,16 @@ strict non-executing reader that allowlists keys and validates values by type, s
 The **split between the two files** is the design, not shipped behaviour, for the same reason as
 everything else above: `mythical.conf` is to stay host-only and never be mounted into any container;
 `<product>.conf` is to be the only file a product can see or write; and the code that eventually
-launches a container is to build its arguments without reading any value out of it. None of that is
-enforced here yet, because nothing in this repository mounts a file or launches a container — those
-obligations belong to the code that does, and this repository does not yet contain it. The format
-itself is specified in [`docs/CONFIG-FORMAT.md`](docs/CONFIG-FORMAT.md).
+launches a container is to build its arguments without reading any value out of it. That is enforced
+at the launch path the verbs walk: the mount, publish and secret-injection rules live at the one
+place a container is created, so no caller can express an unsafe launch. The format itself is
+specified in [`docs/CONFIG-FORMAT.md`](docs/CONFIG-FORMAT.md).
 
 Nothing is scattered across your home directory: every file you are expected to read or edit is
 in there.
 
 Beyond those two files, this project also builds and tests a separate, more privileged
-authenticated-document layer that the lifecycle commands will call on once they land: a family
+authenticated-document layer the lifecycle commands call on: a family
 index, a family policy index, and each product's manifest, chained back to a single authenticated
 root, plus a small bounded reader for a product's own version out of its `/detect` response. That
 contract — the grammar, the trust model, and exactly which keys a manifest may and may not declare
@@ -125,9 +123,9 @@ small enough to read.
 **To run the CLI as it stands:** bash, and nothing else. It answers `--version` and `--help`, and its
 library layer needs only bash builtins, the usual POSIX text tools, and `sha256sum` or `shasum -a 256`.
 
-**A container runtime** is required by the lifecycle verbs, which are not implemented yet — so it is a
-requirement of the design, not of this release. It is listed here because it is the reason this is
-written in shell at all: no language runtime is required to install a product.
+**A container runtime** (rootful Docker Engine 28+ or Docker Desktop, with a local daemon) is
+required by the lifecycle verbs. It is listed here because it is the reason this is written in shell
+at all: no language runtime is required to install a product.
 
 **To install**, you additionally need **`curl`** and **`mktemp`** — the sequence above downloads the
 bootstrap to a temp file and checks its HTTP status before executing anything, rather than piping a

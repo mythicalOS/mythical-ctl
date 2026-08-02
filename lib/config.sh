@@ -925,8 +925,11 @@ mi_conf_product_load() {
 mi_conf_product_add() {
   # Arity BEFORE any positional expansion — under `set -u`, `local spec="$2"` on a short call aborts
   # the CLI with "unbound variable" rather than refusing in our own words.
-  if [ "$#" -lt 5 ] || [ $(( ( $# - 3 ) % 2 )) -ne 0 ]; then
-    mi_warn "config: mi_conf_product_add needs <product> <spec> <gid> and one or more KEY VALUE pairs"
+  # Arity relaxed (Plan 4): a KEYLESS create is legitimate — a fresh install writes a <product>.conf
+  # with NO settings, because the product's own UI writes them (D3). The pair-count PARITY check is
+  # unchanged, so an odd trailing argument (a key with no value) is still refused.
+  if [ "$#" -lt 3 ] || [ $(( ( $# - 3 ) % 2 )) -ne 0 ]; then
+    mi_warn "config: mi_conf_product_add needs <product> <spec> <gid> and zero or more KEY VALUE pairs"
     return 1
   fi
   local product="$1" spec="$2" gid="$3"; shift 3

@@ -35,7 +35,7 @@ run_mctl() { run "${_MCTL_ROOT}/bin/mythical-ctl" "$@"; }
 # tests run before later tasks have created their modules (e.g. Task 2 has no lock.sh yet).
 load_mctl() {
   local m f
-  for m in common layout config lock ledger doc trust policy manifest detect runtime preflight exit prov intent state probe bringup netref copy; do
+  for m in common layout config lock ledger doc trust policy manifest detect runtime preflight exit prov intent state probe bringup netref verbs copy; do
     f="${_MCTL_ROOT}/lib/${m}.sh"
     # shellcheck disable=SC1090
     [ -f "$f" ] && source "$f"
@@ -122,3 +122,70 @@ write_index_fixture() {
 # pid_max can exceed it — so spawn a child, reap it, and reuse its PID: reaped, and not reallocatable
 # until the OS wraps the whole PID space (millions of spawns away), so kill -0 always reports it dead.
 a_dead_pid() { local p; sh -c 'exit 0' & p=$!; wait "$p" 2>/dev/null || true; printf '%s\n' "$p"; }
+
+# Write a complete, VERIFIED document set for a fixture product: family index, policy index and
+# manifest, with the index's digests actually matching the files. Overrides are `key=value` pairs that
+# REPLACE the corresponding manifest default (never append a duplicate — mi_doc_load rejects a
+# `one`-cardinality key that appears twice).
+write_fixture_product() {
+  local p="$1"; shift
+  local pol="$MYTHICAL_HOME/policy" man="$MYTHICAL_HOME/${p}.manifest" idx="$MYTHICAL_HOME/index"
+  local gid=2000
+
+  # The policy index accumulates across products, so re-read what is there and add this product's rows.
+  if [ ! -f "$pol" ]; then
+    { printf 'mythical-policy 1\n'; printf 'version=1\n'
+      printf 'expires=%s\n' "$(( $(date +%s) + 86400 ))"
+      printf 'family_gid=%s\n' "$gid"; } > "$pol"
+  fi
+  { printf '%s.permitted_role=state\n' "$p"
+    printf '%s.permitted_role=secrets\n' "$p"
+    printf '%s.bindable_role=state\n' "$p"
+    printf '%s.permitted_secret=MYTHICAL_TELEMETRY_KEY\n' "$p"
+    printf '%s.permitted_mount=transcripts\n' "$p"; } >> "$pol"
+
+  # Manifest defaults, then overrides applied by key.
+  local -a keys vals
+  keys=(version expires product launched image min_core runtime_uid); vals=(1 "$(( $(date +%s) + 86400 ))" "$p" true "$(a_digestref "$p")" 0.1.0 900)
+  local kv k v i
+  for kv in "$@"; do
+    k="${kv%%=*}"; v="${kv#*=}"; i=0
+    while [ "$i" -lt "${#keys[@]}" ]; do
+      if [ "${keys[$i]}" = "$k" ]; then vals[$i]="$v"; k=""; break; fi
+      i=$((i + 1))
+    done
+    [ -z "$k" ] || { keys+=("$k"); vals+=("$v"); }
+  done
+  { printf 'mythical-manifest 1\n'
+    i=0; while [ "$i" -lt "${#keys[@]}" ]; do printf '%s=%s\n' "${keys[$i]}" "${vals[$i]}"; i=$((i+1)); done
+    printf 'volume=state:/data\n'
+    printf 'volume=secrets:/secrets\n'
+    printf 'secret=MYTHICAL_TELEMETRY_KEY\n'
+    printf 'mount=transcripts\n'
+    printf 'port=7480\n'; } > "$man"
+
+  # The index vouches for both, so its digests must be computed AFTER the files are final.
+  { printf 'mythical-index 1\n'; printf 'version=1\n'
+    printf 'expires=%s\n' "$(( $(date +%s) + 86400 ))"
+    printf 'policy_digest=%s\n' "$(mi_digest "$pol")"
+    printf 'probe_image=%s\n' "$(a_digestref probe)"
+    printf 'copy_image=%s\n' "$(a_digestref copy)"
+    local m
+    for m in "$MYTHICAL_HOME"/*.manifest; do
+      [ -e "$m" ] || continue
+      printf 'manifest=%s:%s\n' "$(basename "$m" .manifest)" "$(mi_digest "$m")"
+    done; } > "$idx"
+  # The anchor and the telemetry key are BOTH ledger/config writes under the family lock. The naive
+  # `printf … >> mythical.conf` the brief showed writes MYTHICAL_TELEMETRY_KEY twice on the second
+  # product, which Plan 2's scanner rejects as a duplicate — so it is written through the additive,
+  # idempotent sanctioned writer instead. Acquire the lock only if the caller has not.
+  if [ -z "${MI_LOCK_TOKEN:-}" ]; then
+    mi_lock_acquire
+    mi_trust_anchor_set "$(mi_digest "$idx")"
+    mi_conf_family_add MYTHICAL_TELEMETRY_KEY tk
+    mi_lock_release
+  else
+    mi_trust_anchor_set "$(mi_digest "$idx")"
+    mi_conf_family_add MYTHICAL_TELEMETRY_KEY tk
+  fi
+}
