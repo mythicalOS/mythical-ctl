@@ -2,8 +2,10 @@
 
 The installer and lifecycle CLI for the **mythicalOS** family of local-first containers.
 
-> **Status: the lifecycle verbs are implemented.** `mythical-ctl` installs, starts, stops, restarts,
-> recreates, reports the status of, and uninstalls mythicalOS products, on top of the foundation it
+> **Status: the lifecycle verbs and data movement are implemented.** `mythical-ctl` installs, starts,
+> stops, restarts, recreates, reports the status of, uninstalls, and repairs the state of mythicalOS
+> products, and moves their data — migrate a volume to a host bind, back a product up, and restore it.
+> On top of the foundation it
 > stands on: the `~/.mythical/` layout and its ownership rules, a single atomic fail-closed state
 > ledger, a family operation lock, the two-config-file layer with its non-executing parser, the
 > authenticated-document trust chain (family index, family policy index, per-product manifests, and
@@ -18,7 +20,8 @@ The installer and lifecycle CLI for the **mythicalOS** family of local-first con
 It is designed to be **product-agnostic**: everything specific to a product (image reference,
 ports, volumes, environment) arrives from a manifest that product ships, never from logic baked
 in here. One command installs a product, keeps its configuration in a predictable place, and
-manages it afterwards — `install`, `start`, `stop`, `restart`, `recreate`, `status`, `uninstall`.
+manages it afterwards — `install`, `start`, `stop`, `restart`, `recreate`, `status`, `uninstall`, and
+`state repair` — and moves data with `migrate-storage`, `backup`, and `restore`.
 
 ```sh
 # fetch, CHECK, run — deliberately not a one-liner (see below).
@@ -48,15 +51,15 @@ environment variables, different ideas about where configuration lives. A user w
 them met two different models, and the shared parts drifted apart with every change.
 
 `mythical-ctl` is that common half, written once: container-runtime preflight, the `~/.mythical/`
-layout, reading and validating configuration, volume and bind lifecycle, and the lifecycle verbs.
-Products contribute a manifest describing themselves, and nothing more. That is the **design** — of
-it, the layout and the configuration layer are built and tested today; the preflight, the volume and
-bind lifecycle and the verbs are not (see the status note at the top).
+layout, reading and validating configuration, volume and bind lifecycle, the lifecycle verbs, and
+data movement. Products contribute a manifest describing themselves, and nothing more. That is the
+**design**, and it is built and tested today — the preflight, the layout and configuration layer, the
+volume and bind lifecycle, the verbs, and data movement all landed (see the status note at the top).
 
 ## One place for everything you edit
 
-The planned layout — the ownership rules below are implemented (`lib/layout.sh`), the mounting is
-not, because nothing here mounts anything yet:
+The layout — the ownership rules below are implemented (`lib/layout.sh`), and the CLI mounts each
+product's configuration and volumes into its container per that product's manifest:
 
 ```
 ~/.mythical/
