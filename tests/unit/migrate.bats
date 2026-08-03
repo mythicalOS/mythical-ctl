@@ -326,6 +326,56 @@ teardown() { teardown_test_env; }
   rm -rf "$t"
 }
 
+# --- the re-walk's OWN scratch file must not live in an attacker-influenceable location (§5.2 round 6) -
+# A bare `mktemp` placed the re-walk's NUL-output temp file in $TMPDIR — the SAME class of defect the
+# reclaim TOCTOU already root-caused, reopened: an attacker with write access to TMPDIR could swap the
+# minted name for a symlink to an operator-writable file before the `find … >` redirect opens it (an
+# overwrite), or swap the written file's content after find finishes but before this reads it back
+# (defeating the whole escaping-symlink defense — exactly what phase 5's commit depends on).
+
+@test "_mi_mig_secure_state_dir creates and verifies an owner-only directory under mi_home" {
+  run _mi_mig_secure_state_dir probe
+  [ "$status" -eq 0 ]
+  [ "$output" = "$MYTHICAL_HOME/.state/probe" ]
+  run _mi_mode_octal "$MYTHICAL_HOME/.state/probe"
+  [ "$output" = 700 ]
+}
+
+@test "the escaping-symlink re-walk still refuses even when TMPDIR points elsewhere" {
+  local sentinel; sentinel="$(mktemp -d)"
+  local t; t="$(mktemp -d)"
+  ln -s /etc/passwd "$t/evil"
+  TMPDIR="$sentinel" run mi_mig_verify_no_escaping_symlinks "$t"
+  [ "$status" -ne 0 ]
+  assert_contains "escapes it"
+  rm -rf "$t" "$sentinel"
+}
+
+@test "the escaping-symlink re-walk's scratch file lives under mi_home's own state tree, never TMPDIR" {
+  local sentinel; sentinel="$(mktemp -d)"
+  local t; t="$(mktemp -d)"
+  mkdir -p "$t/sub"; : > "$t/sub/f"; ln -s sub/f "$t/link"
+  TMPDIR="$sentinel" run mi_mig_verify_no_escaping_symlinks "$t"
+  [ "$status" -eq 0 ]
+  run find "$sentinel" -maxdepth 1 -name 'rewalk.*'
+  [ -z "$output" ]
+  [ -d "$MYTHICAL_HOME/.state/rewalk" ]
+  run _mi_mode_octal "$MYTHICAL_HOME/.state/rewalk"
+  [ "$output" = 700 ]
+  rm -rf "$t" "$sentinel"
+}
+
+@test "the re-walk FAILS CLOSED if the installer's own secure directory cannot be trusted (a symlink)" {
+  mkdir -p "$MYTHICAL_HOME/.state"
+  ln -s /tmp "$MYTHICAL_HOME/.state/rewalk"
+  local t; t="$(mktemp -d)"
+  mkdir -p "$t/sub"; : > "$t/sub/f"; ln -s sub/f "$t/link"    # ordinary, non-escaping — proves the
+  run mi_mig_verify_no_escaping_symlinks "$t"                 # refusal is about the secure dir, not
+  [ "$status" -ne 0 ]                                         # a found escaping symlink
+  assert_contains "is a symlink, not a real directory"
+  rm -rf "$t"
+}
+
 @test "phase 5 refuses to commit a staging tree that gained an ESCAPING symlink after phase 4" {
   # The exact race the finding describes: something with legitimate write access to the staging tree
   # during the copy (the runtime uid's ACL grant §4.5 requires the copy step to set) plants an escaping

@@ -82,6 +82,78 @@ mi_mig_verify_identity() {
   return 0
 }
 
+# THE INSTALLER'S OWN SECURE SCRATCH LOCATION — the ONE definition of "somewhere only this process can
+# write", the same one-definition discipline already applied to "escapes" (mi_copy_link_escapes). Any
+# security-critical, ephemeral filesystem object this module creates — one whose CONTENTS or very
+# PRESENCE gates a commit or identity decision — belongs under `<name>` here, never in a generic
+# `$TMPDIR` (an ATTACKER-INFLUENCEABLE location any co-resident process can also write to) and never as
+# a sibling of the untrusted destination. In an attacker-writable directory, a pathname this process
+# just created can be swapped for a symlink before it is ever opened (turning a later write into an
+# overwrite of whatever the symlink now points to), or the file it wrote can be swapped for different
+# content before this process reads it back (defeating whatever the write was for) — TWO separate
+# attacks, neither closable by re-checking faster, because there is no bash operation atomic with a
+# check made a moment earlier against a name an attacker can also resolve. A directory only the
+# operator can write to closes both by ACCESS CONTROL: there is no party left to run either race.
+#
+# Every property is POSITIVELY VERIFIED, never assumed from a prior call's own reported success —
+# `mkdir -p` on a path that already exists as a symlink-to-directory succeeds silently without creating
+# anything, and a privileged process bypasses ownership/mode-bit enforcement entirely (root can chmod
+# and use a directory some OTHER uid owns), so a successful `mkdir`/`chmod` alone proves nothing about
+# who else can write there. Checked in an order that never mutates through an unverified symlink: create
+# (idempotent) → refuse if it is a symlink → refuse if it is not a real directory → THEN chmod (only
+# once the target is proven to be the real thing) → re-verify ownership and mode afterward rather than
+# trust chmod's own exit status. rc 0 prints the secured path · 1 refused (reported) — never falls back
+# to an unsecured location.
+_mi_mig_secure_state_dir() {
+  if [ "$#" -ne 1 ]; then mi_warn "migrate: _mi_mig_secure_state_dir needs a <name>"; return 1; fi
+  local name="$1" dir euid owner mode last2
+  dir="$(mi_home)/.state/${name}"
+  mkdir -p -- "$dir" 2>/dev/null || {
+    mi_warn "migrate: cannot create the installer's own '$name' directory ($dir)."
+    return 1
+  }
+  if [ -L "$dir" ]; then
+    mi_warn "migrate: '$dir' is a symlink, not a real directory. Refusing to use it as the installer's"
+    mi_warn "  own secure scratch location — a name this process does not control the target of is not"
+    mi_warn "  a safe place to put anything a commit or identity decision depends on."
+    return 1
+  fi
+  if [ ! -d "$dir" ]; then
+    mi_warn "migrate: '$dir' exists and is not a directory. Refusing to use it as the installer's own"
+    mi_warn "  secure scratch location."
+    return 1
+  fi
+  chmod 700 -- "$dir" || {
+    mi_warn "migrate: cannot restrict '$dir' to owner-only. Refusing to use a directory this process"
+    mi_warn "  cannot itself prove is safe."
+    return 1
+  }
+  euid="$(id -u)" || { mi_warn "migrate: could not read the operator's own uid"; return 1; }
+  owner="$(_mi_owner_uid "$dir")" || {
+    mi_warn "migrate: could not read the owner of '$dir'. Refusing to trust it unverified."
+    return 1
+  }
+  if [ "$owner" != "$euid" ]; then
+    mi_warn "migrate: '$dir' is owned by uid $owner, not this process's own uid ($euid). Refusing to"
+    mi_warn "  use it as the installer's own secure scratch location — a directory someone else owns may"
+    mi_warn "  still be writable by them regardless of what chmod just set."
+    return 1
+  fi
+  mode="$(_mi_mode_octal "$dir")" || {
+    mi_warn "migrate: could not read the permissions of '$dir'. Refusing to trust it unverified."
+    return 1
+  }
+  last2="${mode#"${mode%??}"}"
+  case "$last2" in
+    *[2367]*)
+      mi_warn "migrate: '$dir' is writable by its group or by everyone (mode ${mode}) even after"
+      mi_warn "  chmod 700 — refusing to trust it as the installer's own secure scratch location."
+      return 1 ;;
+  esac
+  printf '%s\n' "$dir"
+  return 0
+}
+
 # A DIRECTORY'S OWN IDENTITY (mi_mig_verify_identity, above) proves it was not SWAPPED; it says
 # nothing about what is INSIDE it — adding an entry, or replacing an existing file with a symlink,
 # changes nothing about the containing directory's inode. Between phase 4's copy verification and
@@ -99,7 +171,7 @@ mi_mig_verify_identity() {
 # escape, never guessed clean.
 mi_mig_verify_no_escaping_symlinks() {
   if [ "$#" -ne 1 ]; then mi_warn "migrate: mi_mig_verify_no_escaping_symlinks needs a <root>"; return 1; fi
-  local root="$1" canon p target tmp frc
+  local root="$1" canon p target secure_dir tmp frc
   canon="$(mi_canon "$root" 2>/dev/null)" || {
     mi_warn "migrate: '$root' does not resolve, so its contents cannot be re-verified before the commit."
     return 1
@@ -115,7 +187,22 @@ mi_mig_verify_no_escaping_symlinks() {
   # variable at all — bash strings are NUL-terminated C strings, so a NUL byte truncates silently, which
   # would be exactly the same class of under-reporting this is closing. A failed or partial walk is
   # refused outright, never read as a clean tree.
-  tmp="$(mktemp)" || {
+  #
+  # THE TEMP FILE ITSELF LIVES IN THE INSTALLER'S OWN SECURE DIRECTORY (_mi_mig_secure_state_dir), NOT
+  # $TMPDIR — a bare `mktemp` places it in a generic, ATTACKER-INFLUENCEABLE location, which reopens the
+  # very hole this whole function exists to close, two ways: between mktemp minting the name and the
+  # `find … > "$tmp"` redirect opening it, an attacker with write access to that directory can replace
+  # the name with a symlink to an operator-writable victim file (the redirect follows it, truncating
+  # whatever it points to); or, after `find` finishes writing, replace "$tmp" with an empty file, so the
+  # read below finds zero entries and this concludes "no escaping symlinks" over a scan that never
+  # happened. This is the SAME root cause as the reclaim TOCTOU (a security-critical filesystem object
+  # placed where a party other than this process can create/swap entries), fixed the SAME way: a
+  # directory only this installer can write to, never a re-check of a name in an untrusted one.
+  secure_dir="$(_mi_mig_secure_state_dir rewalk)" || {
+    mi_warn "migrate: refusing to commit — the staged tree could not be re-verified in a secure location."
+    return 1
+  }
+  tmp="$(mktemp "$secure_dir/rewalk.XXXXXX")" || {
     mi_warn "migrate: cannot create a temp file to re-verify the staged tree before the commit."
     return 1
   }
@@ -389,13 +476,14 @@ mi_mig_staging_reclaim() {
   # above warns about. It does not: whoever can still write that parent can rename the NEW name away
   # and replace it too, exactly as easily as the old one — a different name in the same unsafe place
   # only MOVES the race, it does not close it. What actually closes it is a different DIRECTORY: one
-  # under THIS INSTALLER'S OWN ~/.mythical/.state tree (mi_home), created here with mode 0700, that the
-  # untrusted destination's parent has no access to at all. An attacker who cannot write there cannot
-  # rename anything into or out of it, so a check-then-rm pair inside it is safe for the same reason a
-  # re-check immediately before use is not: there is no party left who could win the race. This is the
-  # one place in this module where "operate somewhere safe" (an access-control property, achievable in
-  # bash) replaces "recheck immediately before use" (a timing property bash cannot make atomic — see
-  # mi_mig_check_parent_trust).
+  # under THIS INSTALLER'S OWN ~/.mythical/.state tree (_mi_mig_secure_state_dir, create+secure+verify
+  # in ONE shared place — the same one used for the escaping-symlink re-walk's own temp file), created
+  # with mode 0700, that the untrusted destination's parent has no access to at all. An attacker who
+  # cannot write there cannot rename anything into or out of it, so a check-then-rm pair inside it is
+  # safe for the same reason a re-check immediately before use is not: there is no party left who could
+  # win the race. This is the one place in this module where "operate somewhere safe" (an access-control
+  # property, achievable in bash) replaces "recheck immediately before use" (a timing property bash
+  # cannot make atomic — see mi_mig_check_parent_trust).
   #
   # SAME FILESYSTEM IS REQUIRED for the move itself to be the atomic rename() this safety depends on —
   # a cross-device `mv` falls back to a recursive COPY followed by an ordinary `rm -rf` of the ORIGINAL,
@@ -403,14 +491,8 @@ mi_mig_staging_reclaim() {
   # BEFORE attempting the move, by comparing device numbers (the leading field of mi_mig_identity's
   # `device:inode`) — not discovered after the fact from a `mv` that already silently degraded.
   local rdir tag priv vid sdev rdev
-  rdir="$(mi_home)/.state/reclaim"
-  mkdir -p -- "$rdir" 2>/dev/null || {
-    mi_warn "migrate: cannot create the installer's own reclaim directory $rdir. Nothing was removed."
-    return 1
-  }
-  chmod 700 -- "$rdir" || {
-    mi_warn "migrate: cannot restrict $rdir to owner-only. Refusing to reclaim into a directory this"
-    mi_warn "  process cannot itself prove is safe. Nothing was removed."
+  rdir="$(_mi_mig_secure_state_dir reclaim)" || {
+    mi_warn "migrate: nothing was removed."
     return 1
   }
   sdev="${cur%%:*}"
