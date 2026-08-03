@@ -419,6 +419,28 @@ mi_conf_family_spec() {
   printf 'MYTHICAL_TELEMETRY_KEY\tstr:512\n'
 }
 
+# THE ONE PRODUCT-SCOPED SHAPE THIS CORE RECOGNISES BY PATTERN RATHER THAN BY NAME:
+# `MYTHICAL_<PRODUCT>_<ROLE>_BIND`, the key `migrate-storage` writes (D53's one bindable-storage
+# setting) and `lib/bringup.sh`'s `mi_conf_product_keys` already types the SAME way (`path:4096`) for
+# every role the family policy makes bindable. There is deliberately no enumeration of every
+# product/role pair here — the core does not carry product-specific vocabulary (§7) — only the SHAPE,
+# which is format, not authorization: it says nothing about whether THIS product/role may be bound,
+# only that a value shaped like a bind path is what such a key holds. The bindability entitlement
+# itself is asked, once, at `mi_mig_precheck` (D53), before any caller ever reaches a writer with this
+# key. rc 0 prints the type · 1 the key is not shaped like a bind key.
+_mi_conf_bind_key_type() {
+  local key="$1" mid
+  case "$key" in
+    MYTHICAL_*_BIND) : ;;
+    *) return 1 ;;
+  esac
+  mid="${key#MYTHICAL_}"; mid="${mid%_BIND}"
+  local LC_ALL=C
+  case "$mid" in ''|*[!A-Z0-9_]*) return 1 ;; esac
+  case "$mid" in *_*) : ;; *) return 1 ;; esac   # PRODUCT and ROLE, joined by the '_' this shape needs
+  printf 'path:4096\n'
+}
+
 mi_conf_family_load() {
   mi_conf_load "$(mi_conf_family_path)" "$(mi_conf_family_spec)"
 }
@@ -469,7 +491,13 @@ mi_conf_family_add() {
     mi_warn "config: refusing to write invalid key name '$key'"; return 1
   fi
   if ! type="$(_mi_conf_spec_type "$(mi_conf_family_spec)" "$key")"; then
-    mi_warn "config: $key is not a key mythical.conf accepts"; return 1
+    # NOT IN THE FIXED CORE SPEC — but the one product-scoped SHAPE this core recognises by pattern
+    # (see _mi_conf_bind_key_type) is still a key mythical.conf accepts. Format only: whether THIS
+    # product/role may be bound is D53's question, asked once, upstream, by whoever is about to call
+    # this with an operator-chosen value — never re-derived or re-decided here.
+    if ! type="$(_mi_conf_bind_key_type "$key")"; then
+      mi_warn "config: $key is not a key mythical.conf accepts"; return 1
+    fi
   fi
   if ! _mi_conf_value_ok "$val" || ! _mi_conf_type_ok "$type" "$val"; then
     mi_warn "config: refusing to write an invalid value for $key"; return 1
@@ -598,6 +626,106 @@ mi_conf_family_add() {
 
   # Atomic replace within the same directory, so rename() cannot cross filesystems.
   mv -f "$tmp" "$f" || { rm -f "$tmp"; mi_warn "config: cannot replace $f"; return 1; }
+  return 0
+}
+
+# THE ONE EXPLICIT, NARROW EXCEPTION TO D9 (§5.2). §6 makes mythical.conf user-owned and ADDITIVE ONLY:
+# the installer may add a missing key with its default and may never change a value the operator set.
+# Writing a bind CHANGES a value, so the exception is stated rather than assumed, and bounded:
+#
+#   * Authorized only by `migrate-storage`, which IS an operator instruction to change exactly this
+#     setting. No other verb may write a value into mythical.conf.
+#   * Exactly one key, for the product being migrated.
+#   * Compare-and-set, never blind overwrite — and "absent" STOPS BEING ACCEPTABLE once the write has
+#     been attempted:
+#
+#     | recorded             | key now holds                         | action                     |
+#     |----------------------|----------------------------------------|---------------------------|
+#     | attempt not started  | the expected prior value (or nothing)   | write it                  |
+#     | attempt STARTED      | OUR value                                | already written — advance |
+#     | attempt STARTED      | absent, or anything else                | stop, require confirmation|
+#
+# The third row is the one an earlier revision got wrong: it treated absent as "not yet written" and
+# wrote again — but after a crash mid-write, absent is EQUALLY "the operator deleted the line". Those
+# are indistinguishable from the file alone, and guessing overwrites exactly the edit §6 guarantees
+# will survive.
+#
+# STATED RESIDUAL: THIS IS NOT ATOMIC AGAINST A HUMAN. The operation lock serializes mythical-ctl
+# processes; it has no authority over a text editor. An operator who saves mythical.conf between the
+# comparison and the rename loses that edit — a real window, not a theoretical one. It cannot be closed
+# without a cooperative-locking scheme every editor would have to honour, which does not exist. So D9's
+# guarantee is NARROWED rather than overstated: an operator edit always survives, EXCEPT within the
+# read-to-rename window of an explicitly invoked migrate-storage. Three things make that acceptable and
+# none of them is "it is unlikely": the window is milliseconds; the operator invoked the command that
+# touches this key; and the command REPORTS the value it wrote, so a lost edit is visible immediately.
+#
+# Usage: mi_conf_family_cas <key> <value> <expected-prior> <none|started>
+mi_conf_family_cas() {
+  if [ "$#" -ne 4 ]; then mi_warn "config: mi_conf_family_cas needs <key> <value> <expected-prior> <none|started>"; return 1; fi
+  local key="$1" val="$2" prior="$3" attempt="$4" f cur rc
+  mi_lock_assert_held "compare-and-set a value in mythical.conf"
+  f="$(mi_conf_family_path)"
+
+  if ! _mi_conf_key_ok "$key"; then mi_warn "config: refusing to write invalid key name '$key'"; return 1; fi
+  # BOUNDED TO THE ONE SHAPE THIS DOOR EXISTS FOR. This is the ONE function authorized to change a
+  # value in mythical.conf (the D9 exception stated above), so it must not become a general-purpose
+  # writer for whatever key a future caller hands it — a key outside the bind shape is refused
+  # here, not merely left to whoever calls this correctly.
+  local type
+  if ! type="$(_mi_conf_bind_key_type "$key")"; then
+    mi_warn "config: refusing to compare-and-set '$key' — this door writes only a"
+    mi_warn "  MYTHICAL_<product>_<role>_BIND key, never a core setting."
+    return 1
+  fi
+  if ! _mi_conf_value_ok "$val" || ! _mi_conf_type_ok "$type" "$val"; then
+    mi_warn "config: refusing to write an invalid value for $key"; return 1
+  fi
+
+  if cur="$(mi_conf_get "$f" "$key")"; then rc=0; else rc=$?; fi
+  if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then return "$rc"; fi
+
+  case "$attempt" in
+    none)
+      if [ "$rc" -eq 3 ] && [ -z "$prior" ]; then :
+      elif [ "$rc" -eq 0 ] && [ "$cur" = "$prior" ]; then :
+      else
+        mi_warn "config: $key holds '${cur}', not the expected prior value '${prior}'. Refusing."
+        return 1
+      fi ;;
+    started)
+      if [ "$rc" -eq 0 ] && [ "$cur" = "$val" ]; then
+        mi_log "config: $key already holds the migrated destination; advancing without rewriting."
+        return 0
+      fi
+      mi_warn "config: a write of $key was recorded as IN PROGRESS, and the key now holds"
+      mi_warn "    ${cur:-<nothing>}"
+      mi_warn "  rather than the value this write was in the middle of landing. The write may have"
+      mi_warn "  crashed before it landed, or you may have deleted or changed the line by hand — the"
+      mi_warn "  two are equally possible from the file alone, and guessing which one happened would"
+      mi_warn "  overwrite exactly the edit this file's additive-only rule promises to keep."
+      mi_warn "  Stopping. Confirm explicitly to write '${val}' anyway."
+      mi_confirm "config: write ${key}=${val}, discarding what is there?" || return 1 ;;
+    *) mi_warn "config: '$attempt' is not an attempt state"; return 1 ;;
+  esac
+
+  # Rewrite with the key REPLACED, preserving every other line byte-for-byte. Re-read immediately before
+  # the rename to narrow (never close) the human window.
+  local dir tmp line wrote=0
+  dir="$(dirname "$f")"
+  tmp="$(mktemp "$dir/.mythical.conf.XXXXXX")" || { mi_warn "config: cannot create a temp file"; return 1; }
+  chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+  if [ -f "$f" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in
+        "${key}="*) printf '%s=%s\n' "$key" "$val" >> "$tmp"; wrote=1 ;;
+        *) printf '%s\n' "$line" >> "$tmp" ;;
+      esac
+    done < "$f"
+  fi
+  [ "$wrote" -eq 1 ] || printf '%s=%s\n' "$key" "$val" >> "$tmp"
+  mv -f "$tmp" "$f" || { rm -f "$tmp"; mi_warn "config: could not replace $f"; return 1; }
+  # REPORTED, so the operator sees their configuration changed by the command they ran.
+  mi_log "config: set ${key}=${val} in $f (this is the one setting migrate-storage may change)."
   return 0
 }
 

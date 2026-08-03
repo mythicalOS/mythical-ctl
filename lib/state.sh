@@ -712,7 +712,17 @@ mi_state_reconciled() {
 # `storagemig`, keyed <product>:<role> — NOT an `intent` record keyed by container — so it cannot be
 # found with mi_intent_find, and an earlier draft of this module tried exactly that: the lookup never
 # matched, the suspension was silently dead, and the reconciler would have restarted a container the
-# migration deliberately stopped. The container's product comes from its provenance record.
+# migration deliberately stopped.
+#
+# THE CONTAINER'S PRODUCT COMES FROM ITS OWN NAME, NOT A PROVENANCE FIELD. A `product=` field on the
+# container's provenance record would be the more obvious source, and this function used to read one —
+# but no writer of that record ever carries one: `mi_intent_confirm container … "id=${id}"` is the only
+# call bring-up makes, at both its call sites, and neither adds a product field. Reading it therefore
+# always answered rc 3, and this check silently never fired for any container, in every build before
+# this one. mi_name_container's join is `mythical-<identity>-<product>` (lib/manifest.sh), and stripping
+# THIS installation's own identity prefix — read fresh, never assumed — recovers the product
+# unambiguously: the join is only ambiguous BETWEEN two different identities (see manifest.sh's "NOT
+# INJECTIVE" note), never within the one this process just read.
 #
 # rc 0 a migration governs this container · 1 none does · 2 THE QUESTION COULD NOT BE ANSWERED,
 # reported. The third value is the point of this function's shape: both lookups it makes can fail for
@@ -721,22 +731,24 @@ mi_state_reconciled() {
 # over both, which is what this had, made every one of those mean "no migration governs", i.e.
 # "proceed", i.e. start or stop a container a migration deliberately stopped.
 _mi_state_storagemig_for() {
-  local c="$1" rec product recs line rc
+  local c="$1" rec product recs line rc ident pfx
   if rec="$(mi_prov_find container "$c")"; then rc=0; else rc=$?; fi
-  # No provenance record: nothing says which product this container belongs to, and a storage
-  # migration is keyed by product — so there is no migration this container could be under. That is an
-  # answer, not a failure. (§6b's "is this mine?" question is deletion authority's, and it is asked at
-  # the removal paths, not here.)
+  # No provenance record at all: this is not a container this installer is tracking, so there is no
+  # migration it could be under. That is an answer, not a failure. (§6b's "is this mine?" question is
+  # deletion authority's, and it is asked at the removal paths, not here — this is only asking whether
+  # the object is one of ours AT ALL, on the way to a completely different decision.)
   if [ "$rc" -eq 3 ]; then return 1; fi
   [ "$rc" -eq 0 ] || return 2
-  if product="$(mi_led_field "$rec" product)"; then :; else
+  if ident="$(mi_ident_get)"; then :; else
     rc=$?
-    [ "$rc" -eq 3 ] && return 1      # the record names no product; nothing can be keyed on one
+    [ "$rc" -eq 3 ] && return 1     # no identity minted yet: nothing this installer created can match
     return 2
   fi
-  # `product=` with an empty value would match a migration record carrying an equally empty one, so a
-  # container whose provenance names no product would be suspended by a migration for a different
-  # nothing. Empty is "no product", exactly as an absent field is.
+  pfx="mythical-${ident}-"
+  case "$c" in
+    "$pfx"*) product="${c#"$pfx"}" ;;
+    *) return 1 ;;                  # not shaped like one of this installation's own containers
+  esac
   [ -n "$product" ] || return 1
   if recs="$(mi_led_all "$MI_MIG_KIND")"; then rc=0; else rc=$?; fi
   if [ "$rc" -eq 3 ]; then return 1; fi
