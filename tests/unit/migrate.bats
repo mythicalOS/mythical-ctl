@@ -362,6 +362,42 @@ teardown() { teardown_test_env; }
   chmod 700 "$aliasparent"; rm -rf "$aliasparent" "$real"
 }
 
+# --- the ONE mutation chokepoint canonicalizes for every entry, verb/precheck bypassed or not
+# --- (§5.2 round 10 / codex r9) --------------------------------------------------------------------
+# Canonicalizing only at the verb/precheck boundary left two gaps: a caller invoking mi_mig_run DIRECTLY
+# with a raw destination never went through either, and a pre-canonicalization in-flight ledger record
+# can still carry a raw staging path. _mi_mig_run_body is the one function every phase and every entry
+# funnels through, so it defends itself: it canonicalizes dest at its own top, and always derives the
+# staging path from that canonical dest, never the ledger's carried raw value.
+
+@test "mi_mig_run invoked DIRECTLY refuses through an unsafe ancestor, even bypassing the verb/precheck" {
+  local base; base="$(mktemp -d)"
+  chmod 777 "$base"
+  local unsafe_dest="$base/dest"
+  run mi_mig_run "$IDX" "$POL" "$MAN" p1 state "$unsafe_dest" 1
+  [ "$status" -ne 0 ]
+  assert_contains "writable by its group or by everyone"
+  [ ! -e "$unsafe_dest" ]
+  chmod 700 "$base"; rm -rf "$base"
+}
+
+@test "phase 3 derives the staging mkdir path from the canonical dest, ignoring a bogus carried staging field" {
+  # A record whose carried staging= names neither the canonical nor the raw destination's sibling at
+  # all proves the derivation is actually used, not the carried field: if the carried value were
+  # trusted, phase 3 would try to operate on the bogus path instead of the real one a caller passing
+  # the raw (pre-canonicalization) $DEST here expects to land at.
+  mi_lock_acquire
+  mi_led_put storagemig key "p1:state" "key=p1:state" "phase=3" "product=p1" "role=state" \
+      "dest=${DEST}" "confkey=MYTHICAL_P1_STATE_BIND" "prior=" "attempt=none" "desired=running" \
+      "srcvol=mythical-${IDENT}-p1-state" "staging=/nonexistent-bogus-carried-staging-path" "nonce=nz"
+  mi_lock_release
+  local derived; derived="$(mi_mig_staging_path "$CANON_DEST" nz)"
+  run mi_mig_run "$IDX" "$POL" "$MAN" p1 state "$DEST" 3
+  [ "$status" -eq 0 ]
+  [ -d "$derived" ]                                    # created at the DERIVED (canonical) location
+  [ ! -e "/nonexistent-bogus-carried-staging-path" ]   # the bogus carried value was never touched
+}
+
 # --- the escaping-symlink re-check immediately before the commit (§5.2 round 4, finding 2) -----------
 # A directory's own device+inode (mi_mig_verify_identity) proves it was not SWAPPED; it says nothing
 # about what is INSIDE it. mi_mig_verify_no_escaping_symlinks targets specifically what an inode check

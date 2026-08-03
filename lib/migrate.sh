@@ -949,6 +949,19 @@ _mi_mig_run_body() {
     *) mi_warn "migrate: '$phase' is not a migration phase"; return 1 ;;
   esac
 
+  # THE ONE MUTATION CHOKEPOINT (§5.2 round 10 / codex r9) — EVERY phase (1-9) and EVERY entry point
+  # (the verb, a direct mi_mig_run call, resume) funnels through this one function, and every mutation
+  # in the module (the staging mkdir, the copy, the rename, the bind) happens inside it. Canonicalizing
+  # only at the verb/precheck boundary left two gaps: a caller invoking mi_mig_run DIRECTLY with a raw
+  # symlinked-alias destination bypassed both, reaching phase 3's staging mkdir on the raw path; and a
+  # pre-canonicalization in-flight ledger record still carries a RAW staging path, which a resume would
+  # mkdir/rename through unchanged. Canonicalizing HERE, once, before any phase logic runs, closes both:
+  # no entry point and no carried value can ever present a raw path to a mutation again. Idempotent when
+  # the caller already canonicalized (canon of canon is canon; re-verifying the chain is a cheap
+  # defensive re-check), so this costs nothing extra on the verb's own already-canonical path.
+  dest="$(_mi_mig_canon_dest "$dest")" || return 1
+  mi_mig_check_parent_trust "$dest" || return 1
+
   ident="$(mi_ident_get)" || return 1
   mrec="$(mi_accept_manifest "$idx" "$pol" "$man" "$product")" || return 1
   prec="$(mi_accept_policy "$idx" "$pol")" || return 1
@@ -979,7 +992,18 @@ _mi_mig_run_body() {
     return 1
   fi
   nonce="$(_mi_mig_carry "$rec" nonce)" || return 1
-  stage="$(_mi_mig_carry "$rec" staging)" || return 1
+  # ALWAYS DERIVED FROM THE CANONICAL DEST, NEVER THE LEDGER'S CARRIED RAW VALUE. A record written
+  # before this fix (or by a caller that never canonicalized) can carry a raw staging path through a
+  # symlinked alias; mkdir/rename-ing through it again would be the exact check-canonical/use-raw gap
+  # this round closes. staging is a SIBLING of the destination (mi_mig_staging_path's own definition:
+  # dirname(dest)/.mythical-staging-<nonce>), and dirname(dest)'s PHYSICAL location on disk is the same
+  # real directory whether it was reached through the raw alias or the canonical path — so deriving it
+  # fresh from the now-canonical $dest and the CARRIED nonce lands at the identical physical staging
+  # directory a prior run's mkdir created (the recorded device+inode identity check a few phases down
+  # still matches), while the path used for every mkdir/copy/rename below is canonical and immune to
+  # alias repointing. phase 1 overrides both nonce and this with fresh values immediately below; this
+  # is superseded there, never used, for that phase.
+  stage="$(mi_mig_staging_path "$dest" "$nonce")" || return 1
 
   case "$phase" in
     1)
