@@ -12,6 +12,12 @@ setup() {
   mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
   IDENT="$(mi_ident_get)"; C="mythical-${IDENT}-p1"
   DEST="$(mktemp -d)/dest"
+  # §5.2 round 8: migrate-storage now canonicalizes the destination once at the boundary and records/
+  # reports THAT value, never the raw operand (see _mi_mig_canon_dest). $DEST itself is not
+  # necessarily canonical (macOS resolves mktemp -d's own /var/folders/... through /private/var —
+  # measured, the two are different strings), so tests that assert an EXACT recorded/reported
+  # destination compare against CANON_DEST, computed here the same way the library does.
+  CANON_DEST="$(mi_canon "$(dirname "$DEST")")/$(basename "$DEST")"
 }
 teardown() { teardown_test_env; }
 
@@ -45,7 +51,7 @@ teardown() { teardown_test_env; }
   [ "$status" -eq 0 ]
   grep -aq "privileged bits stripped" "$BATS_TEST_TMPDIR/err"
   run mi_conf_get "$MYTHICAL_HOME/mythical.conf" MYTHICAL_P1_STATE_BIND
-  [ "$output" = "$DEST" ]
+  [ "$output" = "$CANON_DEST" ]   # §5.2 round 8: recorded canonical, not the raw --to-bind operand
 }
 
 @test "a volume with a FOREIGN uid is refused by default" {
@@ -59,7 +65,7 @@ teardown() { teardown_test_env; }
   HELPER_COPY=foreign run mi_verb_migrate_storage "$IDX" "$POL" "$MAN" p1 state --to-bind "$DEST" --map-foreign-to-operator
   [ "$status" -eq 0 ]
   run mi_conf_get "$MYTHICAL_HOME/mythical.conf" MYTHICAL_P1_STATE_BIND
-  [ "$output" = "$DEST" ]
+  [ "$output" = "$CANON_DEST" ]   # §5.2 round 8: recorded canonical, not the raw --to-bind operand
 }
 
 @test "a volume with an ORDINARY (non-escaping) symlink migrates — it must not be refused" {
@@ -101,7 +107,7 @@ teardown() { teardown_test_env; }
   run mi_mig_resume "$IDX" "$POL" "$MAN"
   [ "$status" -eq 0 ]
   run mi_conf_get "$MYTHICAL_HOME/mythical.conf" MYTHICAL_P1_STATE_BIND
-  [ "$output" = "$DEST" ]
+  [ "$output" = "$CANON_DEST" ]   # §5.2 round 8: recorded canonical, not the raw --to-bind operand
   run mi_rt_inspect container c.mounts "$C"
   assert_contains "$DEST"
 }
@@ -111,7 +117,7 @@ teardown() { teardown_test_env; }
   [ "$status" -ne 0 ]
   # The config write (phase 6) must have already landed — it precedes the create this interrupted.
   run mi_conf_get "$MYTHICAL_HOME/mythical.conf" MYTHICAL_P1_STATE_BIND
-  [ "$output" = "$DEST" ]
+  [ "$output" = "$CANON_DEST" ]   # §5.2 round 8: recorded canonical, not the raw --to-bind operand
   run mi_mig_resume "$IDX" "$POL" "$MAN"
   [ "$status" -eq 0 ]
   run mi_rt_inspect container c.mounts "$C"
@@ -208,7 +214,7 @@ teardown() { teardown_test_env; }
   [ "$status" -eq 0 ]
   load_mctl
   run mi_conf_get "$MYTHICAL_HOME/mythical.conf" MYTHICAL_P1_STATE_BIND
-  [ "$output" = "$DEST" ]
+  [ "$output" = "$CANON_DEST" ]   # §5.2 round 8: recorded canonical, not the raw --to-bind operand
   run mi_rt_inspect container c.mounts "$C"
   assert_contains "$DEST"
 }

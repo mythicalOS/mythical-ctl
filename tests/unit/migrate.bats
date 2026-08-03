@@ -8,6 +8,13 @@ setup() {
   mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
   IDENT="$(mi_ident_get)"; C="mythical-${IDENT}-p1"
   DEST="$(mktemp -d)/dest"        # a fresh, non-existent leaf inside a real directory
+  # §5.2 round 8: migrate-storage now canonicalizes the destination once at the boundary and records/
+  # reports THAT value, never the raw operand (see _mi_mig_canon_dest) — the correct, intended fix for
+  # the check-canonical/use-raw gap. $DEST itself is not necessarily canonical (macOS resolves
+  # mktemp -d's own /var/folders/... through /private/var — measured, the two are different strings),
+  # so tests that assert an EXACT recorded/reported destination compare against CANON_DEST, computed
+  # here the same way the library does.
+  CANON_DEST="$(mi_canon "$(dirname "$DEST")")/$(basename "$DEST")"
 }
 teardown() { teardown_test_env; }
 
@@ -56,11 +63,15 @@ teardown() { teardown_test_env; }
 }
 
 @test "a live intent is checked FIRST, so a present bind after a crash RESUMES rather than refusing" {
+  # §5.2 round 8: precheck now canonicalizes the incoming --to-bind/resume destination BEFORE comparing
+  # it against the ledger's own recorded one (see _mi_mig_canon_dest); a genuine resumed migration would
+  # have recorded that SAME canonical value in the first place, so the fixture seeds the ledger (and the
+  # config binding) with CANON_DEST, not the raw $DEST, to match what precheck actually compares against.
   mi_lock_acquire
   mi_led_put storagemig key "p1:state" "key=p1:state" "phase=6" "product=p1" "role=state" \
-      "dest=$DEST" "confkey=MYTHICAL_P1_STATE_BIND" "prior=" "attempt=started" "desired=running" \
-      "srcvol=mythical-${IDENT}-p1-state" "staging=${DEST}.staging" "nonce=nz"
-  mi_conf_family_add MYTHICAL_P1_STATE_BIND "$DEST"
+      "dest=$CANON_DEST" "confkey=MYTHICAL_P1_STATE_BIND" "prior=" "attempt=started" "desired=running" \
+      "srcvol=mythical-${IDENT}-p1-state" "staging=${CANON_DEST}.staging" "nonce=nz"
+  mi_conf_family_add MYTHICAL_P1_STATE_BIND "$CANON_DEST"
   mi_lock_release
   run mi_mig_precheck "$IDX" "$POL" "$MAN" p1 state "$DEST"
   [ "$status" -eq 0 ]
@@ -275,6 +286,82 @@ teardown() { teardown_test_env; }
   assert_contains "writable by its group or by everyone"
 }
 
+# --- canonicalize once at the boundary, use only the canonical value thereafter (§5.2 round 8) -------
+# Two prior findings shared one root cause: the code CANONICALIZED a path to validate it, then USED the
+# RAW path. mi_mig_check_parent_trust used to check only the destination's IMMEDIATE parent, not the
+# whole chain above it; and every phase downstream operated on the raw --to-bind operand, not the
+# canonical value that was actually verified. A canonical path has no symlink components, and once
+# EVERY ancestor is proven owner-safe, there is no foothold left for a non-root party to swap anything
+# on the path — but only if check-time and use-time see the identical value. _mi_mig_canon_dest closes
+# this at mi_verb_migrate_storage's and precheck's own boundary; mi_mig_check_parent_trust now walks
+# the WHOLE chain (_mi_mig_verify_chain_owner_safe, shared with _mi_mig_secure_state_dir).
+
+@test "mi_mig_check_parent_trust REFUSES when an ancestor ABOVE the immediate parent is unsafe" {
+  # The immediate parent itself is owner-only (0700); only the directory ABOVE it is group/other-
+  # writable — proves the walk checks the WHOLE chain, not just the one directory mi_canon resolves
+  # the destination's dirname to.
+  local base; base="$(mktemp -d)"
+  chmod 777 "$base"
+  local safe_parent="$base/sub"
+  mkdir -p "$safe_parent"; chmod 700 "$safe_parent"
+  run mi_mig_check_parent_trust "$safe_parent/dest"
+  [ "$status" -ne 0 ]
+  assert_contains "writable by its group or by everyone"
+  chmod 700 "$base"; rm -rf "$base"
+}
+
+@test "migrate-storage is REFUSED, naming the offending ancestor, when one exists above the parent" {
+  local base; base="$(mktemp -d)"
+  chmod 777 "$base"
+  local safe_parent="$base/sub"
+  mkdir -p "$safe_parent"; chmod 700 "$safe_parent"
+  MI_CONFIRM=no run mi_verb_migrate_storage "$IDX" "$POL" "$MAN" p1 state --to-bind "$safe_parent/dest"
+  [ "$status" -ne 0 ]
+  assert_contains "writable by its group or by everyone"
+  assert_contains "$base"
+  chmod 700 "$base"; rm -rf "$base"
+}
+
+@test "_mi_mig_secure_state_dir returns the CANONICAL leaf, never a raw path through a symlinked alias" {
+  # $MYTHICAL_HOME reached via a symlink whose OWN containing directory is group/other-writable, but
+  # whose TARGET is a safe, operator-owned tree. The finding: returning the raw path let a caller
+  # mktemp inside a name a group member could repoint after this function approved the (different)
+  # canonical target. Accepting this case is CORRECT (the resolved target is genuinely safe, and once
+  # the canonical value is the ONLY thing used afterward, repointing the alias has no effect on
+  # anything already committed to the resolved path) — what must be proven is that the RETURNED value
+  # is that canonical target, not the raw alias.
+  local real; real="$(mktemp -d)"; chmod 700 "$real"
+  local aliasparent; aliasparent="$(mktemp -d)"; chmod 777 "$aliasparent"
+  ln -s "$real" "$aliasparent/home"
+  MYTHICAL_HOME="$aliasparent/home" run _mi_mig_secure_state_dir probe
+  [ "$status" -eq 0 ]
+  case "$output" in "$aliasparent"*) false ;; *) true ;; esac
+  [ "$output" = "$(mi_canon "$real")/.state/probe" ]
+  chmod 700 "$aliasparent"; rm -rf "$aliasparent" "$real"
+}
+
+@test "migrate-storage reached via a symlink into a safe tree operates on and records the CANONICAL dest" {
+  # --to-bind names a path through an alias whose OWN containing directory is unsafe, but whose target
+  # is a safe, operator-owned tree — the destination-side twin of the secure-dir test above. Must
+  # SUCCEED (the resolved target is genuinely safe) and record/report the CANONICAL destination, never
+  # the raw --to-bind operand — proving check-time and use-time now see the identical value.
+  local real; real="$(mktemp -d)"; chmod 700 "$real"
+  local aliasparent; aliasparent="$(mktemp -d)"; chmod 777 "$aliasparent"
+  ln -s "$real" "$aliasparent/link"
+  local raw_dest="$aliasparent/link/dest"
+  local canon_dest; canon_dest="$(mi_canon "$real")/dest"
+  run mi_verb_migrate_storage "$IDX" "$POL" "$MAN" p1 state --to-bind "$raw_dest"
+  [ "$status" -eq 0 ]
+  run mi_conf_get "$MYTHICAL_HOME/mythical.conf" MYTHICAL_P1_STATE_BIND
+  [ "$output" = "$canon_dest" ]
+  run mi_rt_inspect container c.mounts "$C"
+  assert_contains "$canon_dest"
+  run grep -a "$aliasparent" <<<"$output"
+  [ "$status" -ne 0 ]                          # the container's own mount names the resolved target,
+  [ -d "$real/dest" ]                           # never the alias — and the data landed there for real
+  chmod 700 "$aliasparent"; rm -rf "$aliasparent" "$real"
+}
+
 # --- the escaping-symlink re-check immediately before the commit (§5.2 round 4, finding 2) -----------
 # A directory's own device+inode (mi_mig_verify_identity) proves it was not SWAPPED; it says nothing
 # about what is INSIDE it. mi_mig_verify_no_escaping_symlinks targets specifically what an inode check
@@ -336,7 +423,10 @@ teardown() { teardown_test_env; }
 @test "_mi_mig_secure_state_dir creates and verifies an owner-only directory under mi_home" {
   run _mi_mig_secure_state_dir probe
   [ "$status" -eq 0 ]
-  [ "$output" = "$MYTHICAL_HOME/.state/probe" ]
+  # §5.2 round 8: returns the CANONICAL leaf it verified, not the raw $MYTHICAL_HOME — and on macOS
+  # $MYTHICAL_HOME (itself a mktemp -d) resolves /var -> /private/var, so the raw and canonical forms
+  # are different strings here; compare against mi_canon's own answer, the same way the library does.
+  [ "$output" = "$(mi_canon "$MYTHICAL_HOME")/.state/probe" ]
   run _mi_mode_octal "$MYTHICAL_HOME/.state/probe"
   [ "$output" = 700 ]
 }
@@ -437,7 +527,9 @@ teardown() { teardown_test_env; }
   chmod 700 "$owned/deep" "$home"
   MYTHICAL_HOME="$home" run _mi_mig_secure_state_dir probe
   [ "$status" -eq 0 ]
-  [ "$output" = "$home/.state/probe" ]
+  # §5.2 round 8: the returned value is the CANONICAL leaf, not the raw $home — $owned is itself a
+  # mktemp -d, and on macOS that resolves /var -> /private/var, so the raw and canonical forms differ.
+  [ "$output" = "$(mi_canon "$home")/.state/probe" ]
   rm -rf "$owned"
 }
 
@@ -509,7 +601,9 @@ teardown() { teardown_test_env; }
   cw="$(grep -an 'container create' "$FAKE_DOCKER_STATE/calls.log" | tail -n1 | cut -d: -f1)"
   [ -n "$cw" ]
   run mi_conf_get "$MYTHICAL_HOME/mythical.conf" MYTHICAL_P1_STATE_BIND
-  [ "$output" = "$DEST" ]
+  # §5.2 round 8: recorded as the CANONICAL destination, not the raw --to-bind operand — see setup()'s
+  # CANON_DEST and _mi_mig_canon_dest. Reporting the real resolved location is the intended fix.
+  [ "$output" = "$CANON_DEST" ]
 }
 
 @test "after the migration, a RECREATE keeps the product on the bind" {

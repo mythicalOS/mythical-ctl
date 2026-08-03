@@ -142,6 +142,44 @@ _mi_mig_ancestor_chain() {
   return 0
 }
 
+# WALK THE WHOLE ANCESTOR CHAIN of <canonical path> (from / down to and including it) and refuse if ANY
+# component fails _mi_mig_dir_owner_safe — the ONE definition of "every directory on the path to this is
+# safe from non-owner, non-root tampering", shared by _mi_mig_secure_state_dir (the leaf it creates) and
+# mi_mig_check_parent_trust (the destination's parent), so there is exactly one walk-and-report
+# implementation rather than two that can drift. <what> names what <canon> IS, in the caller's own
+# voice (e.g. "the destination's parent directory", "the installer's own secure scratch location"), so
+# one shared walk still reads naturally regardless of which caller is asking. rc 0 every component is
+# safe · 1 refused (reported, naming the offending component and the reason).
+_mi_mig_verify_chain_owner_safe() {
+  if [ "$#" -ne 2 ]; then mi_warn "migrate: _mi_mig_verify_chain_owner_safe needs <canonical path> <what>"; return 1; fi
+  local canon="$1" what="$2" comp reason rc
+  while IFS= read -r comp; do
+    [ -n "$comp" ] || continue
+    if reason="$(_mi_mig_dir_owner_safe "$comp")"; then rc=0; else rc=$?; fi
+    if [ "$rc" -ne 0 ]; then
+      case "$reason" in
+        owner:*)
+          mi_warn "migrate: '$comp', on the path to $what, is owned by uid ${reason#owner:} — neither"
+          mi_warn "  this process's own uid nor root. Refusing: a directory ANYWHERE on the path that"
+          mi_warn "  someone else can rename through makes everything below it worthless — they can"
+          mi_warn "  rename it away and replace it with their own the instant after a check like this one"
+          mi_warn "  passes. Choose a location whose whole chain this operator (or root) owns." ;;
+        mode:*)
+          mi_warn "migrate: '$comp', on the path to $what, is writable by its group or by everyone (mode"
+          mi_warn "  ${reason#mode:}). Refusing: a directory anyone else can write to lets them rename it"
+          mi_warn "  away and replace it — the one class of attack a re-check immediately before each use"
+          mi_warn "  cannot close in a shell with no fd-relative filesystem operations. Restrict '$comp' to"
+          mi_warn "  the owner only (e.g. 'chmod 700 $comp') and re-run." ;;
+        *)
+          mi_warn "migrate: could not verify the ownership or permissions of '$comp', on the path to"
+          mi_warn "  $what. Refusing rather than guessing it is safe." ;;
+      esac
+      return 1
+    fi
+  done <<< "$(_mi_mig_ancestor_chain "$canon")"
+  return 0
+}
+
 # THE INSTALLER'S OWN SECURE SCRATCH LOCATION — the ONE definition of "somewhere only this process can
 # write", the same one-definition discipline already applied to "escapes" (mi_copy_link_escapes). Any
 # security-critical, ephemeral filesystem object this module creates — one whose CONTENTS or very
@@ -219,40 +257,25 @@ _mi_mig_secure_state_dir() {
   # their own for reclaim's `mv` to land in). mi_home() (~/.mythical, or $MYTHICAL_HOME) is NOT assumed
   # safe here — mi_ensure_layout (lib/layout.sh) neither secures nor verifies it, so a group/other-
   # writable HOME (a permissive umask, or MYTHICAL_HOME pointed under a shared directory) is a REAL
-  # vulnerability, proved unsafe by walking it, never assumed safe by skipping it.
-  local lcanon comp creason crc
+  # vulnerability, proved unsafe by walking it, never assumed safe by skipping it. The walk itself is
+  # _mi_mig_verify_chain_owner_safe, shared with mi_mig_check_parent_trust.
+  local lcanon
   lcanon="$(mi_canon "$dir")" || {
     mi_warn "migrate: '$dir' does not resolve. Refusing to use it as the installer's own secure scratch"
     mi_warn "  location."
     return 1
   }
-  while IFS= read -r comp; do
-    [ -n "$comp" ] || continue
-    if creason="$(_mi_mig_dir_owner_safe "$comp")"; then crc=0; else crc=$?; fi
-    if [ "$crc" -ne 0 ]; then
-      case "$creason" in
-        owner:*)
-          mi_warn "migrate: '$comp', on the path to the installer's own secure scratch location, is"
-          mi_warn "  owned by uid ${creason#owner:} — neither this process's own uid nor root. Refusing:"
-          mi_warn "  a directory ANYWHERE on the path to '$dir' that someone else can rename through makes"
-          mi_warn "  the leaf's own permissions worthless — they can rename it away and put their own"
-          mi_warn "  directory where it used to be, the instant after this function returns. Choose an"
-          mi_warn "  installation home (\$MYTHICAL_HOME) whose whole chain this operator (or root) owns." ;;
-        mode:*)
-          mi_warn "migrate: '$comp', on the path to the installer's own secure scratch location, is"
-          mi_warn "  writable by its group or by everyone (mode ${creason#mode:}). Refusing: the same"
-          mi_warn "  reasoning as an unsafe owner above — a directory anyone else can write to lets them"
-          mi_warn "  rename the leaf away and replace it. Restrict '$comp' to the owner only (e.g."
-          mi_warn "  'chmod 700 $comp') and re-run." ;;
-        *)
-          mi_warn "migrate: could not verify the ownership or permissions of '$comp', on the path to the"
-          mi_warn "  installer's own secure scratch location. Refusing rather than guessing it is safe." ;;
-      esac
-      return 1
-    fi
-  done <<< "$(_mi_mig_ancestor_chain "$lcanon")"
+  _mi_mig_verify_chain_owner_safe "$lcanon" "the installer's own secure scratch location" || return 1
 
-  printf '%s\n' "$dir"
+  # RETURN THE CANONICAL LEAF JUST VERIFIED, NEVER THE RAW ONE. Returning $dir here — the raw
+  # $(mi_home)/.state/<name> — would let a caller `mktemp` inside a path whose ancestors were checked
+  # under a DIFFERENT (canonical) name than the one actually used: with a symlinked ancestor under a
+  # group/other-writable directory (e.g. $MYTHICAL_HOME itself a symlink into a safe tree, reached
+  # through an unsafe parent), the walk above approves the safe canonical target, but a caller using
+  # the raw $dir would still resolve through the SAME symlink a group member can repoint the instant
+  # after this function returns — the very check-canonical/use-raw gap the whole chain walk exists to
+  # close. $lcanon is exactly what was walked and approved; nothing else is safe to hand back.
+  printf '%s\n' "$lcanon"
   return 0
 }
 
@@ -446,44 +469,60 @@ mi_mig_is_mountpoint() {
 # the window is. staging lives as a SIBLING of the destination (mi_mig_staging_path), in the very same
 # parent, so one check here covers both.
 #
-# Refused when the destination's parent: does not resolve; is not owned by the uid running this
-# process OR by root (ownership, not mode bits, is what actually excludes a third party — if this
-# process runs privileged, root bypasses mode-bit checks entirely, so a parent someone else owns can
-# still be written by them regardless of what its mode claims; a ROOT-owned parent is the one exception,
-# since only root — trusted by definition here — could write it); or is writable by its group or by
-# everyone. The per-directory question itself is _mi_mig_dir_owner_safe, shared with
-# _mi_mig_secure_state_dir's ancestor-chain walk, so there is exactly one definition of it. rc 0 the
-# parent is safe to operate in · 1 refused (reported).
+# Refused when ANY directory on the WHOLE CHAIN to the destination's parent — not merely the parent
+# itself — does not resolve, is not owned by the uid running this process OR by root (ownership, not
+# mode bits, is what actually excludes a third party — if this process runs privileged, root bypasses
+# mode-bit checks entirely, so a directory someone else owns can still be written by them regardless of
+# what its mode claims; a ROOT-owned directory is the one exception, since only root — trusted by
+# definition here — could write it), or is writable by its group or by everyone. Checking ONLY the
+# immediate parent used to leave a real gap: mi_canon resolves it to a SAFE canonical target, but if
+# anything ABOVE that parent is group/other-writable, the parent itself (or an ancestor's symlink
+# component resolving into it) can be renamed or repointed by someone else the instant after this
+# check passes — the same "check-canonical, then a caller uses something else" gap the destination
+# itself must also be canonicalized once and threaded through to close (see mi_verb_migrate_storage /
+# _mi_mig_canon_dest). The walk is _mi_mig_ancestor_chain + _mi_mig_dir_owner_safe, via the shared
+# _mi_mig_verify_chain_owner_safe also used by _mi_mig_secure_state_dir — ONE definition of "every
+# directory on this path is safe from non-owner tampering". rc 0 the whole chain is safe to operate in
+# · 1 refused (reported, naming the offending component).
 mi_mig_check_parent_trust() {
   if [ "$#" -ne 1 ]; then mi_warn "migrate: mi_mig_check_parent_trust needs a <destination>"; return 1; fi
-  local dest="$1" pdir canon reason rc
+  local dest="$1" pdir canon
   pdir="$(dirname -- "$dest")"
   canon="$(mi_canon "$pdir" 2>/dev/null)" || {
     mi_warn "migrate: the destination's parent directory '$pdir' does not resolve. Refusing."
     return 1
   }
-  if reason="$(_mi_mig_dir_owner_safe "$canon")"; then rc=0; else rc=$?; fi
-  [ "$rc" -eq 0 ] && return 0
-  case "$reason" in
-    owner:*)
-      mi_warn "migrate: the destination's parent directory '$canon' is owned by uid ${reason#owner:},"
-      mi_warn "  neither this process's own uid nor root. Refusing: this migration performs privileged"
-      mi_warn "  host writes there for its whole span, and a parent this process does not itself own (and"
-      mi_warn "  that is not root's either) may still be written to by whoever does — concurrently, in"
-      mi_warn "  ways no in-process re-check can detect, for as long as the migration runs. Choose a"
-      mi_warn "  destination whose parent directory this operator (or root) owns." ;;
-    mode:*)
-      mi_warn "migrate: the destination's parent directory '$canon' is writable by its group or by everyone"
-      mi_warn "  (mode ${reason#mode:}). Refusing: this migration performs privileged host writes there for"
-      mi_warn "  its whole span, and a parent anyone else can write to can be modified out from under it at"
-      mi_warn "  any point — the one class of attack a re-check immediately before each use cannot close"
-      mi_warn "  in a shell with no fd-relative filesystem operations. Restrict the parent to the owner"
-      mi_warn "  only (e.g. 'chmod 700 ${canon}') and re-run." ;;
-    *)
-      mi_warn "migrate: could not verify the ownership or permissions of the destination's parent"
-      mi_warn "  directory '$canon'. Refusing rather than guessing it is safe." ;;
-  esac
-  return 1
+  _mi_mig_verify_chain_owner_safe "$canon" "the destination's parent directory" || return 1
+  return 0
+}
+
+# CANONICALIZE THE DESTINATION EXACTLY ONCE, AT THE BOUNDARY WHERE IT ENTERS THE MIGRATION — every
+# caller downstream (staging, the copy, the rename, the bind, and what gets recorded in the ledger and
+# reported back) must then use ONLY this value, never the raw operand again. Checking a canonical
+# parent and then acting on the RAW destination was the exact gap this closes: with
+# --to-bind /shared/target/dest (/shared group-writable, target a symlink into a safe tree), a check
+# against the canonical target would pass, but every subsequent write following the RAW path still
+# follows target — which a group member can repoint the instant after the check, redirecting every
+# write out of the approved location. Once every caller uses the SAME canonical value the parent-chain
+# walk (mi_mig_check_parent_trust) just verified, check-time and use-time are identical and there is no
+# symlinked component left for a non-root party to swap.
+#
+# The destination's own LEAF may not exist yet (an ordinary, expected state for a fresh migration — the
+# whole point of precheck's non-empty/absent check), so it cannot be canonicalized directly the way
+# mi_canon canonicalizes an existing directory; it is resolved via its PARENT instead, which precheck's
+# OTHER checks already require to exist. rc 0 prints the canonical destination · 1 refused (reported) —
+# a failed resolve is a refusal, never a silent fall-back to the raw value.
+_mi_mig_canon_dest() {
+  if [ "$#" -ne 1 ]; then mi_warn "migrate: _mi_mig_canon_dest needs a <destination>"; return 1; fi
+  local dest="$1" pdir pcanon base
+  pdir="$(dirname -- "$dest")" || { mi_warn "migrate: could not derive the destination's own parent."; return 1; }
+  pcanon="$(mi_canon "$pdir" 2>/dev/null)" || {
+    mi_warn "migrate: the destination's parent directory '$pdir' does not resolve. Refusing."
+    return 1
+  }
+  base="$(basename -- "$dest")" || { mi_warn "migrate: could not derive the destination's own name."; return 1; }
+  printf '%s/%s\n' "$pcanon" "$base"
+  return 0
 }
 
 # §5.2's phase-5 recovery. Decides on POSITIVE EVIDENCE ONLY, and stops when it has none.
@@ -660,6 +699,14 @@ _mi_mig_precheck_body() {
   ident="$(mi_ident_get)" || return 1
   mrec="$(mi_accept_manifest "$idx" "$pol" "$man" "$product")" || return 1
   prec="$(mi_accept_policy "$idx" "$pol")" || return 1
+
+  # CANONICALIZED HERE TOO, NOT ONLY BY mi_verb_migrate_storage — precheck is a boundary in its own
+  # right (called directly, and reachable other than through the verb), so it re-derives its own
+  # canonical value rather than assume a caller already has one. Canonicalizing an ALREADY-canonical
+  # path (the verb's own case) is a no-op, so this costs nothing extra there; every check and the
+  # live-intent comparison below, plus what mi_mig_check_parent_trust verifies, then all agree on the
+  # SAME value — see _mi_mig_canon_dest.
+  dest="$(_mi_mig_canon_dest "$dest")" || return 1
 
   # THE REAL SECURITY GATE for EVERY path that follows — see mi_mig_check_parent_trust. Run before even
   # the live-intent lookup below, whose own early return (line "a live intent for EXACTLY this
@@ -1366,6 +1413,11 @@ _mi_mig_resume_one_locked() {
     mi_warn "  'mythical-ctl state repair'."
     return 1
   fi
+  # CANONICALIZED HERE TOO — a fresh migration records the canonical destination from the start (see
+  # mi_verb_migrate_storage's own boundary reassignment), so this is ordinarily a no-op; it matters for
+  # a record from before this fix, or one a repair tool ever wrote by hand, where the raw operand could
+  # still be sitting in the ledger. Every check and phase call below then agrees on the same value.
+  dest="$(_mi_mig_canon_dest "$dest")" || return 1
   if ! phase="$(mi_led_field "$frec" phase)"; then
     mi_warn "migrate: the recorded migration for $product/$role does not name a phase. Run"
     mi_warn "  'mythical-ctl state repair'."
@@ -1506,6 +1558,13 @@ mi_verb_migrate_storage() {
 _mi_verb_migrate_storage_locked() {
   local idx="$1" pol="$2" man="$3" product="$4" role="$5" dest="$6" mapforeign="$7"
   _mi_verb_prepare || return 1
+
+  # CANONICALIZE ONCE, HERE, AT THE BOUNDARY — see _mi_mig_canon_dest. This single reassignment makes
+  # every downstream use of $dest in this function (precheck, the phase loop below — including phase
+  # 1, which RECORDS it into the ledger, so a resume reads it back already canonical) refer to the
+  # exact path whose whole ancestor chain mi_mig_check_parent_trust is about to verify, closing the
+  # check-canonical/use-raw gap: nothing downstream ever sees the raw operand again.
+  dest="$(_mi_mig_canon_dest "$dest")" || return 1
 
   if [ "$mapforeign" -eq 1 ]; then MI_MIG_MAP_FOREIGN=1; else unset MI_MIG_MAP_FOREIGN 2>/dev/null || true; fi
 
