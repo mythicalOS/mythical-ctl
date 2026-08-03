@@ -701,6 +701,14 @@ _mi_copy_link_escapes() {
   return 1
 }
 
+# PUBLIC WRAPPER for _mi_copy_link_escapes. This module's own escape rule is exercised from inside a
+# single pass over the copier's transcript above; migrate.sh needs the SAME rule for a HOST-SIDE
+# re-walk of an already-copied tree (re-verifying a staging directory immediately before it is
+# committed into place — see mi_mig_verify_no_escaping_symlinks), and a second, hand-written
+# definition of "escapes" is exactly how the two drift apart. Exposed rather than duplicated. rc 0
+# escapes · 1 stays inside.
+mi_copy_link_escapes() { _mi_copy_link_escapes "$@"; }
+
 # EVERY REFUSAL THE ANSWER STATES, from every thing that can state one, in ONE place.
 #
 #   `refused=<path>:<reason>`      the copier's own refusal

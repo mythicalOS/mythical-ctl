@@ -187,6 +187,83 @@ runtime directly — inspect its labels to see which installation it claims, and
 
 ---
 
+## A storage migration stuck at a phase
+
+**What it means.** `mythical-ctl migrate-storage` moves one product's data from a named volume to a host
+directory in nine recorded phases (§5/§5.2), each recorded *before* its own action runs, so a crash
+mid-phase leaves the ledger naming the phase that was in progress rather than the last one that
+finished. If the process was interrupted, resuming re-derives the true state from what is actually on
+disk rather than trusting the recorded phase blindly (phase 6 onward is only trusted once the
+destination is confirmed to carry phase 5's own recorded identity; otherwise resume falls back to phase
+5, whose own resolve-and-recover logic — retry the rename from staging, or proceed with an empty
+destination when there was nothing yet to protect — takes it from there).
+
+**Next command.** `mythical-ctl migrate-storage <product> <role> --to-bind <path>` again, with the SAME
+destination. It reads the recorded intent and resumes; you do not need to know which phase it stopped
+at. This is never automatic — it asks for confirmation before doing anything destructive, exactly as a
+fresh migration does.
+
+### The security posture: a safe location, not a race won
+
+Both trees a migration touches — the source volume's contents and the destination host tree — are
+untrusted by this command's own design (§5.1). Bash has no `openat`/`renameat`/`unlinkat`-style
+operation that stays bound to an already-open directory handle, so **every** filesystem check this
+command makes resolves a path NAME, and between that check and whatever uses the result, anyone who can
+also write the same parent directory can rename or replace what the name refers to. A re-check
+immediately before each use narrows that window; it cannot close it — there is no operation in this
+shell that is atomic with a check made a moment earlier against a name neither side of the check
+controls exclusively.
+
+What **is** achievable in bash is refusing to operate in a location where that premise holds in the
+first place. Before touching anything, `migrate-storage` requires the destination's parent directory to
+be owned by the operator running it and writable by no one else (not the group, not everyone) — reject
+`chmod 700 that-directory` and the command refuses outright, naming the mode it found. If no one besides
+this process can write the parent, there is no party left to run the race, regardless of how wide any
+individual window is. This is why the fix for a "someone tampered with the destination mid-migration"
+report is not a retry with more logging — it's `chmod 700` on the destination's parent, then retry.
+
+Reclaiming a leftover staging directory (a `.mythical-staging-<nonce>` sibling of a destination, left
+behind by an interrupted attempt) follows the same principle rather than a re-check: after its identity
+is verified against the recorded intent, it is renamed into `~/.mythical/.state/reclaim` (mode 700, this
+installer's own, never a sibling of the untrusted destination) *before* being deleted, and re-verified
+there. An attacker who cannot write into that directory cannot swap what the rename is about to delete —
+the same access-control argument as the parent check above, applied to the one place this command
+recursively removes something by name. If the staging directory and `~/.mythical/.state/reclaim` are on
+different filesystems, reclaim refuses rather than fall back to a non-atomic cross-device move (which
+would silently reintroduce exactly the delete-by-untrusted-name pattern this exists to avoid) — the
+leftover is reported and left in place for you to remove by hand.
+
+### The one residual this cannot close, and why
+
+Even with a trusted parent, the copy step itself must grant the product's own runtime uid write access
+to the staging tree while it is populating it (§4.5 — every file's ownership and default ACL entries are
+set as part of the copy, for the product to be able to use its data once migrated). That access is real,
+host-level, and legitimate for the copy's duration. In the narrow window between phase 4's verification
+finishing and phase 5's atomic commit, something already running as that exact runtime uid — not a
+generic attacker, and not reachable at all once the parent-trust check above passes, but specifically a
+process that already holds the same uid the product's own container ran as before this migration stopped
+it — could in principle plant a symlink inside the staging tree that escapes it.
+
+This is mitigated, not eliminated: immediately before the commit, `migrate-storage` re-walks the entire
+staged tree host-side (following no symlink it encounters, the same discipline the copy step's own walk
+uses) and refuses if any symlink's target escapes the tree — the same rule the copy step itself already
+enforces, reused rather than re-implemented, so there is exactly one definition of "escapes" in this
+codebase. This shrinks the window from "the whole gap between phase 4 and phase 5" down to "the time of
+this one host-side walk", which is the smallest window bash can produce without a kernel primitive this
+shell does not have. It is not zero. Closing it fully would mean the copy step never grants the runtime
+uid write access until after the atomic commit — which the copy contract does not support today, since
+per-file ownership is applied *as* each file is copied, not in a separate pass afterward.
+
+**What this means for you:** the residual is only reachable by something already running as the exact
+uid the product's container used, on the same host, in the seconds between phase 4 and phase 5, if it
+already knows the staging directory's path (an unguessable, per-attempt nonce). It is not reachable by
+an unrelated process, and it is not reachable at all if the destination's parent fails the trust check
+above. If you operate on a host where the product's runtime uid could plausibly correspond to another
+live process (a shared, multi-tenant host), treat that as the boundary this residual does not defend
+across.
+
+---
+
 ## Choosing which installation repair rebuilds
 
 `state repair` looks at every container, volume and network's own installation label — never the ledger

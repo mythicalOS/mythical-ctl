@@ -141,6 +141,27 @@ teardown() { teardown_test_env; }
   [ ! -d "$s" ]
 }
 
+@test "reclaim moves into the INSTALLER'S OWN directory, never a sibling of the untrusted destination" {
+  # A prior revision renamed the leftover to a DIFFERENT NAME but still inside the same (untrusted)
+  # parent as the destination before deleting it — which does not close the check-then-rm race, it
+  # only moves it. The fix reclaims into ~/.mythical/.state/reclaim instead, a directory this installer
+  # owns exclusively (mode 700) that the untrusted parent's writer cannot reach at all. Proven two ways:
+  # nothing named `.mythical-reclaim-*` (the old sibling-based scheme's own naming) ever appears beside
+  # the destination, and the installer's reclaim directory is empty again afterward — fully removed,
+  # not merely relocated and left behind.
+  local s="${DEST}.staging"; mkdir -p "$s"
+  id="$(mi_mig_identity "$s")"
+  run mi_mig_staging_reclaim "$s" nonceX "$id" nonceX
+  [ "$status" -eq 0 ]
+  [ ! -d "$s" ]
+  run find "$(dirname "$DEST")" -maxdepth 1 -name '.mythical-reclaim-*'
+  [ -z "$output" ]
+  [ -d "$MYTHICAL_HOME/.state/reclaim" ]
+  [ -z "$(ls -A "$MYTHICAL_HOME/.state/reclaim" 2>/dev/null)" ]
+  run _mi_mode_octal "$MYTHICAL_HOME/.state/reclaim"
+  [ "$output" = 700 ]
+}
+
 @test "a leftover staging MISMATCH is preserved and reported — the name alone is not authority" {
   local s="${DEST}.staging"; mkdir -p "$s"
   run mi_mig_staging_reclaim "$s" nonceX "999:999" nonceX
@@ -160,6 +181,119 @@ teardown() { teardown_test_env; }
   mkdir -p "$(mi_mig_staging_path "$DEST" nonceX)"
   run mi_mig_precheck "$IDX" "$POL" "$MAN" p1 state "$DEST"
   [ "$status" -eq 0 ]
+}
+
+# --- the parent-trust precheck (§5.2 round 4): bash cannot make a check atomic with a later use ------
+# against a name an attacker can also resolve, so the actual security posture is refusing to operate
+# in a location such an attacker could reach in the first place, rather than re-checking immediately
+# before every use (which only narrows the window, never closes it).
+
+@test "mi_mig_check_parent_trust accepts an operator-owned, non-group/other-writable parent" {
+  run mi_mig_check_parent_trust "$DEST"
+  [ "$status" -eq 0 ]
+}
+
+@test "precheck REFUSES a destination whose parent directory is writable by GROUP" {
+  chmod 770 "$(dirname "$DEST")"
+  run mi_mig_precheck "$IDX" "$POL" "$MAN" p1 state "$DEST"
+  [ "$status" -ne 0 ]
+  assert_contains "writable by its group or by everyone"
+}
+
+@test "precheck REFUSES a destination whose parent directory is writable by EVERYONE" {
+  chmod 777 "$(dirname "$DEST")"
+  run mi_mig_precheck "$IDX" "$POL" "$MAN" p1 state "$DEST"
+  [ "$status" -ne 0 ]
+  assert_contains "writable by its group or by everyone"
+}
+
+@test "an UNSAFE parent is refused BEFORE anything else — no role/policy/volume checks run first" {
+  # Refusing here, first, is what makes the guarantee "no attacker with parent write access is ever
+  # let in" hold regardless of which product/role/state combination is requested.
+  chmod 777 "$(dirname "$DEST")"
+  run mi_mig_precheck "$IDX" "$POL" "$MAN" p1 nosuch "$DEST"
+  [ "$status" -ne 0 ]
+  assert_contains "writable by its group or by everyone"
+  run grep -a 'no volume role' <<<"$output"
+  [ "$status" -ne 0 ]
+}
+
+@test "the full migrate-storage verb refuses through an unsafe parent, before any confirmation prompt" {
+  chmod 777 "$(dirname "$DEST")"
+  MI_CONFIRM=no run mi_verb_migrate_storage "$IDX" "$POL" "$MAN" p1 state --to-bind "$DEST"
+  [ "$status" -ne 0 ]
+  assert_contains "writable by its group or by everyone"
+  run grep -aiE 'not confirmed' <<<"$output"
+  [ "$status" -ne 0 ]
+}
+
+@test "mi_mig_resume ALSO refuses through an unsafe parent — it is an independent entry point" {
+  mi_lock_acquire
+  mi_led_put storagemig key "p1:state" "key=p1:state" "phase=2" "product=p1" "role=state" \
+      "dest=$DEST" "confkey=MYTHICAL_P1_STATE_BIND" "prior=" "attempt=none" "desired=running" \
+      "srcvol=mythical-${IDENT}-p1-state" "staging=$(mi_mig_staging_path "$DEST" nz)" "nonce=nz"
+  mi_lock_release
+  chmod 777 "$(dirname "$DEST")"
+  run mi_mig_resume "$IDX" "$POL" "$MAN"
+  [ "$status" -ne 0 ]
+  assert_contains "writable by its group or by everyone"
+}
+
+# --- the escaping-symlink re-check immediately before the commit (§5.2 round 4, finding 2) -----------
+# A directory's own device+inode (mi_mig_verify_identity) proves it was not SWAPPED; it says nothing
+# about what is INSIDE it. mi_mig_verify_no_escaping_symlinks targets specifically what an inode check
+# cannot see, using the copy step's own already-validated escape rule (mi_copy_link_escapes).
+
+@test "mi_mig_verify_no_escaping_symlinks refuses a tree containing an escaping (absolute-target) symlink" {
+  local t; t="$(mktemp -d)"
+  ln -s /etc/passwd "$t/evil"
+  run mi_mig_verify_no_escaping_symlinks "$t"
+  [ "$status" -ne 0 ]
+  assert_contains "escapes it"
+  rm -rf "$t"
+}
+
+@test "mi_mig_verify_no_escaping_symlinks refuses a tree containing a '..'-climbing escaping symlink" {
+  local t; t="$(mktemp -d)"
+  mkdir -p "$t/sub"
+  ln -s ../../outside "$t/sub/evil"
+  run mi_mig_verify_no_escaping_symlinks "$t"
+  [ "$status" -ne 0 ]
+  assert_contains "escapes it"
+  rm -rf "$t"
+}
+
+@test "mi_mig_verify_no_escaping_symlinks accepts a tree containing only an intra-tree symlink" {
+  local t; t="$(mktemp -d)"
+  mkdir -p "$t/sub"
+  : > "$t/sub/f"
+  ln -s sub/f "$t/link"
+  run mi_mig_verify_no_escaping_symlinks "$t"
+  [ "$status" -eq 0 ]
+  rm -rf "$t"
+}
+
+@test "phase 5 refuses to commit a staging tree that gained an ESCAPING symlink after phase 4" {
+  # The exact race the finding describes: something with legitimate write access to the staging tree
+  # during the copy (the runtime uid's ACL grant §4.5 requires the copy step to set) plants an escaping
+  # symlink in the window between phase 4's verification and phase 5's commit. The staging directory's
+  # OWN identity is unchanged — it is the SAME directory phase 3 created — so an inode check alone would
+  # not catch this; the content-level re-scan immediately before the rename is what does.
+  local stagepath sid
+  stagepath="$(mi_mig_staging_path "$DEST" nz)"
+  mkdir -p "$stagepath"
+  ln -s /etc/passwd "$stagepath/evil"
+  sid="$(mi_mig_identity "$stagepath")"
+  mi_lock_acquire
+  mi_led_put storagemig key "p1:state" "key=p1:state" "phase=5" "product=p1" "role=state" \
+      "dest=$DEST" "confkey=MYTHICAL_P1_STATE_BIND" "prior=" "attempt=none" "desired=running" \
+      "srcvol=mythical-${IDENT}-p1-state" "staging=$stagepath" "nonce=nz" "stageid=$sid"
+  mi_lock_release
+  run mi_mig_run "$IDX" "$POL" "$MAN" p1 state "$DEST" 5
+  [ "$status" -ne 0 ]
+  assert_contains "escapes it"
+  [ ! -e "$DEST" ]              # nothing was moved into place
+  [ -d "$stagepath" ]           # the staged tree survives, untouched — not destroyed either
 }
 
 @test "compare-and-set: not started, key absent → write" {

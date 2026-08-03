@@ -117,14 +117,14 @@ selftest() {
                 mi_manifest_runtime_uid \
                 mi_copy_image mi_copy_available mi_copy_preflight \
                 mi_copy_run mi_copy_run_verify mi_copy_verify \
-                mi_copy_access_check mi_copy_host_access_check \
+                mi_copy_access_check mi_copy_host_access_check mi_copy_link_escapes \
                 mi_product_ctx mi_bringup_specs mi_conf_product_ensure mi_confirm \
                 mi_verb_install mi_verb_start mi_verb_stop mi_verb_restart mi_verb_recreate \
                 mi_verb_status mi_verb_uninstall mi_verb_uninstall_family mi_verb_batch \
                 mi_schema_migrate mi_repair_candidates mi_repair_run \
                 mi_verb_state_repair mi_verb_abandon_intent mi_verb_net_rebind \
                 mi_conf_family_cas mi_mig_precheck mi_mig_phase mi_mig_stageid mi_mig_resume_phase \
-                mi_mig_run mi_mig_resume \
+                mi_mig_run mi_mig_resume mi_mig_check_parent_trust mi_mig_verify_no_escaping_symlinks \
                 mi_mig_staging_path mi_mig_identity mi_mig_is_mountpoint mi_verb_migrate_storage; do
         if ! declare -F "$_f" >/dev/null 2>&1; then
           printf 'mythical-ctl: missing library function: %s\n' "$_f" >&2

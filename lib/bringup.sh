@@ -171,6 +171,26 @@ _mi_nlink() {
   return 1
 }
 
+# Numeric OWNER uid, GNU/BSD portable.
+_mi_owner_uid() {
+  local p="$1" out
+  out="$(stat -f '%u' -- "$p" 2>/dev/null)" && { printf '%s\n' "$out"; return 0; }
+  out="$(stat -c '%u' -- "$p" 2>/dev/null)" && { printf '%s\n' "$out"; return 0; }
+  return 1
+}
+
+# Permission bits as OCTAL DIGITS (no leading `0`, no file-type prefix), GNU/BSD portable — `%Lp` on
+# BSD and `%a` on GNU both print the low bits only (never the `S_IFDIR`-family type bits `%p`/`%f`
+# carry). May be 3 or 4 digits (a 4th, leading digit appears only when setuid/setgid/sticky is set);
+# callers that want the group/other write bits take the LAST TWO characters (`${m#"${m%??}"}`) rather
+# than assume a fixed width, since bash 3.2 (this codebase's floor) has no negative substring offset.
+_mi_mode_octal() {
+  local p="$1" out
+  out="$(stat -f '%Lp' -- "$p" 2>/dev/null)" && { printf '%s\n' "$out"; return 0; }   # BSD/macOS
+  out="$(stat -c '%a' -- "$p" 2>/dev/null)" && { printf '%s\n' "$out"; return 0; }    # GNU
+  return 1
+}
+
 # The identities NOTHING mounted into a container may share: mythical.conf, and everything under
 # bin/. Printed one per line; a path that EXISTS and whose identity cannot be read is a refusal, not
 # one fewer member — a protected file silently dropped from this set is a comparison that passes by

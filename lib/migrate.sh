@@ -82,6 +82,47 @@ mi_mig_verify_identity() {
   return 0
 }
 
+# A DIRECTORY'S OWN IDENTITY (mi_mig_verify_identity, above) proves it was not SWAPPED; it says
+# nothing about what is INSIDE it — adding an entry, or replacing an existing file with a symlink,
+# changes nothing about the containing directory's inode. Between phase 4's copy verification and
+# phase 5's commit, whoever holds the runtime uid's write ACL on the staging tree — a grant §4.5
+# requires the copy step itself to set, on every legitimate migration, so it cannot simply be denied —
+# could plant an ESCAPING symlink inside it. This re-walks the tree HOST-SIDE, without following any
+# symlink it encounters (matching the copy step's own walk discipline), and applies the copy step's
+# OWN, already-validated escape rule (mi_copy_link_escapes: absolute, or '..' components that climb
+# above the root — exposed rather than re-implemented, so there is exactly one definition of "escapes"
+# in this codebase) to every symlink found. It is the cheapest host-side check that targets
+# specifically what an inode check cannot see; it is NOT a full re-verification against the source
+# (that already happened, expensively, in the copy helper, moments earlier). Called immediately before
+# the commit, it narrows the remaining window to the time of this walk itself — it does not eliminate
+# it. rc 0 clean · 1 refused (reported) — an unreadable symlink target is refused the same as a stated
+# escape, never guessed clean.
+mi_mig_verify_no_escaping_symlinks() {
+  if [ "$#" -ne 1 ]; then mi_warn "migrate: mi_mig_verify_no_escaping_symlinks needs a <root>"; return 1; fi
+  local root="$1" canon p target
+  canon="$(mi_canon "$root" 2>/dev/null)" || {
+    mi_warn "migrate: '$root' does not resolve, so its contents cannot be re-verified before the commit."
+    return 1
+  }
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    if ! target="$(readlink -- "$p" 2>/dev/null)"; then
+      mi_warn "migrate: could not read the target of the symlink at '$p' in the staged tree, immediately"
+      mi_warn "  before the commit. Refusing to commit an entry this process cannot show does not escape."
+      return 1
+    fi
+    if mi_copy_link_escapes "$p" "$target" "$canon"; then
+      mi_warn "migrate: the staged tree contains a symlink that escapes it, found on the re-check"
+      mi_warn "  immediately before the commit: '$p' -> '$target'."
+      mi_warn "  This is the same escape rule the copy step itself enforces (an absolute target, or one"
+      mi_warn "  whose '..' components climb above the root) — refusing to commit it rather than carry"
+      mi_warn "  it into the replacement container's bind."
+      return 1
+    fi
+  done <<< "$(find "$canon" -type l -print 2>/dev/null)"
+  return 0
+}
+
 # Is <path> itself a MOUNT POINT? Detection must consult MOUNT-TABLE EVIDENCE.
 #
 # Comparing st_dev with the parent's does NOT detect this on its own: a bind mount of the same
@@ -172,6 +213,64 @@ mi_mig_is_mountpoint() {
   return 1
 }
 
+# THE REAL SECURITY POSTURE, STATED PLAINLY: bash has no fd-relative *at() operations (openat/renameat/
+# unlinkat with O_NOFOLLOW-style confinement to an already-open directory handle). Every check this
+# module makes — mi_mig_verify_identity, mi_mig_verify_no_escaping_symlinks, the phase-5 rmdir-then-mv
+# sequence — resolves a PATH NAME, and between that resolution and whatever uses the result, anyone who
+# can ALSO write the same parent directory can rename or replace what the name refers to. A re-check
+# immediately before each use narrows that window; it cannot close it, because there is no bash
+# operation that is atomic with a check made a moment earlier against a name neither side of the check
+# controls exclusively. What CAN be closed is the premise: if NO ONE besides this process can write the
+# parent directory in the first place, there is no party left to run the race, regardless of how wide
+# the window is. staging lives as a SIBLING of the destination (mi_mig_staging_path), in the very same
+# parent, so one check here covers both.
+#
+# Refused when the destination's parent: does not resolve; is not OWNED by the uid running this
+# process (ownership, not mode bits, is what actually excludes a third party — if this process runs
+# privileged, root bypasses mode-bit checks entirely, so a parent someone else owns can still be
+# written by them regardless of what its mode claims); or is writable by its group or by everyone.
+# rc 0 the parent is safe to operate in · 1 refused (reported).
+mi_mig_check_parent_trust() {
+  if [ "$#" -ne 1 ]; then mi_warn "migrate: mi_mig_check_parent_trust needs a <destination>"; return 1; fi
+  local dest="$1" pdir canon euid owner mode last2
+  pdir="$(dirname -- "$dest")"
+  canon="$(mi_canon "$pdir" 2>/dev/null)" || {
+    mi_warn "migrate: the destination's parent directory '$pdir' does not resolve. Refusing."
+    return 1
+  }
+  euid="$(id -u)" || { mi_warn "migrate: could not read the operator's own uid. Refusing."; return 1; }
+  owner="$(_mi_owner_uid "$canon")" || {
+    mi_warn "migrate: could not read the owner of '$canon'. Refusing rather than guessing it is safe."
+    return 1
+  }
+  if [ "$owner" != "$euid" ]; then
+    mi_warn "migrate: the destination's parent directory '$canon' is owned by uid $owner, not this"
+    mi_warn "  process's own uid ($euid). Refusing: this migration performs privileged host writes there"
+    mi_warn "  for its whole span, and a parent this process does not itself own may still be written to"
+    mi_warn "  by whoever does — concurrently, in ways no in-process re-check can detect, for as long as"
+    mi_warn "  the migration runs. Choose a destination whose parent directory this operator owns."
+    return 1
+  fi
+  mode="$(_mi_mode_octal "$canon")" || {
+    mi_warn "migrate: could not read the permissions of '$canon'. Refusing rather than guessing them safe."
+    return 1
+  }
+  # The group-write and other-write bits are the last two octal digits, whatever the string's total
+  # width (a leading setuid/setgid/sticky digit does not shift them) — see _mi_mode_octal.
+  last2="${mode#"${mode%??}"}"
+  case "$last2" in
+    *[2367]*)
+      mi_warn "migrate: the destination's parent directory '$canon' is writable by its group or by everyone"
+      mi_warn "  (mode ${mode}). Refusing: this migration performs privileged host writes there for its"
+      mi_warn "  whole span, and a parent anyone else can write to can be modified out from under it at"
+      mi_warn "  any point — the one class of attack a re-check immediately before each use cannot close"
+      mi_warn "  in a shell with no fd-relative filesystem operations. Restrict the parent to the owner"
+      mi_warn "  only (e.g. 'chmod 700 ${canon}') and re-run."
+      return 1 ;;
+  esac
+  return 0
+}
+
 # §5.2's phase-5 recovery. Decides on POSITIVE EVIDENCE ONLY, and stops when it has none.
 #
 #   identity at the DESTINATION  the rename completed  → advance to phase 6
@@ -252,37 +351,72 @@ mi_mig_staging_reclaim() {
     return 1
   fi
 
-  # ATOMIC RECLAIM, NOT check-then-rm. The check above named $stage by a PATH, and between it and an
-  # `rm -rf` against that same path there is a window in which an attacker who still controls the
-  # parent directory can replace whatever the name refers to — the recursive delete would then remove
-  # the REPLACEMENT, which this process never verified, defeating the nonce+identity rule above
-  # entirely. Renaming $stage away FIRST closes that: rename() is atomic and identity-preserving (by
-  # inode), so the renamed handle is either exactly the object just checked, or the rename itself
-  # raced and failed outright — nothing in between. The identity is re-verified on THAT handle,
-  # immediately before the delete, with no further path-name lookup in between, and only ever removes
-  # what was just renamed — never $stage by its original, still attacker-writable name.
-  local tag priv vid
+  # ATOMIC RECLAIM INTO AN INSTALLER-OWNED DIRECTORY — NOT ANOTHER NAME IN THE SAME PARENT. An earlier
+  # revision of this function renamed $stage to a different name (still a SIBLING, in the SAME
+  # untrusted parent) before deleting it, believing that closed the check-then-rm race the comment
+  # above warns about. It does not: whoever can still write that parent can rename the NEW name away
+  # and replace it too, exactly as easily as the old one — a different name in the same unsafe place
+  # only MOVES the race, it does not close it. What actually closes it is a different DIRECTORY: one
+  # under THIS INSTALLER'S OWN ~/.mythical/.state tree (mi_home), created here with mode 0700, that the
+  # untrusted destination's parent has no access to at all. An attacker who cannot write there cannot
+  # rename anything into or out of it, so a check-then-rm pair inside it is safe for the same reason a
+  # re-check immediately before use is not: there is no party left who could win the race. This is the
+  # one place in this module where "operate somewhere safe" (an access-control property, achievable in
+  # bash) replaces "recheck immediately before use" (a timing property bash cannot make atomic — see
+  # mi_mig_check_parent_trust).
+  #
+  # SAME FILESYSTEM IS REQUIRED for the move itself to be the atomic rename() this safety depends on —
+  # a cross-device `mv` falls back to a recursive COPY followed by an ordinary `rm -rf` of the ORIGINAL,
+  # untrusted-parent path, which is exactly the unsafe pattern this function exists to avoid. Checked
+  # BEFORE attempting the move, by comparing device numbers (the leading field of mi_mig_identity's
+  # `device:inode`) — not discovered after the fact from a `mv` that already silently degraded.
+  local rdir tag priv vid sdev rdev
+  rdir="$(mi_home)/.state/reclaim"
+  mkdir -p -- "$rdir" 2>/dev/null || {
+    mi_warn "migrate: cannot create the installer's own reclaim directory $rdir. Nothing was removed."
+    return 1
+  }
+  chmod 700 -- "$rdir" || {
+    mi_warn "migrate: cannot restrict $rdir to owner-only. Refusing to reclaim into a directory this"
+    mi_warn "  process cannot itself prove is safe. Nothing was removed."
+    return 1
+  }
+  sdev="${cur%%:*}"
+  rdev="$(mi_mig_identity "$rdir" 2>/dev/null)" || rdev=""
+  rdev="${rdev%%:*}"
+  if [ -z "$rdev" ] || [ "$sdev" != "$rdev" ]; then
+    mi_warn "migrate: the staging directory $stage and the installer's reclaim directory $rdir are on"
+    mi_warn "  different filesystems, so moving into it would not be the atomic, same-device rename this"
+    mi_warn "  safety depends on — 'mv' would fall back to a recursive copy-then-remove that deletes the"
+    mi_warn "  ORIGINAL by its untrusted-parent name, which is exactly what this function exists to"
+    mi_warn "  avoid. It is preserved and reported rather than reclaimed unsafely; removing it by hand is"
+    mi_warn "  your call."
+    return 1
+  fi
   tag="$(mi_nonce_new)" || { mi_warn "migrate: could not mint a reclaim path"; return 1; }
-  priv="$(dirname -- "$stage")/.mythical-reclaim-${tag}"
+  priv="${rdir}/${tag}"
   if [ -e "$priv" ]; then
     mi_warn "migrate: the private reclaim path $priv already exists. Refusing rather than risk 'mv'"
     mi_warn "  nesting the staging directory inside it instead of claiming it exclusively."
     return 1
   fi
   if ! mv -- "$stage" "$priv" 2>/dev/null; then
-    mi_warn "migrate: could not rename the staging directory $stage to reclaim it. Nothing was removed."
+    mi_warn "migrate: could not rename the staging directory $stage into the installer's own reclaim"
+    mi_warn "  directory. Nothing was removed."
     return 1
   fi
   vid="$(mi_mig_identity "$priv" 2>/dev/null)" || vid=""
   if [ -z "$vid" ] || [ "$vid" != "$rid" ]; then
-    mi_warn "migrate: after renaming $stage to reclaim it, the renamed directory (now at $priv) no"
-    mi_warn "  longer carries the identity just verified (expected $rid, found ${vid:-<unreadable>}) —"
-    mi_warn "  something replaced it in the instant between the check and the rename. It is preserved"
-    mi_warn "  at $priv, not deleted, and not renamed back onto a name that may already be reassigned."
+    mi_warn "migrate: after renaming $stage to reclaim it, the renamed directory (now at $priv, inside"
+    mi_warn "  the installer's own reclaim directory) no longer carries the identity just verified"
+    mi_warn "  (expected $rid, found ${vid:-<unreadable>}) — something replaced it in the instant between"
+    mi_warn "  the check and the rename. It is preserved at $priv, not deleted, and not renamed back onto"
+    mi_warn "  a name that may already be reassigned."
     return 1
   fi
   rm -rf -- "$priv" || {
-    mi_warn "migrate: could not remove the staging directory (renamed to $priv to reclaim it)"
+    mi_warn "migrate: could not remove the staging directory (renamed to $priv, inside the installer's"
+    mi_warn "  own reclaim directory, to reclaim it)"
     return 1
   }
   return 0
@@ -339,6 +473,11 @@ _mi_mig_precheck_body() {
     return 1
   fi
   [ "$rc" -eq 3 ] || return "$rc"
+
+  # THE REAL SECURITY GATE for everything that follows — see mi_mig_check_parent_trust. Run before any
+  # other check that follows, none of which mean anything if the destination's parent is a location
+  # someone besides this operator can also write to for the whole span of the migration.
+  mi_mig_check_parent_trust "$dest" || return 1
 
   # The role must EXIST in the manifest — which also gives the operator the list.
   local v roles="" found=0 mount=""
@@ -773,6 +912,10 @@ _mi_mig_run_body() {
               return 1
             fi
           fi
+          # THE LAST THING BEFORE THE COMMIT: a content-level re-check, not another identity check —
+          # see mi_mig_verify_no_escaping_symlinks. Placed as close to the `mv` as this shell can put
+          # it, to make the residual window (documented in docs/RECOVERY.md) as small as achievable.
+          mi_mig_verify_no_escaping_symlinks "$stage" || return 1
           mv -- "$stage" "$dest" || {
             mi_warn "migrate: the atomic commit (rename) failed. The copy is intact at $stage; nothing"
             mi_warn "  was destroyed. If the destination is on a different filesystem or is a mount"
@@ -1008,6 +1151,11 @@ mi_mig_resume() {
       mi_warn "  Run 'mythical-ctl state repair'."
       return 1
     fi
+    # THE SAME GATE THE FRESH/RESUME VERB PATH GOES THROUGH VIA mi_mig_precheck — this is an
+    # INDEPENDENT entry point (a reconciliation sweep, not necessarily reached through
+    # mi_verb_migrate_storage at all), so it must establish parent trust itself rather than assume some
+    # other caller already did. See mi_mig_check_parent_trust.
+    mi_mig_check_parent_trust "$dest" || return 1
     p="$(mi_mig_resume_phase "$phase" "$dest" "$stageid")" || return 1
 
     mf="$man"
