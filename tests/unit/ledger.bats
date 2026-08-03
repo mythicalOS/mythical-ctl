@@ -261,3 +261,43 @@ EOF
   [ "$status" -ne 0 ]
   [ -L "$MYTHICAL_HOME/.state/ledger" ] || { echo "the writer replaced the symlink" >&2; return 1; }
 }
+
+# --- §6c/D59: the staging ledger override -----------------------------------------------------------
+
+@test "the ledger path override refuses anything outside the two paths this code owns" {
+  load_mctl; mi_ensure_layout
+  MI_LEDGER_PATH_OVERRIDE="/tmp/some-arbitrary-file" run _mi_ledger_path
+  [ "$status" -ne 0 ]
+  assert_contains "refusing an out-of-tree ledger path override"
+}
+
+@test "the ledger path override accepts exactly the real ledger path and the staging path" {
+  load_mctl; mi_ensure_layout
+  MI_LEDGER_PATH_OVERRIDE="$MYTHICAL_HOME/.state/ledger" run _mi_ledger_path
+  assert_ok
+  [ "$output" = "$MYTHICAL_HOME/.state/ledger" ]
+  MI_LEDGER_PATH_OVERRIDE="$MYTHICAL_HOME/.state/ledger.staging" run _mi_ledger_path
+  assert_ok
+  [ "$output" = "$MYTHICAL_HOME/.state/ledger.staging" ]
+}
+
+@test "the staging reader/writer round-trip, without touching the real ledger" {
+  setup_ledger
+  printf 'identity\tid=staged123\n' | mi_ledger_staging_write
+  run mi_ledger_staging_read
+  assert_ok
+  assert_contains "id=staged123"
+  # Plan 1's ordinary ledger is untouched — still absent.
+  [ ! -e "$MYTHICAL_HOME/.state/ledger" ]
+  run mi_ledger_read
+  [ "$status" -eq 3 ]
+}
+
+@test "Plan 1's ledger.bats still passes unchanged: an ordinary write/read never sees the override" {
+  setup_ledger
+  printf 'identity\tid=abc123\n' | mi_ledger_write
+  run mi_ledger_read
+  assert_ok
+  assert_contains "id=abc123"
+  [ ! -e "$MYTHICAL_HOME/.state/ledger.staging" ]
+}

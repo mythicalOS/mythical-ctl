@@ -4,7 +4,35 @@
 
 MI_LEDGER_SCHEMA=1
 
-_mi_ledger_path() { printf '%s/.state/ledger\n' "$(mi_home)"; }
+# The real ledger path, UNLESS a caller has asked for the staging one instead (§6c/D59). The override
+# is read from the environment, which looks exactly like the kind of configurable path this codebase
+# refuses everywhere else — the difference here is that it selects between TWO PATHS THIS CODE OWNS,
+# both under `~/.mythical/.state/`, never an arbitrary file: an env-settable ledger path with no such
+# guard would let any caller point the atomic writer (mi_ledger_write, which still proves lock
+# ownership itself) at a file of its choosing.
+_mi_ledger_path() {
+  if [ -n "${MI_LEDGER_PATH_OVERRIDE:-}" ]; then
+    case "$MI_LEDGER_PATH_OVERRIDE" in
+      "$(mi_home)/.state/ledger"|"$(mi_home)/.state/ledger.staging") : ;;
+      *) mi_die "ledger: refusing an out-of-tree ledger path override" ;;
+    esac
+    printf '%s\n' "$MI_LEDGER_PATH_OVERRIDE"
+    return 0
+  fi
+  printf '%s/.state/ledger\n' "$(mi_home)"
+}
+
+# §6c/D59 — the STAGING ledger. Same format, same checksum, a distinct well-known name beside the real
+# ledger path, and explicitly NOT AUTHORITATIVE: no operation launches, deletes or reconciles from it
+# (D28 permits exactly one authoritative ledger). It exists because a restore needs somewhere to put an
+# incoming ledger plus its own intent before either is trusted.
+_mi_ledger_staging_path() { printf '%s/.state/ledger.staging\n' "$(mi_home)"; }
+
+# Read/write the staging ledger with the SAME integrity discipline as the real one — implemented by
+# pointing the one shared validator/writer at the staging path via the override above, so a future fix
+# to the read or write path cannot land on only one of the two files.
+mi_ledger_staging_read()  { MI_LEDGER_PATH_OVERRIDE="$(_mi_ledger_staging_path)" mi_ledger_read; }
+mi_ledger_staging_write() { MI_LEDGER_PATH_OVERRIDE="$(_mi_ledger_staging_path)" mi_ledger_write; }
 
 # Decimal-string greater-than: 0 (true) if $1 > $2. Both are already validated all-digit strings.
 # Avoids shell integer conversion so an arbitrarily long schema cannot overflow `[ -gt ]`.
