@@ -66,6 +66,42 @@ teardown() { teardown_test_env; }
   [ "$status" -eq 0 ]
 }
 
+@test "the live-intent early return ALSO enforces the parent-trust gate — it does not bypass it" {
+  # §5.2 round 5, finding 1: mi_mig_check_parent_trust used to run AFTER the live-intent lookup's own
+  # early return (a matching in-flight destination is resumed by returning 0 immediately), so a
+  # migration interrupted while its destination's parent was safe, whose parent became group/world-
+  # writable since, resumed through that early return with the gate skipped entirely. Same fixture as
+  # the passing "a live intent is checked FIRST..." test above, but with an unsafe parent — this must
+  # now refuse instead of resuming.
+  mi_lock_acquire
+  mi_led_put storagemig key "p1:state" "key=p1:state" "phase=6" "product=p1" "role=state" \
+      "dest=$DEST" "confkey=MYTHICAL_P1_STATE_BIND" "prior=" "attempt=started" "desired=running" \
+      "srcvol=mythical-${IDENT}-p1-state" "staging=${DEST}.staging" "nonce=nz"
+  mi_conf_family_add MYTHICAL_P1_STATE_BIND "$DEST"
+  mi_lock_release
+  chmod 777 "$(dirname "$DEST")"
+  run mi_mig_precheck "$IDX" "$POL" "$MAN" p1 state "$DEST"
+  [ "$status" -ne 0 ]
+  assert_contains "writable by its group or by everyone"
+}
+
+@test "the migrate-storage VERB's own resume-existing-intent path also enforces parent-trust" {
+  # The same regression, exercised through the real verb entrypoint (mi_verb_migrate_storage), not
+  # just mi_mig_precheck directly — this is the exact path the finding names as reachable with the
+  # gate skipped: re-invoking the verb on an already-recorded, matching-destination migration.
+  mi_lock_acquire
+  mi_led_put storagemig key "p1:state" "key=p1:state" "phase=2" "product=p1" "role=state" \
+      "dest=$DEST" "confkey=MYTHICAL_P1_STATE_BIND" "prior=" "attempt=none" "desired=running" \
+      "srcvol=mythical-${IDENT}-p1-state" "staging=$(mi_mig_staging_path "$DEST" nz)" "nonce=nz"
+  mi_lock_release
+  chmod 777 "$(dirname "$DEST")"
+  MI_CONFIRM=no run mi_verb_migrate_storage "$IDX" "$POL" "$MAN" p1 state --to-bind "$DEST"
+  [ "$status" -ne 0 ]
+  assert_contains "writable by its group or by everyone"
+  run grep -aiE 'not confirmed' <<<"$output"
+  [ "$status" -ne 0 ]
+}
+
 @test "a live intent naming a DIFFERENT destination stops and reports BOTH paths" {
   mi_lock_acquire
   mi_led_put storagemig key "p1:state" "key=p1:state" "phase=3" "product=p1" "role=state" \
@@ -270,6 +306,23 @@ teardown() { teardown_test_env; }
   ln -s sub/f "$t/link"
   run mi_mig_verify_no_escaping_symlinks "$t"
   [ "$status" -eq 0 ]
+  rm -rf "$t"
+}
+
+@test "mi_mig_verify_no_escaping_symlinks FAILS CLOSED when the walk cannot fully complete" {
+  # §5.2 round 5, finding 2: the walk used to capture find's OUTPUT into a here-string with its EXIT
+  # STATUS discarded — a partial walk (an unreadable subdirectory, a race) would still print whatever
+  # it reached, read as if it were the complete tree, and a clean result over an incomplete scan is
+  # indistinguishable from "nothing found". An unreadable subdirectory makes find exit nonzero while
+  # still printing everything else it walked; this must be refused, not read as "no escaping symlink
+  # was found in what happened to be visible".
+  local t; t="$(mktemp -d)"
+  mkdir -p "$t/blocked"
+  chmod 000 "$t/blocked"
+  run mi_mig_verify_no_escaping_symlinks "$t"
+  [ "$status" -ne 0 ]
+  assert_contains "did not complete cleanly"
+  chmod 755 "$t/blocked"
   rm -rf "$t"
 }
 

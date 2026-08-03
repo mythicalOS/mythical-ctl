@@ -99,17 +99,46 @@ mi_mig_verify_identity() {
 # escape, never guessed clean.
 mi_mig_verify_no_escaping_symlinks() {
   if [ "$#" -ne 1 ]; then mi_warn "migrate: mi_mig_verify_no_escaping_symlinks needs a <root>"; return 1; fi
-  local root="$1" canon p target
+  local root="$1" canon p target tmp frc
   canon="$(mi_canon "$root" 2>/dev/null)" || {
     mi_warn "migrate: '$root' does not resolve, so its contents cannot be re-verified before the commit."
     return 1
   }
-  while IFS= read -r p; do
+  # THE WALK'S OWN EXIT STATUS IS CHECKED, NEVER DISCARDED INTO A COMMAND SUBSTITUTION. `find` keeps
+  # walking past an error it can recover from (a subdirectory it cannot read, an entry that vanishes
+  # mid-walk) and prints everything else it found — but still exits nonzero for the run. Capturing only
+  # the OUTPUT and never asking about the STATUS is precisely how a partial walk gets read as a complete
+  # one: "found nothing suspicious in what I saw" is not "there is nothing there", and this function
+  # exists specifically so that difference is never silently collapsed. Read from a FILE, not a shell
+  # variable: `-print0` (NUL-delimited, immune to a symlink whose own path or target contains a literal
+  # newline — this walks an UNTRUSTED tree, so that is not a hypothetical) cannot survive a bash
+  # variable at all — bash strings are NUL-terminated C strings, so a NUL byte truncates silently, which
+  # would be exactly the same class of under-reporting this is closing. A failed or partial walk is
+  # refused outright, never read as a clean tree.
+  tmp="$(mktemp)" || {
+    mi_warn "migrate: cannot create a temp file to re-verify the staged tree before the commit."
+    return 1
+  }
+  find "$canon" -type l -print0 > "$tmp" 2>/dev/null
+  frc=$?
+  if [ "$frc" -ne 0 ]; then
+    rm -f "$tmp"
+    mi_warn "migrate: the walk of '$canon' for escaping symlinks did not complete cleanly (find exited"
+    mi_warn "  ${frc}), so this cannot show the staged tree contains no escaping symlink. Refusing to"
+    mi_warn "  commit over an incomplete scan — 'could not fully scan' is not 'nothing found'."
+    return 1
+  fi
+  # The temp file is removed ONCE, after this loop fully exits (never from inside it, while the
+  # redirect below still has it open for reading) — a refusal sets $refused and `break`s instead of
+  # returning directly.
+  local refused=0
+  while IFS= read -r -d '' p; do
     [ -n "$p" ] || continue
     if ! target="$(readlink -- "$p" 2>/dev/null)"; then
       mi_warn "migrate: could not read the target of the symlink at '$p' in the staged tree, immediately"
       mi_warn "  before the commit. Refusing to commit an entry this process cannot show does not escape."
-      return 1
+      refused=1
+      break
     fi
     if mi_copy_link_escapes "$p" "$target" "$canon"; then
       mi_warn "migrate: the staged tree contains a symlink that escapes it, found on the re-check"
@@ -117,9 +146,12 @@ mi_mig_verify_no_escaping_symlinks() {
       mi_warn "  This is the same escape rule the copy step itself enforces (an absolute target, or one"
       mi_warn "  whose '..' components climb above the root) — refusing to commit it rather than carry"
       mi_warn "  it into the replacement container's bind."
-      return 1
+      refused=1
+      break
     fi
-  done <<< "$(find "$canon" -type l -print 2>/dev/null)"
+  done < "$tmp"
+  rm -f "$tmp"
+  [ "$refused" -eq 0 ] || return 1
   return 0
 }
 
@@ -451,6 +483,14 @@ _mi_mig_precheck_body() {
   mrec="$(mi_accept_manifest "$idx" "$pol" "$man" "$product")" || return 1
   prec="$(mi_accept_policy "$idx" "$pol")" || return 1
 
+  # THE REAL SECURITY GATE for EVERY path that follows — see mi_mig_check_parent_trust. Run before even
+  # the live-intent lookup below, whose own early return (line "a live intent for EXACTLY this
+  # destination... is resumed") used to skip past this entirely: a migration interrupted while its
+  # destination's parent was safe, whose parent became group/world-writable since, must not resume
+  # through that early return with this gate skipped. There is no legitimate reason to copy or rename
+  # into an unsafe location, fresh migration or resume alike.
+  mi_mig_check_parent_trust "$dest" || return 1
+
   # A live intent for (product, role) is resumed ONLY IF the requested destination matches the recorded
   # one — resuming on (product, role) alone would silently hijack a migration to a DIFFERENT path,
   # reporting success for a destination the operator did not name.
@@ -464,7 +504,8 @@ _mi_mig_precheck_body() {
     # A live intent for EXACTLY this destination is not a refusal — it is resumed, and skipping every
     # check below is deliberate: the destination may legitimately be non-empty by now (a completed
     # rename from an earlier phase), and re-running "is it empty" here would refuse a migration that
-    # is correctly in progress.
+    # is correctly in progress. The parent-trust gate above is NOT one of the checks being skipped —
+    # it already ran, unconditionally, before this lookup.
     if [ -n "$rdest" ] && [ "$rdest" = "$dest" ]; then return 0; fi
     mi_warn "migrate: a migration of $product/$role is already in flight, to a different destination:"
     mi_warn "    in flight: ${rdest:-<unreadable>}"
@@ -473,11 +514,6 @@ _mi_mig_precheck_body() {
     return 1
   fi
   [ "$rc" -eq 3 ] || return "$rc"
-
-  # THE REAL SECURITY GATE for everything that follows — see mi_mig_check_parent_trust. Run before any
-  # other check that follows, none of which mean anything if the destination's parent is a location
-  # someone besides this operator can also write to for the whole span of the migration.
-  mi_mig_check_parent_trust "$dest" || return 1
 
   # The role must EXIST in the manifest — which also gives the operator the list.
   local v roles="" found=0 mount=""
@@ -1095,14 +1131,142 @@ _mi_mig_run_body() {
   return 0
 }
 
+# ONE MIGRATION'S RESUME, ENTIRELY UNDER ONE CONTINUOUSLY HELD LOCK — see mi_mig_resume for why. A
+# SEPARATE ownership flag from _mi_mig_lock_enter/_mi_mig_lock_exit's MI_MIG_LOCK_OWNED, deliberately:
+# that pair is designed for exactly the nesting mi_mig_run's own per-phase lock dance already does
+# (one enter/exit pair per phase call), and reusing the SAME global flag here — one level further out,
+# wrapping a whole SEQUENCE of mi_mig_run calls that each do their own enter/exit — would have each
+# inner call's own "already held, I am not the owner" reset (MI_MIG_LOCK_OWNED=0) clobber THIS level's
+# "I DID acquire it, I DO release it" flag before this level ever reads it back, leaking the lock
+# forever: the LAST mi_mig_run call in the loop would be the last thing to touch MI_MIG_LOCK_OWNED,
+# leaving it 0 by the time this function's own exit checks it. Sets MI_MIG_RESUME_LOCK_OWNED; must be
+# called directly, never through `$( )`.
+_mi_mig_resume_lock_enter() {
+  if [ -n "${MI_LOCK_TOKEN:-}" ]; then MI_MIG_RESUME_LOCK_OWNED=0; return 0; fi
+  mi_lock_acquire || return 1
+  MI_MIG_RESUME_LOCK_OWNED=1
+  return 0
+}
+_mi_mig_resume_lock_exit() {
+  if [ "${MI_MIG_RESUME_LOCK_OWNED:-0}" = 1 ]; then mi_lock_release; fi
+  MI_MIG_RESUME_LOCK_OWNED=0
+  return 0
+}
+
+# Resume the ONE migration recorded for <product>/<role>, while the lock _mi_mig_resume_one (below)
+# acquired is held. rc 0 resumed (or there was nothing left to do — the record was gone by the time
+# this re-read it, meaning another process already finished or abandoned it) · 1 refused.
+_mi_mig_resume_one_locked() {
+  if [ "$#" -ne 5 ]; then
+    mi_warn "migrate: _mi_mig_resume_one_locked needs <index> <policy> <manifest-dir-or-file> <product> <role>"
+    return 1
+  fi
+  local idx="$1" pol="$2" man="$3" product="$4" role="$5"
+  local frec frc dest phase stageid srrc p mf
+
+  # RE-READ HERE, NOW THAT THE LOCK IS ACTUALLY HELD — never carried from mi_mig_resume's earlier,
+  # lock-free listing. Two concurrent resumes of the SAME migration interleaving through
+  # individually-locked phase calls is exactly how a phase regresses (phase 3 finds $stage already
+  # there — created by the OTHER resume moments before — and cannot prove it is its own, so it steps
+  # back to phase 1 with a fresh nonce) or a container gets removed and recreated twice over at phase
+  # 7. Re-reading here, under the lock, is what makes the decision that follows authoritative rather
+  # than a race against whatever else might be acting on this exact record right now.
+  if frec="$(mi_led_find "$MI_MIG_KIND" key "$(_mi_mig_key "$product" "$role")")"; then frc=0; else frc=$?; fi
+  if [ "$frc" -eq 3 ]; then
+    return 0    # gone — another (properly serialized) process already resolved it; nothing to do
+  fi
+  if [ "$frc" -ne 0 ]; then
+    mi_warn "migrate: the recorded migration for $product/$role could not be re-read under the lock."
+    mi_warn "  Run 'mythical-ctl state repair'."
+    return 1
+  fi
+
+  # A record that passed the ledger's format/checksum gate can still be missing a SEMANTIC field this
+  # verb needs. Fail closed on it rather than silently skipping the migration it describes.
+  if ! dest="$(mi_led_field "$frec" dest)"; then
+    mi_warn "migrate: the recorded migration for $product/$role does not name a destination. Run"
+    mi_warn "  'mythical-ctl state repair'."
+    return 1
+  fi
+  if ! phase="$(mi_led_field "$frec" phase)"; then
+    mi_warn "migrate: the recorded migration for $product/$role does not name a phase. Run"
+    mi_warn "  'mythical-ctl state repair'."
+    return 1
+  fi
+  case "$phase" in [1-9]) : ;;
+    *) mi_warn "migrate: the recorded migration for $product/$role names phase '$phase', which is not"
+       mi_warn "  one this core defines. Run 'mythical-ctl state repair'."
+       return 1 ;;
+  esac
+  # OPTIONAL: absent (rc 3) is legitimate — either no migration has reached phase 3 yet, or (as
+  # here) the resume itself has not decided the destination is trustworthy. Anything else is a real
+  # read failure and must not be silently treated as "nothing recorded".
+  if stageid="$(mi_led_field "$frec" stageid)"; then srrc=0; else srrc=$?; fi
+  if [ "$srrc" -eq 3 ]; then stageid=""
+  elif [ "$srrc" -ne 0 ]; then
+    mi_warn "migrate: the recorded migration for $product/$role could not be fully read (stageid)."
+    mi_warn "  Run 'mythical-ctl state repair'."
+    return 1
+  fi
+
+  # THE SAME GATE THE FRESH/RESUME VERB PATH GOES THROUGH VIA mi_mig_precheck — this is an
+  # INDEPENDENT entry point (a reconciliation sweep, not necessarily reached through
+  # mi_verb_migrate_storage at all), so it must establish parent trust itself rather than assume some
+  # other caller already did. See mi_mig_check_parent_trust.
+  mi_mig_check_parent_trust "$dest" || return 1
+  p="$(mi_mig_resume_phase "$phase" "$dest" "$stageid")" || return 1
+
+  mf="$man"
+  [ -d "$man" ] && mf="${man}/${product}.manifest"
+  if [ "$p" = "$phase" ]; then
+    mi_log "migrate: resuming $product/$role at phase $phase."
+  else
+    mi_log "migrate: $product/$role recorded phase $phase, but the destination does not verifiably"
+    mi_log "  carry phase 5's result. Re-deriving from observable state: resuming at phase $p instead."
+  fi
+  # A RESUME IS NEVER AUTOMATIC (§5), exactly like the fresh path. Every phase from here to 9 can
+  # stop the container, copy data, write mythical.conf or replace the container — the SAME
+  # destructive steps a fresh migrate-storage confirms before touching anything — and arriving here
+  # through the resume door (a reconciliation sweep, not an operator's own `migrate-storage`
+  # invocation) must not skip asking. `mi_confirm` reads MI_CONFIRM the same way every other caller
+  # in this codebase does, so a scripted `MI_CONFIRM=yes` still resumes unattended on purpose; what
+  # it must not do is resume destructively with NO confirmation input at all.
+  mi_warn "migrate: $product/$role is recorded at phase $p and will be resumed — depending on the"
+  mi_warn "  phase this stops the container, copies data, writes mythical.conf, or replaces the"
+  mi_warn "  container. Never automatic."
+  mi_confirm "migrate: resume $product/$role from phase $p?" || {
+    mi_warn "migrate: not confirmed. $product/$role stays recorded at phase $phase; nothing was done."
+    return 1
+  }
+  while [ "$p" -le 9 ]; do
+    mi_mig_run "$idx" "$pol" "$mf" "$product" "$role" "$dest" "$p" || return 1
+    p=$((p + 1))
+  done
+  return 0
+}
+
+_mi_mig_resume_one() {
+  if [ "$#" -ne 5 ]; then
+    mi_warn "migrate: _mi_mig_resume_one needs <index> <policy> <manifest-dir-or-file> <product> <role>"
+    return 1
+  fi
+  _mi_mig_resume_lock_enter || return 1
+  local _rc
+  if _mi_mig_resume_one_locked "$@"; then _rc=0; else _rc=$?; fi
+  _mi_mig_resume_lock_exit
+  return "$_rc"
+}
+
 # Resume every live storage migration from its recorded phase.
 mi_mig_resume() {
   if [ "$#" -ne 3 ]; then mi_warn "migrate: mi_mig_resume needs <index> <policy> <manifest-dir-or-file>"; return 1; fi
-  local idx="$1" pol="$2" man="$3" recs rc rec product role dest phase p mf stageid srrc
+  local idx="$1" pol="$2" man="$3" recs rc rec product role
 
-  # CAPTURE AND CHECK FIRST. `done <<< "$(mi_led_all X)"` takes the WHILE loop's status, not the
-  # listing's, so a corrupt or ambiguous ledger (rc 1) would be silently read as an EMPTY listing and
-  # this would report success having resumed nothing at all.
+  # CAPTURE AND CHECK FIRST — a LOCK-FREE listing of WHICH migrations exist, used only to know what to
+  # attempt. Nothing from it is trusted for the actual resume decision: _mi_mig_resume_one re-reads
+  # each one fresh, under the lock, before deciding anything. `done <<< "$(mi_led_all X)"` takes the
+  # WHILE loop's status, not the listing's, so a corrupt or ambiguous ledger (rc 1) would be silently
+  # read as an EMPTY listing and this would report success having resumed nothing at all.
   if recs="$(mi_led_all "$MI_MIG_KIND")"; then rc=0; else rc=$?; fi
   if [ "$rc" -eq 3 ]; then return 0; fi        # no ledger at all: nothing to resume
   if [ "$rc" -ne 0 ]; then
@@ -1114,8 +1278,9 @@ mi_mig_resume() {
 
   while IFS= read -r rec; do
     [ -n "$rec" ] || continue
-    # A record that passed the ledger's format/checksum gate can still be missing a SEMANTIC field this
-    # verb needs. Fail closed on it rather than silently skipping the migration it describes.
+    # Only product/role are read from THIS (lock-free) listing — the KEY identifying which migration to
+    # attempt next. Fail closed on either being unreadable rather than silently skipping the migration
+    # it describes.
     if ! product="$(mi_led_field "$rec" product)"; then
       mi_warn "migrate: a recorded storage migration does not name a product. Refusing to guess which"
       mi_warn "  one it is. Run 'mythical-ctl state repair'."
@@ -1126,64 +1291,12 @@ mi_mig_resume() {
       mi_warn "  state repair'."
       return 1
     fi
-    if ! dest="$(mi_led_field "$rec" dest)"; then
-      mi_warn "migrate: the recorded migration for $product/$role does not name a destination. Run"
-      mi_warn "  'mythical-ctl state repair'."
-      return 1
-    fi
-    if ! phase="$(mi_led_field "$rec" phase)"; then
-      mi_warn "migrate: the recorded migration for $product/$role does not name a phase. Run"
-      mi_warn "  'mythical-ctl state repair'."
-      return 1
-    fi
-    case "$phase" in [1-9]) : ;;
-      *) mi_warn "migrate: the recorded migration for $product/$role names phase '$phase', which is not"
-         mi_warn "  one this core defines. Run 'mythical-ctl state repair'."
-         return 1 ;;
-    esac
-    # OPTIONAL: absent (rc 3) is legitimate — either no migration has reached phase 3 yet, or (as
-    # here) the resume itself has not decided the destination is trustworthy. Anything else is a real
-    # read failure and must not be silently treated as "nothing recorded".
-    if stageid="$(mi_led_field "$rec" stageid)"; then srrc=0; else srrc=$?; fi
-    if [ "$srrc" -eq 3 ]; then stageid=""
-    elif [ "$srrc" -ne 0 ]; then
-      mi_warn "migrate: the recorded migration for $product/$role could not be fully read (stageid)."
-      mi_warn "  Run 'mythical-ctl state repair'."
-      return 1
-    fi
-    # THE SAME GATE THE FRESH/RESUME VERB PATH GOES THROUGH VIA mi_mig_precheck — this is an
-    # INDEPENDENT entry point (a reconciliation sweep, not necessarily reached through
-    # mi_verb_migrate_storage at all), so it must establish parent trust itself rather than assume some
-    # other caller already did. See mi_mig_check_parent_trust.
-    mi_mig_check_parent_trust "$dest" || return 1
-    p="$(mi_mig_resume_phase "$phase" "$dest" "$stageid")" || return 1
-
-    mf="$man"
-    [ -d "$man" ] && mf="${man}/${product}.manifest"
-    if [ "$p" = "$phase" ]; then
-      mi_log "migrate: resuming $product/$role at phase $phase."
-    else
-      mi_log "migrate: $product/$role recorded phase $phase, but the destination does not verifiably"
-      mi_log "  carry phase 5's result. Re-deriving from observable state: resuming at phase $p instead."
-    fi
-    # A RESUME IS NEVER AUTOMATIC (§5), exactly like the fresh path. Every phase from here to 9 can
-    # stop the container, copy data, write mythical.conf or replace the container — the SAME
-    # destructive steps a fresh migrate-storage confirms before touching anything — and arriving here
-    # through the resume door (a reconciliation sweep, not an operator's own `migrate-storage`
-    # invocation) must not skip asking. `mi_confirm` reads MI_CONFIRM the same way every other caller
-    # in this codebase does, so a scripted `MI_CONFIRM=yes` still resumes unattended on purpose; what
-    # it must not do is resume destructively with NO confirmation input at all.
-    mi_warn "migrate: $product/$role is recorded at phase $p and will be resumed — depending on the"
-    mi_warn "  phase this stops the container, copies data, writes mythical.conf, or replaces the"
-    mi_warn "  container. Never automatic."
-    mi_confirm "migrate: resume $product/$role from phase $p?" || {
-      mi_warn "migrate: not confirmed. $product/$role stays recorded at phase $phase; nothing was done."
-      return 1
-    }
-    while [ "$p" -le 9 ]; do
-      mi_mig_run "$idx" "$pol" "$mf" "$product" "$role" "$dest" "$p" || return 1
-      p=$((p + 1))
-    done
+    # EVERYTHING FROM HERE — the fresh re-read, the phase decision, confirmation, and the entire phase
+    # loop for THIS migration — runs under ONE continuously held lock (_mi_mig_resume_one). Holding it
+    # for the whole span, not per-phase, is what makes one migration's resume single-applied: a second
+    # concurrent resume of the same migration simply blocks on the lock until this one finishes, then
+    # re-reads the now-advanced (or now-absent) state and finds nothing left to interleave with.
+    _mi_mig_resume_one "$idx" "$pol" "$man" "$product" "$role" || return 1
   done <<< "$recs"
   return 0
 }
