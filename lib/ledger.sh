@@ -10,10 +10,44 @@ MI_LEDGER_SCHEMA=1
 # both under `~/.mythical/.state/`, never an arbitrary file: an env-settable ledger path with no such
 # guard would let any caller point the atomic writer (mi_ledger_write, which still proves lock
 # ownership itself) at a file of its choosing.
+#
+# THE STAGING HALF OF THIS OVERRIDE IS DELIBERATELY HARDER TO REACH THAN THE GUARD ABOVE MADE IT LOOK
+# (codex gate round 1, HIGH). The guard alone answers "is this one of the two paths we own", which a
+# bare `MI_LEDGER_PATH_OVERRIDE=…/ledger.staging mythical-ctl start …` satisfies just as well as
+# backup.sh's own restore code does — and every ordinary reader in this codebase (mi_led_put/
+# mi_led_all/mi_ident_get/mi_trust_*/…) goes through THIS function with no idea which caller it is,
+# so an inherited environment variable would make a general lifecycle invocation treat the
+# NON-AUTHORITATIVE, not-yet-verified staging ledger as if it were live — reconciling or launching
+# from a restore that has not passed phase 4, let alone activated. `bin/mythical-ctl` scrubs this
+# exact variable from its OWN process environment as its very first action (before sourcing any
+# module — see the top of the file), which closes the reachable path completely: from that point on,
+# for the whole life of one CLI invocation, nothing outside this module's own code can populate it,
+# because a shell `VAR=val command` prefix is dynamically scoped to that command's OWN execution
+# (verified: it does not persist afterward, and never enters this process's exported-environment
+# table unless something explicitly exports it, which nothing here does) — only a fresh, per-call
+# assignment BY THIS CODE can ever set it during one run. Direct library callers that bypass the CLI
+# entirely (tests, chiefly) are outside that scrub and are expected to know what they are doing.
+#
+# BUT THE SCRUB IS AN ENTRYPOINT PROPERTY, NOT SOMETHING THIS FUNCTION CAN OBSERVE — so as a second,
+# independent gate that holds even if some future caller reaches this code without going through the
+# scrubbed CLI, resolving to the STAGING path additionally requires a SECOND, equally
+# entrypoint-scrubbed, single-purpose marker (_MI_LEDGER_STAGING_INTERNAL=1) that only
+# mi_ledger_staging_read/mi_ledger_staging_write (below) and backup.sh's own restore-internal calls
+# ever set, always paired with the override, immediately before the one call that needs it. A bare
+# "I want the staging path" is not enough on its own; a caller has to ALSO carry the marker that says
+# this is genuinely one of backup.sh's own two sanctioned call sites. Neither variable is ever
+# `export`ed, and both are scrubbed at the CLI boundary, so the pair is not a weaker version of a
+# single check — it is what "not an environment variable any process inherits" means in a codebase
+# where the ordinary readers cannot each be taught to take an explicit parameter without threading
+# one through the whole ledger/trust/copy call graph.
 _mi_ledger_path() {
   if [ -n "${MI_LEDGER_PATH_OVERRIDE:-}" ]; then
     case "$MI_LEDGER_PATH_OVERRIDE" in
-      "$(mi_home)/.state/ledger"|"$(mi_home)/.state/ledger.staging") : ;;
+      "$(mi_home)/.state/ledger") : ;;
+      "$(mi_home)/.state/ledger.staging")
+        [ "${_MI_LEDGER_STAGING_INTERNAL:-}" = 1 ] || {
+          mi_die "ledger: refusing to treat the staging ledger as authoritative — naming the path alone is not enough"
+        } ;;
       *) mi_die "ledger: refusing an out-of-tree ledger path override" ;;
     esac
     printf '%s\n' "$MI_LEDGER_PATH_OVERRIDE"
@@ -30,9 +64,12 @@ _mi_ledger_staging_path() { printf '%s/.state/ledger.staging\n' "$(mi_home)"; }
 
 # Read/write the staging ledger with the SAME integrity discipline as the real one — implemented by
 # pointing the one shared validator/writer at the staging path via the override above, so a future fix
-# to the read or write path cannot land on only one of the two files.
-mi_ledger_staging_read()  { MI_LEDGER_PATH_OVERRIDE="$(_mi_ledger_staging_path)" mi_ledger_read; }
-mi_ledger_staging_write() { MI_LEDGER_PATH_OVERRIDE="$(_mi_ledger_staging_path)" mi_ledger_write; }
+# to the read or write path cannot land on only one of the two files. THE TWO SANCTIONED CALL SITES:
+# these, and backup.sh's own restore-internal calls, are the only code in the tree that may ever set
+# BOTH _MI_LEDGER_STAGING_INTERNAL and MI_LEDGER_PATH_OVERRIDE together — see the note on
+# _mi_ledger_path above for why that pairing, and not the path alone, is what authorizes it.
+mi_ledger_staging_read()  { _MI_LEDGER_STAGING_INTERNAL=1 MI_LEDGER_PATH_OVERRIDE="$(_mi_ledger_staging_path)" mi_ledger_read; }
+mi_ledger_staging_write() { _MI_LEDGER_STAGING_INTERNAL=1 MI_LEDGER_PATH_OVERRIDE="$(_mi_ledger_staging_path)" mi_ledger_write; }
 
 # Decimal-string greater-than: 0 (true) if $1 > $2. Both are already validated all-digit strings.
 # Avoids shell integer conversion so an arbitrarily long schema cannot overflow `[ -gt ]`.

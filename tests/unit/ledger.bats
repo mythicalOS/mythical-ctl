@@ -271,12 +271,26 @@ EOF
   assert_contains "refusing an out-of-tree ledger path override"
 }
 
-@test "the ledger path override accepts exactly the real ledger path and the staging path" {
+@test "the ledger path override accepts the real ledger path with no further conditions" {
   load_mctl; mi_ensure_layout
   MI_LEDGER_PATH_OVERRIDE="$MYTHICAL_HOME/.state/ledger" run _mi_ledger_path
   assert_ok
   [ "$output" = "$MYTHICAL_HOME/.state/ledger" ]
+}
+
+# codex gate round 1, fix 1: naming the staging path is no longer enough on its own — a caller must
+# ALSO carry the internal marker that says this is genuinely one of backup.sh's own two sanctioned
+# call sites, never a general invocation that merely knows the path.
+@test "the staging path is refused UNLESS the internal marker is also set (codex gate round 1, fix 1)" {
+  load_mctl; mi_ensure_layout
   MI_LEDGER_PATH_OVERRIDE="$MYTHICAL_HOME/.state/ledger.staging" run _mi_ledger_path
+  [ "$status" -ne 0 ]
+  assert_contains "naming the path alone is not enough"
+}
+
+@test "the staging path is accepted once BOTH the override and the internal marker are set" {
+  load_mctl; mi_ensure_layout
+  _MI_LEDGER_STAGING_INTERNAL=1 MI_LEDGER_PATH_OVERRIDE="$MYTHICAL_HOME/.state/ledger.staging" run _mi_ledger_path
   assert_ok
   [ "$output" = "$MYTHICAL_HOME/.state/ledger.staging" ]
 }

@@ -15,6 +15,20 @@
 
 set -euo pipefail
 
+# SCRUBBED BEFORE ANYTHING ELSE RUNS (codex gate round 1, HIGH — lib/ledger.sh:13). These two names
+# are lib/ledger.sh's own internal channel for redirecting the ledger reader/writer at the
+# NON-AUTHORITATIVE staging ledger during a restore (§6c/D59) — sanctioned for exactly two call
+# sites in lib/backup.sh, never for a general invocation. Left alone, an inherited
+# `MI_LEDGER_PATH_OVERRIDE=…/ledger.staging mythical-ctl start …` would make this ENTIRE process —
+# every lifecycle command, not just restore's own code — treat an in-progress, not-yet-verified
+# restore as if it were the live installation. Unsetting them here, before any module is even
+# sourced, means that for the rest of this one invocation only lib/backup.sh's own code (which sets
+# them itself, immediately before the one call that needs them, as a shell `VAR=val command` prefix —
+# dynamically scoped to that command alone, never exported, never surviving past it) can ever make
+# either variable non-empty again. See lib/ledger.sh's own note on _mi_ledger_path for the second,
+# independent half of this gate.
+unset MI_LEDGER_PATH_OVERRIDE _MI_LEDGER_STAGING_INTERNAL 2>/dev/null || true
+
 VERSION="0.1.0"
 
 # Resolve lib/ relative to this script (symlink-safe enough for install + repo layouts).
@@ -257,27 +271,29 @@ main() {
       mi_verb_migrate_storage "$idx" "$pol" "${mdir}/${products[0]}.manifest" "${products[0]}" "${products[1]}" "${migopts[@]}"
       exit $? ;;
     backup)
-      # backup takes only --index and exactly one operand (the output directory) — every other
-      # option belongs to a different verb and is refused, not silently ignored.
+      # backup takes --index/--policy/--manifest-dir (needed to authenticate each volume's own
+      # product manifest and resolve its declared runtime uid) and exactly one operand (the output
+      # directory) — every other option belongs to a different verb and is refused, not ignored.
       [ -z "$purge$family$image$forced$tobind$mapforeign$abandon" ] || {
-        printf 'mythical-ctl: backup takes only --index and an output directory\n' >&2; exit "$MI_EX_USAGE"; }
+        printf 'mythical-ctl: backup takes only --index/--policy/--manifest-dir and an output directory\n' >&2
+        exit "$MI_EX_USAGE"; }
       [ "${#products[@]}" -eq 1 ] || { printf 'mythical-ctl: backup needs exactly <output-directory>\n' >&2
                                        exit "$MI_EX_USAGE"; }
-      mi_verb_backup "$idx" "${products[0]}"; exit $? ;;
+      mi_verb_backup "$idx" "$pol" "$mdir" "${products[0]}"; exit $? ;;
     restore)
-      # restore takes only --index and EITHER exactly one operand (the backup directory) OR
-      # --abandon on its own — never both, never neither.
+      # restore takes --index/--policy/--manifest-dir and EITHER exactly one operand (the backup
+      # directory) OR --abandon on its own — never both, never neither.
       [ -z "$purge$family$image$forced$tobind$mapforeign" ] || {
-        printf 'mythical-ctl: restore takes only --index, --abandon, and a backup directory\n' >&2
+        printf 'mythical-ctl: restore takes only --index/--policy/--manifest-dir, --abandon, and a backup directory\n' >&2
         exit "$MI_EX_USAGE"; }
       if [ -n "$abandon" ]; then
         [ "${#products[@]}" -eq 0 ] || { printf 'mythical-ctl: restore --abandon takes no directory\n' >&2
                                          exit "$MI_EX_USAGE"; }
-        mi_verb_restore "$idx" --abandon; exit $?
+        mi_verb_restore "$idx" "$pol" "$mdir" --abandon; exit $?
       fi
       [ "${#products[@]}" -eq 1 ] || { printf 'mythical-ctl: restore needs exactly <backup-directory> (or --abandon)\n' >&2
                                        exit "$MI_EX_USAGE"; }
-      mi_verb_restore "$idx" "${products[0]}"; exit $? ;;
+      mi_verb_restore "$idx" "$pol" "$mdir" "${products[0]}"; exit $? ;;
     net)
       # The rebind verb lands in a later task; the mechanism (mi_net_ref_rebind) is present, the CLI
       # wrapper is not yet, so this degrades cleanly rather than calling an undefined function.

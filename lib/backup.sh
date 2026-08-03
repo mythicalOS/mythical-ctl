@@ -40,21 +40,115 @@ MI_RESTORE_KIND=restore
 # residual note says — the fix is REQUIRING a safe (operator- or root-owned, not group/other-writable)
 # location, never trying to out-race a hostile parent with more re-checks.
 #
-# Reused, not re-derived: migrate.sh already owns both the "resolve a directory whose leaf may not yet
-# exist, via its parent" primitive (_mi_mig_canon_dest) and the "every ancestor of the immediate parent is
-# safe" check (mi_mig_check_parent_trust) — a second, hand-written copy of either is exactly the kind of
-# drift this codebase's "one implementation of a security check" rule exists to prevent.
+# THIS IS ALSO THE ONLY AUTHENTICATION A BACKUP GETS (codex gate round 1, HIGH). There is no secret to
+# sign the tree with, and the ledger's plain sha256 is exactly as recomputable by whoever can write the
+# tree as it is by this code — an attacker who can write volumes/V.data can write a mutually consistent
+# volumes/V.manifest beside it, and the ledger's own checksum, right along with it. So the checksums
+# authenticate INTERNAL CONSISTENCY (the bytes were not damaged after being written), never PROVENANCE
+# (that this installer's own backup wrote them) — the same distinction lib/prov.sh draws for the ledger
+# itself. What stands in for a signature is LOCATION: if no other party can write anywhere in the
+# backup root, no other party can forge the manifest or the data underneath it either, mutually
+# consistent or not. See docs/RECOVERY.md's "Trusting a backup" section for the boundary stated in the
+# operator's own terms.
+#
+# REUSED, NOT RE-DERIVED: mi_canon (lib/bringup.sh) and _mi_mig_verify_chain_owner_safe (lib/migrate.sh)
+# are migrate-storage's own hardened primitives for exactly this class of problem — a second,
+# hand-written copy of either is exactly the kind of drift this codebase's "one implementation of a
+# security check" rule exists to prevent.
+#
+# THE WHOLE CANONICAL PATH IS RESOLVED, LEAF INCLUDED, WHEN IT ALREADY EXISTS. An earlier version of
+# this function canonicalized only the PARENT (via migrate's own _mi_mig_canon_dest, built for a
+# migration DESTINATION that is expected not to exist yet) and kept the raw leaf name verbatim — so an
+# EXISTING backup-directory symlink was never followed, and everything below trusted the alias rather
+# than what it actually named. mi_canon on an existing path resolves it fully, following a symlink leaf
+# exactly as it already follows one mid-chain; on a leaf that does not exist yet it falls back to
+# canonical-parent-plus-name on its own, so one call is correct for both a backup being read and one
+# about to be created. Which ANCESTOR CHAIN gets the ownership check then depends on whether anything is
+# there yet: a leaf that already exists is checked WHOLE, itself included — an existing backup root that
+# is group/other-writable is exactly as forgeable as an unsafe parent, per the note above. A leaf that
+# does not exist cannot be stat'd at all, so only its (already-canonical) parent is checked; the leaf
+# itself is safe by construction the instant THIS process creates it under a parent nothing else can
+# write into.
 #
 # rc 0 prints the canonical, safety-verified path · 1 refused (reported).
 _mi_backup_safe_dir() {
   if [ "$#" -ne 2 ]; then mi_warn "backup: _mi_backup_safe_dir needs a <directory> and <what>"; return 1; fi
   local raw="$1" what="$2" canon
-  mi_mig_check_parent_trust "$raw" || {
-    mi_warn "backup: refusing to use an unsafe location for $what."
+  canon="$(mi_canon "$raw" 2>/dev/null)" || {
+    mi_warn "backup: '$raw' does not resolve. Refusing to use it for $what."
     return 1
   }
-  canon="$(_mi_mig_canon_dest "$raw")" || return 1
+  if [ -e "$canon" ] || [ -L "$canon" ]; then
+    _mi_mig_verify_chain_owner_safe "$canon" "$what" || {
+      mi_warn "backup: refusing to use an unsafe location for $what."
+      return 1
+    }
+  else
+    _mi_mig_verify_chain_owner_safe "$(dirname -- "$canon")" "the parent of $what" || {
+      mi_warn "backup: refusing to use an unsafe location for $what."
+      return 1
+    }
+  fi
   printf '%s\n' "$canon"
+}
+
+# Canonicalize <path> AT THE POINT OF USE, refusing unless it resolves to something still inside
+# <root> (which must already be canonical — _mi_backup_safe_dir's own output). This is what closes the
+# gap between an early existence/type check on a path and the moment it is actually read or bound into
+# the copy container (codex gate round 1, HIGH): checking `-L` once and then using the RAW path later
+# leaves a window in which a writable-by-nobody-else-but-still-swappable-by-us-in-theory root could, in
+# principle, have an entry replaced between the two — canonicalizing immediately before use collapses
+# that window to this call itself, the same discipline _mi_backup_safe_dir already applies to the root,
+# and the containment check catches a symlink that escapes the root outright rather than trusting
+# wherever it leads.
+_mi_backup_canon_under() {
+  if [ "$#" -ne 3 ]; then mi_warn "backup: _mi_backup_canon_under needs a <path> <root> <what>"; return 1; fi
+  local p="$1" root="$2" what="$3" canon
+  canon="$(mi_canon "$p" 2>/dev/null)" || {
+    mi_warn "restore: $what does not resolve. Refusing to use it."
+    return 1
+  }
+  case "$canon" in
+    "$root"|"$root"/*) : ;;
+    *)
+      mi_warn "restore: $what resolves to '$canon', which is OUTSIDE the verified backup root ('$root')."
+      mi_warn "  Refusing — a symlink escaping the root cannot be trusted."
+      return 1 ;;
+  esac
+  printf '%s\n' "$canon"
+}
+
+# EACH VOLUME'S REAL, DECLARED runtime_uid — resolved the SAME way lib/migrate.sh's own
+# _mi_mig_run_body does (mi_accept_manifest, then mi_manifest_runtime_uid), never a fixed stand-in
+# (codex gate round 1, HIGH). A product declaring `runtime_uid=900` owns its files as uid 900:
+# treating every volume as if it belonged to uid 0 made backup refuse files genuinely owned by the
+# product (foreign to the assumed (0, operator) pair) and made restore grant ownership to uid 0 —
+# leaving the product unable to read the data it was just given back. That is D59 restated at the
+# ownership layer, not a simplification.
+#
+# The manifest is loaded through the FULL authenticated chain — index, policy and trust, exactly like
+# every other mi_accept_manifest caller — never a bare parse: runtime_uid decides who owns copied
+# files, so it has to come from a document this installation actually vouches for, not merely one that
+# happens to parse. rc 0 prints the uid · 1 refused (reported) — a volume whose product cannot be
+# authenticated, or whose manifest declares no runtime_uid, refuses rather than guessing 0.
+_mi_backup_runtime_uid() {
+  if [ "$#" -ne 5 ]; then
+    mi_warn "backup: _mi_backup_runtime_uid needs <index> <policy> <manifest-dir> <product> <volume>"
+    return 1
+  fi
+  local idx="$1" pol="$2" mdir="$3" product="$4" vol="$5" manfile mrec ruid
+  manfile="${mdir}/${product}.manifest"
+  mrec="$(mi_accept_manifest "$idx" "$pol" "$manfile" "$product")" || {
+    mi_warn "backup: could not authenticate the manifest for product '$product' (volume '$vol') —"
+    mi_warn "  refusing to guess its runtime uid."
+    return 1
+  }
+  ruid="$(mi_manifest_runtime_uid "$mrec")" || {
+    mi_warn "backup: the manifest for product '$product' (volume '$vol') declares no runtime_uid —"
+    mi_warn "  refusing to guess it."
+    return 1
+  }
+  printf '%s\n' "$ruid"
 }
 
 # --- backup manifest --------------------------------------------------------------------------------
@@ -104,8 +198,12 @@ mi_backup_manifest_write() {
 
 # --- backup -----------------------------------------------------------------------------------------
 mi_backup_run() {
-  if [ "$#" -ne 2 ]; then mi_warn "backup: mi_backup_run needs an <index file> and an <output directory>"; return 1; fi
-  local idx="$1" rawdir="$2" dir lf
+  if [ "$#" -ne 4 ]; then
+    mi_warn "backup: mi_backup_run needs an <index file>, a <policy file>, a <manifest dir> and an"
+    mi_warn "  <output directory>"
+    return 1
+  fi
+  local idx="$1" pol="$2" mdir="$3" rawdir="$4" dir lf
 
   dir="$(_mi_backup_safe_dir "$rawdir" "the backup output directory")" || return 1
 
@@ -187,7 +285,7 @@ mi_backup_run() {
   [ "$failed" -eq 0 ] || return 1
 
   # --- every named volume: contents, per-entry manifest, and its recorded nonce ----------------------
-  local records lrc rec name nonce
+  local records lrc rec name nonce product ruid
   if records="$(mi_led_all object)"; then lrc=0; else lrc=$?; fi
   if [ "$lrc" -ne 0 ]; then
     mi_warn "backup: the installer state ledger's object records could not be listed in full — refusing"
@@ -197,12 +295,33 @@ mi_backup_run() {
   while IFS= read -r rec; do
     [ -n "$rec" ] || continue
     _mi_led_record_matches "$rec" class volume || continue
-    name="$(mi_led_field "$rec" name)" || continue
-    nonce="$(mi_led_field "$rec" nonce)" || continue
+    # FAIL CLOSED ON A MISSING REQUIRED FIELD, NEVER SKIP PAST IT (codex gate round 1, MEDIUM). A
+    # record can pass the checksum and _mi_led_record_matches's own well-formedness gate — every
+    # token is a valid key=value field — and still be semantically incomplete: `object` with
+    # `class=volume` but no `name=` or no `nonce=`. `|| continue` treated that the same as "this
+    # record is not a volume" and moved on, so a backup could OMIT a ledger-declared volume with no
+    # trace that anything was skipped — a silent partial backup. The record itself is named in the
+    # refusal because there is no volume name to name it by.
+    name="$(mi_led_field "$rec" name)" || {
+      mi_warn "backup: a 'volume' object record carries no name — refusing rather than silently"
+      mi_warn "  omitting a ledger-declared volume from the backup. Record: ${rec:-<empty>}"
+      return 1
+    }
+    nonce="$(mi_led_field "$rec" nonce)" || {
+      mi_warn "backup: the record for volume '$name' carries no nonce — refusing rather than silently"
+      mi_warn "  omitting it from the backup."
+      return 1
+    }
+    product="$(mi_led_field "$rec" product)" || {
+      mi_warn "backup: the record for volume '$name' carries no product — refusing rather than"
+      mi_warn "  guessing which manifest declares its runtime uid."
+      return 1
+    }
+    ruid="$(_mi_backup_runtime_uid "$idx" "$pol" "$mdir" "$product" "$name")" || return 1
     printf '%s\n' "$nonce" > "$dir/volumes/${name}.nonce" || return 1
     mi_backup_manifest_write "$idx" "$name" "$dir/volumes/${name}.manifest" || return 1
     mkdir -p -- "$dir/volumes/${name}.data" || return 1
-    mi_copy_run "$idx" "$name" "$dir/volumes/${name}.data" 0 "$(id -u)" || return 1
+    mi_copy_run "$idx" "$name" "$dir/volumes/${name}.data" "$ruid" "$(id -u)" || return 1
     mi_log "backup: captured volume $name (contents, per-entry manifest, and its nonce)."
   done <<< "$records"
 
@@ -226,7 +345,7 @@ mi_restore_state() {
   if [ -f "$lf" ]; then printf 'active\n'; return 0; fi
   [ -f "$sf" ] || { printf 'none\n'; return 0; }
   if ! mi_ledger_staging_read >/dev/null 2>&1; then printf 'staging-corrupt\n'; return 0; fi
-  if MI_LEDGER_PATH_OVERRIDE="$sf" mi_led_find "$MI_RESTORE_KIND" key restore >/dev/null 2>&1; then
+  if _MI_LEDGER_STAGING_INTERNAL=1 MI_LEDGER_PATH_OVERRIDE="$sf" mi_led_find "$MI_RESTORE_KIND" key restore >/dev/null 2>&1; then
     printf 'staging-with-intent\n'
   else
     printf 'staging-no-intent\n'
@@ -259,8 +378,12 @@ mi_restore_state() {
 # ordinary reconciliation launch the product on half its data. Identity must not authenticate contents
 # that are not there yet — which is why activation is last.
 mi_restore_run() {
-  if [ "$#" -ne 2 ]; then mi_warn "restore: mi_restore_run needs an <index file> and a <backup directory>"; return 1; fi
-  local idx="$1" rawdir="$2" st sf
+  if [ "$#" -ne 4 ]; then
+    mi_warn "restore: mi_restore_run needs an <index file>, a <policy file>, a <manifest dir> and a"
+    mi_warn "  <backup directory>"
+    return 1
+  fi
+  local idx="$1" pol="$2" mdir="$3" rawdir="$4" st sf
 
   sf="$(_mi_ledger_staging_path)"
   st="$(mi_restore_state)"
@@ -291,6 +414,25 @@ mi_restore_run() {
       mi_warn "  Removing them is your explicit call — the installer cannot prove they are its own."
       _mi_restore_report_blocking
       return 1 ;;
+  esac
+
+  # EVERY REMAINING BRANCH DOES SOMETHING DESTRUCTIVE — creates and fills volumes, or activates the
+  # incoming ledger in place of the (absent) active one — so it is gated HERE, ONCE, covering all
+  # three (a fresh start, a resume, and the activate-only "staging-no-intent" case) before any of them
+  # runs, exactly as migrate-storage and uninstall gate their own destructive verbs (codex gate round
+  # 1, HIGH: `MI_CONFIRM=no mythical-ctl restore BACKUP` used to create, fill and activate with no
+  # confirmation at all — mi_confirm was called only by abandon). `active`/`staging-corrupt` above are
+  # pure refusals — nothing is touched — so they return before this gate, never through it.
+  case "$st" in
+    none)
+      mi_confirm "restore: restore from '${rawdir}' — creates and fills named volumes under their recorded identity, then activates the incoming ledger?" \
+        || { mi_warn "restore: not confirmed."; return 1; } ;;
+    *)
+      mi_confirm "restore: resume the in-progress restore and activate it once every volume verifies?" \
+        || { mi_warn "restore: not confirmed."; return 1; } ;;
+  esac
+
+  case "$st" in
     staging-no-intent)
       mi_log "restore: a completed restore is ready to activate. Activating."
       mi_ledger_staging_activate
@@ -298,23 +440,27 @@ mi_restore_run() {
     staging-with-intent)
       mi_log "restore: resuming the in-progress restore." ;;
     none)
-      local dir
+      local dir ledgercanon
       dir="$(_mi_backup_safe_dir "$rawdir" "the backup directory")" || return 1
       [ -d "$dir" ] || { mi_warn "restore: '$dir' is not a backup directory"; return 1; }
-      if [ -L "$dir/ledger" ] || [ ! -f "$dir/ledger" ]; then
+      # Canonicalized AT THE POINT OF USE, immediately before the read that trusts it — not checked
+      # once here and read via the raw path later, which is exactly the window a writable-by-nobody-
+      # else root still leaves between a `-L` check and the `cp` that follows it.
+      ledgercanon="$(_mi_backup_canon_under "$dir/ledger" "$dir" "the backup's ledger")" || return 1
+      if [ ! -f "$ledgercanon" ]; then
         mi_warn "restore: '$dir' carries no ledger (or it is not a plain file). A backup without one"
         mi_warn "  cannot support a verified restore — it would rebuild a machine with no rollback"
         mi_warn "  floors and no provenance."
         return 1
       fi
       # Phase 1: the staging ledger IS the incoming ledger, with the intent written inside it.
-      cp -- "$dir/ledger" "$sf" || { mi_warn "restore: cannot stage the incoming ledger"; return 1; }
+      cp -- "$ledgercanon" "$sf" || { mi_warn "restore: cannot stage the incoming ledger"; return 1; }
       mi_ledger_staging_read >/dev/null || {
         mi_warn "restore: the incoming ledger does not validate — refusing to stage it."
         rm -f "$sf"
         return 1
       }
-      MI_LEDGER_PATH_OVERRIDE="$sf" mi_led_put "$MI_RESTORE_KIND" key restore \
+      _MI_LEDGER_STAGING_INTERNAL=1 MI_LEDGER_PATH_OVERRIDE="$sf" mi_led_put "$MI_RESTORE_KIND" key restore \
         "key=restore" "phase=2" "source=${dir}" "volumes=" || return 1 ;;
   esac
 
@@ -324,7 +470,7 @@ mi_restore_run() {
   # not even require one), and using the CLI argument here (were it present) rather than the recorded
   # value would let a resume silently read a DIFFERENT directory than the one phase 1 committed to.
   local irec dir
-  irec="$(MI_LEDGER_PATH_OVERRIDE="$sf" mi_led_find "$MI_RESTORE_KIND" key restore)" || {
+  irec="$(_MI_LEDGER_STAGING_INTERNAL=1 MI_LEDGER_PATH_OVERRIDE="$sf" mi_led_find "$MI_RESTORE_KIND" key restore)" || {
     mi_warn "restore: the staging ledger carries no restore intent to resume."
     return 1
   }
@@ -338,7 +484,7 @@ mi_restore_run() {
   # the per-volume loop, from the staged ledger, never from mi_ident_get (which answers for whatever
   # ACTIVE ledger this machine has — none, by construction, while a restore is in progress).
   local ident irc
-  if ident="$(MI_LEDGER_PATH_OVERRIDE="$sf" mi_ident_get)"; then irc=0; else irc=$?; fi
+  if ident="$(_MI_LEDGER_STAGING_INTERNAL=1 MI_LEDGER_PATH_OVERRIDE="$sf" mi_ident_get)"; then irc=0; else irc=$?; fi
   if [ "$irc" -ne 0 ]; then
     mi_warn "restore: the staging ledger's own installation identity cannot be read — refusing to"
     mi_warn "  create volumes under an identity this process cannot establish."
@@ -348,8 +494,8 @@ mi_restore_run() {
   # Phases 2–4, per volume, driven by the staging ledger's own volume records — read ONCE, rc checked:
   # `done <<< "$(...)"` swallows a failed listing as an EMPTY one, which would silently skip every
   # volume rather than refuse.
-  local recs lrc rec name nonce actual arc empty src
-  if recs="$(MI_LEDGER_PATH_OVERRIDE="$sf" mi_led_all object)"; then lrc=0; else lrc=$?; fi
+  local recs lrc rec name nonce actual arc empty src datacanon mancanon product ruid
+  if recs="$(_MI_LEDGER_STAGING_INTERNAL=1 MI_LEDGER_PATH_OVERRIDE="$sf" mi_led_all object)"; then lrc=0; else lrc=$?; fi
   if [ "$lrc" -ne 0 ]; then
     mi_warn "restore: the staging ledger's object records could not be listed in full — refusing to"
     mi_warn "  proceed on a partial view of which volumes this restore is responsible for."
@@ -358,15 +504,39 @@ mi_restore_run() {
   while IFS= read -r rec; do
     [ -n "$rec" ] || continue
     _mi_led_record_matches "$rec" class volume || continue
-    name="$(mi_led_field "$rec" name)" || continue
-    nonce="$(mi_led_field "$rec" nonce)" || continue
+    name="$(mi_led_field "$rec" name)" || {
+      mi_warn "restore: a 'volume' object record in the staging ledger carries no name — refusing rather"
+      mi_warn "  than silently skipping past a ledger-declared volume this restore would otherwise omit."
+      mi_warn "  Record: ${rec:-<empty>}"
+      return 1
+    }
+    nonce="$(mi_led_field "$rec" nonce)" || {
+      mi_warn "restore: the record for volume '$name' carries no nonce — refusing rather than silently"
+      mi_warn "  skipping past a ledger-declared volume this restore would otherwise omit."
+      return 1
+    }
+    product="$(mi_led_field "$rec" product)" || {
+      mi_warn "restore: the record for volume '$name' carries no product — refusing rather than"
+      mi_warn "  guessing which manifest declares its runtime uid."
+      return 1
+    }
+    # Same authenticated-manifest resolution as backup's own loop, and under the SAME staging-ledger
+    # override as every other trust-chain read during a restore (see the note a few lines below on
+    # mi_copy_available/mi_accept_index) — mi_accept_manifest reaches mi_accept_index/mi_accept_policy
+    # too, and the anchor those check lives in the ledger.
+    ruid="$(_MI_LEDGER_STAGING_INTERNAL=1 MI_LEDGER_PATH_OVERRIDE="$sf" _mi_backup_runtime_uid "$idx" "$pol" "$mdir" "$product" "$name")" || return 1
     src="${dir}/volumes/${name}"
-    if [ -L "${src}.data" ] || [ ! -d "${src}.data" ]; then
+    # CANONICALIZED AT THE POINT OF USE, immediately before the fill/verify calls below that trust
+    # them — never checked once here and read via the raw path later. See _mi_backup_canon_under's own
+    # header for why that gap matters even inside an already-verified-safe root.
+    datacanon="$(_mi_backup_canon_under "${src}.data" "$dir" "the backup's contents for volume '$name'")" || return 1
+    if [ ! -d "$datacanon" ]; then
       mi_warn "restore: the backup has no contents directory for volume '$name' (or it is not a plain"
       mi_warn "  directory)."
       return 1
     fi
-    if [ -L "${src}.manifest" ] || [ ! -f "${src}.manifest" ]; then
+    mancanon="$(_mi_backup_canon_under "${src}.manifest" "$dir" "the backup's manifest for volume '$name'")" || return 1
+    if [ ! -f "$mancanon" ]; then
       mi_warn "restore: the backup has no per-entry manifest for volume '$name'."
       mi_warn "  A backup without one cannot support verified restore — this backup was not written by"
       mi_warn "  a version that captures one."
@@ -402,13 +572,14 @@ mi_restore_run() {
     # original installation already had, not a fresh one this machine has to re-earn. Any trust-floor
     # ADVANCE mi_accept_index performs as a side effect (mi_trust_commit) lands in the staging ledger too,
     # which is exactly where it belongs until activation carries it forward.
-    empty="$(MI_LEDGER_PATH_OVERRIDE="$sf" _mi_restore_volume_empty "$idx" "$name")" || return 1
+    empty="$(_MI_LEDGER_STAGING_INTERNAL=1 MI_LEDGER_PATH_OVERRIDE="$sf" _mi_restore_volume_empty "$idx" "$name")" || return 1
     if [ "$empty" = yes ]; then
       # Phase 3: fill, via the pinned copy container — HOST BACKUP DATA (read-only) into the VOLUME
-      # (writable). The reverse of mi_copy_run's direction (see lib/copy.sh's mi_copy_fill).
-      MI_LEDGER_PATH_OVERRIDE="$sf" mi_copy_fill "$idx" "${src}.data" "$name" 0 "$(id -u)" || return 1
+      # (writable). The reverse of mi_copy_run's direction (see lib/copy.sh's mi_copy_fill). $datacanon,
+      # never ${src}.data: the raw path was only ever good for the existence/type check above.
+      _MI_LEDGER_STAGING_INTERNAL=1 MI_LEDGER_PATH_OVERRIDE="$sf" mi_copy_fill "$idx" "$datacanon" "$name" "$ruid" "$(id -u)" || return 1
       # Phase 4: against THE MANIFEST'S contract, not bytes alone.
-      MI_LEDGER_PATH_OVERRIDE="$sf" _mi_restore_verify "$idx" "$name" "${src}.manifest" || return 1
+      _MI_LEDGER_STAGING_INTERNAL=1 MI_LEDGER_PATH_OVERRIDE="$sf" _mi_restore_verify "$idx" "$name" "$mancanon" || return 1
       mi_log "restore: volume $name filled and verified against the backup's per-entry manifest."
     else
       # NOT EMPTY is not automatically a survivor to refuse: RESUME IS STATE-VERIFYING, NOT
@@ -420,7 +591,7 @@ mi_restore_run() {
       # does, this volume is already done and the loop moves on; if it does not, it genuinely holds
       # partial contents from an interrupted fill (or is a real survivor), and there is no safe way to
       # tell those apart except refusing and pointing at abandonment.
-      if MI_LEDGER_PATH_OVERRIDE="$sf" _mi_restore_verify "$idx" "$name" "${src}.manifest"; then
+      if _MI_LEDGER_STAGING_INTERNAL=1 MI_LEDGER_PATH_OVERRIDE="$sf" _mi_restore_verify "$idx" "$name" "$mancanon"; then
         mi_log "restore: volume $name already filled and verified (resumed)."
       else
         mi_warn "restore: volume '$name' carries our nonce but is NOT EMPTY and does not verify against"
@@ -433,7 +604,7 @@ mi_restore_run() {
   done <<< "$recs"
 
   # Phase 5: the intent-free rewrite, atomically.
-  MI_LEDGER_PATH_OVERRIDE="$sf" mi_led_del "$MI_RESTORE_KIND" key restore || return 1
+  _MI_LEDGER_STAGING_INTERNAL=1 MI_LEDGER_PATH_OVERRIDE="$sf" mi_led_del "$MI_RESTORE_KIND" key restore || return 1
   mi_log "restore: every volume verified. The staging ledger is now intent-free and ready to activate."
 
   # Phase 6.
@@ -447,7 +618,7 @@ mi_ledger_staging_activate() {
   sf="$(_mi_ledger_staging_path)"; lf="$(_mi_ledger_path)"
   mi_ledger_staging_read >/dev/null || {
     mi_warn "restore: the staging ledger does not validate — refusing to activate it."; return 1; }
-  if MI_LEDGER_PATH_OVERRIDE="$sf" mi_led_find "$MI_RESTORE_KIND" key restore >/dev/null 2>&1; then
+  if _MI_LEDGER_STAGING_INTERNAL=1 MI_LEDGER_PATH_OVERRIDE="$sf" mi_led_find "$MI_RESTORE_KIND" key restore >/dev/null 2>&1; then
     mi_warn "restore: the staging ledger still carries a live restore intent — refusing to activate."
     mi_warn "  Activating it would leave every later command meeting an in-progress restore that has"
     mi_warn "  finished."
@@ -489,7 +660,7 @@ mi_restore_abandon() {
   mi_warn "  first. Anything that does not match is preserved and reported."
   mi_confirm "restore: abandon it?" || { mi_warn "restore: not confirmed."; return 1; }
 
-  if recs="$(MI_LEDGER_PATH_OVERRIDE="$sf" mi_led_all object)"; then lrc=0; else lrc=$?; fi
+  if recs="$(_MI_LEDGER_STAGING_INTERNAL=1 MI_LEDGER_PATH_OVERRIDE="$sf" mi_led_all object)"; then lrc=0; else lrc=$?; fi
   if [ "$lrc" -ne 0 ]; then
     mi_warn "restore: the staging ledger's object records could not be listed in full — refusing to"
     mi_warn "  abandon on a partial view of which volumes this restore created."
@@ -499,8 +670,20 @@ mi_restore_abandon() {
   while IFS= read -r rec; do
     [ -n "$rec" ] || continue
     _mi_led_record_matches "$rec" class volume || continue
-    name="$(mi_led_field "$rec" name)" || continue
-    nonce="$(mi_led_field "$rec" nonce)" || continue
+    # FAIL CLOSED, not `|| continue`: a volume record missing its own name/nonce is exactly the same
+    # semantically-incomplete-but-checksum-valid case backup and restore's fill loops refuse — see the
+    # note in mi_backup_run. Abandoning on a partial view could leave a ledger-declared volume neither
+    # removed nor reported as preserved.
+    name="$(mi_led_field "$rec" name)" || {
+      mi_warn "restore: a 'volume' object record in the staging ledger carries no name — refusing to"
+      mi_warn "  abandon on a partial view of it. Record: ${rec:-<empty>}"
+      return 1
+    }
+    nonce="$(mi_led_field "$rec" nonce)" || {
+      mi_warn "restore: the record for volume '$name' carries no nonce — refusing to abandon on a"
+      mi_warn "  partial view of it."
+      return 1
+    }
     # rc 3 (absent) and rc 1 (daemon could not be asked) are NOT the same fact: absence means nothing
     # to remove; an unreachable daemon means this loop cannot tell whether the volume is ours at all,
     # and treating it as "gone" would silently skip a real one. Capture and distinguish, as everywhere
@@ -656,21 +839,32 @@ _mi_restore_verify() {
 # --- verbs -------------------------------------------------------------------------------------------
 
 mi_verb_backup() {
-  if [ "$#" -ne 2 ]; then mi_warn "verbs: backup needs an <index> and an <output directory>"; return 2; fi
+  if [ "$#" -ne 4 ]; then
+    mi_warn "verbs: backup needs an <index>, a <policy>, a <manifest-dir> and an <output directory>"
+    return 2
+  fi
   mi_preflight_daemon || return 1
   mi_ensure_layout || return 1
   _mi_with_lock mi_backup_run "$@"
 }
 
 mi_verb_restore() {
-  if [ "$#" -lt 1 ]; then mi_warn "verbs: restore needs an <index> and a <backup directory>, or --abandon"; return 2; fi
-  if [ "$#" -eq 2 ] && [ "$2" = --abandon ]; then
+  if [ "$#" -lt 3 ]; then
+    mi_warn "verbs: restore needs an <index>, a <policy>, a <manifest-dir> and a <backup directory>,"
+    mi_warn "  or --abandon in place of the directory"
+    return 2
+  fi
+  if [ "$#" -eq 4 ] && [ "$4" = --abandon ]; then
     mi_preflight_daemon || return 1
     mi_ensure_layout || return 1
     _mi_with_lock mi_restore_abandon
     return $?
   fi
-  [ "$#" -eq 2 ] || { mi_warn "verbs: restore needs an <index> and a <backup directory>, or --abandon"; return 2; }
+  [ "$#" -eq 4 ] || {
+    mi_warn "verbs: restore needs an <index>, a <policy>, a <manifest-dir> and a <backup directory>,"
+    mi_warn "  or --abandon in place of the directory"
+    return 2
+  }
   mi_preflight_daemon || return 1
   mi_ensure_layout || return 1
   _mi_with_lock mi_restore_run "$@"

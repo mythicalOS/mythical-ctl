@@ -293,6 +293,30 @@ cleanly, having already verified the first.
 **Next command.** `mythical-ctl restore <same-backup-directory>` again. It reads the recorded phase from
 the staging ledger and resumes forward from there — you do not need to know which phase it stopped at.
 
+### Trusting a backup: the honest boundary
+
+`mythical-ctl backup` and `restore` checksum everything — the ledger, and every volume's contents and
+per-entry manifest — but a checksum only proves the bytes have not changed since whoever last wrote
+them; it says nothing about who that was. There is no secret in this installer to sign a backup with,
+so a party who can **write** the backup tree can replace a volume's contents and its manifest with a
+mutually consistent pair, and recompute the ledger's own checksum right along with them — restore would
+accept and activate all of it, because internal consistency is exactly what a checksum can prove.
+
+What stands in for a signature is **location**. Both `backup`'s output directory and `restore`'s input
+directory must resolve (symlinks followed, not merely their parent) to a location that only the
+operator (or root) can write to — not a directory anyone else on the machine has group or other write
+access to, anywhere in its ancestor chain. If no other party can write into the backup root, no other
+party can forge what is inside it, mutually consistent or not — the same "authenticate by location, not
+by out-racing a hostile writer" principle `migrate-storage`'s own destination check applies (see "The
+security posture: a safe location, not a race won", above), stated here as **backup's entire trust
+model**, not a residual on top of a stronger one.
+
+**What this means for you:** keep backups on storage only you (or root) can write to — your own home
+directory, an operator-owned external volume, anything with a `700`/`750`-or-tighter chain from `/` down
+to the backup directory itself. A backup sitting in a world-writable location (a shared `/tmp`, a
+group-writable NFS mount everyone on the box can write to) is not authenticated by its checksums alone,
+and `restore` refuses it outright rather than trusting bytes it cannot vouch for the origin of.
+
 **Refused outright, never merged:** restore while an ACTIVE ledger is present. Restore is a recovery
 operation for a machine with no live installation, not a replacement for one — activating a restored
 ledger over a live one would orphan every running container of the installation that is here now, with
