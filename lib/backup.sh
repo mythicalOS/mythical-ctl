@@ -479,6 +479,14 @@ mi_restore_run() {
     return 1
   }
 
+  # RE-AUTHENTICATE THE BACKUP ROOT AT THE POINT OF USE, on EVERY entry INCLUDING RESUME (codex gate
+  # round 2, HIGH). Phase 1 checked this location, but a crash-and-resume can span an attacker making
+  # the backup root group-writable and swapping its in-root V.data/V.manifest in between; the
+  # fresh-restore path's own safety comes from this same _mi_backup_safe_dir call, so a resume must
+  # re-run it now rather than trust the phase-1 result over the location's state at this instant. The
+  # re-verified CANONICAL path is what every read and mount below uses.
+  dir="$(_mi_backup_safe_dir "$dir" "the backup directory being restored")" || return 1
+
   # The staging ledger's OWN installation identity — the original installation's, carried faithfully
   # by the backup — is what every volume this restore creates must be labelled with. Read ONCE, before
   # the per-volume loop, from the staged ledger, never from mi_ident_get (which answers for whatever
@@ -618,10 +626,22 @@ mi_ledger_staging_activate() {
   sf="$(_mi_ledger_staging_path)"; lf="$(_mi_ledger_path)"
   mi_ledger_staging_read >/dev/null || {
     mi_warn "restore: the staging ledger does not validate — refusing to activate it."; return 1; }
-  if _MI_LEDGER_STAGING_INTERNAL=1 MI_LEDGER_PATH_OVERRIDE="$sf" mi_led_find "$MI_RESTORE_KIND" key restore >/dev/null 2>&1; then
+  # rc 0 = a live restore intent is still recorded (restore not finished) → refuse. rc 3 = the intent
+  # is genuinely GONE (the restore cleared it) → the only case that may activate. Any other rc = the
+  # intent read FAILED (rc 1, ambiguous/unreadable) — FAIL CLOSED, never fold a reader failure into
+  # "absent" and atomically activate a ledger that may still record an unfinished restore (codex gate
+  # round 2, HIGH; the rc-3-vs-rc-1 rule this codebase applies everywhere).
+  local frc
+  if _MI_LEDGER_STAGING_INTERNAL=1 MI_LEDGER_PATH_OVERRIDE="$sf" mi_led_find "$MI_RESTORE_KIND" key restore >/dev/null 2>&1; then frc=0; else frc=$?; fi
+  if [ "$frc" -eq 0 ]; then
     mi_warn "restore: the staging ledger still carries a live restore intent — refusing to activate."
     mi_warn "  Activating it would leave every later command meeting an in-progress restore that has"
     mi_warn "  finished."
+    return 1
+  elif [ "$frc" -ne 3 ]; then
+    mi_warn "restore: whether the staging ledger still carries a live restore intent could not be"
+    mi_warn "  established — the intent read failed. Refusing to activate rather than risk activating a"
+    mi_warn "  ledger that still records an unfinished restore."
     return 1
   fi
   [ ! -f "$lf" ] || { mi_warn "restore: an active ledger appeared — refusing to overwrite it"; return 1; }
