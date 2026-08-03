@@ -3,6 +3,7 @@
 # are untrusted, and every check here asserts over what actually reaches the host, not merely over an
 # exit status. A refusal that still lets bytes reach the destination is not a refusal.
 load '../lib/test_helper'
+load '../harness/snapshot.sh'
 
 setup() {
   setup_test_env; load_mctl; mi_ensure_layout; install_helper_img
@@ -153,4 +154,61 @@ teardown() { teardown_test_env; }
   [ "$status" -ne 0 ]
   run mi_conf_get "$MYTHICAL_HOME/mythical.conf" MYTHICAL_P1_STATE_BIND
   [ "$output" = /operators/own/choice ]     # the operator's edit survives — never silently overwritten
+}
+
+@test "a resume with NO confirmation input is refused, not carried out silently" {
+  mi_lock_acquire
+  mi_led_put storagemig key "p1:state" "key=p1:state" "phase=6" "product=p1" "role=state" \
+      "dest=$DEST" "confkey=MYTHICAL_P1_STATE_BIND" "prior=" "attempt=none" "desired=running" \
+      "srcvol=mythical-${IDENT}-p1-state" "staging=$(mi_mig_staging_path "$DEST" nz)" "nonce=nz"
+  mi_lock_release
+  MI_CONFIRM=no run mi_mig_resume "$IDX" "$POL" "$MAN"
+  [ "$status" -ne 0 ]
+  [ ! -e "$DEST" ]                          # nothing was attempted — not even phase 5's own fallback
+  run mi_conf_get "$MYTHICAL_HOME/mythical.conf" MYTHICAL_P1_STATE_BIND
+  [ "$status" -eq 3 ]                       # the bind was never written
+}
+
+# --- the CLI itself: migrate-storage must be reachable through it, not only through the library ----
+
+@test "CLI: migrate-storage with no role is a usage error (2) and attempts nothing" {
+  snap_runtime "$BATS_TEST_TMPDIR/r0"
+  run_mctl migrate-storage p1 --to-bind "$DEST" --index "$IDX" --policy "$POL" --manifest-dir "$MYTHICAL_HOME"
+  [ "$status" -eq 2 ]
+  snap_runtime "$BATS_TEST_TMPDIR/r1"
+  run snap_assert_unchanged "$BATS_TEST_TMPDIR/r0" "$BATS_TEST_TMPDIR/r1"
+  [ "$status" -eq 0 ]
+}
+
+@test "CLI: migrate-storage with no --to-bind is a usage error (2) and attempts nothing" {
+  snap_runtime "$BATS_TEST_TMPDIR/r0"
+  run_mctl migrate-storage p1 state --index "$IDX" --policy "$POL" --manifest-dir "$MYTHICAL_HOME"
+  [ "$status" -eq 2 ]
+  snap_runtime "$BATS_TEST_TMPDIR/r1"
+  run snap_assert_unchanged "$BATS_TEST_TMPDIR/r0" "$BATS_TEST_TMPDIR/r1"
+  [ "$status" -eq 0 ]
+}
+
+@test "CLI: migrate-storage with a surplus operand is a usage error (2) and attempts nothing" {
+  snap_runtime "$BATS_TEST_TMPDIR/r0"
+  run_mctl migrate-storage p1 state extra --to-bind "$DEST" --index "$IDX" --policy "$POL" --manifest-dir "$MYTHICAL_HOME"
+  [ "$status" -eq 2 ]
+  snap_runtime "$BATS_TEST_TMPDIR/r1"
+  run snap_assert_unchanged "$BATS_TEST_TMPDIR/r0" "$BATS_TEST_TMPDIR/r1"
+  [ "$status" -eq 0 ]
+}
+
+@test "CLI: an unrelated verb rejects --to-bind rather than silently ignoring it" {
+  run_mctl install p1 --to-bind "$DEST" --index "$IDX" --policy "$POL" --manifest-dir "$MYTHICAL_HOME"
+  [ "$status" -eq 2 ]
+}
+
+@test "CLI: migrate-storage end to end, through the real entrypoint, moves the product onto the bind" {
+  run_mctl migrate-storage p1 state --to-bind "$DEST" --index "$IDX" --policy "$POL" --manifest-dir "$MYTHICAL_HOME"
+  [ "$status" -eq 0 ]
+  load_mctl
+  run mi_conf_get "$MYTHICAL_HOME/mythical.conf" MYTHICAL_P1_STATE_BIND
+  [ "$output" = "$DEST" ]
+  run mi_rt_inspect container c.mounts "$C"
+  assert_contains "$DEST"
 }

@@ -53,6 +53,9 @@ COMMANDS
   uninstall --family       remove EVERY product and reset the ledger entirely - identity,
                            membership, every rollback floor, the family-index anchor
                              --purge   also remove every named volume (your data)
+  migrate-storage <product> <role> --to-bind PATH
+                           move a product's storage from its named volume to a host directory
+                             --map-foreign-to-operator   map foreign-uid entries to the operator
 
 OPTIONS
   --index PATH             the family index (default: ~/.mythical/.state/index)
@@ -143,7 +146,7 @@ main() {
   [ "$#" -ne 0 ] || { usage; exit 0; }
 
   local verb="$1"; shift
-  local idx="" pol="" mdir="" purge="" image="" forced="" family=""
+  local idx="" pol="" mdir="" purge="" image="" forced="" family="" tobind="" mapforeign=""
   local -a products
   products=()
   while [ "$#" -gt 0 ]; do
@@ -155,6 +158,8 @@ main() {
       --purge)        purge=1; shift ;;
       --family)       family=1; shift ;;
       --force-install) forced=1; shift ;;
+      --to-bind)      _need_val "$1" "$#"; tobind="$2"; shift 2 ;;
+      --map-foreign-to-operator) mapforeign=1; shift ;;
       -*) printf 'mythical-ctl: unknown option: %s\n' "$1" >&2; exit "$MI_EX_USAGE" ;;
       *) products+=("$1"); shift ;;
     esac
@@ -169,11 +174,15 @@ main() {
     -h|--help)    usage ;;
     __selftest)   selftest ;;
     install|start|stop|restart|recreate)
-      # --purge and --family belong to uninstall ONLY. Silently ignoring a misplaced option is how
-      # `install p1 --purge` returns 0 having quietly done something other than what was written.
+      # --purge and --family belong to uninstall ONLY; --to-bind/--map-foreign-to-operator belong to
+      # migrate-storage ONLY. Silently ignoring a misplaced option is how `install p1 --purge` returns
+      # 0 having quietly done something other than what was written.
       # (--image/--force-install are install-only and are enforced per-product below.)
       [ -z "$purge" ]  || { printf 'mythical-ctl: --purge applies to uninstall only\n' >&2; exit "$MI_EX_USAGE"; }
       [ -z "$family" ] || { printf 'mythical-ctl: --family applies to uninstall only\n' >&2; exit "$MI_EX_USAGE"; }
+      [ -z "$tobind" ] || { printf 'mythical-ctl: --to-bind applies to migrate-storage only\n' >&2; exit "$MI_EX_USAGE"; }
+      [ -z "$mapforeign" ] || { printf 'mythical-ctl: --map-foreign-to-operator applies to migrate-storage only\n' >&2
+                                exit "$MI_EX_USAGE"; }
       [ "${#products[@]}" -gt 0 ] || { printf 'mythical-ctl: %s needs at least one product\n\n' "$verb" >&2
                                        usage >&2; exit "$MI_EX_USAGE"; }
       local -a extra; extra=()
@@ -195,12 +204,12 @@ main() {
     status)
       # status reads; it accepts only --index and product filters. A stray mutating option is a usage
       # error, not something to accept and ignore.
-      [ -z "$image$forced$purge$family" ] || { printf 'mythical-ctl: status takes no options other than --index\n' >&2
+      [ -z "$image$forced$purge$family$tobind$mapforeign" ] || { printf 'mythical-ctl: status takes no options other than --index\n' >&2
                                                exit "$MI_EX_USAGE"; }
       mi_verb_status "$idx" "${products[@]+"${products[@]}"}"; exit $? ;;
     uninstall)
-      # uninstall does not install: --image/--force-install are refused, not ignored.
-      [ -z "$image$forced" ] || { printf 'mythical-ctl: --image/--force-install apply to install only\n' >&2
+      # uninstall does not install and does not migrate storage: those options are refused, not ignored.
+      [ -z "$image$forced$tobind$mapforeign" ] || { printf 'mythical-ctl: --image/--force-install/--to-bind/--map-foreign-to-operator apply to install/migrate-storage only\n' >&2
                                   exit "$MI_EX_USAGE"; }
       if [ -n "$family" ]; then
         # --family removes the WHOLE family; a product argument alongside it is contradictory. Silently
@@ -215,6 +224,22 @@ main() {
                                        exit "$MI_EX_USAGE"; }
       if [ -n "$purge" ]; then mi_verb_uninstall "${products[0]}" --purge
       else mi_verb_uninstall "${products[0]}"; fi
+      exit $? ;;
+    migrate-storage)
+      # --purge/--family/--image/--force-install belong to other verbs; refused, not ignored, exactly
+      # as those verbs refuse THIS command's own options above.
+      [ -z "$purge$family$image$forced" ] || { printf 'mythical-ctl: migrate-storage takes only --to-bind and --map-foreign-to-operator\n' >&2
+                                                exit "$MI_EX_USAGE"; }
+      [ -n "$tobind" ] || { printf 'mythical-ctl: migrate-storage needs --to-bind <path>\n' >&2; exit "$MI_EX_USAGE"; }
+      # EXACTLY <product> <role> — a missing or surplus operand must not be silently dropped and acted
+      # on anyway: this mutates the fleet, the host and mythical.conf, so a malformed invocation is a
+      # usage error with NOTHING attempted, the same discipline already applied to state repair / state
+      # abandon-intent / net rebind above.
+      [ "${#products[@]}" -eq 2 ] || { printf 'mythical-ctl: migrate-storage needs exactly <product> <role> --to-bind <path>\n' >&2
+                                        exit "$MI_EX_USAGE"; }
+      local -a migopts; migopts=(--to-bind "$tobind")
+      [ -z "$mapforeign" ] || migopts+=(--map-foreign-to-operator)
+      mi_verb_migrate_storage "$idx" "$pol" "${mdir}/${products[0]}.manifest" "${products[0]}" "${products[1]}" "${migopts[@]}"
       exit $? ;;
     net)
       # The rebind verb lands in a later task; the mechanism (mi_net_ref_rebind) is present, the CLI

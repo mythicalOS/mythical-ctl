@@ -56,6 +56,32 @@ mi_mig_identity() {
   _mi_ino "$1"
 }
 
+# CLOSE THE TOCTOU AT THE POINT OF USE, not at the point of the check. A device+inode captured once
+# and trusted for everything that follows is only as good as the assumption that nothing changes in
+# between — and both trees this module touches are untrusted (§5.1's own premise), so a parent
+# directory an attacker can write to can replace a checked path with anything, including a symlink,
+# between the check and whatever comes next. `_mi_ino` (via `stat`, no `-L`) reports the identity of
+# the path ITSELF, not of a symlink's target — so a swap to a symlink changes the observed identity
+# and is caught here, same as a swap to an ordinary different directory. This narrows the window to
+# the gap between THIS call and the very next thing that touches the path, rather than eliminating it
+# outright (a bash script hands a PATH STRING to whatever it invokes next, never a held-open handle,
+# so no shell-level check can be perfectly atomic with an external process's own path resolution) — the
+# same accepted narrowing this codebase already applies to mythical.conf's own read-to-rename window
+# (lib/config.sh). Called immediately before each place that would otherwise re-resolve the path name
+# after checking it once. rc 0 the identity still matches · 1 refused, nothing further attempted.
+mi_mig_verify_identity() {
+  if [ "$#" -ne 3 ]; then mi_warn "migrate: mi_mig_verify_identity needs <path> <expected identity> <what>"; return 1; fi
+  local path="$1" want="$2" what="$3" cur
+  cur="$(mi_mig_identity "$path" 2>/dev/null)" || cur=""
+  if [ -z "$cur" ] || [ "$cur" != "$want" ]; then
+    mi_warn "migrate: $what no longer carries the identity this process recorded for it (expected"
+    mi_warn "  ${want}, found ${cur:-<unreadable>}). Between the check and this use, whatever is at"
+    mi_warn "  '$path' changed. Refusing rather than operate on something this process never verified."
+    return 1
+  fi
+  return 0
+}
+
 # Is <path> itself a MOUNT POINT? Detection must consult MOUNT-TABLE EVIDENCE.
 #
 # Comparing st_dev with the parent's does NOT detect this on its own: a bind mount of the same
@@ -181,17 +207,50 @@ mi_mig_staging_reclaim() {
   local stage="$1" rnonce="$2" rid="$3" pnonce="$4" cur
   [ -d "$stage" ] || return 0
   cur="$(mi_mig_identity "$stage" 2>/dev/null)" || cur=""
-  if [ "$pnonce" = "$rnonce" ] && [ -n "$cur" ] && [ "$cur" = "$rid" ]; then
-    rm -rf -- "$stage" || { mi_warn "migrate: could not remove the staging directory $stage"; return 1; }
-    return 0
+  if [ "$pnonce" != "$rnonce" ] || [ -z "$cur" ] || [ "$cur" != "$rid" ]; then
+    mi_warn "migrate: the staging directory $stage does not match the recorded intent"
+    mi_warn "    recorded nonce=$rnonce identity=$rid"
+    mi_warn "    found    nonce=$pnonce identity=${cur:-<unreadable>}"
+    mi_warn "  it is preserved and reported. A name can be reassigned to something this installer never"
+    mi_warn "  created, so the name alone is not authority to remove it. Whether to reclaim the space is"
+    mi_warn "  your call; a retry proceeds beside it with a fresh nonce and a fresh path."
+    return 1
   fi
-  mi_warn "migrate: the staging directory $stage does not match the recorded intent"
-  mi_warn "    recorded nonce=$rnonce identity=$rid"
-  mi_warn "    found    nonce=$pnonce identity=${cur:-<unreadable>}"
-  mi_warn "  it is preserved and reported. A name can be reassigned to something this installer never"
-  mi_warn "  created, so the name alone is not authority to remove it. Whether to reclaim the space is"
-  mi_warn "  your call; a retry proceeds beside it with a fresh nonce and a fresh path."
-  return 1
+
+  # ATOMIC RECLAIM, NOT check-then-rm. The check above named $stage by a PATH, and between it and an
+  # `rm -rf` against that same path there is a window in which an attacker who still controls the
+  # parent directory can replace whatever the name refers to — the recursive delete would then remove
+  # the REPLACEMENT, which this process never verified, defeating the nonce+identity rule above
+  # entirely. Renaming $stage away FIRST closes that: rename() is atomic and identity-preserving (by
+  # inode), so the renamed handle is either exactly the object just checked, or the rename itself
+  # raced and failed outright — nothing in between. The identity is re-verified on THAT handle,
+  # immediately before the delete, with no further path-name lookup in between, and only ever removes
+  # what was just renamed — never $stage by its original, still attacker-writable name.
+  local tag priv vid
+  tag="$(mi_nonce_new)" || { mi_warn "migrate: could not mint a reclaim path"; return 1; }
+  priv="$(dirname -- "$stage")/.mythical-reclaim-${tag}"
+  if [ -e "$priv" ]; then
+    mi_warn "migrate: the private reclaim path $priv already exists. Refusing rather than risk 'mv'"
+    mi_warn "  nesting the staging directory inside it instead of claiming it exclusively."
+    return 1
+  fi
+  if ! mv -- "$stage" "$priv" 2>/dev/null; then
+    mi_warn "migrate: could not rename the staging directory $stage to reclaim it. Nothing was removed."
+    return 1
+  fi
+  vid="$(mi_mig_identity "$priv" 2>/dev/null)" || vid=""
+  if [ -z "$vid" ] || [ "$vid" != "$rid" ]; then
+    mi_warn "migrate: after renaming $stage to reclaim it, the renamed directory (now at $priv) no"
+    mi_warn "  longer carries the identity just verified (expected $rid, found ${vid:-<unreadable>}) —"
+    mi_warn "  something replaced it in the instant between the check and the rename. It is preserved"
+    mi_warn "  at $priv, not deleted, and not renamed back onto a name that may already be reassigned."
+    return 1
+  fi
+  rm -rf -- "$priv" || {
+    mi_warn "migrate: could not remove the staging directory (renamed to $priv to reclaim it)"
+    return 1
+  }
+  return 0
 }
 
 # --- preconditions (§5, D53/D55) -------------------------------------------------------------------
@@ -544,7 +603,15 @@ _mi_mig_run_body() {
       _mi_mig_set "$product" "$role" 3 "dest=${dest}" "srcvol=${srcvol}" "staging=${stage}" \
         "nonce=${nonce}" "confkey=${key}" "prior=${prior3}" "attempt=${attempt3}" \
         "desired=${desired3}" "mount=${mount}" "stageid=${sid}" || return 1
+      # RE-VERIFIED IMMEDIATELY BEFORE EACH POINT $stage IS HANDED TO THE COPY HELPER AS A WRITABLE
+      # BIND SOURCE — never trusted on the strength of the identity captured above alone. The ledger
+      # write between that capture and here (and, for the second check, the whole preflight round-trip)
+      # is real wall-clock time in which an attacker who controls the destination's parent could replace
+      # $stage with a symlink; the helper would then follow the raw path and write volume contents
+      # outside the intended root. See mi_mig_verify_identity.
+      mi_mig_verify_identity "$stage" "$sid" "the staging directory" || return 1
       mi_copy_preflight "$idx" "$stage" "$ruid" "$ouid" || return 1
+      mi_mig_verify_identity "$stage" "$sid" "the staging directory" || return 1
       if [ -n "${MI_MIG_MAP_FOREIGN:-}" ]; then
         mi_copy_run "$idx" "$srcvol" "$stage" "$ruid" "$ouid" --map-foreign-to-operator || return 1
       else
@@ -613,12 +680,39 @@ _mi_mig_run_body() {
         local where
         where="$(mi_mig_resolve_phase5 "$dest" "$stage" "$stageid5")" || return 1
         if [ "$where" = staging ]; then
-          rmdir -- "$dest" 2>/dev/null || true      # an EMPTY destination is renamed onto; a missing one too
+          # AN EMPTY DESTINATION IS RENAMED ONTO; A MISSING ONE TOO — but the rmdir's OWN result
+          # decides which of those this is, never an assumption. precheck accepted $dest empty or
+          # absent, which an attacker who controls its parent can undo afterward by creating a
+          # NON-EMPTY directory (or a symlink to one) there before this phase runs. Discarding rmdir's
+          # failure and moving on regardless used to let `mv` silently reinterpret the operation: `mv`
+          # treats an EXISTING destination directory as a place to move INTO, not one to replace, so a
+          # non-empty $dest would have nested the whole copy one level down (as
+          # $dest/<staging's basename>) beside whatever the attacker put there — non-atomic, and wrong
+          # in a way nothing afterward would notice. If $dest still exists after rmdir, it is not the
+          # empty/absent leaf this migration verified, and this fails closed rather than hand it to
+          # `mv`.
+          if [ -e "$dest" ]; then
+            rmdir -- "$dest" 2>/dev/null
+            if [ -e "$dest" ]; then
+              mi_warn "migrate: '$dest' is no longer the empty or absent directory this migration"
+              mi_warn "  verified — something exists there now that 'rmdir' could not remove (it is not"
+              mi_warn "  empty, or is not a directory at all). Refusing to move the copy onto it: doing"
+              mi_warn "  so would let 'mv' move it INSIDE whatever is there instead of atomically"
+              mi_warn "  replacing it. Nothing was moved; the copy is intact at $stage."
+              return 1
+            fi
+          fi
           mv -- "$stage" "$dest" || {
             mi_warn "migrate: the atomic commit (rename) failed. The copy is intact at $stage; nothing"
             mi_warn "  was destroyed. If the destination is on a different filesystem or is a mount"
             mi_warn "  point, migrate into a subdirectory instead."
             return 1; }
+          # AND AFTER THE RENAME, THE RESULT IS VERIFIED TOO — not assumed from `mv`'s own exit status
+          # alone. A rename this process just performed should leave $dest carrying exactly the identity
+          # that just moved there; if it does not, something about the destination is not what this
+          # process believes it just put in place, and continuing to phase 6 (which writes this very
+          # path into mythical.conf) over that would commit to it anyway.
+          mi_mig_verify_identity "$dest" "$stageid5" "the destination" || return 1
         fi
       fi
       ;;
@@ -841,6 +935,20 @@ mi_mig_resume() {
       mi_log "migrate: $product/$role recorded phase $phase, but the destination does not verifiably"
       mi_log "  carry phase 5's result. Re-deriving from observable state: resuming at phase $p instead."
     fi
+    # A RESUME IS NEVER AUTOMATIC (§5), exactly like the fresh path. Every phase from here to 9 can
+    # stop the container, copy data, write mythical.conf or replace the container — the SAME
+    # destructive steps a fresh migrate-storage confirms before touching anything — and arriving here
+    # through the resume door (a reconciliation sweep, not an operator's own `migrate-storage`
+    # invocation) must not skip asking. `mi_confirm` reads MI_CONFIRM the same way every other caller
+    # in this codebase does, so a scripted `MI_CONFIRM=yes` still resumes unattended on purpose; what
+    # it must not do is resume destructively with NO confirmation input at all.
+    mi_warn "migrate: $product/$role is recorded at phase $p and will be resumed — depending on the"
+    mi_warn "  phase this stops the container, copies data, writes mythical.conf, or replaces the"
+    mi_warn "  container. Never automatic."
+    mi_confirm "migrate: resume $product/$role from phase $p?" || {
+      mi_warn "migrate: not confirmed. $product/$role stays recorded at phase $phase; nothing was done."
+      return 1
+    }
     while [ "$p" -le 9 ]; do
       mi_mig_run "$idx" "$pol" "$mf" "$product" "$role" "$dest" "$p" || return 1
       p=$((p + 1))
