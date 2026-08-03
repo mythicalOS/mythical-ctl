@@ -58,17 +58,18 @@ of deadlocking on it — see the zero-candidates row below.
 
 ## An in-progress restore
 
-**What it means.** `~/.mythical/.state/ledger.staging` is present. A restore of installer state started
-and did not finish committing.
+**What it means.** `~/.mythical/.state/ledger.staging` is present. A `mythical-ctl restore` started and
+did not finish committing.
 
 **What the CLI will and will not do.** Every ordinary command refuses and names the staging file rather
 than proceeding as if nothing were happening — a half-restored ledger is not a fresh install and not a
-valid one either.
+valid one either. This is deliberate: the staging ledger is NEVER authoritative (§6c/D59) — nothing
+launches, deletes or reconciles from it, only from the real ledger a restore activates at its very last
+step.
 
-**Next command.** Resume or abandon the restore per the message `mythical-ctl` prints when it sees the
-staging marker. Restore itself is data-movement machinery outside this page's scope (see
-`lib/copy.sh`/`lib/migrate.sh`); this section exists so the state is recognisable when you meet it from
-the repair side.
+**Next command.** Run `mythical-ctl restore <backup-directory>` again to resume, or `mythical-ctl restore
+--abandon` to give up on it. See "A restore stuck at a phase" below for what each recorded state means and
+what each command does about it.
 
 ## A retained network intent
 
@@ -263,6 +264,53 @@ live process (a shared, multi-tenant host), treat that as the boundary this resi
 across.
 
 ---
+
+## A restore stuck at a phase
+
+**What it means.** `mythical-ctl restore <backup-directory>` moves a backup's ledger and named volumes
+back onto a machine in six recorded phases (§6c/D59), the first of which — writing the incoming ledger to
+`.state/ledger.staging`, with the restore's own intent inside it — happens before anything is created. If
+the process was interrupted, the staging ledger still names the state it last reached; `mythical-ctl
+restore` (with the same backup directory) reads it and resumes.
+
+**What the CLI will and will not do — by phase:**
+
+| Recorded phase | What has happened | What has not |
+|---|---|---|
+| 1 | The incoming ledger is staged, with the restore's own intent recorded inside it. | No volume has been touched yet; there is no active ledger. |
+| 2 | Per volume: created WITH the recorded nonce label, then re-inspected. A same-name volume that does not carry that nonce is a SURVIVOR — restore refuses, naming it, rather than filling a volume it cannot prove it just created. | The volume has not been filled. |
+| 3 | The volume is filled from the backup's own contents, through the pinned copy container. | Nothing has been verified yet. |
+| 4 | The filled volume is verified against the backup's own per-entry manifest — type, link targets, hardlink topology, mode, ownership and mtime, not bytes alone. A symlink recreated as a plain file, or a hardlink group flattened into independent copies, is caught here even though both can digest identically. | The staging ledger still carries the restore's intent. |
+| 5 | Once EVERY volume verifies, the staging ledger is atomically rewritten to its intent-free form. | The staging ledger has not been activated — it is still not the active ledger. |
+| 6 | The staging ledger is renamed into the real ledger path. | — the restore is complete; the installation is live again. |
+
+Resuming does not trust the recorded phase blindly for the per-volume work (phases 2–4): a volume that
+already carries the recorded nonce but is not empty is not automatically treated as a stranger's leftover
+— it is re-verified against the backup's manifest first, and only refused as a genuine partial fill if
+that check does not pass. This is what lets a crash while filling the *second* of several volumes resume
+cleanly, having already verified the first.
+
+**Next command.** `mythical-ctl restore <same-backup-directory>` again. It reads the recorded phase from
+the staging ledger and resumes forward from there — you do not need to know which phase it stopped at.
+
+**Refused outright, never merged:** restore while an ACTIVE ledger is present. Restore is a recovery
+operation for a machine with no live installation, not a replacement for one — activating a restored
+ledger over a live one would orphan every running container of the installation that is here now, with
+its provenance gone in the same atomic rename. Uninstall the current installation first.
+
+**A corrupt staging ledger authorizes no cleanup.** If `.state/ledger.staging` exists but does not
+validate, its own checksum is exactly what says not to trust the record of which partial volumes a
+previous attempt created. It is preserved aside (named in the refusal) rather than read, and any partial
+volumes from that attempt are left in place, blocking a fresh restore, until you remove them yourself —
+the installer cannot prove they are its own from a ledger it just refused to read.
+
+**Next command (abandon).** `mythical-ctl restore --abandon`. Volumes the abandoned attempt created —
+matching the EXACT name and nonce it recorded — are removed FIRST, under their own recorded identity;
+only once that is done is the staging ledger itself deleted. A volume carrying a *different* nonce than
+recorded is preserved and reported rather than guessed at. This ordering is deliberate: the staging
+ledger is the only record proving which volumes belong to this attempt, so destroying it before the
+volumes it names would leave them as unrecorded survivors the next restore refuses to fill over, with
+nothing left to authorize their removal either.
 
 ## Choosing which installation repair rebuilds
 

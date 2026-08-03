@@ -128,6 +128,45 @@
 #                                traverse=ok|fail  read=ok|fail  write=ok|fail
 #                              exit 0 when all three are ok; 1 otherwise.
 #
+# PART B, TASK 13 (§6c/D59) — BACKUP AND RESTORE. Three more READ-ONLY modes of the SAME `verify`
+# command word (D49: new command ARGUMENTS, never a new closed command word) — distinguished from the
+# 4-arg form above by their SECOND argument, which can never be the literal `/dst` every ordinary
+# caller passes:
+#
+#   verify <src> --manifest    THE BACKUP MANIFEST: per-entry TYPE, digest, link target, hardlink
+#                              group, mode, owner and mtime for the volume at /src — the manifest that
+#                              authenticates the copy CONTRACT (§5.1), not bytes alone, so a restore can
+#                              later catch a symlink recreated as a file or a hardlink group flattened
+#                              even though both can digest identically.
+#                                manifest=<type>:<path>              type ∈ file|dir|symlink|hardlink
+#                                digest=<path>:<sha256>              regular files
+#                                linktarget=<path><target>:<pathlen> symlinks — the IDENTICAL
+#                                                                     length-delimited shape `copy`
+#                                                                     uses (same key name, same
+#                                                                     colon-in-path/target problem,
+#                                                                     same reader: _mi_copy_linktarget_split)
+#                                mode=<path>:<octal>
+#                                owner=<path>:<uid>:<gid>
+#                                mtime=<path>:<epoch>
+#                                hardlink=<path>:<groupid>           hardlink-group members only
+#                                done=ok
+#                              exit 0 once written; no <dst>/<ruid>/<ouid> — this is enumeration, not a
+#                              mapping or an access check.
+#   verify <src> --count       EMPTINESS, for restore's phase-2 re-inspection: a volume this phase just
+#                              created must be provably empty before it is filled, and a same-name
+#                              survivor carrying our nonce but leftover contents from an interrupted
+#                              attempt must never be filled over.
+#                                checked=<n>   done=ok        (0 = empty; reused field name, same
+#                                                               meaning as the 4-arg verify's own)
+#   verify <src> --against-stdin
+#                              PHASE 4: verify the just-filled volume against the backup's OWN
+#                              per-entry manifest, handed on STDIN rather than a third host mount (see
+#                              lib/runtime.sh's `stdin=1` spec) — a restore never mounts an extra
+#                              untrusted path just to authenticate against it.
+#                                mismatch=<path>:type|hardlink|mode|owner|mtime|digest|linktarget
+#                                checked=<n>   done=ok
+#                              exit 0 with no mismatch; 1 otherwise.
+#
 # THE FIELD SHAPES ARE PARSED, so their layout is part of the contract, and both of the two-part ones
 # put the FIXED-SHAPE component where a path's own bytes cannot reach it:
 #
@@ -478,7 +517,108 @@ case "$cmd" in
     fin "$rc"
     ;;
   verify)
-    src="${1:-}"; dst="${2:-}"; ruid="${3:-}"; ouid="${4:-}"
+    src="${1:-}"
+    # PART B, Task 13 (§6c/D59 restore): three READ-ONLY modes over a single volume mounted at /src,
+    # taking no <dst>/<ruid>/<ouid> at all — they are distinguished from the ordinary 4-arg verify
+    # below by "$2" being one of these three flags, which can never be the literal "/dst" every real
+    # caller of the ordinary form passes. Each is a SEPARATE grammar; none shares a field namespace
+    # with the ordinary verify's mismatch=/checked=/acl= below by accident — checked= is reused
+    # DELIBERATELY (same meaning: "how many entries this answer is about") by --count and
+    # --against-stdin, never by --manifest, which counts nothing.
+    case "${2:-}" in
+      --manifest)
+        # THE BACKUP MANIFEST: per-entry TYPE, digest, link target, hardlink group, mode, owner and
+        # mtime for the volume at /src — the same per-entry contract §5.1's copy verification already
+        # defines (mi_backup_manifest_write captures this transcript to a file, verbatim, as the
+        # backup's manifest for this volume). No <dst>/<ruid>/<ouid>: this is enumeration, not a
+        # mapping or an access check.
+        [ -n "$src" ] || { printf 'helperimg: verify --manifest needs <source>\n' >&2; exit 1; }
+        mknob="${HELPER_MANIFEST:-ok}"
+        [ "$mknob" != silent ] || exit 0
+        case "$mknob" in
+          ok|empty-vol) : ;;
+          *) printf 'helperimg: unknown HELPER_MANIFEST setting: %s\n' "$mknob" >&2; exit 2 ;;
+        esac
+        if [ "$mknob" = empty-vol ]; then printf 'done=ok\n'; exit 0; fi
+        # ONE deterministic tree: a directory, two regular files, a symlink and a two-member hardlink
+        # group — one example of every TYPE the contract distinguishes.
+        printf 'manifest=dir:%s/data\n'          "$src"
+        printf 'manifest=file:%s/data/f\n'       "$src"
+        printf 'digest=%s/data/f:%s\n'           "$src" "$(printf 'f%.0s' $(seq 1 64))"
+        printf 'mode=%s/data/f:0644\n'            "$src"
+        printf 'owner=%s/data/f:1000:1000\n'      "$src"
+        printf 'mtime=%s/data/f:1700000000\n'     "$src"
+        printf 'manifest=file:%s/data/f3\n'      "$src"
+        printf 'digest=%s/data/f3:%s\n'          "$src" "$(printf '3%.0s' $(seq 1 64))"
+        printf 'mode=%s/data/f3:0644\n'           "$src"
+        printf 'owner=%s/data/f3:1000:1000\n'     "$src"
+        printf 'mtime=%s/data/f3:1700000000\n'    "$src"
+        printf 'manifest=symlink:%s/data/link\n' "$src"
+        emit_linktarget "$src/data/link" "../data/f"
+        printf 'mode=%s/data/link:0777\n'         "$src"
+        printf 'owner=%s/data/link:1000:1000\n'   "$src"
+        printf 'mtime=%s/data/link:1700000000\n'  "$src"
+        printf 'manifest=hardlink:%s/data/f2\n'  "$src"
+        printf 'hardlink=%s/data/f2:g1\n'         "$src"
+        printf 'digest=%s/data/f2:%s\n'           "$src" "$(printf 'f%.0s' $(seq 1 64))"
+        printf 'mode=%s/data/f2:0644\n'           "$src"
+        printf 'owner=%s/data/f2:1000:1000\n'     "$src"
+        printf 'mtime=%s/data/f2:1700000000\n'    "$src"
+        printf 'done=ok\n'
+        exit 0 ;;
+      --count)
+        # EMPTINESS, for restore's phase 2 re-inspection (a just-created volume must be empty before
+        # it is filled; a same-name survivor with our nonce but leftover contents from an interrupted
+        # attempt must NOT be filled over). `checked=` reused deliberately: same meaning as the
+        # ordinary verify's own field, "how many entries this answer counted".
+        [ -n "$src" ] || { printf 'helperimg: verify --count needs <source>\n' >&2; exit 1; }
+        case "${HELPER_COUNT:-empty}" in
+          empty)    printf 'checked=0\ndone=ok\n' ;;
+          nonempty) printf 'checked=3\ndone=ok\n' ;;
+          silent)   exit 0 ;;
+          *) printf 'helperimg: unknown HELPER_COUNT setting: %s\n' "${HELPER_COUNT}" >&2; exit 2 ;;
+        esac
+        exit 0 ;;
+      --against-stdin)
+        # PHASE 4: verify the just-filled volume against the backup's OWN per-entry manifest, fed on
+        # stdin (never mounted as a host path — see lib/copy.sh's mi_copy_fill / lib/runtime.sh's
+        # `stdin=1` spec). The fake cannot really re-derive the volume's contents, so it counts the
+        # manifest it was handed and reports mismatches purely by HELPER_RESTORE_VERIFY knob — the
+        # caller-side parsing and refusal logic is what these tests are actually pinning.
+        [ -n "$src" ] || { printf 'helperimg: verify --against-stdin needs <source>\n' >&2; exit 1; }
+        rknob="${HELPER_RESTORE_VERIFY:-ok}"
+        [ "$rknob" != silent ] || { cat >/dev/null; exit 0; }
+        n=0
+        while IFS= read -r ln; do
+          case "$ln" in manifest=*) n=$((n + 1)) ;; esac
+        done
+        case "$rknob" in
+          ok) printf 'checked=%s\ndone=ok\n' "$n" ;;
+          # A restored SYMLINK re-created as a plain FILE — no bytes to mismatch, only the TYPE differs.
+          type-symlink-as-file)
+            printf 'mismatch=%s/data/link:type\n' "$src"
+            printf 'checked=%s\ndone=ok\n' "$n"; fin 1 ;;
+          # A restored hardlink GROUP flattened into independent copies — digests can still agree.
+          hardlink-flattened)
+            printf 'mismatch=%s/data/f2:hardlink\n' "$src"
+            printf 'checked=%s\ndone=ok\n' "$n"; fin 1 ;;
+          # A restored file whose MODE was not carried (an ordinary tar/cp would not preserve it either).
+          mode-dropped)
+            printf 'mismatch=%s/data/f:mode\n' "$src"
+            printf 'checked=%s\ndone=ok\n' "$n"; fin 1 ;;
+          # Completion claimed with NO checked= at all — nothing in the answer says the manifest was
+          # measured against anything. The caller binds `checked` to the manifest's own entry count
+          # and must refuse an answer that never states it, the same vacuity rule as the ordinary
+          # 4-arg verify's own `nocount` knob above.
+          nocount) printf 'done=ok\n' ;;
+          # A count that UNDERSTATES the manifest — claims completion having checked fewer entries
+          # than the manifest actually names.
+          understate) printf 'checked=1\ndone=ok\n' ;;
+          *) printf 'helperimg: unknown HELPER_RESTORE_VERIFY setting: %s\n' "$rknob" >&2; exit 2 ;;
+        esac
+        exit 0 ;;
+    esac
+    dst="${2:-}"; ruid="${3:-}"; ouid="${4:-}"
     if [ -z "$src" ] || [ -z "$dst" ] || [ -z "$ruid" ] || [ -z "$ouid" ]; then
       printf 'helperimg: verify needs <source> <destination> <runtime-uid> <operator-uid>\n' >&2
       exit 1

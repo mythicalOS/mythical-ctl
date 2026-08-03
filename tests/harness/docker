@@ -31,6 +31,10 @@
 #   * A container's NAME and its `--network-alias`es are answered by the NETWORK RESOLVER; only its
 #     HOSTNAME is in its own hosts file. The two surfaces are handed to the helper entrypoint
 #     separately, so a selfcheck that answers out of the wrong one is observably different.
+#   * `container run -i` is ACCEPTED (Task 13/D59): stdin already reaches the fixture entrypoint
+#     unconditionally here, so the flag is a no-op rather than a knob — but it must be RECOGNISED, not
+#     bounced by the closed-surface gate, since the adapter sends it whenever a caller (restore's
+#     manifest verification) needs the helper to read from stdin.
 #
 # THE CLOSED SURFACE — why an unimplemented flag is fatal here.
 # Every parse loop below used to end in a catch-all that either swallowed the word (`*) shift`) or
@@ -1120,6 +1124,13 @@ case "${1:-}" in
             --user) shift 2 ;;
             --label) parse_label "$2"; shift 2 ;;
             --mount) mounts="${mounts}${2};"; shift 2 ;;
+            # `-i`/`--interactive` (Task 13, D59 restore): a no-op HERE rather than a knob, because
+            # this fake already forwards the invoking process's real stdin to the fixture entrypoint
+            # unconditionally, below — it behaves as though `-i` were always given. Accepted (not
+            # ignored-and-dropped: it is recognised, tracked, and does nothing further) because a real
+            # daemon requires it before it will connect stdin to the container at all, and the adapter
+            # (lib/runtime.sh) must be free to send it.
+            -i|--interactive) shift ;;
             --) shift ;;
             # `-v /:/hostroot` was SWALLOWED here — a whole-host bind mount that this fake reported
             # as a clean run. Of every silently-ignored flag, that is the one that decides the

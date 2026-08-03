@@ -25,7 +25,7 @@ _MCTL_BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # everything between these two sentinels with the modules inlined verbatim, so the published
 # artifact is a single self-contained file with no ../lib to resolve.
 _MCTL_LIB="${_MCTL_BIN}/../lib"
-for _m in common layout config lock ledger doc trust policy manifest detect runtime preflight exit prov intent state probe bringup netref verbs repair copy migrate; do
+for _m in common layout config lock ledger doc trust policy manifest detect runtime preflight exit prov intent state probe bringup netref verbs repair copy migrate backup; do
   if [ -f "${_MCTL_LIB}/${_m}.sh" ]; then
     # shellcheck disable=SC1090
     source "${_MCTL_LIB}/${_m}.sh"
@@ -56,6 +56,16 @@ COMMANDS
   migrate-storage <product> <role> --to-bind PATH
                            move a product's storage from its named volume to a host directory
                              --map-foreign-to-operator   map foreign-uid entries to the operator
+  backup <output-directory>
+                           write the ledger, the tree, and every named volume's contents plus its
+                           per-entry manifest and its recorded identity — copying the directory alone
+                           is not a backup
+  restore <backup-directory>
+                           restore installer state and named volumes from a backup, staging the
+                           incoming ledger before anything is created; refused while an active
+                           installation is present
+                             --abandon   abandon an in-progress restore, removing the partial
+                                         volumes it created under their recorded identity
 
 OPTIONS
   --index PATH             the family index (default: ~/.mythical/.state/index)
@@ -125,7 +135,10 @@ selftest() {
                 mi_verb_state_repair mi_verb_abandon_intent mi_verb_net_rebind \
                 mi_conf_family_cas mi_mig_precheck mi_mig_phase mi_mig_stageid mi_mig_resume_phase \
                 mi_mig_run mi_mig_resume mi_mig_check_parent_trust mi_mig_verify_no_escaping_symlinks \
-                mi_mig_staging_path mi_mig_identity mi_mig_is_mountpoint mi_verb_migrate_storage; do
+                mi_mig_staging_path mi_mig_identity mi_mig_is_mountpoint mi_verb_migrate_storage \
+                mi_backup_manifest_write mi_backup_run mi_restore_state mi_restore_run \
+                mi_restore_abandon mi_ledger_staging_activate mi_ledger_staging_read \
+                mi_ledger_staging_write mi_copy_fill mi_verb_backup mi_verb_restore; do
         if ! declare -F "$_f" >/dev/null 2>&1; then
           printf 'mythical-ctl: missing library function: %s\n' "$_f" >&2
           exit 1
@@ -146,7 +159,7 @@ main() {
   [ "$#" -ne 0 ] || { usage; exit 0; }
 
   local verb="$1"; shift
-  local idx="" pol="" mdir="" purge="" image="" forced="" family="" tobind="" mapforeign=""
+  local idx="" pol="" mdir="" purge="" image="" forced="" family="" tobind="" mapforeign="" abandon=""
   local -a products
   products=()
   while [ "$#" -gt 0 ]; do
@@ -160,6 +173,7 @@ main() {
       --force-install) forced=1; shift ;;
       --to-bind)      _need_val "$1" "$#"; tobind="$2"; shift 2 ;;
       --map-foreign-to-operator) mapforeign=1; shift ;;
+      --abandon)      abandon=1; shift ;;
       -*) printf 'mythical-ctl: unknown option: %s\n' "$1" >&2; exit "$MI_EX_USAGE" ;;
       *) products+=("$1"); shift ;;
     esac
@@ -183,6 +197,7 @@ main() {
       [ -z "$tobind" ] || { printf 'mythical-ctl: --to-bind applies to migrate-storage only\n' >&2; exit "$MI_EX_USAGE"; }
       [ -z "$mapforeign" ] || { printf 'mythical-ctl: --map-foreign-to-operator applies to migrate-storage only\n' >&2
                                 exit "$MI_EX_USAGE"; }
+      [ -z "$abandon" ] || { printf 'mythical-ctl: --abandon applies to restore only\n' >&2; exit "$MI_EX_USAGE"; }
       [ "${#products[@]}" -gt 0 ] || { printf 'mythical-ctl: %s needs at least one product\n\n' "$verb" >&2
                                        usage >&2; exit "$MI_EX_USAGE"; }
       local -a extra; extra=()
@@ -204,12 +219,12 @@ main() {
     status)
       # status reads; it accepts only --index and product filters. A stray mutating option is a usage
       # error, not something to accept and ignore.
-      [ -z "$image$forced$purge$family$tobind$mapforeign" ] || { printf 'mythical-ctl: status takes no options other than --index\n' >&2
+      [ -z "$image$forced$purge$family$tobind$mapforeign$abandon" ] || { printf 'mythical-ctl: status takes no options other than --index\n' >&2
                                                exit "$MI_EX_USAGE"; }
       mi_verb_status "$idx" "${products[@]+"${products[@]}"}"; exit $? ;;
     uninstall)
       # uninstall does not install and does not migrate storage: those options are refused, not ignored.
-      [ -z "$image$forced$tobind$mapforeign" ] || { printf 'mythical-ctl: --image/--force-install/--to-bind/--map-foreign-to-operator apply to install/migrate-storage only\n' >&2
+      [ -z "$image$forced$tobind$mapforeign$abandon" ] || { printf 'mythical-ctl: --image/--force-install/--to-bind/--map-foreign-to-operator/--abandon apply elsewhere\n' >&2
                                   exit "$MI_EX_USAGE"; }
       if [ -n "$family" ]; then
         # --family removes the WHOLE family; a product argument alongside it is contradictory. Silently
@@ -228,7 +243,7 @@ main() {
     migrate-storage)
       # --purge/--family/--image/--force-install belong to other verbs; refused, not ignored, exactly
       # as those verbs refuse THIS command's own options above.
-      [ -z "$purge$family$image$forced" ] || { printf 'mythical-ctl: migrate-storage takes only --to-bind and --map-foreign-to-operator\n' >&2
+      [ -z "$purge$family$image$forced$abandon" ] || { printf 'mythical-ctl: migrate-storage takes only --to-bind and --map-foreign-to-operator\n' >&2
                                                 exit "$MI_EX_USAGE"; }
       [ -n "$tobind" ] || { printf 'mythical-ctl: migrate-storage needs --to-bind <path>\n' >&2; exit "$MI_EX_USAGE"; }
       # EXACTLY <product> <role> — a missing or surplus operand must not be silently dropped and acted
@@ -241,6 +256,28 @@ main() {
       [ -z "$mapforeign" ] || migopts+=(--map-foreign-to-operator)
       mi_verb_migrate_storage "$idx" "$pol" "${mdir}/${products[0]}.manifest" "${products[0]}" "${products[1]}" "${migopts[@]}"
       exit $? ;;
+    backup)
+      # backup takes only --index and exactly one operand (the output directory) — every other
+      # option belongs to a different verb and is refused, not silently ignored.
+      [ -z "$purge$family$image$forced$tobind$mapforeign$abandon" ] || {
+        printf 'mythical-ctl: backup takes only --index and an output directory\n' >&2; exit "$MI_EX_USAGE"; }
+      [ "${#products[@]}" -eq 1 ] || { printf 'mythical-ctl: backup needs exactly <output-directory>\n' >&2
+                                       exit "$MI_EX_USAGE"; }
+      mi_verb_backup "$idx" "${products[0]}"; exit $? ;;
+    restore)
+      # restore takes only --index and EITHER exactly one operand (the backup directory) OR
+      # --abandon on its own — never both, never neither.
+      [ -z "$purge$family$image$forced$tobind$mapforeign" ] || {
+        printf 'mythical-ctl: restore takes only --index, --abandon, and a backup directory\n' >&2
+        exit "$MI_EX_USAGE"; }
+      if [ -n "$abandon" ]; then
+        [ "${#products[@]}" -eq 0 ] || { printf 'mythical-ctl: restore --abandon takes no directory\n' >&2
+                                         exit "$MI_EX_USAGE"; }
+        mi_verb_restore "$idx" --abandon; exit $?
+      fi
+      [ "${#products[@]}" -eq 1 ] || { printf 'mythical-ctl: restore needs exactly <backup-directory> (or --abandon)\n' >&2
+                                       exit "$MI_EX_USAGE"; }
+      mi_verb_restore "$idx" "${products[0]}"; exit $? ;;
     net)
       # The rebind verb lands in a later task; the mechanism (mi_net_ref_rebind) is present, the CLI
       # wrapper is not yet, so this degrades cleanly rather than calling an undefined function.

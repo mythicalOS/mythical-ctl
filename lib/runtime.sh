@@ -495,6 +495,23 @@ mi_rt_run_helper() {
                  rtargv+=(--mount "type=bind,source=${s#staging=},target=/dst") ;;
       dstro=*)   _mi_rt_bind_path_ok "${s#dstro=}" "helper read-only source" || return 1
                  rtargv+=(--mount "type=bind,source=${s#dstro=},target=/dst,readonly") ;;
+      # THE REVERSE PAIR (Task 13, §6c/D59 restore): filling a freshly created volume from a backup's
+      # host tree needs mount roles exactly opposite srcvol=/staging= above — a read-only BIND at /src
+      # (the backup's untrusted tree is a host directory, not a volume) and a WRITABLE VOLUME at /dst
+      # (the destination being filled). The copy container's own command word and transcript grammar do
+      # not change: "copy /src /dst <ruid> <ouid>" reads whatever backs /src and writes whatever backs
+      # /dst, so no new closed command word is needed — only these two new mount specs (lib/copy.sh's
+      # mi_copy_fill assembles them; mi_copy_run/mi_copy_available's existing callers never use them).
+      srcbind=*) _mi_rt_bind_path_ok "${s#srcbind=}" "helper read-only bind source" || return 1
+                 rtargv+=(--mount "type=bind,source=${s#srcbind=},target=/src,readonly") ;;
+      dstvol=*)  _mi_rt_volume_name_ok "${s#dstvol=}" || { mi_warn "runtime: refusing helper spec '$s'"; return 1; }
+                 rtargv+=(--mount "type=volume,source=${s#dstvol=},target=/dst") ;;
+      # Keep the container's stdin open. The ONLY use today is restore's per-entry manifest verify
+      # (Task 13): the manifest is handed to the helper on stdin rather than as a THIRD host mount, so
+      # a restore never has to mount an extra untrusted path just to authenticate against it. `docker
+      # run` detaches stdin by default; without this a caller piping data into `_mi_copy_helper` would
+      # silently reach nothing.
+      stdin=1)   rtargv+=(-i) ;;
       # The name the caller's own record names it by, and the installation it belongs to — the same
       # two facts every other create in this module records. See the note above the function.
       name=*)    _mi_rt_arg_ok "${s#name=}" || { mi_warn "runtime: invalid helper container name"; return 1; }

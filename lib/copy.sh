@@ -363,6 +363,41 @@ mi_copy_run() {
       *) mi_warn "copy: unknown option '$1'"; return 1 ;;
     esac
   done
+  _mi_copy_do "$idx" "$ruid" "$ouid" "$mapforeign" "srcvol=${srcvol}" "staging=${stage}"
+}
+
+# THE REVERSE DIRECTION (Task 13, §6c/D59): fill a freshly created, freshly-labelled volume from a
+# HOST backup directory — restore's phase 3. Mount roles are exactly reversed from mi_copy_run's: the
+# untrusted backup tree is read-only at /src (a bind, not a volume — nothing here is a docker volume
+# yet), and the volume being filled is the only writable mount, at /dst. Everything else — the entry
+# contract, the refusal vocabulary, the count that binds verification — is IDENTICAL, because the copy
+# container's "copy /src /dst <ruid> <ouid>" has no notion of which physical thing backs either mount
+# point. One parsing implementation (_mi_copy_do), reused rather than duplicated: two copies of the
+# entry/refusal/count-binding checks this file's own header calls out as the part most worth getting
+# wrong would be exactly the kind of drift this codebase's "one implementation of a security check"
+# rule exists to prevent.
+mi_copy_fill() {
+  if [ "$#" -lt 5 ]; then
+    mi_warn "copy: mi_copy_fill needs <index> <host source directory> <destination volume> <runtime-uid> <operator-uid> [--map-foreign-to-operator]"
+    return 1
+  fi
+  local idx="$1" srcdir="$2" dstvol="$3" ruid="$4" ouid="$5"; shift 5
+  local mapforeign=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --map-foreign-to-operator) mapforeign=1; shift ;;
+      *) mi_warn "copy: unknown option '$1'"; return 1 ;;
+    esac
+  done
+  _mi_copy_do "$idx" "$ruid" "$ouid" "$mapforeign" "srcbind=${srcdir}" "dstvol=${dstvol}"
+}
+
+# THE SHARED BODY of mi_copy_run and mi_copy_fill: everything from here down operates on the copy
+# container's TRANSCRIPT and does not care which mount specs produced it. <mountspecs...> are the
+# already-typed lib/runtime.sh specs (srcvol=+staging=, or srcbind=+dstvol=) the two callers above
+# assemble; nothing here interpolates a raw path.
+_mi_copy_do() {
+  local idx="$1" ruid="$2" ouid="$3" mapforeign="$4"; shift 4
   _mi_copy_uid_ok "$ruid" "the product's runtime uid" || return 1
   _mi_copy_uid_ok "$ouid" "the operator uid" || return 1
   mi_copy_available "$idx" || return 1
@@ -375,7 +410,7 @@ mi_copy_run() {
   if [ "$mapforeign" -ne 0 ]; then cspecs+=("arg=--map-foreign"); fi
 
   local out rc
-  if out="$(_mi_copy_helper "$idx" copy "${cspecs[@]}" "srcvol=${srcvol}" "staging=${stage}")"; then rc=0; else rc=$?; fi
+  if out="$(_mi_copy_helper "$idx" copy "${cspecs[@]}" "$@")"; then rc=0; else rc=$?; fi
   _mi_copy_grammar_ok "$out" entry linktarget stripped mapped refused mismatch "done" || return 1
 
   # Report the contract observations BEFORE deciding, so a refusal still tells the operator what the
