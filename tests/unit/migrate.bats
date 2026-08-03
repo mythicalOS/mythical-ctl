@@ -376,6 +376,71 @@ teardown() { teardown_test_env; }
   rm -rf "$t"
 }
 
+# --- the ANCESTOR CHAIN above the secure-dir leaf must be trusted too (§5.2 round 7) -----------------
+# The leaf being owner-only-writable is worthless if something ABOVE it on the path can be renamed by
+# someone else: they rename the leaf away, AFTER _mi_mig_secure_state_dir has already returned its
+# "verified" path, and put whatever they want where it used to be. mi_ensure_layout neither secures nor
+# verifies mi_home() or mi_home()/.state, so a group/other-writable MYTHICAL_HOME (a permissive umask,
+# or MYTHICAL_HOME pointed under a shared directory) is a real vulnerability, not a hypothetical.
+
+@test "_mi_mig_secure_state_dir REFUSES when MYTHICAL_HOME sits under a group/other-writable ancestor" {
+  local base; base="$(mktemp -d)"
+  chmod 777 "$base"
+  local unsafe_home="$base/home"
+  mkdir -p "$unsafe_home"
+  chmod 700 "$unsafe_home"    # the leaf's own immediate parent IS owner-only; only the ANCESTOR above
+                               # it ($base) is unsafe — proves the walk checks the WHOLE chain, not just
+                               # the directory immediately above the leaf
+  MYTHICAL_HOME="$unsafe_home" run _mi_mig_secure_state_dir probe
+  [ "$status" -ne 0 ]
+  assert_contains "writable by its group or by everyone"
+  chmod 700 "$base"; rm -rf "$base"
+}
+
+@test "the escaping-symlink re-walk fails closed when MYTHICAL_HOME sits under an unsafe ancestor" {
+  local base; base="$(mktemp -d)"
+  chmod 777 "$base"
+  local unsafe_home="$base/home"
+  mkdir -p "$unsafe_home"; chmod 700 "$unsafe_home"
+  local t; t="$(mktemp -d)"
+  mkdir -p "$t/sub"; : > "$t/sub/f"; ln -s sub/f "$t/link"    # ordinary, non-escaping tree — the
+  MYTHICAL_HOME="$unsafe_home" run mi_mig_verify_no_escaping_symlinks "$t"   # refusal must be about
+  [ "$status" -ne 0 ]                                                       # the ancestor, not a
+  assert_contains "writable by its group or by everyone"                    # found escaping symlink
+  chmod 700 "$base"; rm -rf "$base" "$t"
+}
+
+@test "reclaim fails closed (removes nothing) when MYTHICAL_HOME sits under an unsafe ancestor" {
+  local base; base="$(mktemp -d)"
+  chmod 777 "$base"
+  local unsafe_home="$base/home"
+  mkdir -p "$unsafe_home"; chmod 700 "$unsafe_home"
+  local s="${DEST}.staging"; mkdir -p "$s"
+  local id; id="$(mi_mig_identity "$s")"
+  MYTHICAL_HOME="$unsafe_home" run mi_mig_staging_reclaim "$s" nonceX "$id" nonceX
+  [ "$status" -ne 0 ]
+  assert_contains "writable by its group or by everyone"
+  [ -d "$s" ]    # nothing was removed
+  chmod 700 "$base"; rm -rf "$base"
+}
+
+@test "_mi_mig_secure_state_dir SUCCEEDS on a normal, fully operator-owned chain" {
+  # Constructed explicitly rather than relying on the ambient host's own tmp-root permissions: a
+  # chmod-700 base this test process owns outright, with a fixed umask for every intermediate mkdir -p
+  # creates along the way, so the walk's positive case is provably about the LOGIC, not about this
+  # host's default tmp layout happening to already be safe (root-owned 755 / self-owned 755, which it
+  # is on the host this suite was developed on — see the report).
+  local owned; owned="$(mktemp -d)"
+  chmod 700 "$owned"
+  local home="$owned/deep/home"
+  ( umask 022 && mkdir -p "$home" )
+  chmod 700 "$owned/deep" "$home"
+  MYTHICAL_HOME="$home" run _mi_mig_secure_state_dir probe
+  [ "$status" -eq 0 ]
+  [ "$output" = "$home/.state/probe" ]
+  rm -rf "$owned"
+}
+
 @test "phase 5 refuses to commit a staging tree that gained an ESCAPING symlink after phase 4" {
   # The exact race the finding describes: something with legitimate write access to the staging tree
   # during the copy (the runtime uid's ACL grant §4.5 requires the copy step to set) plants an escaping

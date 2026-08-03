@@ -82,6 +82,66 @@ mi_mig_verify_identity() {
   return 0
 }
 
+# THE ONE DEFINITION OF "THIS DIRECTORY CANNOT BE RENAMED/REPLACED BY A NON-OWNER, NON-ROOT PARTY" —
+# shared by mi_mig_check_parent_trust (checks ONE directory: the destination's immediate parent) and
+# _mi_mig_secure_state_dir's ancestor-chain walk (checks EVERY directory from / down to a leaf this
+# module secures). A single directory being owner-only-writable proves nothing on its own if something
+# ABOVE it in the path can be renamed by someone else — so both callers need the identical per-directory
+# question answered the identical way, never two hand-written copies that can drift.
+#
+# Ownership, not mode bits alone, is what actually excludes a third party: a privileged process bypasses
+# mode-bit enforcement entirely, so a directory some OTHER uid owns may still be writable by them
+# regardless of what its mode claims — UNLESS that owner is root (uid 0). A root-owned, non-other-
+# writable directory IS accepted: only root could rename through it, and root is trusted by definition
+# in this codebase's threat model (if root is adversarial nothing here holds regardless). This is also
+# what makes an ancestor-chain walk even POSSIBLE for a non-root operator: `/`, and most of the path
+# above a typical `$HOME`, are root-owned — refusing every root-owned ancestor would make the chain walk
+# refuse every real install.
+#
+# rc 0 safe · 1 refused — the REASON is printed on stdout as `owner:<uid>` (neither this process's own
+# uid nor root), `mode:<octal>` (group- or other-writable), or `unreadable` (a stat this process could
+# not perform — a failed read is a refusal, never assumed safe), so each caller can name it in its own
+# voice. <dir> must already be an absolute, resolved path; this does not canonicalize it.
+_mi_mig_dir_owner_safe() {
+  if [ "$#" -ne 1 ]; then mi_warn "migrate: _mi_mig_dir_owner_safe needs a <directory>"; return 1; fi
+  local dir="$1" euid owner mode last2
+  euid="$(id -u)" || { printf 'unreadable\n'; return 1; }
+  owner="$(_mi_owner_uid "$dir")" || { printf 'unreadable\n'; return 1; }
+  if [ "$owner" != "$euid" ] && [ "$owner" != 0 ]; then
+    printf 'owner:%s\n' "$owner"
+    return 1
+  fi
+  mode="$(_mi_mode_octal "$dir")" || { printf 'unreadable\n'; return 1; }
+  # The group-write and other-write bits are the last two octal digits, whatever the string's total
+  # width (a leading setuid/setgid/sticky digit does not shift them) — see _mi_mode_octal.
+  last2="${mode#"${mode%??}"}"
+  case "$last2" in
+    *[2367]*) printf 'mode:%s\n' "$mode"; return 1 ;;
+  esac
+  return 0
+}
+
+# Every ancestor directory of <path>, ONE PER LINE, from / down to and including <path> itself. Pure
+# parameter expansion (bash 3.2 floor — no `mapfile`, no external tools): the leading `/` is stripped
+# once, then each `/`-separated component is peeled off the front and appended to a running prefix.
+# <path> must already be absolute and canonical (mi_canon's job, not this function's).
+_mi_mig_ancestor_chain() {
+  if [ "$#" -ne 1 ]; then mi_warn "migrate: _mi_mig_ancestor_chain needs an <absolute path>"; return 1; fi
+  local path="$1" rest comp cur
+  case "$path" in /*) : ;; *) mi_warn "migrate: '$path' is not absolute"; return 1 ;; esac
+  printf '/\n'
+  rest="${path#/}"
+  cur=""
+  while [ -n "$rest" ]; do
+    comp="${rest%%/*}"
+    if [ "$rest" = "$comp" ]; then rest=""; else rest="${rest#*/}"; fi
+    [ -n "$comp" ] || continue
+    cur="${cur}/${comp}"
+    printf '%s\n' "$cur"
+  done
+  return 0
+}
+
 # THE INSTALLER'S OWN SECURE SCRATCH LOCATION — the ONE definition of "somewhere only this process can
 # write", the same one-definition discipline already applied to "escapes" (mi_copy_link_escapes). Any
 # security-critical, ephemeral filesystem object this module creates — one whose CONTENTS or very
@@ -150,6 +210,48 @@ _mi_mig_secure_state_dir() {
       mi_warn "  chmod 700 — refusing to trust it as the installer's own secure scratch location."
       return 1 ;;
   esac
+
+  # THE WHOLE ANCESTOR CHAIN, NOT JUST THE LEAF. A directory is only as trustworthy as the
+  # least-trusted directory ON THE PATH TO IT: the leaf being owner-only-writable is worthless if its
+  # parent — or ITS parent, all the way up to / — is writable by someone else, because that someone can
+  # rename the leaf away the instant after this function returns its "verified" path, and put whatever
+  # they want where it used to be (a symlink for the re-walk's temp file to follow; a directory of
+  # their own for reclaim's `mv` to land in). mi_home() (~/.mythical, or $MYTHICAL_HOME) is NOT assumed
+  # safe here — mi_ensure_layout (lib/layout.sh) neither secures nor verifies it, so a group/other-
+  # writable HOME (a permissive umask, or MYTHICAL_HOME pointed under a shared directory) is a REAL
+  # vulnerability, proved unsafe by walking it, never assumed safe by skipping it.
+  local lcanon comp creason crc
+  lcanon="$(mi_canon "$dir")" || {
+    mi_warn "migrate: '$dir' does not resolve. Refusing to use it as the installer's own secure scratch"
+    mi_warn "  location."
+    return 1
+  }
+  while IFS= read -r comp; do
+    [ -n "$comp" ] || continue
+    if creason="$(_mi_mig_dir_owner_safe "$comp")"; then crc=0; else crc=$?; fi
+    if [ "$crc" -ne 0 ]; then
+      case "$creason" in
+        owner:*)
+          mi_warn "migrate: '$comp', on the path to the installer's own secure scratch location, is"
+          mi_warn "  owned by uid ${creason#owner:} — neither this process's own uid nor root. Refusing:"
+          mi_warn "  a directory ANYWHERE on the path to '$dir' that someone else can rename through makes"
+          mi_warn "  the leaf's own permissions worthless — they can rename it away and put their own"
+          mi_warn "  directory where it used to be, the instant after this function returns. Choose an"
+          mi_warn "  installation home (\$MYTHICAL_HOME) whose whole chain this operator (or root) owns." ;;
+        mode:*)
+          mi_warn "migrate: '$comp', on the path to the installer's own secure scratch location, is"
+          mi_warn "  writable by its group or by everyone (mode ${creason#mode:}). Refusing: the same"
+          mi_warn "  reasoning as an unsafe owner above — a directory anyone else can write to lets them"
+          mi_warn "  rename the leaf away and replace it. Restrict '$comp' to the owner only (e.g."
+          mi_warn "  'chmod 700 $comp') and re-run." ;;
+        *)
+          mi_warn "migrate: could not verify the ownership or permissions of '$comp', on the path to the"
+          mi_warn "  installer's own secure scratch location. Refusing rather than guessing it is safe." ;;
+      esac
+      return 1
+    fi
+  done <<< "$(_mi_mig_ancestor_chain "$lcanon")"
+
   printf '%s\n' "$dir"
   return 0
 }
@@ -344,50 +446,44 @@ mi_mig_is_mountpoint() {
 # the window is. staging lives as a SIBLING of the destination (mi_mig_staging_path), in the very same
 # parent, so one check here covers both.
 #
-# Refused when the destination's parent: does not resolve; is not OWNED by the uid running this
-# process (ownership, not mode bits, is what actually excludes a third party — if this process runs
-# privileged, root bypasses mode-bit checks entirely, so a parent someone else owns can still be
-# written by them regardless of what its mode claims); or is writable by its group or by everyone.
-# rc 0 the parent is safe to operate in · 1 refused (reported).
+# Refused when the destination's parent: does not resolve; is not owned by the uid running this
+# process OR by root (ownership, not mode bits, is what actually excludes a third party — if this
+# process runs privileged, root bypasses mode-bit checks entirely, so a parent someone else owns can
+# still be written by them regardless of what its mode claims; a ROOT-owned parent is the one exception,
+# since only root — trusted by definition here — could write it); or is writable by its group or by
+# everyone. The per-directory question itself is _mi_mig_dir_owner_safe, shared with
+# _mi_mig_secure_state_dir's ancestor-chain walk, so there is exactly one definition of it. rc 0 the
+# parent is safe to operate in · 1 refused (reported).
 mi_mig_check_parent_trust() {
   if [ "$#" -ne 1 ]; then mi_warn "migrate: mi_mig_check_parent_trust needs a <destination>"; return 1; fi
-  local dest="$1" pdir canon euid owner mode last2
+  local dest="$1" pdir canon reason rc
   pdir="$(dirname -- "$dest")"
   canon="$(mi_canon "$pdir" 2>/dev/null)" || {
     mi_warn "migrate: the destination's parent directory '$pdir' does not resolve. Refusing."
     return 1
   }
-  euid="$(id -u)" || { mi_warn "migrate: could not read the operator's own uid. Refusing."; return 1; }
-  owner="$(_mi_owner_uid "$canon")" || {
-    mi_warn "migrate: could not read the owner of '$canon'. Refusing rather than guessing it is safe."
-    return 1
-  }
-  if [ "$owner" != "$euid" ]; then
-    mi_warn "migrate: the destination's parent directory '$canon' is owned by uid $owner, not this"
-    mi_warn "  process's own uid ($euid). Refusing: this migration performs privileged host writes there"
-    mi_warn "  for its whole span, and a parent this process does not itself own may still be written to"
-    mi_warn "  by whoever does — concurrently, in ways no in-process re-check can detect, for as long as"
-    mi_warn "  the migration runs. Choose a destination whose parent directory this operator owns."
-    return 1
-  fi
-  mode="$(_mi_mode_octal "$canon")" || {
-    mi_warn "migrate: could not read the permissions of '$canon'. Refusing rather than guessing them safe."
-    return 1
-  }
-  # The group-write and other-write bits are the last two octal digits, whatever the string's total
-  # width (a leading setuid/setgid/sticky digit does not shift them) — see _mi_mode_octal.
-  last2="${mode#"${mode%??}"}"
-  case "$last2" in
-    *[2367]*)
+  if reason="$(_mi_mig_dir_owner_safe "$canon")"; then rc=0; else rc=$?; fi
+  [ "$rc" -eq 0 ] && return 0
+  case "$reason" in
+    owner:*)
+      mi_warn "migrate: the destination's parent directory '$canon' is owned by uid ${reason#owner:},"
+      mi_warn "  neither this process's own uid nor root. Refusing: this migration performs privileged"
+      mi_warn "  host writes there for its whole span, and a parent this process does not itself own (and"
+      mi_warn "  that is not root's either) may still be written to by whoever does — concurrently, in"
+      mi_warn "  ways no in-process re-check can detect, for as long as the migration runs. Choose a"
+      mi_warn "  destination whose parent directory this operator (or root) owns." ;;
+    mode:*)
       mi_warn "migrate: the destination's parent directory '$canon' is writable by its group or by everyone"
-      mi_warn "  (mode ${mode}). Refusing: this migration performs privileged host writes there for its"
-      mi_warn "  whole span, and a parent anyone else can write to can be modified out from under it at"
+      mi_warn "  (mode ${reason#mode:}). Refusing: this migration performs privileged host writes there for"
+      mi_warn "  its whole span, and a parent anyone else can write to can be modified out from under it at"
       mi_warn "  any point — the one class of attack a re-check immediately before each use cannot close"
       mi_warn "  in a shell with no fd-relative filesystem operations. Restrict the parent to the owner"
-      mi_warn "  only (e.g. 'chmod 700 ${canon}') and re-run."
-      return 1 ;;
+      mi_warn "  only (e.g. 'chmod 700 ${canon}') and re-run." ;;
+    *)
+      mi_warn "migrate: could not verify the ownership or permissions of the destination's parent"
+      mi_warn "  directory '$canon'. Refusing rather than guessing it is safe." ;;
   esac
-  return 0
+  return 1
 }
 
 # §5.2's phase-5 recovery. Decides on POSITIVE EVIDENCE ONLY, and stops when it has none.
