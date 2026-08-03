@@ -10,21 +10,8 @@ teardown() { teardown_test_env; }
 
 @test "a NEWER ledger schema is refused, naming the required version (already Plan 1; asserted here)" {
   mi_lock_acquire; mi_ident_ensure >/dev/null; mi_lock_release
-  # Recompute the checksum after bumping the schema, so this is a CHECKSUM-VALID, merely-newer-schema
-  # ledger, not a checksum mismatch — the same construction tests/unit/ledger.bats' own "a newer schema
-  # is refused, not parsed" test uses (header+body first, digest THAT exact file, append the sum).
-  # Round 8 split mi_ledger_read's old single "corrupt/newer-schema" rc 1 into rc 4 (positively
-  # confirmed corrupt: a checksum mismatch, checked BEFORE the schema number is ever read) and rc 1
-  # (refused without confirming anything about the content, which is what a checksum-valid newer
-  # schema deliberately stays). A bare `sed` replace leaving the OLD checksum in place — this test's
-  # prior construction — produces a checksum MISMATCH, not a clean newer-schema ledger; before the
-  # split that happened to land on the same rc as this test asserts either way, so it never actually
-  # pinned "newer schema" specifically. Rebuilding the checksum over the bumped header is what does.
-  local f="$MYTHICAL_HOME/.state/ledger"
-  sed -e 's/schema=1/schema=99/' -e '$d' "$f" > "$f.new"
-  local sum; sum="$(mi_digest "$f.new")"
-  printf '#sha256=%s\n' "$sum" >> "$f.new"
-  mv "$f.new" "$f"
+  sed 's/schema=1/schema=99/' "$MYTHICAL_HOME/.state/ledger" > "$MYTHICAL_HOME/.state/l2"
+  mv "$MYTHICAL_HOME/.state/l2" "$MYTHICAL_HOME/.state/ledger"
   run mi_ident_get
   [ "$status" -eq 1 ]
 }

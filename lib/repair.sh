@@ -817,21 +817,24 @@ _mi_repair_report_residual() {
 # function was probing a perfectly good ledger reset it anyway — discarding the trust anchor and every
 # rollback floor on nothing more than "the read failed once" (round 8 cross-model gate).
 #
-# mi_ledger_read now reports rc 4 for the ONLY case that is actually POSITIVE evidence of corrupt
-# CONTENT — a checksum computed over bytes it has already proven it holds a complete, faithful copy of
-# disagreeing with what they claim, or those same proven bytes failing to parse as a ledger at all —
-# and rc 1 for everything else that refuses without establishing anything about the content (an
-# unreadable snapshot step, a broken digest tool, and — deliberately — a schema NEWER than this build
-# understands, since that is D35's own gate doing its job, not corruption: `mi_schema_migrate`'s own
-# header already says the refusal there "must stay" a refusal — "an older CLI that MISREADS a newer
-# ledger deletes objects it misidentifies" — and renaming a STILL-VALID, merely-newer ledger to
-# `.corrupt.$$` and replacing it with an empty one is exactly that deletion, reached through the repair
-# door instead of the read door). The reset path below now destroys ONLY on rc 4.
+# THIS GATE ALONE gets the finer distinction, through `mi_ledger_confirmed_corrupt` (lib/ledger.sh) —
+# NOT through `mi_ledger_read` itself. Round 8's first cut put the distinction directly on
+# `mi_ledger_read`'s own rc (0/1/3/4), which is what every OTHER module (prov.sh, trust.sh, state.sh,
+# intent.sh) also calls — all of them propagate whatever `mi_ledger_read` returns unexamined beyond
+# `-eq 3`, so a corrupt ledger started surfacing as rc 4 instead of rc 1 through every one of them,
+# and `tests/unit/prov.bats`'s "a corrupt ledger fails CLOSED for identity" test — which asserts rc 1,
+# correctly, since that IS those modules' real contract — broke. `mi_ledger_read`'s external contract
+# is unchanged, byte for byte, from before round 8 for every caller except this one: corrupt, newer-
+# schema, and a transient read/IO failure all still report the same rc 1 through it. Only this gate
+# asks `mi_ledger_confirmed_corrupt` the ONE question it actually needs answered — "is this positively,
+# provably corrupt, or not?" — and destroys ONLY when the answer is yes.
 #
-# The header is STILL peeked at first, ahead of ever calling mi_ledger_read, purely for a BETTER
-# diagnostic — "install the current release" is far more actionable than the generic "could not be
-# read" rc-1 message the reset path now gives every other refusal — not because it is still the only
-# thing standing between a newer-schema ledger and destruction; the rc split below is that on its own.
+# The header is STILL peeked at first, ahead of either ledger.sh call, purely for a BETTER diagnostic —
+# "install the current release" is far more actionable than the generic "could not be read" message the
+# reset path gives every other refusal — not because it is still the only thing standing between a
+# newer-schema ledger and destruction; `mi_ledger_confirmed_corrupt` reports newer-schema as "not
+# confirmed corrupt" on its own (lib/ledger.sh keeps that case at rc 1 inside the shared implementation,
+# same reasoning as always: D35's own gate doing its job is not evidence of damage).
 _mi_repair_reset_ledger() {
   local f; f="$(_mi_ledger_path)"
 
@@ -865,15 +868,14 @@ _mi_repair_reset_ledger() {
   fi
 
   if [ -f "$f" ]; then
-    local rrc
-    if ( mi_ledger_read >/dev/null 2>&1 ); then rrc=0; else rrc=$?; fi
-    if [ "$rrc" -eq 4 ]; then
-      # rc 4 — POSITIVELY CONFIRMED corrupt content (round 8 cross-model gate). mi_ledger_read reaches
-      # this rc only once IT has already proven it holds a complete, faithful copy of the bytes on
-      # disk; a checksum computed over THOSE bytes disagreeing with what they claim, or their failing
-      # to parse as a ledger at all, is evidence about the ledger's CONTENT — not about this process's
-      # ability to read it this one time. This is the ONLY failure this function treats as licence to
-      # destroy.
+    if mi_ledger_confirmed_corrupt; then
+      # POSITIVELY CONFIRMED corrupt content (round 8 cross-model gate, refined after the coordinator
+      # found the first cut leaked a new mi_ledger_read rc through every general caller). The dedicated
+      # lib/ledger.sh helper reaches "yes" only once it has already proven it holds a complete, faithful
+      # copy of the bytes on disk; a checksum computed over THOSE bytes disagreeing with what they
+      # claim, or their failing to parse as a ledger at all, is evidence about the ledger's CONTENT —
+      # not about this process's ability to read it this one time. This is the ONLY failure this
+      # function treats as licence to destroy.
       local aside="${f}.corrupt.$$"
       mv -f "$f" "$aside" || { mi_warn "repair: cannot move the corrupt ledger aside"; return 1; }
       mi_warn "repair: the corrupt ledger has been PRESERVED at $aside — it is evidence, not rubbish."
@@ -881,12 +883,12 @@ _mi_repair_reset_ledger() {
       mi_warn "  from — so this installation will need to be online once to re-establish it."
       printf '' | mi_ledger_write
       return $?
-    elif [ "$rrc" -ne 0 ]; then
-      # ANY OTHER non-zero rc (1, typically) does NOT positively confirm anything about the ledger's
-      # content — it can be a transient read/IO failure while THIS call was copying or hashing an
-      # otherwise-perfectly-good file, which looks, from here, indistinguishable from real damage. The
-      # whole point of the rc split above is to not guess: renaming this aside or replacing it would be
-      # destroying a possibly-still-valid ledger, and its trust anchor and rollback floors along with
+    elif ! ( mi_ledger_read >/dev/null 2>&1 ); then
+      # Present, a regular file, NOT positively confirmed corrupt, and still could not be read — a
+      # transient read/IO failure while THIS call was copying or hashing an otherwise-perfectly-good
+      # file looks, from here, indistinguishable from real damage. The whole point of asking
+      # `mi_ledger_confirmed_corrupt` FIRST is to not guess: renaming this aside or replacing it would
+      # be destroying a possibly-still-valid ledger, and its trust anchor and rollback floors along with
       # it, on exactly that guess. Refuse instead — nothing here has been touched or moved.
       mi_warn "repair: the ledger exists but could not be read, and nothing here positively confirms"
       mi_warn "  its content is corrupt — this can be a transient read or I/O failure rather than actual"

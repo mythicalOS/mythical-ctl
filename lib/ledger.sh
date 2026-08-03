@@ -17,7 +17,12 @@ _mi_num_gt() {
   [[ "$a" > "$b" ]]   # equal length ⇒ byte order equals numeric order for digits (under LC_ALL=C)
 }
 
-# Print body records (everything between the header and the checksum). Validates first.
+# THE SHARED IMPLEMENTATION. Print body records (everything between the header and the checksum),
+# validating first. INTERNAL — every ordinary caller goes through the public `mi_ledger_read` wrapper
+# below, which normalizes this function's finer-grained rc to the PUBLIC 0/1/3 contract every existing
+# caller (and every existing test of every module) already depends on. This function alone carries the
+# extra distinction repair's destroy gate needs, via `mi_ledger_confirmed_corrupt` further below — the
+# ONE caller allowed to see it.
 #
 # rc 0 ok · 3 missing · 1 refused for a reason that does NOT positively confirm the ledger's CONTENT
 # is bad (a permissions/path-shape problem before we ever open it, unable to even snapshot or read the
@@ -37,7 +42,16 @@ _mi_num_gt() {
 # `cat "$f" > "$snap"` below has already succeeded — from that point on, "these exact bytes do not
 # check out" is genuine, positive evidence, not a guess. Everything before that point — unable to even
 # take the snapshot, unable to read it — stays rc 1: nothing about the content was ever established.
-mi_ledger_read() {
+#
+# rc 4 MUST NOT leak past the public wrapper (round 8-refined: the FIRST cut of this split gave rc 4
+# directly to `mi_ledger_read`, which every general caller — `mi_ledger_get`/`mi_led_all` and the
+# direct callers in prov.sh/trust.sh/state.sh/intent.sh — propagates unexamined; a corrupt ledger then
+# surfaced as rc 4 instead of rc 1 through ALL of them, and `tests/unit/prov.bats`'s "a corrupt ledger
+# fails CLOSED for identity" test, which asserts rc 1 specifically, broke. Those modules' rc-1 contract
+# for a corrupt ledger is the CORRECT, load-bearing one and must stay byte-for-byte; only repair may
+# ever see the finer distinction, and only through the dedicated helper below, never through this
+# function's own name).
+_mi_ledger_read_impl() {
   local f; f="$(_mi_ledger_path)"
   # ABSENT is rc 3 — a legitimate first write. PRESENT-BUT-NOT-A-REGULAR-FILE is not absent, and
   # conflating the two was silent data loss. `[ -f ]` alone is false for a directory and for a
@@ -123,6 +137,41 @@ mi_ledger_read() {
   # Body = everything except line 1 and the last line — from the SAME snapshot we validated.
   sed -e '1d' -e '$d' "$snap"
   rm -f "$snap"
+}
+
+# THE PUBLIC READER. Every ordinary caller's contract, UNCHANGED from before round 8: rc 0 ok · 3
+# missing · 1 refused — corrupt, newer-schema, and a transient read/IO failure ALL report this same rc,
+# exactly as they always did. `mi_ledger_get`/`mi_led_all` and the direct callers in prov.sh/trust.sh/
+# state.sh/intent.sh all propagate whatever this returns unexamined beyond `-eq 3`; none of them, or
+# their tests, may observe rc 4 — only `_mi_ledger_read_impl` produces it, and only
+# `mi_ledger_confirmed_corrupt` below ever looks for it.
+mi_ledger_read() {
+  _mi_ledger_read_impl
+  local rc=$?
+  case "$rc" in
+    4) return 1 ;;
+    *) return "$rc" ;;
+  esac
+}
+
+# THE ONE CALLER ALLOWED TO SEE THE DISTINCTION. Whether the ledger, if present, is POSITIVELY
+# CONFIRMED corrupt — a checksum computed over a complete, faithfully-read copy of its bytes
+# disagreeing with what they claim, or those same proven bytes failing to parse as a ledger at all.
+# This exists ONLY for `state repair`'s destroy-and-rebuild gate (lib/repair.sh), which may act only on
+# this, never on "could not be read" in general — see `_mi_ledger_read_impl`'s own rc-4 note for why.
+#
+# rc 0 positively confirmed corrupt (destroy-eligible) · 1 NOT confirmed corrupt — covers a valid
+# ledger, an absent ledger, AND an unreadable-for-an-unproven-reason ledger alike; the caller must treat
+# all three the same way: do not destroy.
+#
+# Subshelled: `_mi_ledger_read_impl` still routes its OWN operational-failure branches through
+# `mi_die`, which calls `exit`. Called bare (as this function's caller does — `if
+# mi_ledger_confirmed_corrupt; then`, not through `$( )`), an unguarded `exit` there would terminate the
+# CALLER's process, not just this function. `( … )` contains it to a boolean answer, the same way
+# `mi_ledger_write` and repair's own destroy-probe already contain `mi_ledger_read` for the same reason.
+mi_ledger_confirmed_corrupt() {
+  ( _mi_ledger_read_impl >/dev/null 2>&1 )
+  [ "$?" -eq 4 ]
 }
 
 # Replace the ledger atomically from records on stdin. Requires the caller to actually HOLD the
