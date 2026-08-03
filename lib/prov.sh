@@ -920,8 +920,45 @@ mi_prov_authority() {
   fi
   _mi_prov_class_ok "$class" || return 1
 
+  # ikind/field/ifield are needed both by the no-record branch immediately below (to tell "genuinely
+  # unattributed" apart from "already gone — this installer's own prior removal tombstoned the record"
+  # §5.2 round 10) and further down (to check whose it is once a record does exist) — computed once,
+  # here, so every use of them agrees.
+  local field ifield ikind="$class"
+  [ "$ikind" = probe ] && ikind=container
+  case "$class" in
+    volume)             field=v.nonce ; ifield=v.install ;;
+    container|probe)    field=c.nonce ; ifield=c.install ;;
+    network)            field=n.nonce ; ifield=n.install ;;
+  esac
+
   if rec="$(mi_prov_find "$class" "$name")"; then rc=0; else rc=$?; fi
   if [ "$rc" -eq 3 ]; then
+    # NO ACTIVE RECORD is not one fact, it is two, and this branch used to answer both the same way.
+    # §5.2 round 10 / codex r9: a resume that reaches phase 7 after its OWN prior attempt already
+    # removed the old container and tombstoned its record (mi_prov_tombstone replaces the object record
+    # with a tombstone — mi_prov_find, which only reads object records, then legitimately returns rc 3)
+    # has nothing left to authorize and nothing to fear either — the object is GONE, by this installer's
+    # own hand. That is "already gone" (rc 3), not "cannot prove ownership" (rc 1), and migrate.sh's
+    # phase 7 already handles rc 3 correctly (skip the removal, proceed) — it was THIS function that
+    # never reached it for a missing/tombstoned record, unlike its own two sibling checks below (rc 3
+    # from mi_rt_inspect once a record DOES exist), which already draw exactly this distinction. Fixed
+    # to match them: ask the runtime directly before concluding there is nothing this installer can act
+    # on. GONE (rc 3 from mi_rt_inspect, daemon reachable, no such object) → return 3, nothing to
+    # authorize, nothing to preserve. PRESENT (rc 0) → the existing behavior is unchanged: an
+    # unattributed object standing at this name is preserved and reported, never assumed ours on no
+    # evidence. Daemon UNREACHABLE (anything else) → fail closed exactly like the sibling checks do —
+    # authorizing "already gone" on a question that could not even be asked would be the same
+    # rc-1-into-rc-3 fold every other refusal in this module exists to prevent.
+    local grc
+    if mi_rt_inspect "$ikind" "$ifield" "$name" >/dev/null 2>&1; then grc=0; else grc=$?; fi
+    if [ "$grc" -eq 3 ]; then return 3; fi
+    if [ "$grc" -ne 0 ]; then
+      mi_warn "prov: '$name' has no provenance record, and whether it still exists could not be"
+      mi_warn "  established either — the container runtime did not answer. Refusing rather than"
+      mi_warn "  authorizing anything on a question that could not be asked."
+      return 1
+    fi
     mi_warn "prov: '$name' has no provenance record — preserving it and reporting."
     mi_warn "  The installer cannot prove it created this, so it will not remove it."
     return 1
@@ -948,15 +985,8 @@ mi_prov_authority() {
 
   # Compare against what is ACTUALLY there. A record is a claim about the past; the labels are the
   # object's own answer about the present, and there are TWO of them because the question has two
-  # halves: did THIS installer create this object, and is the thing there now still it?
-  local field ifield
-  case "$class" in
-    volume)             field=v.nonce ; ifield=v.install ;;
-    container|probe)    field=c.nonce ; ifield=c.install ;;
-    network)            field=n.nonce ; ifield=n.install ;;
-  esac
-  local ikind="$class"
-  [ "$ikind" = probe ] && ikind=container
+  # halves: did THIS installer create this object, and is the thing there now still it? (field, ifield,
+  # ikind computed once, at the top of this function — see the comment there.)
 
   # WHOSE IS IT — the half the nonce does not answer, and the half this function did not ask.
   #
