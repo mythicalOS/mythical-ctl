@@ -809,17 +809,29 @@ _mi_repair_report_residual() {
 # repair opens, stated to the operator above — and dropping them does not touch what the anchor protects:
 # an attacker still cannot swap the index itself for a different one without failing digest verification.
 #
-# "mi_ledger_read failed" IS NOT ONE FACT. It calls mi_die for every non-absent failure — a checksum
-# mismatch, a truncated file, a malformed header, AND a schema NEWER than this build understands — so a
-# subshelled `! ( mi_ledger_read … )` reports the SAME exit status (the subshell's own `exit 1`) for all
-# of them, with no way to tell "genuinely corrupt" from "this file is fine, this binary is old" from its
-# rc alone. Reading the newer-schema case as corruption is the worst of the four: `mi_schema_migrate`'s
-# own header already says the refusal there "must stay" a refusal — "an older CLI that MISREADS a newer
+# "mi_ledger_read failed" USED TO NOT BE ONE FACT. It called mi_die for every non-absent failure — a
+# checksum mismatch, a truncated file, a malformed header, a transient I/O error while COPYING or
+# HASHING the file, AND a schema NEWER than this build understands — all as the SAME exit status (mi_die
+# always `exit 1`), with no way to tell "genuinely corrupt" from "this file is fine, this read just
+# failed" from the rc alone. Reset ran on a GENERIC nonzero, and a runtime I/O hiccup while this
+# function was probing a perfectly good ledger reset it anyway — discarding the trust anchor and every
+# rollback floor on nothing more than "the read failed once" (round 8 cross-model gate).
+#
+# mi_ledger_read now reports rc 4 for the ONLY case that is actually POSITIVE evidence of corrupt
+# CONTENT — a checksum computed over bytes it has already proven it holds a complete, faithful copy of
+# disagreeing with what they claim, or those same proven bytes failing to parse as a ledger at all —
+# and rc 1 for everything else that refuses without establishing anything about the content (an
+# unreadable snapshot step, a broken digest tool, and — deliberately — a schema NEWER than this build
+# understands, since that is D35's own gate doing its job, not corruption: `mi_schema_migrate`'s own
+# header already says the refusal there "must stay" a refusal — "an older CLI that MISREADS a newer
 # ledger deletes objects it misidentifies" — and renaming a STILL-VALID, merely-newer ledger to
 # `.corrupt.$$` and replacing it with an empty one is exactly that deletion, reached through the repair
-# door instead of the read door. So the header is peeked at FIRST, without going through mi_ledger_read
-# at all (it refuses before telling us the number), and a newer schema is refused outright — never
-# repaired over.
+# door instead of the read door). The reset path below now destroys ONLY on rc 4.
+#
+# The header is STILL peeked at first, ahead of ever calling mi_ledger_read, purely for a BETTER
+# diagnostic — "install the current release" is far more actionable than the generic "could not be
+# read" rc-1 message the reset path now gives every other refusal — not because it is still the only
+# thing standing between a newer-schema ledger and destruction; the rc split below is that on its own.
 _mi_repair_reset_ledger() {
   local f; f="$(_mi_ledger_path)"
 
@@ -852,14 +864,37 @@ _mi_repair_reset_ledger() {
     # them is "valid, just newer".
   fi
 
-  if [ -f "$f" ] && ! ( mi_ledger_read >/dev/null 2>&1 ); then
-    local aside="${f}.corrupt.$$"
-    mv -f "$f" "$aside" || { mi_warn "repair: cannot move the corrupt ledger aside"; return 1; }
-    mi_warn "repair: the corrupt ledger has been PRESERVED at $aside — it is evidence, not rubbish."
-    mi_warn "  Its trust anchor could not be salvaged either — nothing here was readable to salvage it"
-    mi_warn "  from — so this installation will need to be online once to re-establish it."
-    printf '' | mi_ledger_write
-    return $?
+  if [ -f "$f" ]; then
+    local rrc
+    if ( mi_ledger_read >/dev/null 2>&1 ); then rrc=0; else rrc=$?; fi
+    if [ "$rrc" -eq 4 ]; then
+      # rc 4 — POSITIVELY CONFIRMED corrupt content (round 8 cross-model gate). mi_ledger_read reaches
+      # this rc only once IT has already proven it holds a complete, faithful copy of the bytes on
+      # disk; a checksum computed over THOSE bytes disagreeing with what they claim, or their failing
+      # to parse as a ledger at all, is evidence about the ledger's CONTENT — not about this process's
+      # ability to read it this one time. This is the ONLY failure this function treats as licence to
+      # destroy.
+      local aside="${f}.corrupt.$$"
+      mv -f "$f" "$aside" || { mi_warn "repair: cannot move the corrupt ledger aside"; return 1; }
+      mi_warn "repair: the corrupt ledger has been PRESERVED at $aside — it is evidence, not rubbish."
+      mi_warn "  Its trust anchor could not be salvaged either — nothing here was readable to salvage it"
+      mi_warn "  from — so this installation will need to be online once to re-establish it."
+      printf '' | mi_ledger_write
+      return $?
+    elif [ "$rrc" -ne 0 ]; then
+      # ANY OTHER non-zero rc (1, typically) does NOT positively confirm anything about the ledger's
+      # content — it can be a transient read/IO failure while THIS call was copying or hashing an
+      # otherwise-perfectly-good file, which looks, from here, indistinguishable from real damage. The
+      # whole point of the rc split above is to not guess: renaming this aside or replacing it would be
+      # destroying a possibly-still-valid ledger, and its trust anchor and rollback floors along with
+      # it, on exactly that guess. Refuse instead — nothing here has been touched or moved.
+      mi_warn "repair: the ledger exists but could not be read, and nothing here positively confirms"
+      mi_warn "  its content is corrupt — this can be a transient read or I/O failure rather than actual"
+      mi_warn "  damage. Refusing to move it aside or replace it on a guess; nothing has been touched."
+      mi_warn "  Re-run; if this persists, investigate the filesystem/storage this installation's state"
+      mi_warn "  lives on before repairing further."
+      return 1
+    fi
   fi
   local records rc kept="" line anchor_count=0 anchor_row=""
   if records="$(mi_ledger_read)"; then rc=0; else rc=$?; fi

@@ -10,8 +10,21 @@ teardown() { teardown_test_env; }
 
 @test "a NEWER ledger schema is refused, naming the required version (already Plan 1; asserted here)" {
   mi_lock_acquire; mi_ident_ensure >/dev/null; mi_lock_release
-  sed 's/schema=1/schema=99/' "$MYTHICAL_HOME/.state/ledger" > "$MYTHICAL_HOME/.state/l2"
-  mv "$MYTHICAL_HOME/.state/l2" "$MYTHICAL_HOME/.state/ledger"
+  # Recompute the checksum after bumping the schema, so this is a CHECKSUM-VALID, merely-newer-schema
+  # ledger, not a checksum mismatch — the same construction tests/unit/ledger.bats' own "a newer schema
+  # is refused, not parsed" test uses (header+body first, digest THAT exact file, append the sum).
+  # Round 8 split mi_ledger_read's old single "corrupt/newer-schema" rc 1 into rc 4 (positively
+  # confirmed corrupt: a checksum mismatch, checked BEFORE the schema number is ever read) and rc 1
+  # (refused without confirming anything about the content, which is what a checksum-valid newer
+  # schema deliberately stays). A bare `sed` replace leaving the OLD checksum in place — this test's
+  # prior construction — produces a checksum MISMATCH, not a clean newer-schema ledger; before the
+  # split that happened to land on the same rc as this test asserts either way, so it never actually
+  # pinned "newer schema" specifically. Rebuilding the checksum over the bumped header is what does.
+  local f="$MYTHICAL_HOME/.state/ledger"
+  sed -e 's/schema=1/schema=99/' -e '$d' "$f" > "$f.new"
+  local sum; sum="$(mi_digest "$f.new")"
+  printf '#sha256=%s\n' "$sum" >> "$f.new"
+  mv "$f.new" "$f"
   run mi_ident_get
   [ "$status" -eq 1 ]
 }
@@ -722,4 +735,61 @@ teardown() { teardown_test_env; }
   load_mctl
   run mi_ident_get
   [ "$status" -eq 3 ]
+}
+
+# --- codex round 8: 1 HIGH — a transient read failure must not be treated as confirmed corruption ---
+
+@test "a transient/unreadable ledger read does not destroy it — repair fails closed, ledger intact" {
+  mi_lock_acquire; mi_ident_ensure >/dev/null; mi_lock_release
+  local f="$MYTHICAL_HOME/.state/ledger" before
+  before="$(mi_digest "$f")"
+  # A broken digest TOOL is an operational failure of this process's environment, not evidence about
+  # the ledger's own bytes: mi_ledger_read's "failed to compute checksum" branch stays rc 1
+  # (lib/ledger.sh), never rc 4 — the same distinction a genuine mid-read I/O error would hit. Reached
+  # with zero labelled runtime objects (none created below, same as the round-2 "NEWER schema" test
+  # above), mi_repair_run takes the --reinitialize path and calls _mi_repair_reset_ledger, whose destroy
+  # gate must refuse on this rc rather than treat "the read failed" as "the content is corrupt". Before
+  # the fix, ANY nonzero non-absent rc reached the SAME destroy branch (mi_die always `exit 1`, so
+  # "checksum mismatch" and "the hasher itself is broken" were indistinguishable) and reset a perfectly
+  # good ledger — discarding the trust anchor and every rollback floor — over a failure that said
+  # nothing about its content (round 8 cross-model gate, the residual round 2 flagged and left open).
+  local badbin="$BATS_TEST_TMPDIR/badbin"; mkdir -p "$badbin"
+  printf '#!/usr/bin/env bash\nexit 3\n' > "$badbin/sha256sum"; chmod +x "$badbin/sha256sum"
+  printf '#!/usr/bin/env bash\nexit 3\n' > "$badbin/shasum";    chmod +x "$badbin/shasum"
+  local oldpath="$PATH"
+  PATH="$badbin:$PATH"
+  run mi_repair_run "$IDX" --reinitialize
+  PATH="$oldpath"
+  [ "$status" -ne 0 ]
+  assert_contains "could not be read"
+  assert_contains "positively confirms"
+  # untouched: same bytes as before the broken-tool run, no `.corrupt.*` sibling, still reads clean
+  # now that a working digest tool is back on PATH.
+  [ "$(mi_digest "$f")" = "$before" ] \
+    || { echo "the ledger was replaced — it now holds: $(cat "$f")" >&2; return 1; }
+  [ -z "$(find "$MYTHICAL_HOME/.state" -maxdepth 1 -name '*.corrupt.*' -print -quit)" ] \
+    || { echo "a .corrupt.* sibling was created despite this being a non-positive-corruption failure" >&2; return 1; }
+  run mi_ledger_read
+  assert_ok
+}
+
+@test "a GENUINELY corrupt ledger (checksum mismatch) still is destroyed, preserved aside, and rebuilt" {
+  # The other half of the round-8 fix: proving the rc 1/4 split did not turn the destroy path OFF for
+  # the case that must still use it. A checksum mismatch is rc 4 (positively confirmed corrupt content
+  # — lib/ledger.sh), so this must behave exactly as it did before round 8: reset, evidence preserved,
+  # a fresh identity minted.
+  mi_lock_acquire; mi_ident_ensure >/dev/null; mi_lock_release
+  local f="$MYTHICAL_HOME/.state/ledger"
+  printf 'tampered\tx=1\n' >> "$f"     # body changed after the checksum was written — genuine corruption
+  run mi_repair_run "$IDX" --reinitialize
+  [ "$status" -eq 0 ]
+  assert_contains "PRESERVED"
+  local corrupt_count=0 g
+  for g in "$MYTHICAL_HOME/.state/"ledger.corrupt.*; do [ -e "$g" ] && corrupt_count=$((corrupt_count + 1)); done
+  [ "$corrupt_count" -eq 1 ]
+  load_mctl
+  run mi_ledger_read
+  assert_ok
+  run mi_ident_get
+  [ "$status" -eq 0 ]
 }
