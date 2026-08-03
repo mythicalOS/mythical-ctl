@@ -17,9 +17,41 @@ _mi_num_gt() {
   [[ "$a" > "$b" ]]   # equal length ⇒ byte order equals numeric order for digits (under LC_ALL=C)
 }
 
-# Print body records (everything between the header and the checksum). Validates first.
-# Exit: 0 ok · 3 missing · 1 corrupt/newer-schema (fail closed).
-mi_ledger_read() {
+# THE SHARED IMPLEMENTATION. Print body records (everything between the header and the checksum),
+# validating first. INTERNAL — every ordinary caller goes through the public `mi_ledger_read` wrapper
+# below, which normalizes this function's finer-grained rc to the PUBLIC 0/1/3 contract every existing
+# caller (and every existing test of every module) already depends on. This function alone carries the
+# extra distinction repair's destroy gate needs, via `mi_ledger_confirmed_corrupt` further below — the
+# ONE caller allowed to see it.
+#
+# rc 0 ok · 3 missing · 1 refused for a reason that does NOT positively confirm the ledger's CONTENT
+# is bad (a permissions/path-shape problem before we ever open it, unable to even snapshot or read the
+# bytes, the digest tool itself failed, or the schema is merely NEWER than this build understands —
+# D35's own gate, not corruption) · 4 the content itself is POSITIVELY CONFIRMED corrupt: this function
+# already holds a complete, faithful private copy of the bytes on disk (the snapshot below succeeded)
+# and either they fail to parse as a ledger or their own checksum disagrees with what they claim.
+#
+# THE 1-vs-4 SPLIT EXISTS FOR REPAIR (round 8 cross-model gate). `state repair`'s reset path renames an
+# existing ledger aside and replaces it with an empty one — a real destructive action only corruption
+# justifies. Before this split every non-absent failure here reported the SAME rc 1 (mi_die always
+# `exit 1`), so a failure with NO bearing on the ledger's actual content — a runtime I/O error while
+# THIS call was copying or hashing it, an out-of-space mktemp, a momentarily broken sha256 tool — was
+# indistinguishable from a genuinely corrupt file, and the reset path could not tell them apart: it
+# reset a perfectly good ledger, discarding the trust anchor and every rollback floor, because reading
+# it once happened to fail for a reason that said nothing about its bytes. rc 4 is reported ONLY once
+# `cat "$f" > "$snap"` below has already succeeded — from that point on, "these exact bytes do not
+# check out" is genuine, positive evidence, not a guess. Everything before that point — unable to even
+# take the snapshot, unable to read it — stays rc 1: nothing about the content was ever established.
+#
+# rc 4 MUST NOT leak past the public wrapper (round 8-refined: the FIRST cut of this split gave rc 4
+# directly to `mi_ledger_read`, which every general caller — `mi_ledger_get`/`mi_led_all` and the
+# direct callers in prov.sh/trust.sh/state.sh/intent.sh — propagates unexamined; a corrupt ledger then
+# surfaced as rc 4 instead of rc 1 through ALL of them, and `tests/unit/prov.bats`'s "a corrupt ledger
+# fails CLOSED for identity" test, which asserts rc 1 specifically, broke. Those modules' rc-1 contract
+# for a corrupt ledger is the CORRECT, load-bearing one and must stay byte-for-byte; only repair may
+# ever see the finer distinction, and only through the dedicated helper below, never through this
+# function's own name).
+_mi_ledger_read_impl() {
   local f; f="$(_mi_ledger_path)"
   # ABSENT is rc 3 — a legitimate first write. PRESENT-BUT-NOT-A-REGULAR-FILE is not absent, and
   # conflating the two was silent data loss. `[ -f ]` alone is false for a directory and for a
@@ -48,7 +80,13 @@ mi_ledger_read() {
   # The file MUST end in a newline. Truncating just the final byte leaves the header/body byte range
   # identical, so `sed '$d'` would hash the same bytes and accept a truncated write. A trailing
   # newline makes `tail -c1` yield empty; anything else is truncation → fail closed.
-  [ -z "$(tail -c1 "$snap")" ] || { rm -f "$snap"; mi_die "ledger is not newline-terminated (truncated?) — refusing (fail closed)"; }
+  #
+  # rc 4 from here down: $snap is a proven, complete, private copy of the bytes on disk (the `cat`
+  # above already succeeded), so every refusal below is POSITIVE evidence about THOSE bytes — not
+  # about this process's ability to read them.
+  if [ -n "$(tail -c1 "$snap")" ]; then
+    rm -f "$snap"; mi_warn "ledger is not newline-terminated (truncated?) — refusing (fail closed)"; return 4
+  fi
 
   # Split: header (line 1), checksum (last line), body (the rest).
   local header checkline
@@ -56,27 +94,42 @@ mi_ledger_read() {
   checkline="$(tail -n1 "$snap")"
   case "$checkline" in
     '#sha256='*) : ;;
-    *) rm -f "$snap"; mi_die "ledger checksum line missing or malformed — refusing (fail closed)" ;;
+    *) rm -f "$snap"; mi_warn "ledger checksum line missing or malformed — refusing (fail closed)"; return 4 ;;
   esac
 
-  # Recompute the checksum over everything except the last line.
+  # Recompute the checksum over everything except the last line. A FAILURE to compute it (the digest
+  # tool itself misbehaving) is an operational fact about this process, not evidence about the ledger's
+  # bytes — stays rc 1 via mi_die. A computed-but-DISAGREEING checksum is the opposite: definitive,
+  # positive proof the bytes do not check out.
   local recomputed expected
   expected="${checkline#\#sha256=}"
   recomputed="$(sed '$d' "$snap" | mi_digest /dev/stdin)" || { rm -f "$snap"; mi_die "ledger: failed to compute checksum — refusing (fail closed)"; }
   [ -n "$recomputed" ] || { rm -f "$snap"; mi_die "ledger: empty computed checksum — refusing (fail closed)"; }
-  [ "$recomputed" = "$expected" ] || { rm -f "$snap"; mi_die "ledger checksum mismatch — refusing (fail closed)"; }
+  if [ "$recomputed" != "$expected" ]; then
+    rm -f "$snap"; mi_warn "ledger checksum mismatch — refusing (fail closed)"; return 4
+  fi
 
   # Schema gate (after integrity, so a torn header is caught as corruption first).
   case "$header" in
     '#mythical-ctl-ledger schema='*) : ;;
-    *) rm -f "$snap"; mi_die "ledger header malformed — refusing (fail closed)" ;;
+    *) rm -f "$snap"; mi_warn "ledger header malformed — refusing (fail closed)"; return 4 ;;
   esac
   local schema="${header#\#mythical-ctl-ledger schema=}"
   # Must be plain decimal digits BEFORE any comparison — a non-numeric schema is corruption.
   case "$schema" in
-    ''|*[!0-9]*) rm -f "$snap"; mi_die "ledger schema '$schema' is not a number — refusing (fail closed)" ;;
+    ''|*[!0-9]*)
+      rm -f "$snap"; mi_warn "ledger schema '$schema' is not a number — refusing (fail closed)"; return 4 ;;
   esac
   # Compare as decimal STRINGS, never via `[ -gt ]` (overflow → parse). Digit-count then lexical.
+  #
+  # NEWER-than-understood is deliberately NOT rc 4. It is the one case in this function where the
+  # checksum has already validated AND the header parses cleanly, yet the ledger must still be
+  # refused — and unlike every rc-4 case above, refusing it is not because anything is wrong with
+  # these bytes: D35 says a newer mythical-ctl legitimately wrote a schema this build does not
+  # understand yet. Reporting rc 4 here would tell a caller "destroy this", and repair's reset path
+  # (lib/repair.sh) would rename a STILL-VALID, merely-newer ledger aside and replace it with an
+  # empty one — deleting everything a newer mythical-ctl already recorded through the repair door
+  # instead of the read door. Stays rc 1: refused, but never mistaken for corruption.
   if _mi_num_gt "$schema" "$MI_LEDGER_SCHEMA"; then
     rm -f "$snap"; mi_die "ledger schema $schema is newer than this mythical-ctl understands ($MI_LEDGER_SCHEMA) — refusing"
   fi
@@ -84,6 +137,41 @@ mi_ledger_read() {
   # Body = everything except line 1 and the last line — from the SAME snapshot we validated.
   sed -e '1d' -e '$d' "$snap"
   rm -f "$snap"
+}
+
+# THE PUBLIC READER. Every ordinary caller's contract, UNCHANGED from before round 8: rc 0 ok · 3
+# missing · 1 refused — corrupt, newer-schema, and a transient read/IO failure ALL report this same rc,
+# exactly as they always did. `mi_ledger_get`/`mi_led_all` and the direct callers in prov.sh/trust.sh/
+# state.sh/intent.sh all propagate whatever this returns unexamined beyond `-eq 3`; none of them, or
+# their tests, may observe rc 4 — only `_mi_ledger_read_impl` produces it, and only
+# `mi_ledger_confirmed_corrupt` below ever looks for it.
+mi_ledger_read() {
+  _mi_ledger_read_impl
+  local rc=$?
+  case "$rc" in
+    4) return 1 ;;
+    *) return "$rc" ;;
+  esac
+}
+
+# THE ONE CALLER ALLOWED TO SEE THE DISTINCTION. Whether the ledger, if present, is POSITIVELY
+# CONFIRMED corrupt — a checksum computed over a complete, faithfully-read copy of its bytes
+# disagreeing with what they claim, or those same proven bytes failing to parse as a ledger at all.
+# This exists ONLY for `state repair`'s destroy-and-rebuild gate (lib/repair.sh), which may act only on
+# this, never on "could not be read" in general — see `_mi_ledger_read_impl`'s own rc-4 note for why.
+#
+# rc 0 positively confirmed corrupt (destroy-eligible) · 1 NOT confirmed corrupt — covers a valid
+# ledger, an absent ledger, AND an unreadable-for-an-unproven-reason ledger alike; the caller must treat
+# all three the same way: do not destroy.
+#
+# Subshelled: `_mi_ledger_read_impl` still routes its OWN operational-failure branches through
+# `mi_die`, which calls `exit`. Called bare (as this function's caller does — `if
+# mi_ledger_confirmed_corrupt; then`, not through `$( )`), an unguarded `exit` there would terminate the
+# CALLER's process, not just this function. `( … )` contains it to a boolean answer, the same way
+# `mi_ledger_write` and repair's own destroy-probe already contain `mi_ledger_read` for the same reason.
+mi_ledger_confirmed_corrupt() {
+  ( _mi_ledger_read_impl >/dev/null 2>&1 )
+  [ "$?" -eq 4 ]
 }
 
 # Replace the ledger atomically from records on stdin. Requires the caller to actually HOLD the
