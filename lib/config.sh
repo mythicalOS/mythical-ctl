@@ -708,19 +708,51 @@ mi_conf_family_cas() {
     *) mi_warn "config: '$attempt' is not an attempt state"; return 1 ;;
   esac
 
-  # Rewrite with the key REPLACED, preserving every other line byte-for-byte. Re-read immediately before
-  # the rename to narrow (never close) the human window.
-  local dir tmp line wrote=0
+  # NOT A COMPARE-AND-SET UNLESS THE COMPARE HAPPENS AT THE WRITE. The check just completed reads the
+  # file once; building the replacement below reads it AGAIN, independently — and between those two
+  # reads is a real window (mktemp, chmod, the read itself) in which an operator's own edit can land.
+  # Re-reading the CURRENT content without re-comparing it would silently discard that edit: the
+  # rewrite would replace whatever is now there with $val regardless of whether it is still what this
+  # call verified. `expected` is the value THIS call cleared to write over — $prior for an ordinary
+  # compare-and-set, or the exact value that was just CONFIRMED to be overwritten for `started` — and
+  # the comparison is repeated using the SAME pass that builds the rewritten file, immediately before
+  # each line is decided, so nothing after this read may act on a fact this read did not itself
+  # establish. This narrows the window stated above (the operation lock has no authority over a text
+  # editor) to the read itself; it does not and cannot close it.
+  local expected="$prior"
+  [ "$attempt" = started ] && expected="$cur"
+
+  local dir tmp line wrote=0 sawkey=0 nowval
   dir="$(dirname "$f")"
   tmp="$(mktemp "$dir/.mythical.conf.XXXXXX")" || { mi_warn "config: cannot create a temp file"; return 1; }
   chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
   if [ -f "$f" ]; then
     while IFS= read -r line || [ -n "$line" ]; do
       case "$line" in
-        "${key}="*) printf '%s=%s\n' "$key" "$val" >> "$tmp"; wrote=1 ;;
+        "${key}="*)
+          sawkey=1
+          nowval="${line#*=}"
+          if [ "$nowval" != "$expected" ]; then
+            rm -f "$tmp"
+            mi_warn "config: $key now holds '${nowval}', not '${expected}' as this call verified — it"
+            mi_warn "  changed between that check and this rewrite. Refusing to overwrite an edit this"
+            mi_warn "  call never re-verified. Re-run to re-evaluate against the CURRENT value."
+            return 1
+          fi
+          printf '%s=%s\n' "$key" "$val" >> "$tmp"; wrote=1 ;;
         *) printf '%s\n' "$line" >> "$tmp" ;;
       esac
     done < "$f"
+  fi
+  if [ "$sawkey" -eq 0 ] && [ -n "$expected" ]; then
+    # Expected to find $key holding $expected, and this pass never saw the key at all — it was DELETED
+    # between the check and the rewrite. Absent is not the same fact as "holds $expected", and
+    # appending $val below would write back a line an operator's edit just removed.
+    rm -f "$tmp"
+    mi_warn "config: $key is no longer present in $f (expected it to hold '${expected}') — it was"
+    mi_warn "  removed between this call's check and its rewrite. Refusing to write '${val}' over an"
+    mi_warn "  edit this call never re-verified. Re-run to re-evaluate against the current file."
+    return 1
   fi
   [ "$wrote" -eq 1 ] || printf '%s=%s\n' "$key" "$val" >> "$tmp"
   mv -f "$tmp" "$f" || { rm -f "$tmp"; mi_warn "config: could not replace $f"; return 1; }

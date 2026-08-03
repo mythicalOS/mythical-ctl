@@ -89,6 +89,12 @@ mi_mig_verify_identity() {
 # st_dev is not conclusive of "not a mount point" — only a DIFFERING st_dev is conclusive of the
 # opposite. A differing st_dev below is therefore used only as a cheap first filter, never as the test
 # on its own; a matching st_dev falls through to the mount table, which is authoritative either way.
+#
+# rc 0 IS a mount point · 1 is NOT (established positively, or the path does not resolve/exist at all
+# — nothing there cannot be a mount point) · 2 COULD NOT BE ESTABLISHED (the mount table itself could
+# not be read). Callers must treat 2 as its own case, never fold it into 1: "could not determine" is
+# not "not a mount point", and a caller that cannot tell the two apart silently proceeds on an absence
+# of evidence rather than evidence of absence.
 mi_mig_is_mountpoint() {
   if [ "$#" -ne 1 ]; then mi_warn "migrate: mi_mig_is_mountpoint needs a <path>"; return 1; fi
   local p="$1" canon
@@ -130,10 +136,39 @@ mi_mig_is_mountpoint() {
   # buys nothing there, and on a BSD where it IS supported it prints fstab format that the parser below
   # does not read — while SUCCEEDING, which would suppress the fallback and silently make this check
   # find nothing. A probe that quietly finds nothing is worse than one that is not attempted.
-  local mp
-  while IFS= read -r mp; do
-    [ "$mp" = "$canon" ] && return 0
-  done <<< "$( mount 2>/dev/null | sed -n 's/^.* on \([^(]*\) (.*$/\1/p' | sed 's/[[:space:]]*$//' )"
+  #
+  # THE PIPELINE'S OWN EXIT STATUS IS CAPTURED FIRST, never discarded into a pipe. `mount | sed | sed`
+  # reports only the LAST stage's status — a `mount` that fails (unreadable table, daemon down, `mount`
+  # missing from PATH, whatever) still leaves `sed` reading empty input and exiting 0, so the whole
+  # pipeline "succeeds" having found nothing, and nothing found reads exactly like "not a mount point".
+  # Read the raw output into a variable and check `mount`'s OWN exit status before filtering ANYTHING;
+  # the filtering itself is done in pure shell below (never a second pipeline stage), so nothing
+  # downstream of this check can mask a real failure the same way again.
+  local raw mrc
+  raw="$(mount 2>/dev/null)"; mrc=$?
+  if [ "$mrc" -ne 0 ]; then
+    mi_warn "migrate: the mount table could not be read ('mount' exited ${mrc}), so whether '$canon' is"
+    mi_warn "  a mount point cannot be established. Refusing rather than treating 'could not determine'"
+    mi_warn "  as 'not a mount point'."
+    return 2
+  fi
+  local line2 mp
+  while IFS= read -r line2; do
+    case "$line2" in
+      *' on '*)
+        # `${line2##* on }` is the GREEDY-prefix equivalent of the sed pass's `^.* on ` — the LAST
+        # occurrence of " on " in the line, matching a device or mountpoint name that itself happens to
+        # contain the substring " on ". `${…%%(*}` then takes the FIRST literal `(` after that (the
+        # start of the `(type, …)` suffix), and the trim loop removes the one-or-more trailing
+        # whitespace characters the original `sed 's/[[:space:]]*$//'` pass removed.
+        mp="${line2##* on }"
+        mp="${mp%%(*}"
+        while :; do
+          case "$mp" in *[[:space:]]) mp="${mp%[[:space:]]}" ;; *) break ;; esac
+        done
+        [ "$mp" = "$canon" ] && return 0 ;;
+    esac
+  done <<< "$raw"
   return 1
 }
 
@@ -402,12 +437,22 @@ _mi_mig_precheck_body() {
   # EXCEPT WHEN THE DESTINATION IS ITSELF A MOUNT POINT — then its sibling may be on the PARENT
   # filesystem, making the rename cross-device (EXDEV), and replacing a mount point fails regardless
   # (EBUSY).
-  if mi_mig_is_mountpoint "$dest"; then
+  #
+  # rc 2 (the mount table could not be read) is its OWN case, not folded into "not a mount point" — a
+  # bare `if mi_mig_is_mountpoint …` treats every nonzero alike, which is exactly the fail-open this
+  # distinguishes against.
+  local mprc
+  if mi_mig_is_mountpoint "$dest"; then mprc=0; else mprc=$?; fi
+  if [ "$mprc" -eq 0 ]; then
     mi_warn "migrate: '$dest' is itself a mount point, so the atomic commit cannot work: a sibling of it"
     mi_warn "  may be on the parent filesystem (EXDEV), and replacing a mount point fails anyway (EBUSY)."
     mi_warn "  The remedy is to migrate into a subdirectory of the mount instead — that restores a"
     mi_warn "  same-filesystem sibling and works normally. Refusing beats silently falling back to a"
     mi_warn "  non-atomic copy, which would give up the one property this phase exists to provide."
+    return 1
+  elif [ "$mprc" -eq 2 ]; then
+    mi_warn "migrate: whether '$dest' is a mount point could not be established (see above). Refusing"
+    mi_warn "  rather than proceed on the strength of an unreadable mount table."
     return 1
   fi
 
@@ -576,7 +621,14 @@ _mi_mig_run_body() {
       ;;
     3)
       mi_copy_available "$idx" || return 1
-      if mi_mig_is_mountpoint "$dest"; then mi_warn "migrate: '$dest' became a mount point"; return 1; fi
+      local mprc
+      if mi_mig_is_mountpoint "$dest"; then mprc=0; else mprc=$?; fi
+      case "$mprc" in
+        0) mi_warn "migrate: '$dest' became a mount point"; return 1 ;;
+        2) mi_warn "migrate: whether '$dest' is a mount point could not be established (see above)."
+           mi_warn "  Refusing rather than proceed on the strength of an unreadable mount table."
+           return 1 ;;
+      esac
       local prior3 attempt3 desired3
       prior3="$(_mi_mig_carry "$rec" prior)" || return 1
       attempt3="$(_mi_mig_carry "$rec" attempt none)" || return 1
@@ -633,7 +685,23 @@ _mi_mig_run_body() {
         mi_log "  process to compare against. A genuine crash here re-enters phase 3, which redoes the"
         mi_log "  copy from scratch; this call has nothing to do."
       else
-        local n
+        # THE SAME TOCTOU PHASE 3 CLOSES, closed here too — $stage is handed to THREE separate external
+        # touches below (mi_copy_verify mounts it read-only in the copy helper; mi_copy_host_access_check
+        # walks it directly on the host; mi_copy_access_check mounts it writable in the copy helper and
+        # writes a probe file), each its own process round-trip, each a window in which an attacker who
+        # controls the destination's parent could replace $stage with a symlink to somewhere else
+        # entirely. A recorded identity to verify against MUST exist here: phase 3 always records
+        # `stageid` in the SAME ledger write that creates $stage (never one without the other), so
+        # reaching phase 4 with $stage on disk but no recorded identity is a corrective ledger edit, not
+        # a live migration — exactly the ambiguity phase 5 refuses under (§5.2's "no identity, no
+        # commit"), and this refuses the same way rather than trust a directory it cannot attribute.
+        local n stageid4
+        stageid4="$(_mi_mig_carry "$rec" stageid)" || return 1
+        if [ -z "$stageid4" ]; then
+          mi_warn "migrate: phase 4 has no recorded staging identity, so this process cannot prove the"
+          mi_warn "  directory at '$stage' is its own. Refusing to verify or access it."
+          return 1
+        fi
         n="${MI_COPY_ENTRIES:-}"
         case "$n" in
           ''|*[!0-9]*)
@@ -642,9 +710,12 @@ _mi_mig_run_body() {
             mi_warn "  no step derived."
             return 1 ;;
         esac
+        mi_mig_verify_identity "$stage" "$stageid4" "the staging directory" || return 1
         mi_copy_verify "$idx" "$srcvol" "$stage" "$n" "$ruid" "$ouid" || return 1
+        mi_mig_verify_identity "$stage" "$stageid4" "the staging directory" || return 1
         mi_copy_host_access_check "$stage" || return 1
         if [ "$ruid" != "$ouid" ]; then
+          mi_mig_verify_identity "$stage" "$stageid4" "the staging directory" || return 1
           mi_copy_access_check "$idx" "$stage" "$ruid" || return 1
         fi
       fi
@@ -750,6 +821,18 @@ _mi_mig_run_body() {
       _mi_mig_set "$product" "$role" 7 "dest=${dest}" "srcvol=${srcvol}" "staging=${stage}" \
         "nonce=${nonce}" "confkey=${key}" "prior=${prior7}" "attempt=${attempt7}" \
         "desired=${desired7}" "mount=${mount}" "stageid=${stageid7}" || return 1
+      # RE-VERIFIED BEFORE THE REPLACEMENT CONTAINER MOUNTS IT, and before the (irreversible) old
+      # container is removed below — $dest is about to become a live bind source for the ACTUAL
+      # product container, the same class of external use phase 3/4 already close, not a throwaway
+      # helper. When a real identity was recorded (the ordinary case — every live migration has one by
+      # the time it reaches phase 7, since phase 3 always records it and phase 5's rename preserves
+      # it), it is re-verified here, before anything below acts. When none was ever recorded (phase 5's
+      # "nothing was there to protect" fallback, which establishes no identity because it attributed
+      # nothing) there is nothing to check against, and this is unchanged from before — the same
+      # absence of evidence phase 5 itself already accepted at the moment $dest was created.
+      if [ -n "$stageid7" ]; then
+        mi_mig_verify_identity "$dest" "$stageid7" "the destination" || return 1
+      fi
       local netid alias image envfile
       netid="$(mi_net_target "$idx")" || return 1
       alias="$(mi_name_alias "$product")" || return 1
