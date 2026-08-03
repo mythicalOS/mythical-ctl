@@ -364,13 +364,19 @@ mi_name_network() {
 #
 # So it has to be the name the siblings actually resolve, and they resolve the PREFIXED one. Each
 # shipped product states this contract as data in its own source, as a table it calls the single
-# source of truth, for candidate ②:
+# source of truth, for candidate ②. The container is `mythical-<product>` (mi_name_alias) and the
+# service DNS is `http://mythical-<product>:<UI port>`; the UI ports are:
 #
-#     product   container          UI port   service DNS
-#     brokkr    mythical-brokkr    7480      http://mythical-brokkr:7480
-#     saga      mythical-saga      7482      http://mythical-saga:7482
-#     skuld     mythical-skuld     7481      http://mythical-skuld:7481
+#     product   container          service DNS
+#     brokkr    mythical-brokkr    http://mythical-brokkr:<port>
+#     saga      mythical-saga      http://mythical-saga:<port>
+#     skuld     mythical-skuld     http://mythical-skuld:<port>
 #
+# The UI ports themselves are declared BELOW as machine-readable data (mi_family_ports), not left
+# in this prose block — because a cross-repo contract test (D15) cannot assert a comment, and the
+# three independent owners of this table (this file, mythical-saga's core/family-peers.ts and
+# mythical-brokkr's ui/src/server/route-family.ts) are reconciled by that test rather than by a
+# shared source. Change a port here without changing the other two owners and the test fails.
 # TWO DIFFERENT NAMES, AND CONFLATING THEM IS WHAT PUT THE BARE FORM HERE. The DNS name is
 # `mythical-<product>`; the `product` STRING each sibling reports at `GET /detect` is the BARE key
 # (`brokkr`, not `mythical-brokkr`) — that source says so explicitly, and notes the family
@@ -386,4 +392,18 @@ mi_name_alias() {
   if [ "$#" -ne 1 ]; then mi_warn "manifest: mi_name_alias needs <product>"; return 1; fi
   _mi_name_part_ok "$1" || { mi_warn "manifest: '$1' is not a product identifier"; return 1; }
   printf '%s-%s\n' "$MI_NAME_PREFIX" "$1"
+}
+
+# The family UI-port table (D15) — this repo's machine-readable single source of truth for the
+# family's UI ports, promoted from the prose block above so a test can assert it. Emitted as
+# `<product>\t<port>` rows, the same tab-separated shape mi_manifest_spec uses, so it is DATA a
+# reader parses rather than a comment it cannot. This is one of THREE independent owners of the
+# same numbers (mythical-saga core/family-peers.ts, mythical-brokkr ui/src/server/route-family.ts);
+# the cross-repo contract test executes this function and asserts all three agree. Changing a port
+# here without changing the other two owners fails that test — which is the whole point (D15: the
+# table is reconciled by a test, never by a vendored shared copy).
+mi_family_ports() {
+  printf 'brokkr\t7480\n'
+  printf 'saga\t7482\n'
+  printf 'skuld\t7481\n'
 }
