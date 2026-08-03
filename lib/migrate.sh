@@ -134,6 +134,43 @@ mi_mig_resolve_phase5() {
   return 1
 }
 
+# RESUME MUST VERIFY, NOT TRUST (§5.2). The recorded phase is a WRITE-AHEAD intent — written BEFORE
+# the phase's own action runs, precisely so a crash mid-action still names the phase that was in
+# progress. That same property means a recorded phase of 6 or later does NOT, by itself, prove phase
+# 5's rename ever produced a destination: phases 1-5 are each the first place that establishes their
+# own postcondition, so resuming AT any of them is always well-defined, but 6 (write the config)
+# through 9 (restore desired state) all depend on phase 5's result already being on disk — phase 7's
+# bind mount fails outright if the destination is not there.
+#
+# Verified the same way phase 5 itself verifies (mi_mig_resolve_phase5): the recorded device+inode,
+# found or not, is the ONLY evidence trusted — never the destination's mere presence, and never its
+# absence either. If it checks out, the recorded phase is trustworthy and resume proceeds from there
+# unmodified. If it does not — no identity was ever recorded, or it is at neither candidate path, or
+# the destination holds something else entirely — resume falls back to phase 5, where the SAME
+# resolve-and-recover logic that already handles a genuine phase-5 crash (retry the rename from
+# staging, or — when nothing was ever recorded because there was nothing yet to protect — proceed with
+# an empty destination) re-derives the true state, and phases 6 on repeat over it. The source volume
+# is untouched throughout, so redoing this tail is always well-defined.
+mi_mig_resume_phase() {
+  if [ "$#" -ne 3 ]; then
+    mi_warn "migrate: mi_mig_resume_phase needs <recorded phase> <destination> <recorded stageid>"
+    return 1
+  fi
+  local phase="$1" dest="$2" stageid="$3"
+  case "$phase" in
+    [1-5]) printf '%s\n' "$phase"; return 0 ;;
+  esac
+  if [ -n "$stageid" ]; then
+    local curid
+    if curid="$(mi_mig_identity "$dest" 2>/dev/null)" && [ "$curid" = "$stageid" ]; then
+      printf '%s\n' "$phase"
+      return 0
+    fi
+  fi
+  printf '5\n'
+  return 0
+}
+
 # A RECOGNISABLE STAGING NAME IS NOT AUTHORITY. The destination is untrusted by §5.1's own premise, so
 # after a crash a directory bearing our staging name may be attacker-placed or may be replacement user
 # data. Recovery verifies the NONCE recorded in the intent AND the directory's IMMUTABLE IDENTITY
@@ -326,6 +363,17 @@ mi_mig_phase() {
   local rec
   rec="$(mi_led_find "$MI_MIG_KIND" key "$(_mi_mig_key "$1" "$2")")" || return $?
   mi_led_field "$rec" phase
+}
+
+# The recorded phase-5 identity (device+inode) for <product>/<role>, one field over from
+# mi_mig_phase — rc 0 prints it · 3 no migration is recorded, OR one is but has no stageid yet
+# (legitimate before phase 3 has ever run) · 1 refused. Kept separate rather than folded into
+# mi_mig_phase so a caller that only wants the phase never has to know this field exists.
+mi_mig_stageid() {
+  if [ "$#" -ne 2 ]; then mi_warn "migrate: mi_mig_stageid needs <product> <role>"; return 1; fi
+  local rec
+  rec="$(mi_led_find "$MI_MIG_KIND" key "$(_mi_mig_key "$1" "$2")")" || return $?
+  mi_led_field "$rec" stageid
 }
 
 _mi_mig_set() {   # <product> <role> <phase> <field>...
@@ -730,7 +778,7 @@ _mi_mig_run_body() {
 # Resume every live storage migration from its recorded phase.
 mi_mig_resume() {
   if [ "$#" -ne 3 ]; then mi_warn "migrate: mi_mig_resume needs <index> <policy> <manifest-dir-or-file>"; return 1; fi
-  local idx="$1" pol="$2" man="$3" recs rc rec product role dest phase p mf
+  local idx="$1" pol="$2" man="$3" recs rc rec product role dest phase p mf stageid srrc
 
   # CAPTURE AND CHECK FIRST. `done <<< "$(mi_led_all X)"` takes the WHILE loop's status, not the
   # listing's, so a corrupt or ambiguous ledger (rc 1) would be silently read as an EMPTY listing and
@@ -773,10 +821,26 @@ mi_mig_resume() {
          mi_warn "  one this core defines. Run 'mythical-ctl state repair'."
          return 1 ;;
     esac
+    # OPTIONAL: absent (rc 3) is legitimate — either no migration has reached phase 3 yet, or (as
+    # here) the resume itself has not decided the destination is trustworthy. Anything else is a real
+    # read failure and must not be silently treated as "nothing recorded".
+    if stageid="$(mi_led_field "$rec" stageid)"; then srrc=0; else srrc=$?; fi
+    if [ "$srrc" -eq 3 ]; then stageid=""
+    elif [ "$srrc" -ne 0 ]; then
+      mi_warn "migrate: the recorded migration for $product/$role could not be fully read (stageid)."
+      mi_warn "  Run 'mythical-ctl state repair'."
+      return 1
+    fi
+    p="$(mi_mig_resume_phase "$phase" "$dest" "$stageid")" || return 1
+
     mf="$man"
     [ -d "$man" ] && mf="${man}/${product}.manifest"
-    mi_log "migrate: resuming $product/$role at phase $phase."
-    p="$phase"
+    if [ "$p" = "$phase" ]; then
+      mi_log "migrate: resuming $product/$role at phase $phase."
+    else
+      mi_log "migrate: $product/$role recorded phase $phase, but the destination does not verifiably"
+      mi_log "  carry phase 5's result. Re-deriving from observable state: resuming at phase $p instead."
+    fi
     while [ "$p" -le 9 ]; do
       mi_mig_run "$idx" "$pol" "$mf" "$product" "$role" "$dest" "$p" || return 1
       p=$((p + 1))
@@ -836,6 +900,21 @@ _mi_verb_migrate_storage_locked() {
            mi_warn "  defines — refusing to resume it blindly. Run 'mythical-ctl state repair'."
            return 1 ;;
       esac
+      # THE RECORDED PHASE IS A WRITE-AHEAD INTENT, VERIFIED BEFORE IT IS TRUSTED — see
+      # mi_mig_resume_phase. A phase of 6 or later is only resumed there directly when the destination
+      # verifiably carries phase 5's result; otherwise this re-derives the true starting phase (5, where
+      # the existing resolve-and-recover logic takes it from there) so the operator is told, and this
+      # proceeds from, the phase that will actually run.
+      local stageid strc
+      if stageid="$(mi_mig_stageid "$product" "$role")"; then strc=0; else strc=$?; fi
+      if [ "$strc" -eq 3 ]; then stageid=""
+      elif [ "$strc" -ne 0 ]; then
+        mi_warn "verbs: the recorded migration for $product/$role could not be fully read (stageid)."
+        mi_warn "  Refusing to resume over a ledger this core cannot read. Run 'mythical-ctl state"
+        mi_warn "  repair'."
+        return 1
+      fi
+      p="$(mi_mig_resume_phase "$p" "$dest" "$stageid")" || return 1
       # CONFIRMATION COVERS RESUME TOO, NOT ONLY A FRESH START. Depending on the recorded phase,
       # resuming can stop the container, copy data, write mythical.conf, and replace the container —
       # the same destructive steps a fresh migration performs, picked up partway through.
