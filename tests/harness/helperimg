@@ -490,8 +490,20 @@ case "$cmd" in
     # dual-principal default ACL specifically. `skipped` is a genuine no-op ONLY when the two
     # principals are one uid — a default entry naming it twice grants nothing new.
     if [ "$ruid" = "$ouid" ]; then acl=skipped; else acl=ok; fi
+    # base5 is the "ordinary tree" count every HELPER_COPY setting reports UNLESS it also adds an
+    # entry= line of its own. Among the settings that reach a normal, completing verify (i.e. do not
+    # themselves refuse or mismatch during the copy), only `setuid` does that — one extra
+    # `entry=file:.../bin/tool` beside the base five (see the copy case above). This is a fixture-only
+    # self-consistency fix (§5.2 round 9): mi_copy_verify's caller binds `checked` to the COPY step's
+    # own MI_COPY_ENTRIES, which for HELPER_COPY=setuid is genuinely 6, not 5 — a hardcoded 5 here was
+    # a stale fixture count, not a real product defect (lib/copy.sh's count-binding check is exactly
+    # what is supposed to catch two fake-helper invocations disagreeing with each other). HELPER_COPY
+    # is still set in this verify invocation's own environment (the caller exports it for the whole
+    # copy+verify round trip), so it is read here read-only, never written.
+    base5=5
+    case "${HELPER_COPY:-}" in setuid) base5=6 ;; esac
     case "$knob" in
-      ok) printf 'checked=5\nacl=%s\ndone=ok\n' "$acl" ;;
+      ok) printf 'checked=%s\nacl=%s\ndone=ok\n' "$base5" "$acl" ;;
       # Completion claimed with no count: nothing in the answer says a single entry was looked at.
       nocount) printf 'acl=%s\ndone=ok\n' "$acl" ;;
       # Completion claimed having checked ZERO entries — a vacuous pass the caller must reject against

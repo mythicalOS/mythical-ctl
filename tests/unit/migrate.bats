@@ -487,6 +487,26 @@ teardown() { teardown_test_env; }
   chmod 700 "$base"; rm -rf "$base"
 }
 
+# --- home resolved and verified BEFORE any mkdir/chmod touches it (§5.2 round 9 / codex r8) ---------
+# The prior version built $dir from the RAW $(mi_home) and mkdir -p'd / chmod'd it BEFORE
+# canonicalizing — so an unsafe/attacker-repointable alias was already MUTATED (a directory created and
+# chmod'd at whatever it happened to resolve to) by the time the chain walk ran on the ALREADY-CREATED
+# target and refused. The refusal was correct; the mutation that already happened through the
+# unresolved alias was not — a root-run migration could be steered into creating+chmod-700ing an
+# attacker-chosen path. This asserts the observable difference: when MYTHICAL_HOME ITSELF is unsafe (no
+# ancestor trick needed — the walk covers home's own directory too), refusing must leave NOTHING
+# created under it — proving mkdir never ran before the safety check, not merely that the overall call
+# failed.
+@test "_mi_mig_secure_state_dir REFUSES an unsafe home WITHOUT ever creating anything under it" {
+  local unsafe_home; unsafe_home="$(mktemp -d)"
+  chmod 777 "$unsafe_home"
+  MYTHICAL_HOME="$unsafe_home" run _mi_mig_secure_state_dir probe
+  [ "$status" -ne 0 ]
+  assert_contains "writable by its group or by everyone"
+  [ ! -e "$unsafe_home/.state" ]   # not just refused — NOTHING was mkdir'd/chmod'd under the unsafe home
+  chmod 700 "$unsafe_home"; rm -rf "$unsafe_home"
+}
+
 @test "the escaping-symlink re-walk fails closed when MYTHICAL_HOME sits under an unsafe ancestor" {
   local base; base="$(mktemp -d)"
   chmod 777 "$base"

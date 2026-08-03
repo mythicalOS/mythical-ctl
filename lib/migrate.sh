@@ -204,8 +204,27 @@ _mi_mig_verify_chain_owner_safe() {
 # to an unsecured location.
 _mi_mig_secure_state_dir() {
   if [ "$#" -ne 1 ]; then mi_warn "migrate: _mi_mig_secure_state_dir needs a <name>"; return 1; fi
-  local name="$1" dir euid owner mode last2
-  dir="$(mi_home)/.state/${name}"
+  local name="$1" home dir euid owner mode last2
+
+  # RESOLVE mi_home TO CANONICAL — AND VERIFY ITS WHOLE CHAIN — BEFORE creating anything under it (§5.2
+  # round 9 / codex r8). The prior version built $dir from the RAW $(mi_home) and mkdir/chmod'd it before
+  # any canonicalization ran: if MYTHICAL_HOME is reached through a group/other-writable symlink alias, a
+  # party who controls that alias can repoint it between this function's build of $dir and its own
+  # mkdir/chmod, steering the CREATE and the CHMOD onto a target of their own choosing (a root-run
+  # migration can be made to mkdir+chmod-700 an attacker-selected root-owned path). The chain walk used
+  # to run only AFTER — on the already-created, already-mutated target — which passes but is worthless:
+  # the damage (an mkdir + a chmod at an attacker-chosen path) already happened through the unresolved
+  # alias by the time anything is checked. Resolving and verifying home FIRST means no mkdir/chmod below
+  # ever traverses an alias nobody has vetted yet — once home is proven canonical (no symlink components)
+  # and owner-safe all the way up, there is nothing left for another party to repoint out from under it.
+  home="$(mi_canon "$(mi_home)")" || {
+    mi_warn "migrate: '$(mi_home)' does not resolve. Refusing to use it as the installer's own secure"
+    mi_warn "  scratch location's home."
+    return 1
+  }
+  _mi_mig_verify_chain_owner_safe "$home" "the installer's own secure scratch location's home" || return 1
+
+  dir="$home/.state/${name}"
   mkdir -p -- "$dir" 2>/dev/null || {
     mi_warn "migrate: cannot create the installer's own '$name' directory ($dir)."
     return 1
@@ -249,16 +268,15 @@ _mi_mig_secure_state_dir() {
       return 1 ;;
   esac
 
-  # THE WHOLE ANCESTOR CHAIN, NOT JUST THE LEAF. A directory is only as trustworthy as the
-  # least-trusted directory ON THE PATH TO IT: the leaf being owner-only-writable is worthless if its
-  # parent — or ITS parent, all the way up to / — is writable by someone else, because that someone can
-  # rename the leaf away the instant after this function returns its "verified" path, and put whatever
-  # they want where it used to be (a symlink for the re-walk's temp file to follow; a directory of
-  # their own for reclaim's `mv` to land in). mi_home() (~/.mythical, or $MYTHICAL_HOME) is NOT assumed
-  # safe here — mi_ensure_layout (lib/layout.sh) neither secures nor verifies it, so a group/other-
-  # writable HOME (a permissive umask, or MYTHICAL_HOME pointed under a shared directory) is a REAL
-  # vulnerability, proved unsafe by walking it, never assumed safe by skipping it. The walk itself is
-  # _mi_mig_verify_chain_owner_safe, shared with mi_mig_check_parent_trust.
+  # THE WHOLE ANCESTOR CHAIN, NOT JUST THE LEAF — re-verified here, on top of the upfront $home check
+  # above, because $home alone does not cover `.state` or `.state/$name`: those two components did not
+  # exist before this call's own `mkdir -p` created them, so they were never part of the chain the
+  # upfront walk verified. A directory is only as trustworthy as the least-trusted directory ON THE PATH
+  # TO IT: the leaf being owner-only-writable is worthless if its parent — or ITS parent, all the way up
+  # to / — is writable by someone else, because that someone can rename the leaf away the instant after
+  # this function returns its "verified" path, and put whatever they want where it used to be (a symlink
+  # for the re-walk's temp file to follow; a directory of their own for reclaim's `mv` to land in). The
+  # walk itself is _mi_mig_verify_chain_owner_safe, shared with mi_mig_check_parent_trust.
   local lcanon
   lcanon="$(mi_canon "$dir")" || {
     mi_warn "migrate: '$dir' does not resolve. Refusing to use it as the installer's own secure scratch"

@@ -46,10 +46,16 @@ teardown() { teardown_test_env; }
 }
 
 @test "a volume with a setuid file migrates, with the privileged bit stripped and reported" {
-  HELPER_COPY=setuid run mi_verb_migrate_storage "$IDX" "$POL" "$MAN" p1 state --to-bind "$DEST" 2>"$BATS_TEST_TMPDIR/err"
-  status=$?
+  # §5.2 round 9: was `status=$?` (reads `run`'s OWN exit status, which bats' `run` always returns as
+  # 0, regardless of the wrapped command's real result — so this line never actually gated on anything)
+  # and a `grep` of a stderr FILE this command never wrote to (the "privileged bits stripped" line is
+  # `mi_log`, stdout, not `mi_warn`, stderr — lib/copy.sh:~394 — so the file was always empty and the
+  # grep always failed once the real status check above it was fixed to gate on anything at all). Both
+  # bugs were latent pre-existing test defects, independent of round 8/9's canonicalization work — fixed
+  # here to use bats' own $status/$output the way every other test in this file does.
+  HELPER_COPY=setuid run mi_verb_migrate_storage "$IDX" "$POL" "$MAN" p1 state --to-bind "$DEST"
   [ "$status" -eq 0 ]
-  grep -aq "privileged bits stripped" "$BATS_TEST_TMPDIR/err"
+  assert_contains "privileged bits stripped"
   run mi_conf_get "$MYTHICAL_HOME/mythical.conf" MYTHICAL_P1_STATE_BIND
   [ "$output" = "$CANON_DEST" ]   # §5.2 round 8: recorded canonical, not the raw --to-bind operand
 }
@@ -137,10 +143,23 @@ teardown() { teardown_test_env; }
   s="$(find "$sib" -maxdepth 1 -name '.mythical-staging-*' | head -n1)"
   [ -n "$s" ]
   [ -d "$s" ]
-  # A fresh attempt (a new nonce, a new staging path) must not be blocked by the abandoned one, and
-  # must not silently adopt it either — it proceeds beside it, and reclaiming it is never automatic
-  # (mi_mig_staging_reclaim exists as a tool for an operator or a future repair sweep, not a step this
-  # flow calls on its own), so the leftover survives the whole migration untouched.
+  # §5.2 round 9: this test's own expectation was wrong, not migrate.sh — reconciled after directly
+  # reproducing the scenario outside bats. The recorded phase (3) carries the SAME nonce/staging the
+  # interrupted attempt already created, so the FIRST resume re-enters phase 3 with that carried
+  # nonce; `mkdir` (no `-p`, see the phase-3 comment in lib/migrate.sh) on the still-existing $s
+  # correctly REFUSES to adopt it and downgrades the ledger to phase 1 with nonce/staging cleared —
+  # this is the documented "preserved and reported; re-run to proceed beside it with a fresh nonce"
+  # behavior working as designed, not a defect. A SECOND resume is required to actually mint a fresh
+  # nonce/staging path and step around the leftover — a single resume call was never going to see the
+  # step-around succeed, only trigger it.
+  run mi_mig_resume "$IDX" "$POL" "$MAN"
+  [ "$status" -ne 0 ]
+  assert_contains "already exists"
+  [ -d "$s" ]
+  # NOW the fresh attempt (a new nonce, a new staging path) proceeds beside the abandoned one rather
+  # than adopting it — reclaiming it is never automatic (mi_mig_staging_reclaim exists as a tool for
+  # an operator or a future repair sweep, not a step this flow calls on its own), so the leftover
+  # survives the whole migration untouched.
   run mi_mig_resume "$IDX" "$POL" "$MAN"
   [ "$status" -eq 0 ]
   [ -d "$s" ]                               # still there — never removed, never adopted
