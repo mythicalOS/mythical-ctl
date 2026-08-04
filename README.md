@@ -99,8 +99,8 @@ lives in named container volumes, and the containers, images and shared network 
 container runtime. None of that is in this directory. So:
 
 - **Copying `~/.mythical/` is not a backup.** The data and the runtime secrets are not in it — a
-  complete backup has to include the named volumes as well. (There is no backup command; the
-  documented volume-aware procedure will ship with the lifecycle commands.)
+  complete backup has to include the named volumes as well. That is what `mythical-ctl backup`
+  is for: it captures the named volumes too, and `restore` puts them back.
 - **Deleting `~/.mythical/` is not an uninstall.** The containers keep running.
 
 **Your data must never be collateral — that is the rule the installer is being built to.** It will
