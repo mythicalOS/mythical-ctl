@@ -241,7 +241,7 @@ _mi_repair_netref() {
     # it). Recorded BEFORE the network-agreement check below so a container with no attachments at all
     # (which `continue`s out of that check) is still part of the fleet a migration would move.
     fleet="${fleet}${c}"$'\n'
-    if nets="$(mi_rt_inspect container c.nets "$c")"; then netsrc=0; else netsrc=$?; fi
+    if nets="$(mi_rt_container_nets_resolved "$c")"; then netsrc=0; else netsrc=$?; fi
     if [ "$netsrc" -eq 3 ]; then continue; fi   # gone since the label read a moment ago
     if [ "$netsrc" -ne 0 ]; then
       mi_warn "repair: '$c' carries this identity's label, but its network attachments could not be"
@@ -598,7 +598,7 @@ _mi_repair_run_locked() {
         # HAS no network attachment, which requires having actually read its attachments — never a
         # failed read defaulted to empty. Recording `+none` from a question that was never answered
         # would assert nothing needs verifying for a container that may well be attached and running.
-        if netid="$(mi_rt_inspect container c.nets "$name")"; then netidrc=0; else netidrc=$?; fi
+        if netid="$(mi_rt_container_nets_resolved "$name")"; then netidrc=0; else netidrc=$?; fi
         if [ "$netidrc" -eq 3 ]; then continue; fi   # gone since the label read a moment ago
         if [ "$netidrc" -ne 0 ]; then
           mi_warn "repair: '$name' is recorded, but its network attachments could not be read, so whether"

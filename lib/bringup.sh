@@ -887,12 +887,16 @@ _mi_bringup_attach_ok() {
 }
 
 # Step 2's entry point: inspect, then judge. The judgement itself is the predicate above, which step 5
-# calls on its own inspection.
+# calls on its own inspection. This step runs on a container that has NEVER started, whose endpoints
+# carry no NetworkID yet — so it reads the RESOLVED attachment views (lib/runtime.sh
+# mi_rt_container_{nets,aliases}_resolved), which identify each network by its NAME and resolve it to
+# the id the predicate compares, failing closed if a name cannot be resolved. Step 5 (verify_live)
+# inspects a RUNNING container, where the id is populated, and reads c.nets/c.aliases directly.
 mi_bringup_verify_attach() {
   if [ "$#" -ne 3 ]; then mi_warn "bringup: mi_bringup_verify_attach needs <container> <expected netid> <alias>"; return 1; fi
   local c="$1" want="$2" alias="$3" nets aliases
-  nets="$(mi_rt_inspect container c.nets "$c")" || return 1
-  aliases="$(mi_rt_inspect container c.aliases "$c")" || return 1
+  nets="$(mi_rt_container_nets_resolved "$c")" || return 1
+  aliases="$(mi_rt_container_aliases_resolved "$c")" || return 1
   _mi_bringup_attach_ok "$c" "$want" "$alias" "$nets" "$aliases"
 }
 

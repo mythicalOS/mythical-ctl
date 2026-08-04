@@ -612,7 +612,7 @@ _mi_netmig_live_ok() {
 # rc 0 verified · 1 refused (reported).
 _mi_netmig_target_only_ok() {
   local idx="$1" c="$2" tgt="$3" alias="$4" nets line tid expect="" cnt=0 obs
-  nets="$(mi_rt_inspect container c.nets "$c")" || return 1
+  nets="$(mi_rt_container_nets_resolved "$c")" || return 1
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     tid="${line%%$'\t'*}"
@@ -655,7 +655,7 @@ _mi_netmig_target_only_ok() {
 # caller: "could not ask" is not "still there", and neither authorizes a detach.
 _mi_netmig_on_target() {
   local c="$1" tgt="$2" nets line
-  nets="$(mi_rt_inspect container c.nets "$c")" || return $?
+  nets="$(mi_rt_container_nets_resolved "$c")" || return $?
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     [ "${line%%$'\t'*}" = "$tgt" ] && return 0
@@ -751,7 +751,7 @@ mi_netmig_run() {
         [ -n "$c" ] || continue
         local alias2 nets2
         alias2="$(_mi_netmig_alias "$c")" || return 1
-        nets2="$(mi_rt_inspect container c.nets "$c")" || return 1
+        nets2="$(mi_rt_container_nets_resolved "$c")" || return 1
         # Already attached? Re-running a phase must be idempotent, because recovery re-enters it.
         case ";${nets2}" in *";${tgt}="*) continue ;; esac
         # LOWER gateway priority than the source, so the SOURCE REMAINS THE PREFERRED ROUTE through

@@ -496,6 +496,10 @@ render() {
                             printf '%s\n' "$(rec_get "$f" nets)" ;;
     '{{range $k,$v := .NetworkSettings.Networks}}{{$v.NetworkID}}:{{range $v.Aliases}}{{.}},{{end}};{{end}}')
                             printf '%s\n' "$(rec_get "$f" aliases)" ;;
+    '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}={{$v.NetworkID}}={{$v.IPAddress}};{{end}}')
+                            printf '%s\n' "$(nets_named "$f")" ;;
+    '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}={{$v.NetworkID}}:{{range $v.Aliases}}{{.}},{{end}};{{end}}')
+                            printf '%s\n' "$(aliases_named "$f")" ;;
     '{{range .Mounts}}{{.Type}}|{{.Name}}|{{.Source}}|{{.Destination}}|{{.RW}};{{end}}')
                             printf '%s\n' "$(rec_get "$f" mounts)" ;;
     '{{range $p,$bs := .NetworkSettings.Ports}}{{range $bs}}{{$p}}={{.HostIp}}:{{.HostPort}};{{end}}{{end}}')
@@ -529,6 +533,44 @@ addr_for() { printf '10.88.%d.%d\n' $(( $(printf '%s' "$1$2" | cksum | cut -d' '
 # so the fake keeps it: whatever else ends up in a hosts file, the hostname is a name the IMAGE could
 # in principle have known nothing about but the RESOLVER was never asked for.
 short_id() { printf '%012x\n' "$(printf '%s' "$1" | cksum | cut -d' ' -f1)"; }
+
+# --- name-carrying attachment views (c.netpairs / c.aliaspairs) -----------------------------------
+# The `nets`/`aliases` records are stored id-keyed (`<id>=<addr>` / `<id>:<aliases>`). lib/runtime.sh's
+# NAME-carrying templates read the inspect map's KEY, which is the network NAME, so `netnames` records
+# the id->name mapping at every attachment (create + connect) and these render the map-key view.
+#
+# THE NETWORKID FIDELITY THAT LET THE BUG SHIP: a container that has NEVER started (state=created)
+# reports an EMPTY NetworkID for every endpoint on a real daemon — the endpoint id is assigned at first
+# start, and then persists across stop. The old fake stored the id at create and so never modelled the
+# created-but-not-started state that §6b.3 step 2 actually inspects. Here the id is blanked while the
+# container is `created`, and present once it is running or exited (started-then-stopped), matching a
+# real daemon in all three states.
+netname_of() {  # <container-file> <netid>  -> the network name that id was attached under
+  local pair
+  for pair in $(printf '%s' "$(rec_get "$1" netnames)" | tr ';' ' '); do
+    case "$pair" in "${2}="*) printf '%s' "${pair#*=}"; return 0 ;; esac
+  done
+}
+nets_named() {  # <container-file>  -> "<name>=<id-or-empty>=<addr>;..."
+  local f="$1" st pair id addr name vid out=""
+  st="$(rec_get "$f" state)"
+  for pair in $(printf '%s' "$(rec_get "$f" nets)" | tr ';' ' '); do
+    id="${pair%%=*}"; addr="${pair#*=}"; name="$(netname_of "$f" "$id")"
+    if [ "$st" = created ]; then vid=""; else vid="$id"; fi
+    out="${out}${name}=${vid}=${addr};"
+  done
+  printf '%s' "$out"
+}
+aliases_named() {  # <container-file>  -> "<name>=<id-or-empty>:<aliases>;..."
+  local f="$1" st pair id rest name vid out=""
+  st="$(rec_get "$f" state)"
+  for pair in $(printf '%s' "$(rec_get "$f" aliases)" | tr ';' ' '); do
+    id="${pair%%:*}"; rest="${pair#*:}"; name="$(netname_of "$f" "$id")"
+    if [ "$st" = created ]; then vid=""; else vid="$id"; fi
+    out="${out}${name}=${vid}:${rest};"
+  done
+  printf '%s' "$out"
+}
 
 # --- the two NAME-RESOLUTION SURFACES a container really has ---------------------------------------
 # A container turns a name into an address two ways, and they are not interchangeable:
@@ -891,6 +933,7 @@ case "${1:-}" in
         rec_set "$f" nets "${nets}${netid}=${a};"
         rec_set "$f" aliases "${al}${netid}:$(alias_list "$alias" "$c");"
         rec_set "$f" gw "$(rec_get "$f" gw)${netid}=${gw};"
+        rec_set "$f" netnames "$(rec_get "$f" netnames)${netid}=$(rec_get "$nf" name);"
         ;;
       disconnect)
         shift; netid=""; c=""
@@ -925,6 +968,7 @@ case "${1:-}" in
         if [ -z "${FAKE_DOCKER_DISCONNECT_SILENT:-}" ]; then
           rec_set "$f" nets "$(printf '%s' "$(rec_get "$f" nets)" | tr ';' '\n' | grep -av "^${netid}=" | tr '\n' ';' | sed 's/;*$/;/;s/^;$//')"
           rec_set "$f" aliases "$(printf '%s' "$(rec_get "$f" aliases)" | tr ';' '\n' | grep -av "^${netid}:" | tr '\n' ';' | sed 's/;*$/;/;s/^;$//')"
+          rec_set "$f" netnames "$(printf '%s' "$(rec_get "$f" netnames)" | tr ';' '\n' | grep -av "^${netid}=" | tr '\n' ';' | sed 's/;*$/;/;s/^;$//')"
         fi
         ;;
       *) die "fake docker: unsupported network subcommand: ${1:-}" ;;
@@ -987,6 +1031,9 @@ case "${1:-}" in
         rec_set "$f" nets "${netid}=;"
         rec_set "$f" aliases "${netid}:$(alias_list "$alias" "$name");"
         rec_set "$f" gw "${netid}=0;"
+        # The network NAME this id was attached under — the inspect map KEY the name-carrying views
+        # (c.netpairs / c.aliaspairs) report, and the only identifier a never-started container exposes.
+        rec_set "$f" netnames "${netid}=$(rec_get "$(find_network "$netid")" name);"
         rec_set "$f" envfile "$envfile"
         # Ports are recorded in the inspect shape: <cport>/tcp=<hostip>:<hostport>;
         #

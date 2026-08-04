@@ -296,7 +296,11 @@ teardown() { teardown_test_env; }
   # silently skipped c1 from the "do the containers agree" comparison, so repair could record a clean
   # non-owned reference even though c1 might still be on the OLD network — a split fleet the ledger
   # would then report as healthy.
-  FAKE_DOCKER_DOWN_AFTER=24 run mi_repair_run "$IDX" insta
+  # 25, not 24: c1 is a created-but-never-started container, so mi_rt_container_nets_resolved makes ONE
+  # extra `network inspect` (resolving its empty NetworkID by name) during the earlier state-rebuild
+  # pass. That shifts c1's install-label read here by one call; land the daemon-down on it, not on the
+  # container listing before the loop.
+  FAKE_DOCKER_DOWN_AFTER=25 run mi_repair_run "$IDX" insta
   [ "$status" -ne 0 ]
   assert_contains "could not be asked for its installation label"
   assert_contains "fleet agrees"

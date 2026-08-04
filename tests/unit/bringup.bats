@@ -102,6 +102,39 @@ learn_addr() {
   assert_contains "alias"
 }
 
+# §6b.3 step 2 inspects a container that was CREATED but has NEVER STARTED. On a real daemon such a
+# container reports an EMPTY NetworkID for every endpoint — the id is assigned at first start — while
+# the network NAME (the inspect map key) is present from creation. verify_attach must identify the
+# network by name and resolve it; reading the empty id directly saw our OWN network as '' and refused
+# every real install. (The fake models the empty-id state; before this fix it stored the id at create,
+# so the whole suite was green while the real bring-up could not attach.)
+@test "verify_attach accepts a NEVER-STARTED container by resolving the network name (empty NetworkID)" {
+  mi_bringup_create "$C" "$IMG" "$NET" p1 running - >/dev/null
+  run mi_rt_inspect container c.running "$C"
+  [ "$output" = false ]                                    # never started
+  # the name-carrying view the fix reads: our network NAME is present, immediately followed by "=="
+  # (an EMPTY NetworkID then an empty address) — the never-started state the fix resolves by name.
+  run mi_rt_inspect container c.netpairs "$C"
+  [ "$status" -eq 0 ]
+  assert_contains "mythical-${IDENT}-net=="                # NAME present AND its id segment EMPTY
+  case "$output" in *"$NET"*) echo "netpairs unexpectedly carries the resolved id $NET: $output" >&2; return 1 ;; esac
+  run mi_bringup_verify_attach "$C" "$NET" p1
+  [ "$status" -eq 0 ]
+}
+
+# The exact-set guard must still hold at step 2, BEFORE start: a never-started container on our network
+# PLUS a stray one (both ids empty) must be refused, by resolving each name to its id.
+@test "verify_attach rejects a stray network on a NEVER-STARTED container (exact set holds pre-start)" {
+  mi_bringup_create "$C" "$IMG" "$NET" p1 running - >/dev/null
+  STRAY="$(mi_rt_network_create stray "$IDENT" nn9)"
+  mi_rt_network_connect "$STRAY" "$C" p1 0
+  run mi_rt_inspect container c.running "$C"
+  [ "$output" = false ]                                    # still never started
+  run mi_bringup_verify_attach "$C" "$NET" p1
+  [ "$status" -ne 0 ]
+  assert_contains "not permitted"
+}
+
 @test "the full bring-up sets the outstanding entry at CONFIRM and clears it only after live verify" {
   run mi_bringup "$IDX" "$C" "$IMG" "$NET" p1 running -
   [ "$status" -eq 0 ]

@@ -120,6 +120,16 @@ _mi_rt_tmpl() {
     # is a property the tests observe rather than a claim they assume.
     c.nets)     printf '{{range $k,$v := .NetworkSettings.Networks}}{{$v.NetworkID}}={{$v.IPAddress}};{{end}}' ;;
     c.aliases)  printf '{{range $k,$v := .NetworkSettings.Networks}}{{$v.NetworkID}}:{{range $v.Aliases}}{{.}},{{end}};{{end}}' ;;
+    # NAME-CARRYING variants, for the PRE-START attach check only (§6b.3 step 2). A container that has
+    # NEVER started reports an EMPTY NetworkID for every endpoint — the runtime assigns the endpoint id
+    # at first start, and it then PERSISTS across stop (measured: `docker create --network X` leaves
+    # NetworkID empty; `start` fills it; a later `stop` keeps it). Step 2 inspects a created-but-not-yet
+    # -started container, so it cannot identify a network by id at all. The inspect map KEY ($k) is the
+    # network NAME, present from creation, so these emit it and the caller resolves name->id. The two
+    # above are UNCHANGED for every running-container caller (verify_live, repair, netref), where the id
+    # is populated and no resolution is needed.
+    c.netpairs)   printf '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}={{$v.NetworkID}}={{$v.IPAddress}};{{end}}' ;;
+    c.aliaspairs) printf '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}={{$v.NetworkID}}:{{range $v.Aliases}}{{.}},{{end}};{{end}}' ;;
     c.mounts)   printf '{{range .Mounts}}{{.Type}}|{{.Name}}|{{.Source}}|{{.Destination}}|{{.RW}};{{end}}' ;;
     c.ports)    printf '{{range $p,$bs := .NetworkSettings.Ports}}{{range $bs}}{{$p}}={{.HostIp}}:{{.HostPort}};{{end}}{{end}}' ;;
     n.id)       printf '{{.Id}}' ;;
@@ -162,6 +172,53 @@ mi_rt_inspect() {
   if mi_rt_ping; then return 3; fi
   mi_warn "runtime: the container runtime did not answer"
   return 1
+}
+
+# --- attachment sets, with NEVER-STARTED endpoints resolved ---------------------------------------
+# Read a container's network attachments in the id-keyed form every caller compares — "<id>=<addr>;…"
+# for nets, "<id>:<aliases>;…" for aliases — RESOLVING the empty NetworkID a never-started container
+# reports (the runtime assigns the endpoint id at first start; before that only the network NAME, the
+# inspect map key, is present). `c.nets`/`c.aliases` alone return an EMPTY id for such a container, so
+# a bare read on a created-but-not-started container mis-identifies every network as ''. These are the
+# readers install/recreate (step 2), state repair, and network migration use in its place.
+#
+# FAIL CLOSED, and it is not a name-substitution fallback: a network may LEGALLY be named a 64-hex
+# string — the exact spelling of an expected id — so emitting the name when resolution fails would let
+# a stray attachment named the expected id pass an exact-set check on a transient inspect hiccup. If an
+# endpoint reports no id AND its name cannot be resolved to one, the whole read fails (rc 1) and the
+# caller refuses rather than guessing. rc 0 value printed · 3 the container is gone · 1 unreadable or
+# unresolvable.
+mi_rt_container_nets_resolved()    { _mi_rt_container_pairs_resolved "$1" c.netpairs '=' ; }
+mi_rt_container_aliases_resolved() { _mi_rt_container_pairs_resolved "$1" c.aliaspairs ':' ; }
+_mi_rt_container_pairs_resolved() {
+  if [ "$#" -ne 3 ]; then mi_warn "runtime: _mi_rt_container_pairs_resolved needs <container> <field> <sep>"; return 1; fi
+  local c="$1" field="$2" sep="$3" pairs rc rest f name tail nid val out="" resolved rrc
+  if pairs="$(mi_rt_inspect container "$field" "$c")"; then rc=0; else rc=$?; fi
+  [ "$rc" -eq 0 ] || return "$rc"    # 3 (gone) / 1 (unreadable) propagated verbatim
+  rest="$pairs"
+  # Walk "<name>=<id><sep><value>;" one ';'-field at a time with parameter expansion — an unquoted IFS
+  # split also GLOBS. The name is split off on the FIRST `=`; names and ids never contain `=`/`:`/`;`.
+  while [ -n "$rest" ]; do
+    f="${rest%%;*}"
+    if [ "$rest" = "$f" ]; then rest=""; else rest="${rest#*;}"; fi
+    [ -n "$f" ] || continue
+    name="${f%%=*}"
+    tail="${f#*=}"
+    nid="${tail%%"${sep}"*}"
+    val="${tail#*"${sep}"}"
+    if [ -z "$nid" ]; then
+      if resolved="$(mi_rt_inspect network n.id "$name" 2>/dev/null)"; then rrc=0; else rrc=$?; fi
+      if [ "$rrc" -ne 0 ] || [ -z "$resolved" ]; then
+        mi_warn "runtime: an attachment ('$name') on '$c' reports no id and its name could not be"
+        mi_warn "  resolved to one, so the container's exact network set cannot be established. Refusing"
+        mi_warn "  rather than guessing — a guessed id could match an expected network it is not on."
+        return 1
+      fi
+      nid="$resolved"
+    fi
+    out="${out}${nid}${sep}${val};"
+  done
+  printf '%s\n' "$out"
 }
 
 # --- identity queries -----------------------------------------------------------------------------
