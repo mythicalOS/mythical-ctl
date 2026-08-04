@@ -73,6 +73,15 @@ _mi_recovery_exit() { rm -f "$1"; }
 
 mi_lock_acquire() {
   local lf; lf="$(_mi_lock_file)"
+  # THE LOCK LIVES UNDER .state/, WHICH MUST EXIST BEFORE THE LOCK CAN BE PUBLISHED. On a fresh
+  # machine no verb has created the layout yet — install (and every other mutating verb) creates it
+  # via mi_ensure_layout INSIDE this lock, so the very first operation would otherwise find its own
+  # lock directory missing. Without this, mktemp in _mi_lock_try fails, that failure is
+  # indistinguishable from "already held" (both rc 1), and the acquire below MIS-REPORTS a missing
+  # directory as lock contention ("… acquiring the lock — try again shortly"), forever. Create the
+  # lock's own directory here — the minimal precondition, reported honestly if it cannot be made.
+  local ld="${lf%/*}"
+  [ -d "$ld" ] || mkdir -p "$ld" || { mi_warn "lock: cannot create the lock directory '$ld'"; return 1; }
   _mi_lock_try "$lf" && return 0
 
   # Held. Read the owner. If the holder RELEASED $lf between the failed try and this read, sed

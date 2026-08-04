@@ -10,6 +10,22 @@ load '../lib/test_helper'
   [ ! -e "$MYTHICAL_HOME/.state/lock" ]
 }
 
+# The lock lives under .state/, which does not exist on a fresh machine — install (and every other
+# mutating verb) creates the layout INSIDE this lock, so the first operation must not need the
+# directory to already exist. Before the fix, mktemp failed on the missing .state/, the failure was
+# indistinguishable from "already held", and acquire mis-reported it as contention ("… acquiring the
+# lock — try again shortly"), so no verb could bootstrap a fresh machine. This test DELIBERATELY does
+# NOT call mi_ensure_layout, so it reproduces the fresh machine the whole suite otherwise masks.
+@test "acquire creates its own .state directory on a fresh machine (never mis-reports a missing dir as contention)" {
+  load_mctl                                   # NO mi_ensure_layout — this is the whole point
+  [ ! -d "$MYTHICAL_HOME/.state" ]            # precondition: the lock dir does not exist yet
+  run mi_lock_acquire
+  [ "$status" -eq 0 ]                         # acquired, not refused
+  case "$output" in *acquiring*|*contention*) echo "mis-reported a missing dir as lock contention: $output" >&2; return 1 ;; esac
+  [ -d "$MYTHICAL_HOME/.state" ]              # it created its own directory
+  [ -f "$MYTHICAL_HOME/.state/lock" ]         # and published the lock in it
+}
+
 @test "a live holder blocks a second acquire and names the holder" {
   load_mctl; mi_ensure_layout
   # plant a live holder as a lock FILE (our own PID is alive)
