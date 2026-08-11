@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # mythical-ctl — installer and lifecycle CLI for the mythicalOS family.
-# Copyright 2026 mythicalOS. Licensed under the Apache License, Version 2.0.
+# Copyright 2026 mythicalOS ApS. Licensed under the Apache License, Version 2.0.
 #
 # Shell, deliberately: this runs before any language runtime is guaranteed to
 # exist on the machine. Its only dependencies are bash and a container runtime.
