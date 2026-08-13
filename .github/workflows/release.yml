@@ -64,26 +64,125 @@ jobs:
 
       # Public-safety gate — same intent as CI's hygiene job. A tag can be pushed
       # to a commit that never saw a PR, so the release must re-run it or a banned
-      # internal name could be published. vendor/ (the bats submodule, checked out
-      # for the test step) is third-party and excluded, matching CI's plain-checkout
-      # hygiene scope.
+      # internal name could be published. docs-bar.yml does NOT cover this: it
+      # triggers on pull_request and push to main only, never on tags. vendor/
+      # (the bats submodule, checked out for the test step) is third-party and
+      # excluded, matching CI's plain-checkout hygiene scope.
+      #
+      # The term list is sourced from the organisation secret DOCS_DENY_PATTERN,
+      # never written here — see the long note in ci.yml for why an inline,
+      # bracket-split list was the leak it claimed to prevent.
+      #
+      # No fork-PR escape hatch here, deliberately: this workflow only ever runs
+      # on a tag push in this repository, where the secret is always available.
+      # A release must be strictly fail-closed.
       - name: Genericize gate (banned internal names)
+        env:
+          DENY: ${{ secrets.DOCS_DENY_PATTERN }}
         run: |
           set -euo pipefail
-          pattern='mythical-proj[e]ct|mythical-serv[e]r|mythical-asga[r]d|agent-remote-mc[p]|agent-local-mc[p]|agent-daemo[n]|agent-playbook[s]|agent-skill[s]|agent-we[b]|de-ne[t]|dene[t]|saas-dra[f]t|mythical-master-pl[a]n|hamed[d]k|esmile[y]|sattar[i]|/private/tmp|/opt/mythical'
-          if grep -rliIE "$pattern" . \
-              --exclude-dir=.git --exclude-dir=.github --exclude-dir=node_modules --exclude-dir=vendor
-          then
+
+          # FAIL CLOSED — and test DENY *on its own*, never the combined pattern
+          # built below. EXTRAS is a non-empty literal, so an unset secret would
+          # still leave a non-empty FULL: the job would go green having checked
+          # almost nothing, and would publish. Explicit guard, deliberately here.
+          if [ -z "${DENY:-}" ]; then
+            echo "::error::DOCS_DENY_PATTERN is unset or empty — failing closed"
+            exit 1
+          fi
+
+          # Repo-local extra, safe to spell out: an in-image install path is not
+          # a private name and discloses nothing.
+          EXTRAS='/opt/mythical'
+          FULL="${DENY}|${EXTRAS}"
+
+          # Self-test A — the SECRET half alone, probe assembled from fragments
+          # at runtime so no banned term is written in this file. Proves the
+          # secret arrived, is a usable ERE, and fires. Does NOT prove the list
+          # is complete; the umbrella repository being canonical does that.
+          p1=de-; p2=net
+          printf '%s\n' "$p1$p2" | grep -aiqE -e "$DENY" && rc=0 || rc=$?
+          [ "$rc" -eq 0 ] || { echo "::error::self-test failed (grep rc=$rc) — DOCS_DENY_PATTERN did not match its probe, or is not a usable pattern; the gate is not firing"; exit 1; }
+
+          # Self-test B — the COMBINED pattern is still a usable ERE once joined.
+          printf '%s\n' '/opt/mythical' | grep -aiqE -e "$FULL" && rc=0 || rc=$?
+          [ "$rc" -eq 0 ] || { echo "::error::self-test failed (grep rc=$rc) — combined pattern did not match its repo-local probe"; exit 1; }
+
+          # -a, never -I: one NUL byte hides a whole file from a bare grep.
+          # grep rc >=2 means the scan FAILED; a bare `if grep` would fold that
+          # into "no match" and publish a release off a scan that never ran.
+          # PASS 1 — the combined pattern, .github excluded so the repo-local
+          # EXTRAS spelled out in this file cannot match it.
+          hits="$(grep -rlaiE -e "$FULL" . \
+              --exclude-dir=.git --exclude-dir=.github --exclude-dir=node_modules --exclude-dir=vendor)" && rc=0 || rc=$?
+          [ "$rc" -le 1 ] || { echo "::error::tree scan failed (grep rc=$rc) — the tree was NOT fully scanned"; exit 1; }
+          if [ -n "$hits" ]; then
+            # A path is printed, never the matched line. Workflow commands are
+            # suppressed around it with a per-use random token: a file whose NAME
+            # contains a newline followed by "::" would otherwise inject a command
+            # into the log. Log integrity only -- the build is already failing.
+            tok="stop-$RANDOM$RANDOM"
+            echo "::stop-commands::$tok"
+            printf '%s\n' "$hits"
+            echo "::${tok}::"
+            echo "::error::banned internal name(s) found — see the file(s) listed above"
+            exit 1
+          fi
+
+          # PASS 2 — the SECRET half over the WHOLE tree, .github INCLUDED. See
+          # the long note in ci.yml: --exclude-dir skips that directory name at
+          # EVERY depth, so pass 1 alone is blind to nested .github paths too.
+          # vendor/ stays excluded in both passes: it is the third-party bats
+          # submodule, not this project's text.
+          ghits="$(grep -rlaiE -e "$DENY" . \
+              --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=vendor)" && rc=0 || rc=$?
+          [ "$rc" -le 1 ] || { echo "::error::whole-tree scan failed (grep rc=$rc) — NOT fully scanned"; exit 1; }
+          if [ -n "$ghits" ]; then
+            # A path is printed, never the matched line. Workflow commands are
+            # suppressed around it with a per-use random token: a file whose NAME
+            # contains a newline followed by "::" would otherwise inject a command
+            # into the log. Log integrity only -- the build is already failing.
+            tok="stop-$RANDOM$RANDOM"
+            echo "::stop-commands::$tok"
+            printf '%s\n' "$ghits"
+            echo "::${tok}::"
             echo "::error::banned internal name(s) found — see the file(s) listed above"
             exit 1
           fi
           echo "genericize gate: clean"
 
+      # Case-SENSITIVE half, from its own secret — see ci.yml for why it cannot
+      # be folded into the case-insensitive pattern above.
       - name: Genericize gate (internal role moniker, case-sensitive)
+        env:
+          DENY_CS: ${{ secrets.DOCS_DENY_PATTERN_CS }}
         run: |
           set -euo pipefail
-          if grep -rlI --exclude-dir=.git --exclude-dir=.github --exclude-dir=node_modules --exclude-dir=vendor -E '\bB[O]SS\b' .
-          then
+
+          if [ -z "${DENY_CS:-}" ]; then
+            echo "::error::DOCS_DENY_PATTERN_CS is unset or empty — failing closed"
+            exit 1
+          fi
+
+          q1=B; q2=OSS
+          printf '%s\n' "$q1$q2" | grep -aqE -e "$DENY_CS" && rc=0 || rc=$?
+          [ "$rc" -eq 0 ] || { echo "::error::self-test failed (grep rc=$rc) — DOCS_DENY_PATTERN_CS did not match its probe, or is not a usable pattern; the gate is not firing"; exit 1; }
+
+          # ONE pass over the WHOLE tree, .github INCLUDED — no inline extras
+          # here, so the old .github exclusion would only cost a blind spot.
+          # grep rc >=2 means the scan failed, not that the tree is clean.
+          hits="$(grep -rlaE -e "$DENY_CS" . \
+              --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=vendor)" && rc=0 || rc=$?
+          [ "$rc" -le 1 ] || { echo "::error::tree scan failed (grep rc=$rc) — the tree was NOT fully scanned"; exit 1; }
+          if [ -n "$hits" ]; then
+            # A path is printed, never the matched line. Workflow commands are
+            # suppressed around it with a per-use random token: a file whose NAME
+            # contains a newline followed by "::" would otherwise inject a command
+            # into the log. Log integrity only -- the build is already failing.
+            tok="stop-$RANDOM$RANDOM"
+            echo "::stop-commands::$tok"
+            printf '%s\n' "$hits"
+            echo "::${tok}::"
             echo "::error::internal role moniker found (case-sensitive) — see the file(s) listed above"
             exit 1
           fi

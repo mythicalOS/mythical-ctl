@@ -16,16 +16,20 @@ jobs:
   # Public-safety gate. Internal-only names must never appear in this PUBLIC
   # repository. Any hit is a release blocker, not a style nit.
   #
-  # Every banned term below is split by a single-character bracket class so this
-  # file never spells one out contiguously in plaintext — a public workflow that
-  # listed the private names verbatim would itself be the leak the gate exists to
-  # catch. The --exclude-dir=.github below is defence in depth on top of that,
-  # not the primary fix.
+  # THE TERM LIST IS NOT WRITTEN HERE, IN ANY ENCODING. It arrives at runtime
+  # from the organisation secret DOCS_DENY_PATTERN, mirroring the canonical list
+  # that lives in the private umbrella repository. This step used to inline the
+  # list with every term split by a single-character bracket class; that defeats
+  # grep but not a reader, so the gate against disclosure was itself the
+  # disclosure. Do not reintroduce it — not verbatim, not bracket-split, not
+  # obfuscated any other way. The --exclude-dir=.github below is defence in
+  # depth on top of sourcing, not a substitute for it. Same model as
+  # docs-bar.yml, which is byte-identical across the family.
   #
   # DELIBERATELY NOT BANNED: the sibling product names (brokkr, skuld, saga).
   # They are open source too, and naming them is this repository's entire job —
-  # an installer that cannot say what it installs is not an installer. Copying a
-  # sister repo's pattern verbatim would fail this build on its own README.
+  # an installer that cannot say what it installs is not an installer. The
+  # shared secret does not carry them, so there is nothing here to un-ban.
   hygiene:
     name: hygiene
     runs-on: ubuntu-latest
@@ -34,27 +38,165 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Genericize gate (banned internal names)
+        env:
+          DENY: ${{ secrets.DOCS_DENY_PATTERN }}
+          EVENT: ${{ github.event_name }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          THIS_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          pattern='mythical-proj[e]ct|mythical-serv[e]r|mythical-asga[r]d|agent-remote-mc[p]|agent-local-mc[p]|agent-daemo[n]|agent-playbook[s]|agent-skill[s]|agent-we[b]|de-ne[t]|dene[t]|saas-dra[f]t|mythical-master-pl[a]n|hamed[d]k|esmile[y]|sattar[i]|/private/tmp|/opt/mythical'
-          if grep -rliIE "$pattern" . \
-              --exclude-dir=.git --exclude-dir=.github --exclude-dir=node_modules
-          then
+
+          # Fork PRs cannot read organisation secrets. Skipping is the same call
+          # docs-bar.yml makes: maintainer review covers a fork's diff.
+          if [ "$EVENT" = pull_request ] && [ -n "$HEAD_REPO" ] && [ "$HEAD_REPO" != "$THIS_REPO" ]; then
+            echo "::notice::genericize gate skipped on fork PRs — secret unavailable; maintainer review covers this"
+            exit 0
+          fi
+
+          # FAIL CLOSED — and test DENY *on its own*, never the combined pattern
+          # built below. EXTRAS is a non-empty literal, so an unset secret would
+          # still leave a non-empty FULL: the job would go green having checked
+          # almost nothing. That is the single most dangerous failure mode of
+          # sourcing the list, and this is the explicit guard against it.
+          if [ -z "${DENY:-}" ]; then
+            echo "::error::DOCS_DENY_PATTERN is unset or empty — failing closed"
+            exit 1
+          fi
+
+          # Repo-local extras, safe to spell out: an in-image install path is
+          # not a private name and discloses nothing. Deliberately NOT in the
+          # shared secret — it is this repository's concern, not the family's.
+          EXTRAS='/opt/mythical'
+          FULL="${DENY}|${EXTRAS}"
+
+          # Self-test A — the SECRET half alone. The probe is assembled from
+          # fragments at runtime so no banned term is written in this file. It
+          # proves the secret arrived, is a usable ERE, and actually fires. It
+          # does NOT prove the list is COMPLETE: completeness is guaranteed by
+          # the umbrella repository being canonical, not by this check.
+          p1=de-; p2=net
+          printf '%s\n' "$p1$p2" | grep -aiqE -e "$DENY" && rc=0 || rc=$?
+          [ "$rc" -eq 0 ] || { echo "::error::self-test failed (grep rc=$rc) — DOCS_DENY_PATTERN did not match its probe, or is not a usable pattern; the gate is not firing"; exit 1; }
+
+          # Self-test B — the COMBINED pattern: proves the alternation is still
+          # a usable ERE once joined, and that the repo-local half fires too.
+          printf '%s\n' '/opt/mythical' | grep -aiqE -e "$FULL" && rc=0 || rc=$?
+          [ "$rc" -eq 0 ] || { echo "::error::self-test failed (grep rc=$rc) — combined pattern did not match its repo-local probe"; exit 1; }
+
+          # -a, never -I. One NUL byte makes a file invisible to a bare grep,
+          # and -I (what this step used before) skips such a file outright — a
+          # silent pass on the one file most worth reading. -e guards a pattern
+          # that begins with a dash from being parsed as an option.
+          #
+          # grep's exit code is THREE-valued: 0 = matched, 1 = no match, >=2 =
+          # the scan itself failed (unreadable file, pattern too large, I/O
+          # error). A bare `if grep ...; then` folds >=2 into the no-match
+          # branch and reports a clean tree it never finished reading — a green
+          # build with no scan behind it. So capture the code and treat
+          # anything above 1 as a hard failure, exactly as docs-bar.yml does.
+          # PASS 1 — the combined pattern, with .github excluded so the
+          # repo-local EXTRAS spelled out in this very file cannot match it.
+          hits="$(grep -rlaiE -e "$FULL" . \
+              --exclude-dir=.git --exclude-dir=.github --exclude-dir=node_modules)" && rc=0 || rc=$?
+          [ "$rc" -le 1 ] || { echo "::error::tree scan failed (grep rc=$rc) — the tree was NOT fully scanned"; exit 1; }
+          if [ -n "$hits" ]; then
+            # A path is printed, never the matched line. Workflow commands are
+            # suppressed around it with a per-use random token: a file whose NAME
+            # contains a newline followed by "::" would otherwise inject a command
+            # into the log. Log integrity only -- the build is already failing.
+            tok="stop-$RANDOM$RANDOM"
+            echo "::stop-commands::$tok"
+            printf '%s\n' "$hits"
+            echo "::${tok}::"
             echo "::error::banned internal name(s) found — see the file(s) listed above"
             exit 1
           fi
+
+          # PASS 2 — the SECRET half over the WHOLE tree, .github INCLUDED.
+          # The exclusion above exists only for the inline EXTRAS; the secret's
+          # terms are not written anywhere in this repository any more, so there
+          # is nothing for them to self-match and no reason to skip a directory.
+          # This matters more than it looks: --exclude-dir skips that directory
+          # NAME AT EVERY DEPTH, so pass 1 alone is blind to a nested path such
+          # as docs/.github/ as well as to the root one. After this pass the
+          # private names have no blind spot left anywhere in the tree. Only the
+          # repo-local EXTRAS stay unchecked inside a .github directory, and
+          # they are written inline precisely because they disclose nothing.
+          ghits="$(grep -rlaiE -e "$DENY" . \
+              --exclude-dir=.git --exclude-dir=node_modules)" && rc=0 || rc=$?
+          [ "$rc" -le 1 ] || { echo "::error::whole-tree scan failed (grep rc=$rc) — NOT fully scanned"; exit 1; }
+          if [ -n "$ghits" ]; then
+            # A path is printed, never the matched line. Workflow commands are
+            # suppressed around it with a per-use random token: a file whose NAME
+            # contains a newline followed by "::" would otherwise inject a command
+            # into the log. Log integrity only -- the build is already failing.
+            tok="stop-$RANDOM$RANDOM"
+            echo "::stop-commands::$tok"
+            printf '%s\n' "$ghits"
+            echo "::${tok}::"
+            echo "::error::banned internal name(s) found — see the file(s) listed above"
+            exit 1
+          fi
+
+          # Accepted residual (availability only, never a bypass): with -a, a
+          # long base64 data-URI payload or a binary asset can in principle
+          # match by chance. The secret half already carries that risk in
+          # docs-bar.yml, which strips payloads before re-testing. The EXTRAS
+          # add ~nothing to it: '/opt/mythical' is 13 base64-alphabet
+          # characters (~1e-19 per offset) and every other extra contains '-',
+          # '.' or ':', which cannot occur inside a base64 payload at all.
+          # A chance hit fails the build and names the file — loud, and safe.
           echo "genericize gate: clean"
 
       # Separate, case-SENSITIVE check for the internal decision-maker moniker
       # (an all-caps role term). It cannot join the pattern above: that gate greps
       # case-insensitively, so folding an all-caps word in would also flag the
       # same word used lowercase in ordinary prose and fail on false positives.
-      # Bracket-split for the same self-safety reason.
+      # Its pattern is sourced from a SECOND organisation secret for exactly the
+      # reason the first one is — so the term is not written in this file.
       - name: Genericize gate (internal role moniker, case-sensitive)
+        env:
+          DENY_CS: ${{ secrets.DOCS_DENY_PATTERN_CS }}
+          EVENT: ${{ github.event_name }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          THIS_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          if grep -rlI --exclude-dir=.git --exclude-dir=.github --exclude-dir=node_modules -E '\bB[O]SS\b' .
-          then
+
+          if [ "$EVENT" = pull_request ] && [ -n "$HEAD_REPO" ] && [ "$HEAD_REPO" != "$THIS_REPO" ]; then
+            echo "::notice::role-moniker gate skipped on fork PRs — secret unavailable; maintainer review covers this"
+            exit 0
+          fi
+
+          if [ -z "${DENY_CS:-}" ]; then
+            echo "::error::DOCS_DENY_PATTERN_CS is unset or empty — failing closed"
+            exit 1
+          fi
+
+          # Self-test, runtime-assembled probe — same contract as above: it
+          # proves the gate is live, not that the list is complete. No -i on any
+          # grep in this step; case sensitivity is the entire point of it.
+          q1=B; q2=OSS
+          printf '%s\n' "$q1$q2" | grep -aqE -e "$DENY_CS" && rc=0 || rc=$?
+          [ "$rc" -eq 0 ] || { echo "::error::self-test failed (grep rc=$rc) — DOCS_DENY_PATTERN_CS did not match its probe, or is not a usable pattern; the gate is not firing"; exit 1; }
+
+          # ONE pass over the WHOLE tree, .github INCLUDED. This step has no
+          # inline extras, and the term is no longer written here, so the
+          # .github exclusion it used to carry would buy nothing and cost a
+          # blind spot at every depth. grep rc >=2 means the scan failed, not
+          # that the tree is clean.
+          hits="$(grep -rlaE -e "$DENY_CS" . \
+              --exclude-dir=.git --exclude-dir=node_modules)" && rc=0 || rc=$?
+          [ "$rc" -le 1 ] || { echo "::error::tree scan failed (grep rc=$rc) — the tree was NOT fully scanned"; exit 1; }
+          if [ -n "$hits" ]; then
+            # A path is printed, never the matched line. Workflow commands are
+            # suppressed around it with a per-use random token: a file whose NAME
+            # contains a newline followed by "::" would otherwise inject a command
+            # into the log. Log integrity only -- the build is already failing.
+            tok="stop-$RANDOM$RANDOM"
+            echo "::stop-commands::$tok"
+            printf '%s\n' "$hits"
+            echo "::${tok}::"
             echo "::error::internal role moniker found (case-sensitive) — see the file(s) listed above"
             exit 1
           fi
