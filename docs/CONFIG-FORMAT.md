@@ -230,12 +230,15 @@ Two consequences worth stating, because neither is visible in the pattern:
   way on an operator's laptop and another in CI. Measured on the bash 3.2 floor. `mi_zone`
   deliberately carries no second copy of that pin: with the authority behind it, a copy would decide
   nothing and could be removed with nothing going red.
-- **The reserved leaf is compared as a string, not matched as a pattern.** `case` honours bash's
-  `nocasematch`, so a caller that had enabled it would otherwise let `brokkr/CLI.TOML` reach the
-  slot arm. One caveat with it: that option also changes how the grammar's own `case` matches —
-  measured, `BROKKR/cli.toml` would then classify as the slot — and that is not defended here,
-  because it would mean hardening a published grammar the whole CLI depends on against an option
-  nothing sets and which cannot be set from the environment.
+- **Bash's `nocasematch` is defended against, on both halves.** `case` honours that option, so with
+  it enabled `brokkr/CLI.TOML` would otherwise reach the slot arm — hence the leaf being compared as
+  a string rather than matched as a pattern. The option also changes how the grammar's own `case`
+  matches (measured: `_mi_conf_product_name_ok Brokkr` succeeds under it), so the validator is called
+  with the option unset. It is worth knowing that this is reachable from the *environment*:
+  `BASHOPTS=nocasematch` does not arm it, but `BASH_ENV` naming a file that sets it does, for every
+  non-interactive shell. That reachability is a property of the whole CLI, not of this slot — every
+  other `case` in it is still affected — and closing it generally is not something this amendment
+  attempts.
 
 Read the classifier's answer as a statement about the path, never as permission to create one.
 

@@ -1183,7 +1183,11 @@ mi_first_use() {
     # `fooBAR/` are not `user-owned` there either, and this call decided nothing that the line below
     # did not already decide. A guard no input reaches is not defence in depth — it is a guard whose
     # removal no test would notice, which is worse than not having it. One enforcement point.
-    if [ -d "$p" ] && [ ! -L "$p" ] && _mi_prov_host_tool_only "$b"; then continue; fi
+    # No `[ -d "$p" ]` in front of this: it was measured to be MASKED. `[ ! -L ]` already rejects a
+    # link, and for anything else that is not a directory the helper refuses on its own — its globs
+    # match nothing, so `seen` stays 0. A condition that decides no input is a condition whose loss
+    # no test would notice.
+    if [ ! -L "$p" ] && _mi_prov_host_tool_only "$b"; then continue; fi
     if [ -d "$p" ]; then found="${found} ${b}/"; continue; fi
     if [ -L "$p" ]; then found="${found} ${b}"; continue; fi
     # Anything else here is a plain file at a name this installer never creates — not evidence.

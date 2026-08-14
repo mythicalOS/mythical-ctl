@@ -214,6 +214,37 @@ load '../lib/test_helper'
   [ "$got_lower" = user-owned ] || { echo "cli.toml classified '$got_lower'" >&2; return 1; }
 }
 
+@test "an uppercase product NAME is refused under nocasematch too — the validator is called with it off" {
+  load_mctl
+  # The leaf comparison above does not cover this half: `BROKKR/cli.toml` has the exact leaf, and
+  # under nocasematch the grammar's own `case` accepts `BROKKR` — measured. So the validator is
+  # invoked with the option unset, and this is the test that says so.
+  shopt -s nocasematch
+  local got authority
+  got="$(mi_zone BROKKR/cli.toml)"
+  # ...and the hazard is proven present rather than assumed: the bare validator DOES accept it here.
+  if _mi_conf_product_name_ok BROKKR; then authority=accepts; else authority=refuses; fi
+  shopt -u nocasematch
+  [ "$authority" = accepts ] || skip "this bash does not case-fold the grammar under nocasematch"
+  [ "$got" = installer-managed ] || { echo "BROKKR/cli.toml classified '$got'" >&2; return 1; }
+}
+
+@test "nocasematch reaching the CLI through BASH_ENV does not promote a path to the slot" {
+  # The environment vector, end to end, in a shell started the way the CLI is. BASHOPTS does NOT arm
+  # the option; BASH_ENV naming a file that sets it DOES, which is why the contract says so.
+  printf 'shopt -s nocasematch\n' > "$BATS_TEST_TMPDIR/nc.sh"
+  run env BASH_ENV="$BATS_TEST_TMPDIR/nc.sh" bash -c \
+    'source "$1/lib/common.sh"; source "$1/lib/layout.sh"; source "$1/lib/config.sh"
+     shopt -q nocasematch || { echo NOT-ARMED; exit 0; }
+     printf "%s %s\n" "$(mi_zone BROKKR/cli.toml)" "$(mi_zone brokkr/CLI.TOML)"' _ "$_MCTL_ROOT"
+  [ "$status" -eq 0 ]
+  case "$output" in
+    NOT-ARMED) skip "BASH_ENV does not arm nocasematch on this bash" ;;
+    "installer-managed installer-managed") : ;;
+    *) echo "BASH_ENV-armed nocasematch gave: $output" >&2; return 1 ;;
+  esac
+}
+
 @test "mi_zone fails CLOSED for the slot when the name authority is not loaded" {
   # mi_zone lives in a module sourced BEFORE lib/config.sh, and a caller may source this file alone.
   # An unanswerable question must yield the class the path carried before the carve-out existed,

@@ -56,13 +56,16 @@ mi_ensure_layout() {
 # guard belongs and where a test can still kill it. A guard no input reaches is not defence in
 # depth; it is a line that looks like protection and is not.
 #
-# WHAT IS STILL EXPOSED, SAID PLAINLY: a caller that has run `shopt -s nocasematch` changes how every
-# `case` in this file matches, and the grammar's authority is a `case` too — measured, under that
-# option `_mi_conf_product_name_ok Brokkr` SUCCEEDS, so `BROKKR/cli.toml` would classify as the slot.
-# The leaf is defended here because it is this amendment's own reserved name; the name half is not,
-# because it would mean hardening a published grammar that the whole CLI depends on, against an
-# option nothing in this tree sets and which is not reachable from the environment. Recorded rather
-# than silently relied upon.
+# `nocasematch` IS REACHABLE FROM THE ENVIRONMENT, and an earlier revision of this comment said it
+# was not. MEASURED: `BASHOPTS=nocasematch` does NOT arm it, which is what that claim was based on —
+# but `BASH_ENV=<file>` naming a file that runs `shopt -s nocasematch` DOES, for every
+# non-interactive bash, this CLI included. Both halves of this arm are defended against it: the leaf
+# by a string comparison, the name by unsetting the option around the validator call.
+#
+# THAT IS THIS ARM ONLY. The option still changes how every other `case` in the CLI matches — the
+# ledger's field parsing, the config scanner, the document readers — which is a pre-existing,
+# codebase-wide exposure this amendment neither introduces nor closes. Recorded here because the
+# measurement was made here.
 #
 # `LC_ALL=C` IS LOAD-BEARING ON THE ONE RANGE BELOW, and it is not decoration. Under a non-C
 # collation `[a-z]` matches uppercase: measured here on bash 3.2 under da_DK.UTF-8, `case Brokkr in
@@ -88,9 +91,14 @@ mi_zone() {
       # `*/*/*` arm used to sit above this and say the same thing; it was measured to be MASKED once
       # this comparison existed — no input reached a different answer through it — so it is gone
       # rather than left looking like the thing that enforces depth. This is that thing.
+      # THE VALIDATOR IS CALLED WITH `nocasematch` OFF, in a subshell, because the option changes how
+      # ITS `case` matches too: measured, `_mi_conf_product_name_ok Brokkr` SUCCEEDS under it, so the
+      # leaf comparison alone would still let `BROKKR/cli.toml` through. The subshell is what makes
+      # this arm's answer independent of a caller's shell options without reaching into a published
+      # grammar the rest of the CLI depends on.
       if [ "${p#*/}" = cli.toml ] \
          && declare -F _mi_conf_product_name_ok >/dev/null 2>&1 \
-         && _mi_conf_product_name_ok "${p%%/*}"; then
+         && ( shopt -u nocasematch; _mi_conf_product_name_ok "${p%%/*}" ); then
         printf 'user-owned\n'
       else
         printf 'installer-managed\n'
