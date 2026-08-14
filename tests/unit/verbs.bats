@@ -293,7 +293,12 @@ _slot_is() {                      # _slot_is <what-changed-if-this-fires> <diges
   [ "$mode" = "-rw-r-----" ] || { echo "fixture mode is '$mode', not the 0640 this test needs" >&2; return 1; }
   ino="$(_mi_ino "$MYTHICAL_HOME/p1/cli.toml")"
   uid="$(_mi_owner_uid "$MYTHICAL_HOME/p1/cli.toml")"
-  [ -n "$ino" ] && [ -n "$uid" ]
+  # `[ -n "$ino" ] && [ -n "$uid" ]` was decorative: MEASURED on bash 3.2, errexit does not abort on
+  # a failing AND-list, so an empty fixture would have sailed past and every later comparison would
+  # have been ""-against-"". Same trap this suite's own hygiene scanner documents for `[[ ]]`, and
+  # the same remedy — an explicit failure handler that says what went wrong.
+  [ -n "$ino" ] || { echo "could not read the fixture's inode" >&2; return 1; }
+  [ -n "$uid" ] || { echo "could not read the fixture's owner uid" >&2; return 1; }
 
   # A first install, then a re-install over the populated home (§10a's byte-identical rule).
   mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null

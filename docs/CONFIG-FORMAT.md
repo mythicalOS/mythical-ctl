@@ -167,9 +167,18 @@ accepted as a bind source, which mounts the same inode read-write. This is the s
 same reasoning, as the [Ownership and identity](#ownership-and-identity) section already describes
 for `<product>.conf` — which is why *that* file's link count is checked. It is **not** specific to
 the host-tool slot: `mythical.conf`, holding the bootstrap secrets, is reachable exactly the same
-way, and was before this slot existed. Treat "never mounted" as "never mounted by name, on a machine
-where nobody has hard-linked out of your home directory", and note that creating such a link
-requires write access to the directory holding the file in the first place.
+way, and was before this slot existed.
+
+**What that gap does and does not give an attacker**, because the answer is what makes it a bounded
+residual rather than an open door. Creating the hard link requires traversing
+`~/.mythical/<product>/`, which this contract puts at **0700**, and linking a file this contract
+puts at **0600** — so the capability needed to plant the link is the operator's own, and anyone
+holding it can simply read the token instead. It is therefore a defence-in-depth gap, not a
+privilege escalation: it does not let a container, or a second local user, reach something they
+could not already reach. What it does mean is that "never mounted" is a guarantee about *paths*, and
+a bind whose source is an inode reached by another name is outside what the check can see. Closing
+it means giving the operator-bind path the object-identity comparison the core-fixed path already
+performs — the right fix, and a change to the launch path rather than to this layout contract.
 
 `mythical-ctl` enforces none of the owner, mode, group or identity rules above, because it never
 opens the file. They are requirements **on the host-side tool**, written here so that every such
