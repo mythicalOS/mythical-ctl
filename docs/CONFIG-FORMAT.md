@@ -88,12 +88,22 @@ second name: that is a further amendment, not an extension a tool may make for i
 grammar above admits `bin`, `logs` and `transcripts` as product names, but those three directories
 already mean something else directly under `~/.mythical/`: `bin/` is the installer's own, and
 `logs/` and `transcripts/` are the user-data trees. Their zones are decided before the slot is
-considered, so `~/.mythical/bin/cli.toml` stays installer-managed and
-`~/.mythical/logs/cli.toml` stays user-data. That collision is older and wider than this amendment —
-a product named `logs` collides with the user-data tree whatever it puts in there — and it is not
-resolved here, because doing so would mean changing what is a legal product name, which is a
-different contract. A host-side tool for a product with one of those three names has **no** slot
-under this amendment. No product in the family is so named.
+considered, so `~/.mythical/bin/cli.toml` classifies installer-managed and
+`~/.mythical/logs/cli.toml` classifies user-data. Neither is a slot, and this is the one place in
+this amendment where following the general rule would be actively unsafe rather than merely
+unsupported:
+
+> **`~/.mythical/logs/` and `~/.mythical/transcripts/` are bind-mounted into product containers.**
+> They are two of the three core-fixed mounts. A host-side tool for a product named `logs` or
+> `transcripts` that followed the general rule would write its bearer token *inside a directory the
+> container can read and write* — the exact outcome this slot exists to prevent, arrived at by
+> obeying the contract. **A host-side tool for a product with one of these three names has no slot,
+> and must not invent one at these paths.**
+
+The collision is older and wider than this amendment: a product named `logs` collides with the
+user-data tree whatever it puts there. It is not resolved here, because resolving it means changing
+what is a legal product name — a different contract, with its own published grammar and its own
+tests. No product in the family is so named.
 
 The **directory** `~/.mythical/<product>/` is unchanged — still installer-managed. Only the
 `cli.toml` leaf inside it changes class.
@@ -219,7 +229,9 @@ Two honest exceptions, neither of them a deletion:
 
 `mi_zone` classifies a **home-relative path**. It answers `user-owned` for `<component>/cli.toml`
 exactly when `<component>` is a single path component that satisfies the
-[product-name grammar](#what-product-may-be) in full — so the reserved `mythical` is refused, and so
+[product-name grammar](#what-product-may-be) in full **and is not `bin`, `logs` or `transcripts`**,
+whose top-level meanings are decided by earlier arms (see
+[the three names that cannot carry a slot](#the-slot)) — so the reserved `mythical` is refused, and so
 are `Brokkr/`, `1foo/`, `-foo/`, `fooBAR/`, `foo.conf/`, `foo bar/`, a 65-character name,
 `.hidden/`, and `../`. Everything else nested keeps the class it always had.
 

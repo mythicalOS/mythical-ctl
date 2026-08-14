@@ -89,7 +89,10 @@ directory that the installer does not own. It is where a product's *host-side* t
 beside this one rather than inside that product's container, keeps its own configuration, including
 host-only credentials. It is yours: mode 0600, owned by you, and never mounted into any container by
 name — which is precisely why such a credential does not go in `<product>.conf`, which is to be
-mounted into the container read-write. (`docs/CONFIG-FORMAT.md` states the limit on that guarantee,
+mounted into the container read-write. Three product names are excluded — `bin`, `logs` and
+`transcripts`, whose directories already mean something else here, and two of which *are* mounted
+into containers — so a host-side tool for a product so named has no slot and must not invent one.
+(`docs/CONFIG-FORMAT.md` has that exclusion in full, and the limit on the never-mounted guarantee,
 which applies equally to `mythical.conf`.) `mythical-ctl` never creates, modifies or removes it, and
 never parses it; the one thing that reads its bytes is `backup`, which copies the whole directory —
 so treat a backup as secret material.

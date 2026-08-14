@@ -113,8 +113,24 @@ load '../lib/test_helper'
   [ "$(mi_zone bin/cli.toml)"         = installer-managed ]   # ...with no slot
   [ "$(mi_zone logs/cli.toml)"        = user-data ]
   [ "$(mi_zone transcripts/cli.toml)" = user-data ]
-  # The document says so in as many words, so the limit is published and not merely true.
+  # Two of the three are worse than "no slot": logs/ and transcripts/ ARE core-fixed mounts, so a
+  # host-side tool that followed the general rule for a product named `logs` would put its bearer
+  # token inside a directory the container reads and writes — the exact outcome the slot exists to
+  # prevent, reached by obeying the contract. Pinned against the mount set rather than asserted.
+  run mi_mount_core_fixed brokkr
+  [ "$status" -eq 0 ]
+  local d
+  for d in logs transcripts; do
+    case "$output" in
+      *"/$d"*) : ;;
+      *) echo "'$d' is not a core-fixed mount any more — this test's premise is stale: $output" >&2
+         return 1 ;;
+    esac
+  done
+  # The document says all of it in as many words, so the limit is published and not merely true.
   grep -Faq 'Three product names cannot carry a slot' "${_MCTL_ROOT}/docs/CONFIG-FORMAT.md"
+  grep -Faq 'are bind-mounted into product containers' "${_MCTL_ROOT}/docs/CONFIG-FORMAT.md"
+  grep -Faq 'must not invent one' "${_MCTL_ROOT}/README.md"
 }
 
 @test "a component that could not BEGIN a legal product name is not the slot" {
