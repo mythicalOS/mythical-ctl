@@ -166,10 +166,22 @@ teardown() { rm -rf "$OUT"; mi_lock_release; teardown_test_env; }
   assert_contains "family home"
   run mi_mount_check_overlap brokkr "$MYTHICAL_HOME/brokkr"
   [ "$status" -ne 0 ]
-  # And not through a symlink planted outside the home either.
+  # And not through a symlink planted outside the home either — the check canonicalizes first, so
+  # the link resolves back inside and is refused.
   ln -s "$MYTHICAL_HOME/brokkr/cli.toml" "$OUT/sneaky.toml"
   run mi_mount_check_overlap brokkr "$OUT/sneaky.toml"
   [ "$status" -ne 0 ]
+
+  # WHAT THIS TEST DOES NOT COVER, said out loud so nobody reads it as covering more than it does: a
+  # HARD LINK. This check compares canonical PATHNAMES, and a hard link created outside the home has
+  # a canonical path that genuinely is outside it, so `ln "$MYTHICAL_HOME/brokkr/cli.toml"
+  # "$OUT/hard.toml"` is ACCEPTED here and mounts the same inode read-write. Measured, not assumed.
+  # It is not a property of the host-tool slot: mythical.conf is reachable identically and was before
+  # this slot existed, which is why <product>.conf's link count is checked and these are not. Closing
+  # it means giving the operator-bind path the identity comparison the core-fixed path already has
+  # (`_mi_mount_protected`), which is a change to the launch path rather than to the layout contract,
+  # and it is deliberately not made here. No assertion is written for the gap: a test that passed by
+  # confirming the bypass works would enshrine it.
 }
 
 @test "a SYMLINK whose target resolves inside the family home is rejected" {

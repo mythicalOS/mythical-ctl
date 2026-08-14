@@ -122,7 +122,7 @@ happen.
 |---|---|
 | Ownership class (`mi_zone`) | **`user-owned`** — the same class as the two `.conf` files |
 | Who writes it | the operator, or that product's host-side tool running **as the operator** |
-| Mounted into a container | **never** — by any manifest, any policy, or any operator bind |
+| Mounted into a container | **never by name** — no manifest, policy or operator bind can name it; see the limit below |
 | Owner | the user running the host-side tool, which is the user running `mythical-ctl` |
 | Mode | **0600** |
 | Group | not constrained — 0600 makes it irrelevant, and it must **not** be the family group |
@@ -142,6 +142,20 @@ name for the same inode and passes every symlink test.
 
 The containing directory is created by whichever side needs it first, mode **0700**, and neither
 side widens it. The file's own 0600 is the guarantee that does not depend on the directory's mode.
+
+**The limit on "never mounted", stated plainly.** The core-fixed mount set is closed and does not
+name the slot, and every operator-configurable bind is refused when its canonical source is, is
+inside, or contains the family home — so nothing can mount this file *by naming it or anything above
+it*, and a symlink pointing back inside is refused because the check canonicalizes first. What that
+check does **not** do is compare object identity: it works on pathnames, so a **hard link** to this
+file created outside `~/.mythical/` has a canonical path that is genuinely outside the home and is
+accepted as a bind source, which mounts the same inode read-write. This is the same gap, and the
+same reasoning, as the [Ownership and identity](#ownership-and-identity) section already describes
+for `<product>.conf` — which is why *that* file's link count is checked. It is **not** specific to
+the host-tool slot: `mythical.conf`, holding the bootstrap secrets, is reachable exactly the same
+way, and was before this slot existed. Treat "never mounted" as "never mounted by name, on a machine
+where nobody has hard-linked out of your home directory", and note that creating such a link
+requires write access to the directory holding the file in the first place.
 
 `mythical-ctl` enforces none of the owner, mode, group or identity rules above, because it never
 opens the file. They are requirements **on the host-side tool**, written here so that every such

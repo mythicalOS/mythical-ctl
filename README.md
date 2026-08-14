@@ -87,9 +87,10 @@ specified in [`docs/CONFIG-FORMAT.md`](docs/CONFIG-FORMAT.md).
 `<product>/cli.toml` is the **host-tool slot** — the one leaf inside an installer-managed product
 directory that the installer does not own. It is where a product's *host-side* tool, a CLI that runs
 beside this one rather than inside that product's container, keeps its own configuration, including
-host-only credentials. It is yours: mode 0600, owned by you, never mounted into any container — and
-that last part is precisely why such a credential does not go in `<product>.conf`, which is to be
-mounted into the container read-write. `mythical-ctl` never creates, modifies or removes it, and
+host-only credentials. It is yours: mode 0600, owned by you, and never mounted into any container by
+name — which is precisely why such a credential does not go in `<product>.conf`, which is to be
+mounted into the container read-write. (`docs/CONFIG-FORMAT.md` states the limit on that guarantee,
+which applies equally to `mythical.conf`.) `mythical-ctl` never creates, modifies or removes it, and
 never parses it; the one thing that reads its bytes is `backup`, which copies the whole directory —
 so treat a backup as secret material.
 The slot is specified in [`docs/CONFIG-FORMAT.md`](docs/CONFIG-FORMAT.md), which is also where the
