@@ -287,6 +287,12 @@ _slot_is() {                      # _slot_is <what-changed-if-this-fires> <diges
   # cannot show that: a regression that unconditionally ran `chmod 600` would land on the same bits
   # and the test would pass. Starting somewhere else makes "preserved" and "normalised"
   # distinguishable, which is the whole point of asserting it.
+  #
+  # 0640 IS NOT BLESSED BY THIS. A slot at 0640 is group-readable and the contract calls that
+  # compromised — but enforcing the mode is the host-side tool's job, and mythical-ctl's job is to
+  # touch nothing, INCLUDING a mode it would not itself have chosen. An installer that silently
+  # "corrected" the file would be writing to a file it promises never to write to. That is the
+  # property this fixture is shaped to catch, not an endorsement of the mode it starts from.
   chmod 640 "$MYTHICAL_HOME/p1/cli.toml"
   want="$(mi_digest "$MYTHICAL_HOME/p1/cli.toml")"
   mode="$(ls -ld "$MYTHICAL_HOME/p1/cli.toml" | awk 'NR==1{print $1}')"
