@@ -255,6 +255,104 @@ teardown() { mi_lock_release; teardown_test_env; }
   assert_contains "labelled"
 }
 
+# --- the host-tool slot in the first-use sweep -----------------------------------------------------
+# docs/CONFIG-FORMAT.md, "Amendment: the host-tool slot". A product's HOST-SIDE tool writes
+# ~/.mythical/<product>/cli.toml, and it can be installed and configured before mythical-ctl has ever
+# run on the machine. Counting that directory as a trace makes the very FIRST install refuse as
+# "inconsistent" and send the operator to 'state repair' over a file they meant to create. The
+# exemption is exactly one file wide, and every test below is a way of widening it that must not work.
+
+@test "a product directory holding NOTHING BUT the host-tool slot is not a trace" {
+  mkdir -p "$MYTHICAL_HOME/brokkr"
+  printf 'token = "host-only"\n' > "$MYTHICAL_HOME/brokkr/cli.toml"
+  run mi_first_use
+  [ "$status" -eq 0 ]
+}
+
+@test "the host-tool slot BESIDE a generated artifact is still a trace" {
+  mkdir -p "$MYTHICAL_HOME/brokkr"
+  printf 'token = "host-only"\n' > "$MYTHICAL_HOME/brokkr/cli.toml"
+  printf 'services: {}\n' > "$MYTHICAL_HOME/brokkr/compose.yaml"
+  run mi_first_use
+  [ "$status" -eq 1 ]
+  assert_contains "already holds"
+  assert_contains "brokkr"
+}
+
+@test "a HIDDEN entry beside the host-tool slot is still a trace — a bare * would not see it" {
+  # `for e in "$d"/*` skips dotfiles entirely, so a generated artifact named `.anything` would be
+  # invisible to the very check that exists to notice one, and the directory would read as clean.
+  mkdir -p "$MYTHICAL_HOME/brokkr"
+  printf 'token = "host-only"\n' > "$MYTHICAL_HOME/brokkr/cli.toml"
+  printf 'x\n' > "$MYTHICAL_HOME/brokkr/.generated"
+  run mi_first_use
+  [ "$status" -eq 1 ]
+  assert_contains "brokkr"
+}
+
+@test "an EMPTY product directory is STILL a trace — the slot must be present, not merely unopposed" {
+  # The exemption is "nothing here but the slot", not "nothing here that offends me". An empty
+  # product directory has always been a trace and stays one.
+  mkdir -p "$MYTHICAL_HOME/brokkr"
+  run mi_first_use
+  [ "$status" -eq 1 ]
+  assert_contains "brokkr"
+}
+
+@test "a DIRECTORY at the slot's name is a trace, not the slot" {
+  # Otherwise a whole generated subtree hides behind the one reserved name.
+  mkdir -p "$MYTHICAL_HOME/brokkr/cli.toml"
+  run mi_first_use
+  [ "$status" -eq 1 ]
+  assert_contains "brokkr"
+}
+
+@test "a SYMLINK at the slot's name is a trace — the contract requires a regular file" {
+  mkdir -p "$MYTHICAL_HOME/brokkr"
+  printf 'token = "host-only"\n' > "$BATS_TEST_TMPDIR/elsewhere.toml"
+  ln -s "$BATS_TEST_TMPDIR/elsewhere.toml" "$MYTHICAL_HOME/brokkr/cli.toml"
+  run mi_first_use
+  [ "$status" -eq 1 ]
+  assert_contains "brokkr"
+  # And a DANGLING one, which is what a half-finished restore leaves.
+  rm -f "$MYTHICAL_HOME/brokkr/cli.toml"
+  ln -s "$BATS_TEST_TMPDIR/gone.toml" "$MYTHICAL_HOME/brokkr/cli.toml"
+  run mi_first_use
+  [ "$status" -eq 1 ]
+  assert_contains "brokkr"
+}
+
+@test "a SYMLINK standing where the product directory should be is a trace, whatever it holds" {
+  # The exemption is about a directory THIS layout owns. mi_zone classifies home-relative paths, not
+  # link targets somewhere else on the disk, so a link is never exempted on the strength of what is
+  # at the far end of it.
+  mkdir -p "$BATS_TEST_TMPDIR/elsewhere"
+  printf 'token = "host-only"\n' > "$BATS_TEST_TMPDIR/elsewhere/cli.toml"
+  ln -s "$BATS_TEST_TMPDIR/elsewhere" "$MYTHICAL_HOME/brokkr"
+  run mi_first_use
+  [ "$status" -eq 1 ]
+  assert_contains "brokkr"
+}
+
+@test "an UNREADABLE product directory is a trace — 'I could not look' is not 'nothing is there'" {
+  mkdir -p "$MYTHICAL_HOME/brokkr"
+  printf 'token = "host-only"\n' > "$MYTHICAL_HOME/brokkr/cli.toml"
+  chmod 000 "$MYTHICAL_HOME/brokkr"
+  run mi_first_use
+  chmod 755 "$MYTHICAL_HOME/brokkr"
+  [ "$status" -eq 1 ]
+  assert_contains "brokkr"
+}
+
+@test "the exemption is per-directory: an exempt product does not excuse a second product's trace" {
+  mkdir -p "$MYTHICAL_HOME/brokkr" "$MYTHICAL_HOME/saga"
+  printf 'token = "host-only"\n' > "$MYTHICAL_HOME/brokkr/cli.toml"
+  printf 'services: {}\n' > "$MYTHICAL_HOME/saga/compose.yaml"
+  run mi_first_use
+  [ "$status" -eq 1 ]
+  assert_contains "saga"
+}
+
 @test "a ledger that EXISTS is not first use" {
   mi_ident_ensure >/dev/null
   run mi_first_use

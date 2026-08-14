@@ -1054,6 +1054,48 @@ mi_prov_authority() {
 }
 
 # --- first use (§6b.3) ----------------------------------------------------------------------------
+# rc 0 iff <rel> — ONE home-relative component — is a real directory holding at least one host-tool
+# slot (docs/CONFIG-FORMAT.md, "Amendment: the host-tool slot") and NOTHING that is not one. Every
+# entry in it is put to mi_zone, so this exemption and the ownership contract cannot drift apart: the
+# day another leaf becomes user-owned, this follows without being edited.
+#
+# FAIL CLOSED, IN BOTH DIRECTIONS THAT MATTER. An unreadable directory returns 1, because "I could
+# not look" must never become "there is nothing here" — that is the fail-open this whole module is
+# written against. An EMPTY directory returns 1 too, and that is not the same rule: an empty product
+# directory has always been a trace, and turning it into a non-trace here would widen the exemption
+# past the file it exists for. Hence `seen`: the slot must be PRESENT, not merely unopposed.
+#
+# The slot must be a plain regular file. A directory or a symlink at that name is not the host-tool
+# config the contract describes (which requires a regular file, not a symlink, link count 1), and
+# exempting a DIRECTORY called `cli.toml` would hide a whole generated subtree behind a reserved
+# name.
+_mi_prov_host_tool_only() {
+  local rel="$1" h d e b seen=0
+  h="$(mi_home)"
+  d="$h/$rel"
+  # An `if`, not `A && B || return 1` — SC2015, which local shellcheck misses and CI flags. Stated
+  # here rather than left to `seen` below: an unreadable directory would also fall out as a refusal
+  # because its globs match nothing, but that is a consequence, and the rule deserves to be the
+  # first line of the function rather than a side effect of the last.
+  if [ ! -r "$d" ] || [ ! -x "$d" ]; then return 1; fi
+  # THREE GLOBS, because `*` alone does not match a dotfile and a hidden generated artifact must not
+  # be invisible to a question whose entire job is to notice one. `.[!.]*` covers `.x`, `..?*` covers
+  # `..x`; neither can expand to `.` or `..` themselves. An unmatched glob expands to the literal
+  # pattern, which the presence test below drops.
+  for e in "$d"/* "$d"/.[!.]* "$d"/..?*; do
+    [ -e "$e" ] || [ -L "$e" ] || continue
+    b="${e##*/}"
+    case "$(mi_zone "$rel/$b")" in
+      user-owned)
+        if [ -L "$e" ] || [ ! -f "$e" ]; then return 1; fi
+        seen=1
+        ;;
+      *) return 1 ;;
+    esac
+  done
+  [ "$seen" -eq 1 ]
+}
+
 # "No ledger" is only first use when nothing else is there either. An earlier revision said absence
 # means a fresh installation AND claimed a backup restored without the ledger would be detected —
 # which cannot both hold if absence is unconditionally benign. The distinguishing evidence is not the
@@ -1115,6 +1157,16 @@ mi_first_use() {
     esac
     # A per-product directory — or a link standing where one was. `-d` follows the link, so it is
     # true for a link to a live directory and false for a dangling one; `-L` catches what is left.
+    #
+    # ONE EXEMPTION (docs/CONFIG-FORMAT.md, "Amendment: the host-tool slot"): a REAL product
+    # directory holding nothing but `<product>/cli.toml` is not evidence of a previous INSTALLATION.
+    # That file belongs to the product's host-side tool, which an operator can install and configure
+    # before mythical-ctl has ever run here — so counting it would refuse the very first install as
+    # "inconsistent" and send them to 'state repair' over a file they meant to create. A SYMLINK
+    # standing where the directory should be is NOT exempt, whatever it resolves to: the exemption is
+    # about a directory this layout owns, and mi_zone classifies home-relative paths, not link
+    # targets somewhere else on the disk. Everything else in there is still a trace.
+    if [ -d "$p" ] && [ ! -L "$p" ] && _mi_prov_host_tool_only "$b"; then continue; fi
     if [ -d "$p" ]; then found="${found} ${b}/"; continue; fi
     if [ -L "$p" ]; then found="${found} ${b}"; continue; fi
     # Anything else here is a plain file at a name this installer never creates — not evidence.

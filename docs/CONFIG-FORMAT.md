@@ -4,6 +4,11 @@
 product's own UI implements when it writes its settings file. It is normative: a file that does not
 follow it is rejected, and rejection is not a bug.
 
+The layout holds one further configuration path, `~/.mythical/<product>/cli.toml`, which is **not**
+a `.conf` file and which `mythical-ctl` never reads. It is specified in
+[its own section below](#amendment-the-host-tool-slot-mythicalproductclitoml), and nothing else in
+this document applies to it.
+
 ## The two files
 
 | | `~/.mythical/mythical.conf` | `~/.mythical/<product>.conf` |
@@ -52,6 +57,137 @@ container-launch argument, as the design this format exists to serve rather than
 verify against this release. They are stated here because they are *why* the format is shaped the way
 it is — why `<product>.conf` must be written in place, why it needs a marker, and why its size is
 treated as attacker-controlled. Nothing here should be read as a delivered security guarantee.
+
+## Amendment: the host-tool slot `~/.mythical/<product>/cli.toml`
+
+**This section amends the layout's ownership zones**, and is where they are written down normatively
+for an outside implementer. Until it, the rule was flat: a **top-level** `*.conf` was
+user-owned, and *every* nested path under `~/.mythical/` — anything with a separator in it — was
+installer-managed, meaning generated artifacts the installer owns and may regenerate or remove. The
+amendment carves one leaf out of that zone and nothing else. Every other nested path keeps the class
+it had.
+
+### The slot
+
+```
+~/.mythical/<product>/cli.toml
+```
+
+Exactly that: the reserved leaf name **`cli.toml`**, directly inside a product's directory, one
+level down and no deeper. `<product>` is the same grammar as everywhere else here
+([What `<product>` may be](#what-product-may-be)), so `mythical` is reserved and
+`~/.mythical/mythical/cli.toml` is not a slot.
+
+It is the **general** case, not a per-product favour. Every product may have one, the name is the
+same for all of them, and `mythical-ctl` will never generate a file at that name for any product in
+any version — the name is reserved family-wide. A host-side tool that needs *more than one* file
+does not get to assume a second name: that is a further amendment, not an extension a tool may make
+for itself.
+
+The **directory** `~/.mythical/<product>/` is unchanged — still installer-managed. Only the
+`cli.toml` leaf inside it changes class.
+
+### What a host-side tool is, and why neither `.conf` file fits
+
+A host-side tool runs on the host beside `mythical-ctl` — a product's own CLI, for instance — rather
+than inside that product's container. Its configuration is neither of the two things the layout
+already had a home for. It is not *product settings*: the product never reads it, and the product's
+UI must not write it. It is not an *installer artifact*: nothing in `mythical-ctl` produces it.
+
+Putting it in `~/.mythical/<product>.conf` would be actively wrong, not merely untidy. That file is
+specified above to be **bind-mounted into that product's container, as a single file, read-write**.
+A host-only credential — the bearer token such a tool holds — placed there is handed to the
+container by design, and *stays* handed over after a container compromise, because the container can
+rewrite it as well as read it. The host-tool slot is never mounted into anything, and that is the
+whole reason it exists.
+
+`~/.mythical/mythical.conf` is host-only and would be safe in that respect, but it is the **family**
+file: one shared, core-owned keyspace that `mythical-ctl` itself writes. A per-tool configuration is
+not family configuration, and several tools sharing one flat keyspace is a collision waiting to
+happen.
+
+### Ownership, mode, and identity
+
+| | `~/.mythical/<product>/cli.toml` |
+|---|---|
+| Ownership class (`mi_zone`) | **`user-owned`** — the same class as the two `.conf` files |
+| Who writes it | the operator, or that product's host-side tool running **as the operator** |
+| Mounted into a container | **never** — by any manifest, any policy, or any operator bind |
+| Owner | the user running the host-side tool, which is the user running `mythical-ctl` |
+| Mode | **0600** |
+| Group | not constrained — 0600 makes it irrelevant, and it must **not** be the family group |
+| Format | the tool's own (TOML). `mythical-ctl` does not read, parse or validate it |
+| Integrity marker | no — nothing here reads it, so there is nothing here to detect a tear |
+| Size ceiling | none imposed by this document |
+
+**0600, and specifically not the 0660 + family group that `<product>.conf` uses.** That combination
+exists so the *container* can write its own settings file; applying it here would hand away the one
+property the slot is for. A host-tool slot found group- or world-readable should be treated as
+compromised — rotate whatever it holds.
+
+**The identity requirements are the same shape as for the `.conf` files**, and for the same reasons
+given in [Ownership and identity](#ownership-and-identity): a regular file, not a symlink, link
+count exactly 1. A tool that finds otherwise should refuse rather than read; a hardlink is a second
+name for the same inode and passes every symlink test.
+
+The containing directory is created by whichever side needs it first, mode **0700**, and neither
+side widens it. The file's own 0600 is the guarantee that does not depend on the directory's mode.
+
+`mythical-ctl` enforces none of the owner, mode, group or identity rules above, because it never
+opens the file. They are requirements **on the host-side tool**, written here so that every such
+tool implements the same ones. What `mythical-ctl` does guarantee is the next section.
+
+### What `mythical-ctl` may do to it: nothing
+
+It does not create it, read it, parse it, write it, move it, change its mode or ownership, or delete
+it. Pinned by tests today, and named exactly: a first `install`, a re-install over a populated home,
+`stop`, `start`, `restart`, `recreate`, `uninstall --purge`, and `uninstall --family --purge` — the
+two destructive verbs at their most destructive — leave it **byte-identical and at the mode it
+already had**. The rule is not limited to that list; it binds every verb, including ones not yet
+written.
+
+That is a change in what the installer is *permitted* to do, not only a description of what it does
+today. Installer-managed means the installer may remove what it put in there, and
+`~/.mythical/<product>/` is still installer-managed. **It may not remove that directory wholesale.**
+Any future code that reaps generated artifacts must delete the artifacts it created **by name**, or
+skip every entry whose `mi_zone` class is `user-owned` — never `rm -rf` the product directory. No
+such reaper exists in this release; the rule is written down before one does.
+
+Two honest exceptions, neither of them a deletion:
+
+- **`backup` captures it.** A backup copies the whole `~/.mythical/` tree, so the slot is inside it —
+  exactly as `mythical.conf`'s host secrets already are. **Treat a backup as secret material.**
+  `restore` does not write that tree back onto the machine; it restores the named volumes and the
+  installer state ledger, and the captured tree is a record.
+- **First use notices the directory, and is not confused by it.** A machine with no installer state
+  ledger is swept for traces of a previous installation, and a product *directory* is one such
+  trace. A product directory holding **nothing but** its host-tool slot is not: the host-side tool
+  can legitimately be installed and configured before `mythical-ctl` ever runs on that machine, and
+  refusing the first install over a file the operator meant to create would be a false alarm with a
+  misleading remedy. Anything else in there is still a trace — a generated artifact, a hidden file,
+  a subdirectory, an empty product directory, a symlink standing where the directory should be, or
+  anything at the slot's own name that is not a plain regular file (a directory, a symlink, a
+  dangling symlink) — and the install still refuses and names `state repair`. A directory that
+  cannot be read is a trace too: "I could not look" is not "there is nothing there".
+
+### How the classification is spelled, and what it does not check
+
+`mi_zone` classifies a **home-relative path's shape**. It answers `user-owned` for
+`<component>/cli.toml` when `<component>` is a single path component that does not begin with `.`,
+and leaves everything else nested exactly as it was.
+
+It deliberately does **not** validate that `<component>` is a legal product name. No arm of that
+function ever has — `brokkr/compose.yaml` and `Nonsense/compose.yaml` have always classified alike —
+and teaching a path classifier to validate names would give the layout a second, disagreeing
+authority on what a product is. `_mi_conf_product_name_ok` is that authority. So `Brokkr/cli.toml`
+and `mythical/cli.toml` classify as `user-owned` while being paths this contract does not sanction.
+Nothing creates them, and no caller reads a zone as permission to create.
+
+The depth rule is load-bearing and is not visible in the pattern. `case` globs match `/`, so a bare
+`*/cli.toml` would also match `brokkr/generated/cli.toml` — and `../cli.toml`, which is not even
+inside the home. The classifier therefore decides **every path with two or more separators first**,
+as installer-managed, and the leading-component test rejects `.` and `..`; so neither a nested
+artifact nor a traversal spelling can land in the one class the installer promises never to touch.
 
 ## Ownership and identity
 

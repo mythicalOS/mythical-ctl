@@ -242,6 +242,76 @@ EOF
   assert_contains alias
 }
 
+# --- the host-tool slot survives every verb --------------------------------------------------------
+# docs/CONFIG-FORMAT.md, "Amendment: the host-tool slot" says mythical-ctl does not create, read,
+# write, move, chmod or delete ~/.mythical/<product>/cli.toml. That is a claim about the DESTRUCTIVE
+# verbs above all: the slot lives inside a directory the layout still calls installer-managed, so
+# nothing but this rule stands between a future artifact reaper and a host-only credential.
+#
+# EVERY ASSERTION BELOW NAMES ITSELF, and that is not decoration. These calls run several frames
+# deep under the verbs' own `set -e`, and bats reports such a failure with the stack of the frame
+# errexit unwound through — measured here as `mi_verb_install … line 259` for a mutation that only
+# ever ran a `chmod` inside the FAMILY UNINSTALL, twenty lines later. The reported line is
+# misleading, so the assertion has to say what it was checking or a future failure gets debugged in
+# the wrong function entirely.
+_slot_is() {                      # _slot_is <what-changed-if-this-fires> <expected-digest> <expected-mode>
+  local at="$1" want="$2" mode="$3" slot="$MYTHICAL_HOME/p1/cli.toml" got gotmode
+  if [ ! -f "$slot" ]; then echo "host-tool slot GONE after $at" >&2; return 1; fi
+  got="$(mi_digest "$slot")"
+  if [ "$got" != "$want" ]; then echo "host-tool slot REWRITTEN by $at ($want -> $got)" >&2; return 1; fi
+  if [ -n "$mode" ]; then
+    gotmode="$(ls -ld "$slot" | awk 'NR==1{print $1}')"
+    if [ "$gotmode" != "$mode" ]; then echo "host-tool slot CHMOD'd by $at ($mode -> $gotmode)" >&2; return 1; fi
+  fi
+  return 0
+}
+
+@test "the host-tool slot survives the whole lifecycle, byte-identical and mode-unchanged" {
+  mkdir -p "$MYTHICAL_HOME/p1"
+  printf 'token = "host-only"\n' > "$MYTHICAL_HOME/p1/cli.toml"
+  chmod 600 "$MYTHICAL_HOME/p1/cli.toml"
+  want="$(mi_digest "$MYTHICAL_HOME/p1/cli.toml")"
+  mode="$(ls -ld "$MYTHICAL_HOME/p1/cli.toml" | awk 'NR==1{print $1}')"
+
+  # A first install, then a re-install over the populated home (§10a's byte-identical rule).
+  mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
+  _slot_is "the first install" "$want" "$mode"
+  mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
+  _slot_is "a re-install over a populated home" "$want" "$mode"
+
+  # The whole running lifecycle.
+  mi_verb_stop p1 >/dev/null
+  _slot_is stop "$want" "$mode"
+  mi_verb_start "$IDX" p1 >/dev/null
+  _slot_is start "$want" "$mode"
+  mi_verb_restart "$IDX" p1 >/dev/null
+  _slot_is restart "$want" "$mode"
+  mi_verb_recreate "$IDX" "$POL" "$MAN" p1 >/dev/null
+  _slot_is recreate "$want" "$mode"
+
+  # And both destructive ends, purge included — the two that remove things on purpose.
+  mi_verb_uninstall p1 --purge >/dev/null
+  _slot_is "uninstall --purge" "$want" "$mode"
+  MI_CONFIRM=yes mi_verb_uninstall_family --purge >/dev/null
+  _slot_is "uninstall --family --purge" "$want" "$mode"
+}
+
+@test "no verb ever creates a host-tool slot for a product that has none" {
+  # The slot is the OPERATOR's file. An installer that helpfully created an empty one would be
+  # creating a path it has just promised never to write, and would mask a missing host-side tool.
+  _no_slot() {
+    [ ! -e "$MYTHICAL_HOME/p1/cli.toml" ] && return 0
+    echo "a host-tool slot was CREATED by $1, for a product that has no host-side tool" >&2
+    return 1
+  }
+  mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
+  _no_slot install
+  mi_verb_recreate "$IDX" "$POL" "$MAN" p1 >/dev/null
+  _no_slot recreate
+  MI_CONFIRM=yes mi_verb_uninstall_family --purge >/dev/null
+  _no_slot "uninstall --family --purge"
+}
+
 @test "product uninstall RETAINS the trust floor and membership (§6c) — the rollback bypass" {
   mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
   floor="$(mi_trust_floor_get manifest:p1)"

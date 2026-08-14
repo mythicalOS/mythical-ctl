@@ -67,11 +67,12 @@ product's configuration and volumes into its container per that product's manife
   <product>.conf       per-product settings — to be mounted into that product's container
   bin/                 this CLI, and its siblings
   <product>/           generated artifacts, owned by the installer
+    cli.toml           that product's host-side tool config — yours, host-only, never mounted
   .state/              lock + ledger, owned by the installer — not an editing surface
   transcripts/ logs/   product data
 ```
 
-Both files are `KEY=value` text. They are **never** executed — `mythical-ctl` parses them with a
+Both `.conf` files are `KEY=value` text. They are **never** executed — `mythical-ctl` parses them with a
 strict non-executing reader that allowlists keys and validates values by type, so a line like
 `KEY=$(...)` is refused rather than run. That reader is built and tested today.
 
@@ -82,6 +83,15 @@ launches a container is to build its arguments without reading any value out of 
 at the launch path the verbs walk: the mount, publish and secret-injection rules live at the one
 place a container is created, so no caller can express an unsafe launch. The format itself is
 specified in [`docs/CONFIG-FORMAT.md`](docs/CONFIG-FORMAT.md).
+
+`<product>/cli.toml` is the **host-tool slot** — the one leaf inside an installer-managed product
+directory that the installer does not own. It is where a product's *host-side* tool, a CLI that runs
+beside this one rather than inside that product's container, keeps its own configuration, including
+host-only credentials. It is yours: mode 0600, owned by you, never mounted into any container — and
+that last part is precisely why such a credential does not go in `<product>.conf`, which is to be
+mounted into the container read-write. `mythical-ctl` never creates, reads, writes or removes it.
+The slot is specified in [`docs/CONFIG-FORMAT.md`](docs/CONFIG-FORMAT.md), which is also where the
+ownership zones themselves are written down.
 
 Nothing is scattered across your home directory: every file you are expected to read or edit is
 in there.

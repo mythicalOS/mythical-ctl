@@ -137,6 +137,41 @@ teardown() { rm -rf "$OUT"; mi_lock_release; teardown_test_env; }
   [ "$status" -ne 0 ]
 }
 
+# The host-tool slot holds a HOST-ONLY credential (docs/CONFIG-FORMAT.md, "Amendment: the host-tool
+# slot"). It is the whole reason the slot is not kept in <product>.conf, which IS mounted read-write.
+# Two independent things have to hold, and only both together make "never mounted" true: the
+# core-fixed set — the closed allowlist the core computes for itself — must not name it, and an
+# operator-configurable bind must not be able to reach it either.
+@test "the host-tool slot is not in the core-fixed mount set" {
+  mkdir -p "$MYTHICAL_HOME/brokkr"
+  printf 'token = "host-only"\n' > "$MYTHICAL_HOME/brokkr/cli.toml"
+  run mi_mount_core_fixed brokkr
+  [ "$status" -eq 0 ]
+  case "$output" in
+    *cli.toml*) echo "the host-tool slot reached the core-fixed mount set: $output" >&2; return 1 ;;
+  esac
+  # The set is the three it has always been, so this is an assertion about a KNOWN list rather than
+  # about an empty one that would pass having named nothing.
+  case "$output" in
+    *brokkr.conf*) : ;;
+    *) echo "core-fixed set did not name brokkr.conf at all: $output" >&2; return 1 ;;
+  esac
+}
+
+@test "an operator bind cannot reach the host-tool slot, nor the directory holding it" {
+  mkdir -p "$MYTHICAL_HOME/brokkr"
+  printf 'token = "host-only"\n' > "$MYTHICAL_HOME/brokkr/cli.toml"
+  run mi_mount_check_overlap brokkr "$MYTHICAL_HOME/brokkr/cli.toml"
+  [ "$status" -ne 0 ]
+  assert_contains "family home"
+  run mi_mount_check_overlap brokkr "$MYTHICAL_HOME/brokkr"
+  [ "$status" -ne 0 ]
+  # And not through a symlink planted outside the home either.
+  ln -s "$MYTHICAL_HOME/brokkr/cli.toml" "$OUT/sneaky.toml"
+  run mi_mount_check_overlap brokkr "$OUT/sneaky.toml"
+  [ "$status" -ne 0 ]
+}
+
 @test "a SYMLINK whose target resolves inside the family home is rejected" {
   ln -s "$MYTHICAL_HOME/bin" "$OUT/sneaky"
   run mi_mount_check_overlap brokkr "$OUT/sneaky"

@@ -46,6 +46,11 @@ skipped or failing checks exactly.
 - **Data is never collateral.** `mi_zone` classifies every path into an ownership class; config
   writes are additive by construction (append absent keys, refuse to change set ones, preserve
   every other byte). Any new write path must fit those zones.
+- **The host-tool slot is user-owned.** `~/.mythical/<product>/cli.toml` is carved out of the
+  installer-managed product directory for a product's *host-side* tool, and it holds host-only
+  credentials. Never create, read, write, chmod or delete it — and never remove a product directory
+  wholesale: a reaper deletes the artifacts it created by name, or skips every `user-owned` entry.
+  `docs/CONFIG-FORMAT.md` is the contract.
 - **Container launches go through the one launch path** — mount, publish, and secret-injection
   rules live at the single place a container is created, so no caller can express an unsafe
   launch. Do not add a second `docker run` site.
