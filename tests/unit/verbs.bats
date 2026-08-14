@@ -254,15 +254,28 @@ EOF
 # ever ran a `chmod` inside the FAMILY UNINSTALL, twenty lines later. The reported line is
 # misleading, so the assertion has to say what it was checking or a future failure gets debugged in
 # the wrong function entirely.
-_slot_is() {                      # _slot_is <what-changed-if-this-fires> <expected-digest> <expected-mode>
-  local at="$1" want="$2" mode="$3" slot="$MYTHICAL_HOME/p1/cli.toml" got gotmode
+_slot_is() {                      # _slot_is <what-changed-if-this-fires> <digest> <mode> <inode> <uid>
+  local at="$1" want="$2" mode="$3" wantino="$4" wantuid="$5"
+  local slot="$MYTHICAL_HOME/p1/cli.toml" got gotmode gotino gotuid
+  # A SYMLINK IS NOT THE FILE, and `-f` follows one — so it is asked first and separately. Without
+  # this a verb could replace the slot with a link to an identical file elsewhere and every
+  # assertion below would read the target and pass.
+  if [ -L "$slot" ]; then echo "host-tool slot REPLACED BY A SYMLINK by $at" >&2; return 1; fi
   if [ ! -f "$slot" ]; then echo "host-tool slot GONE after $at" >&2; return 1; fi
+  # IDENTITY, NOT JUST CONTENT. `rm` plus a byte-identical rewrite, or a `mv` into place, changes the
+  # inode while leaving the digest and the mode exactly as they were — and the contract forbids
+  # moving or re-creating this file, not merely altering its bytes. It is the same reason
+  # <product>.conf must never be replaced by rename: a new inode detaches anything bound to the old.
+  gotino="$(_mi_ino "$slot")" || { echo "cannot read the slot's identity after $at" >&2; return 1; }
+  if [ "$gotino" != "$wantino" ]; then
+    echo "host-tool slot REPLACED by $at (inode $wantino -> $gotino)" >&2; return 1; fi
+  gotuid="$(_mi_owner_uid "$slot")" || { echo "cannot read the slot's owner after $at" >&2; return 1; }
+  if [ "$gotuid" != "$wantuid" ]; then
+    echo "host-tool slot CHOWNed by $at ($wantuid -> $gotuid)" >&2; return 1; fi
   got="$(mi_digest "$slot")"
   if [ "$got" != "$want" ]; then echo "host-tool slot REWRITTEN by $at ($want -> $got)" >&2; return 1; fi
-  if [ -n "$mode" ]; then
-    gotmode="$(ls -ld "$slot" | awk 'NR==1{print $1}')"
-    if [ "$gotmode" != "$mode" ]; then echo "host-tool slot CHMOD'd by $at ($mode -> $gotmode)" >&2; return 1; fi
-  fi
+  gotmode="$(ls -ld "$slot" | awk 'NR==1{print $1}')"
+  if [ "$gotmode" != "$mode" ]; then echo "host-tool slot CHMOD'd by $at ($mode -> $gotmode)" >&2; return 1; fi
   return 0
 }
 
@@ -278,28 +291,31 @@ _slot_is() {                      # _slot_is <what-changed-if-this-fires> <expec
   want="$(mi_digest "$MYTHICAL_HOME/p1/cli.toml")"
   mode="$(ls -ld "$MYTHICAL_HOME/p1/cli.toml" | awk 'NR==1{print $1}')"
   [ "$mode" = "-rw-r-----" ] || { echo "fixture mode is '$mode', not the 0640 this test needs" >&2; return 1; }
+  ino="$(_mi_ino "$MYTHICAL_HOME/p1/cli.toml")"
+  uid="$(_mi_owner_uid "$MYTHICAL_HOME/p1/cli.toml")"
+  [ -n "$ino" ] && [ -n "$uid" ]
 
   # A first install, then a re-install over the populated home (§10a's byte-identical rule).
   mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
-  _slot_is "the first install" "$want" "$mode"
+  _slot_is "the first install" "$want" "$mode" "$ino" "$uid"
   mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
-  _slot_is "a re-install over a populated home" "$want" "$mode"
+  _slot_is "a re-install over a populated home" "$want" "$mode" "$ino" "$uid"
 
   # The whole running lifecycle.
   mi_verb_stop p1 >/dev/null
-  _slot_is stop "$want" "$mode"
+  _slot_is stop "$want" "$mode" "$ino" "$uid"
   mi_verb_start "$IDX" p1 >/dev/null
-  _slot_is start "$want" "$mode"
+  _slot_is start "$want" "$mode" "$ino" "$uid"
   mi_verb_restart "$IDX" p1 >/dev/null
-  _slot_is restart "$want" "$mode"
+  _slot_is restart "$want" "$mode" "$ino" "$uid"
   mi_verb_recreate "$IDX" "$POL" "$MAN" p1 >/dev/null
-  _slot_is recreate "$want" "$mode"
+  _slot_is recreate "$want" "$mode" "$ino" "$uid"
 
   # And both destructive ends, purge included — the two that remove things on purpose.
   mi_verb_uninstall p1 --purge >/dev/null
-  _slot_is "uninstall --purge" "$want" "$mode"
+  _slot_is "uninstall --purge" "$want" "$mode" "$ino" "$uid"
   MI_CONFIRM=yes mi_verb_uninstall_family --purge >/dev/null
-  _slot_is "uninstall --family --purge" "$want" "$mode"
+  _slot_is "uninstall --family --purge" "$want" "$mode" "$ino" "$uid"
 }
 
 @test "no verb ever creates a host-tool slot for a product that has none" {

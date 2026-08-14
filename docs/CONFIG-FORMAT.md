@@ -126,15 +126,18 @@ happen.
 | Mounted into a container | **never by name** — no manifest, policy or operator bind can name it; see the limit below |
 | Owner | the user running the host-side tool, which is the user running `mythical-ctl` |
 | Mode | **0600** |
-| Group | not constrained — 0600 makes it irrelevant, and it must **not** be the family group |
+| Group | not constrained — at 0600 no group has access, so whichever one the file lands in is fine |
 | Format | the tool's own (TOML). `mythical-ctl` does not parse or validate it |
 | Integrity marker | no — nothing here interprets it, so there is nothing here to detect a tear against |
 | Size ceiling | none imposed by this document |
 
 **0600, and specifically not the 0660 + family group that `<product>.conf` uses.** That combination
 exists so the *container* can write its own settings file; applying it here would hand away the one
-property the slot is for. A host-tool slot found group- or world-readable should be treated as
-compromised — rotate whatever it holds.
+property the slot is for. What is forbidden is the *arrangement* — a group-readable or
+group-writable mode, whichever group it names — not membership of any particular group: at 0600 the
+group is inert, so a file that lands in the operator's primary group, or in the family group, is
+equally fine. A host-tool slot found group- or world-readable should be treated as compromised —
+rotate whatever it holds.
 
 **The identity requirements are the same shape as for the `.conf` files**, and for the same reasons
 given in [Ownership and identity](#ownership-and-identity): a regular file, not a symlink, link

@@ -66,11 +66,6 @@ mi_ensure_layout() {
 # ledger's field parsing, the config scanner, the document readers — which is a pre-existing,
 # codebase-wide exposure this amendment neither introduces nor closes. Recorded here because the
 # measurement was made here.
-#
-# `LC_ALL=C` IS LOAD-BEARING ON THE ONE RANGE BELOW, and it is not decoration. Under a non-C
-# collation `[a-z]` matches uppercase: measured here on bash 3.2 under da_DK.UTF-8, `case Brokkr in
-# [a-z]*)` MATCHES, so without this the same path classifies differently on an operator's laptop
-# than in CI. Scoped `local` so nothing else in the process is affected.
 mi_zone() {
   local p="$1"
   case "$p" in
