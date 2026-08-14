@@ -78,11 +78,21 @@ level down and no deeper. `<product>` is the same grammar as everywhere else her
 ([What `<product>` may be](#what-product-may-be)), so `mythical` is reserved and
 `~/.mythical/mythical/cli.toml` is not a slot.
 
-It is the **general** case, not a per-product favour. Every product may have one, the name is the
-same for all of them, and `mythical-ctl` will never generate a file at that name for any product in
-any version — the name is reserved family-wide. A host-side tool that needs *more than one* file
-does not get to assume a second name: that is a further amendment, not an extension a tool may make
-for itself.
+It is the **general** case, not a per-product favour. The name is the same for every product, and
+`mythical-ctl` will never generate a file at that name for any product in any version — the name is
+reserved family-wide. A host-side tool that needs *more than one* file does not get to assume a
+second name: that is a further amendment, not an extension a tool may make for itself.
+
+**Three product names cannot carry a slot, and this is a limit rather than an oversight.** The
+grammar above admits `bin`, `logs` and `transcripts` as product names, but those three directories
+already mean something else directly under `~/.mythical/`: `bin/` is the installer's own, and
+`logs/` and `transcripts/` are the user-data trees. Their zones are decided before the slot is
+considered, so `~/.mythical/bin/cli.toml` stays installer-managed and
+`~/.mythical/logs/cli.toml` stays user-data. That collision is older and wider than this amendment —
+a product named `logs` collides with the user-data tree whatever it puts in there — and it is not
+resolved here, because doing so would mean changing what is a legal product name, which is a
+different contract. A host-side tool for a product with one of those three names has **no** slot
+under this amendment. No product in the family is so named.
 
 The **directory** `~/.mythical/<product>/` is unchanged — still installer-managed. Only the
 `cli.toml` leaf inside it changes class.
@@ -182,6 +192,14 @@ and teaching a path classifier to validate names would give the layout a second,
 authority on what a product is. `_mi_conf_product_name_ok` is that authority. So `Brokkr/cli.toml`
 and `mythical/cli.toml` classify as `user-owned` while being paths this contract does not sanction.
 Nothing creates them, and no caller reads a zone as permission to create.
+
+**A caller that is deciding about a real directory validates the name itself**, and the first-use
+sweep does exactly that: a directory called `Brokkr/` or `mythical/` holding a `cli.toml` is *not*
+exempted from it, because there the question is not "what shape is this path" but "is this
+unexplained directory evidence of a previous installation" — and an unsanctioned name is precisely
+what makes it unexplained. `mythical/` matters most, being reserved for the reason given
+[above](#what-product-may-be). Read the classifier's answer as a statement about the path, never as
+permission.
 
 The depth rule is load-bearing and is not visible in the pattern. `case` globs match `/`, so a bare
 `*/cli.toml` would also match `brokkr/generated/cli.toml` — and `../cli.toml`, which is not even

@@ -344,6 +344,28 @@ teardown() { mi_lock_release; teardown_test_env; }
   assert_contains "brokkr"
 }
 
+@test "a directory whose NAME is not a legal product is a trace, slot or no slot" {
+  # mi_zone answers about a path's shape and deliberately does not validate the name — but THIS
+  # decision is about a real directory standing in the home, and an unsanctioned name is exactly what
+  # makes such a directory unexplained. Without the name check the sweep reports the machine as
+  # genuinely fresh and the install initialises state over it.
+  mkdir -p "$MYTHICAL_HOME/Brokkr"
+  printf 'token = "host-only"\n' > "$MYTHICAL_HOME/Brokkr/cli.toml"
+  run mi_first_use
+  [ "$status" -eq 1 ]
+  assert_contains "Brokkr"
+}
+
+@test "the RESERVED name 'mythical' is a trace even holding nothing but a slot" {
+  # `mythical` is refused as a product name because ~/.mythical/mythical.conf is the host-only family
+  # file; a directory of that name is the last one to wave through as "a fresh machine".
+  mkdir -p "$MYTHICAL_HOME/mythical"
+  printf 'token = "host-only"\n' > "$MYTHICAL_HOME/mythical/cli.toml"
+  run mi_first_use
+  [ "$status" -eq 1 ]
+  assert_contains "mythical"
+}
+
 @test "the exemption is per-directory: an exempt product does not excuse a second product's trace" {
   mkdir -p "$MYTHICAL_HOME/brokkr" "$MYTHICAL_HOME/saga"
   printf 'token = "host-only"\n' > "$MYTHICAL_HOME/brokkr/cli.toml"

@@ -94,6 +94,26 @@ load '../lib/test_helper'
   [ "$(mi_zone logs/cli.toml)"           = user-data ]
 }
 
+@test "the three product names that CANNOT carry a slot are pinned as a known limit" {
+  load_mctl
+  # `bin`, `logs` and `transcripts` are legal product names, yet those directories already mean
+  # something else directly under the home — so their `cli.toml` is decided by the arm above and a
+  # product so named gets no slot. That is documented as a limit rather than fixed here: fixing it
+  # would mean changing what is a legal product NAME, which is a different contract with its own
+  # published grammar and its own tests. Pinned so the limit stays a decision, and so anyone who
+  # later narrows the grammar finds the two halves named in one place.
+  local n
+  for n in bin logs transcripts; do
+    run _mi_conf_product_name_ok "$n"
+    [ "$status" -eq 0 ]                     # a legal product name...
+  done
+  [ "$(mi_zone bin/cli.toml)"         = installer-managed ]   # ...with no slot
+  [ "$(mi_zone logs/cli.toml)"        = user-data ]
+  [ "$(mi_zone transcripts/cli.toml)" = user-data ]
+  # The document says so in as many words, so the limit is published and not merely true.
+  grep -Faq 'Three product names cannot carry a slot' "${_MCTL_ROOT}/docs/CONFIG-FORMAT.md"
+}
+
 @test "mi_zone classifies path SHAPE and does not validate the product name" {
   load_mctl
   # A documented non-guarantee, pinned so it stays a decision rather than becoming an accident. No

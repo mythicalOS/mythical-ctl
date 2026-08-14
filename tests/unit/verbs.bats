@@ -299,15 +299,30 @@ _slot_is() {                      # _slot_is <what-changed-if-this-fires> <expec
 @test "no verb ever creates a host-tool slot for a product that has none" {
   # The slot is the OPERATOR's file. An installer that helpfully created an empty one would be
   # creating a path it has just promised never to write, and would mask a missing host-side tool.
+  # `-e` ALONE IS NOT THE TEST. It follows a symlink, so it is false for a DANGLING one — and a verb
+  # that planted a dangling `cli.toml` would satisfy it while having created exactly the path this
+  # asserts nothing creates. `-L` is the only test that sees the link itself, which is the same rule
+  # the first-use sweep in lib/prov.sh is built on.
   _no_slot() {
-    [ ! -e "$MYTHICAL_HOME/p1/cli.toml" ] && return 0
-    echo "a host-tool slot was CREATED by $1, for a product that has no host-side tool" >&2
-    return 1
+    local slot="$MYTHICAL_HOME/p1/cli.toml"
+    if [ -e "$slot" ] || [ -L "$slot" ]; then
+      echo "a host-tool slot was CREATED by $1, for a product that has no host-side tool" >&2
+      return 1
+    fi
+    return 0
   }
   mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
   _no_slot install
+  mi_verb_stop p1 >/dev/null
+  _no_slot stop
+  mi_verb_start "$IDX" p1 >/dev/null
+  _no_slot start
+  mi_verb_restart "$IDX" p1 >/dev/null
+  _no_slot restart
   mi_verb_recreate "$IDX" "$POL" "$MAN" p1 >/dev/null
   _no_slot recreate
+  mi_verb_uninstall p1 --purge >/dev/null
+  _no_slot "uninstall --purge"
   MI_CONFIRM=yes mi_verb_uninstall_family --purge >/dev/null
   _no_slot "uninstall --family --purge"
 }

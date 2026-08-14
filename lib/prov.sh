@@ -1166,7 +1166,16 @@ mi_first_use() {
     # standing where the directory should be is NOT exempt, whatever it resolves to: the exemption is
     # about a directory this layout owns, and mi_zone classifies home-relative paths, not link
     # targets somewhere else on the disk. Everything else in there is still a trace.
-    if [ -d "$p" ] && [ ! -L "$p" ] && _mi_prov_host_tool_only "$b"; then continue; fi
+    #
+    # AND THE NAME IS VALIDATED HERE, WHICH mi_zone DELIBERATELY DOES NOT DO. That asymmetry is the
+    # point, not an inconsistency: mi_zone answers about a path's SHAPE and has no business holding a
+    # second opinion on what a product is, but THIS is a decision about a real directory standing in
+    # the home, and `Brokkr/` or `mythical/` is exactly the unexplained directory the sweep exists to
+    # notice. `mythical` matters most — it is reserved because it aims at the host-only family file's
+    # namespace. Without this the sweep would report a machine as genuinely fresh on the strength of
+    # a directory the contract does not sanction, and the install would initialise state over it.
+    if [ -d "$p" ] && [ ! -L "$p" ] \
+       && _mi_conf_product_name_ok "$b" && _mi_prov_host_tool_only "$b"; then continue; fi
     if [ -d "$p" ]; then found="${found} ${b}/"; continue; fi
     if [ -L "$p" ]; then found="${found} ${b}"; continue; fi
     # Anything else here is a plain file at a name this installer never creates — not evidence.
