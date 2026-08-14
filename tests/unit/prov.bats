@@ -344,16 +344,50 @@ teardown() { mi_lock_release; teardown_test_env; }
   assert_contains "brokkr"
 }
 
+@test "GLOBIGNORE cannot hide a generated artifact from the exemption's own sweep" {
+  # MEASURED on bash 3.2, and the mechanism is not the obvious one: a GLOBIGNORE inherited from the
+  # ENVIRONMENT does not filter — bash imports the variable without arming it — so
+  # `GLOBIGNORE=... mythical-ctl` proves nothing and a test written that way passes over a live hole.
+  # ANY in-shell assignment arms the value, which is what this does, and is what one future line
+  # anywhere in the process would do to an operator-supplied one. Hidden artifact, real trace.
+  mkdir -p "$MYTHICAL_HOME/brokkr"
+  printf 'token = "host-only"\n' > "$MYTHICAL_HOME/brokkr/cli.toml"
+  printf 'services: {}\n' > "$MYTHICAL_HOME/brokkr/compose.yaml"
+  GLOBIGNORE='*.yaml:*/compose.yaml'
+  export GLOBIGNORE
+  run mi_first_use
+  unset GLOBIGNORE
+  [ "$status" -eq 1 ]
+  assert_contains "brokkr"
+}
+
 @test "a directory whose NAME is not a legal product is a trace, slot or no slot" {
-  # mi_zone answers about a path's shape and deliberately does not validate the name — but THIS
-  # decision is about a real directory standing in the home, and an unsanctioned name is exactly what
-  # makes such a directory unexplained. Without the name check the sweep reports the machine as
-  # genuinely fresh and the install initialises state over it.
+  # mi_zone stops short of the full grammar; this decision is about a real directory standing in the
+  # home, and an unsanctioned name is exactly what makes such a directory unexplained.
   mkdir -p "$MYTHICAL_HOME/Brokkr"
   printf 'token = "host-only"\n' > "$MYTHICAL_HOME/Brokkr/cli.toml"
   run mi_first_use
   [ "$status" -eq 1 ]
   assert_contains "Brokkr"
+}
+
+@test "the name check is what closes mi_zone's residual overmatch — 'fooBAR' proves it alone" {
+  # THE ISOLATING TEST, and it exists because the other two stopped isolating anything. `Brokkr` and
+  # `mythical` are refused by mi_zone itself now, so with the name check DELETED they are still
+  # traces and both tests above stay green over a missing guard — measured, exactly the masking this
+  # suite is meant to make impossible.
+  #
+  # `fooBAR` is the case only the name check can decide: mi_zone classifies `fooBAR/cli.toml` as
+  # user-owned (it stops after the first character, by design), and the product-name grammar refuses
+  # it. Nothing else in the chain says no.
+  [ "$(mi_zone fooBAR/cli.toml)" = user-owned ]
+  run _mi_conf_product_name_ok fooBAR
+  [ "$status" -ne 0 ]
+  mkdir -p "$MYTHICAL_HOME/fooBAR"
+  printf 'token = "host-only"\n' > "$MYTHICAL_HOME/fooBAR/cli.toml"
+  run mi_first_use
+  [ "$status" -eq 1 ]
+  assert_contains "fooBAR"
 }
 
 @test "the RESERVED name 'mythical' is a trace even holding nothing but a slot" {

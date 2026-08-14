@@ -1071,6 +1071,16 @@ mi_prov_authority() {
 # name.
 _mi_prov_host_tool_only() {
   local rel="$1" h d e b seen=0
+  # GLOBIGNORE WOULD HIDE ENTRIES FROM THE VERY SWEEP THAT MUST SEE ALL OF THEM, and the mechanism is
+  # not the obvious one. MEASURED on bash 3.2: a GLOBIGNORE inherited from the ENVIRONMENT does NOT
+  # filter — bash imports the variable but does not arm it — so `GLOBIGNORE=... mythical-ctl` is not
+  # the live vector, and anyone testing that way concludes there is nothing here. But ANY assignment
+  # to it inside the shell arms the inherited value retroactively, even `GLOBIGNORE="$GLOBIGNORE"`.
+  # Nothing in this tree assigns it today; one future line anywhere in the process would turn an
+  # operator-supplied value into a filter on this function, and the failure is silent — a directory
+  # with a generated artifact hidden from the glob reads as "nothing but the host-tool slot" and the
+  # machine reports as fresh. Cleared locally, so it cannot depend on that line never being written.
+  local GLOBIGNORE=
   h="$(mi_home)"
   d="$h/$rel"
   # An `if`, not `A && B || return 1` — SC2015, which local shellcheck misses and CI flags. Stated

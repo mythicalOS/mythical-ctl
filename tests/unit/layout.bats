@@ -114,18 +114,69 @@ load '../lib/test_helper'
   grep -Faq 'Three product names cannot carry a slot' "${_MCTL_ROOT}/docs/CONFIG-FORMAT.md"
 }
 
-@test "mi_zone classifies path SHAPE and does not validate the product name" {
+@test "a component that could not BEGIN a legal product name is not the slot" {
   load_mctl
-  # A documented non-guarantee, pinned so it stays a decision rather than becoming an accident. No
-  # arm of mi_zone validates a product name; `_mi_conf_product_name_ok` is the single authority, and
-  # giving the path classifier a second, disagreeing opinion would be worse than having none.
-  # Nothing creates these paths, and no caller reads a zone as permission to create one.
-  [ "$(mi_zone Brokkr/cli.toml)"         = user-owned ]
-  [ "$(mi_zone mythical/cli.toml)"       = user-owned ]
-  run _mi_conf_product_name_ok Brokkr
+  # The classifier stops short of the full grammar but not at nothing: it refuses anything that
+  # could not start a legal name, and the RESERVED name by name. `mythical` is the one that matters
+  # — it is reserved because ~/.mythical/mythical.conf is the host-only family file.
+  [ "$(mi_zone mythical/cli.toml)"       = installer-managed ]
+  [ "$(mi_zone Brokkr/cli.toml)"         = installer-managed ]
+  [ "$(mi_zone 1foo/cli.toml)"           = installer-managed ]
+  [ "$(mi_zone -foo/cli.toml)"           = installer-managed ]
+  [ "$(mi_zone _foo/cli.toml)"           = installer-managed ]
+  # ...and a legal-shaped one still is.
+  [ "$(mi_zone brokkr/cli.toml)"         = user-owned ]
+  [ "$(mi_zone a1/cli.toml)"             = user-owned ]
+  [ "$(mi_zone my-product/cli.toml)"     = user-owned ]
+}
+
+@test "the uppercase refusal survives a non-C collation — mi_zone fixes its own locale" {
+  # MEASURED on bash 3.2: under a dictionary-collating locale, `case Brokkr in [a-z]*)` MATCHES, so
+  # without the function's own `local LC_ALL=C` this path classifies one way on an operator's laptop
+  # and another in CI — and the laptop is the one that gets it wrong.
+  #
+  # THE LOCALE HAS TO REACH THE SHELL AT STARTUP. A prefix assignment on the function call
+  # (`LC_ALL=xx mi_zone …`) does NOT re-arm collation for a `case` glob in the running shell —
+  # written that way first, and the test then passed with the guard REMOVED: it could not fail. Only
+  # a shell that inherits the locale in its environment exercises it, which is what this runs.
+  #
+  # AND THE HAZARD IS PROVEN PRESENT BEFORE THE GUARD IS ASSERTED AGAINST IT. If no installed locale
+  # collates that way (a stock CI image may generate none), there is nothing here to defeat and this
+  # SKIPS loudly rather than passing over a guard it never tested.
+  local loc="" cand
+  for cand in en_US.UTF-8 en_US.utf8 da_DK.UTF-8 da_DK.utf8 en_GB.UTF-8 de_DE.UTF-8; do
+    if LC_ALL="$cand" bash -c 'case Brokkr in [a-z]*) exit 0 ;; *) exit 1 ;; esac' 2>/dev/null; then
+      loc="$cand"; break
+    fi
+  done
+  if [ -z "$loc" ]; then
+    skip "no installed locale collates [a-z] over uppercase — the guard cannot be exercised here"
+  fi
+
+  run env LC_ALL="$loc" bash -c \
+    'source "$1/lib/common.sh"; source "$1/lib/layout.sh"; mi_zone Brokkr/cli.toml' _ "$_MCTL_ROOT"
+  [ "$status" -eq 0 ]
+  [ "$output" = installer-managed ] || { echo "under $loc: got '$output'" >&2; return 1; }
+  # The positive case is unaffected by locale either way, asserted so a guard that simply refused
+  # everything would not pass this test.
+  run env LC_ALL="$loc" bash -c \
+    'source "$1/lib/common.sh"; source "$1/lib/layout.sh"; mi_zone brokkr/cli.toml' _ "$_MCTL_ROOT"
+  [ "$output" = user-owned ] || { echo "under $loc: got '$output'" >&2; return 1; }
+}
+
+@test "the residual overmatch is documented, narrow, and in the SAFE direction" {
+  load_mctl
+  # What the classifier does NOT re-check: the characters after the first. These read as user-owned
+  # while the grammar refuses them. Pinned so it stays a decision — and it errs toward PRESERVING a
+  # file, which is the mistake this installer is built to make. The sweep that decides about a real
+  # directory validates the name itself, so nothing acts on the overmatch.
+  [ "$(mi_zone fooBAR/cli.toml)"    = user-owned ]
+  [ "$(mi_zone foo.conf/cli.toml)"  = user-owned ]
+  run _mi_conf_product_name_ok fooBAR
   [ "$status" -ne 0 ]
-  run _mi_conf_product_name_ok mythical
+  run _mi_conf_product_name_ok foo.conf
   [ "$status" -ne 0 ]
+  grep -Faq 'narrow overmatch' "${_MCTL_ROOT}/docs/CONFIG-FORMAT.md"
 }
 
 @test "the host-tool amendment changed NO pre-existing classification" {
@@ -167,9 +218,12 @@ load '../lib/test_helper'
   local before; before="$(mi_digest "$MYTHICAL_HOME/brokkr/cli.toml")"
   mi_ensure_layout
   [ "$before" = "$(mi_digest "$MYTHICAL_HOME/brokkr/cli.toml")" ]
-  # And it does not invent one for a product that has no host-side tool.
+  # And it does not invent one for a product that has no host-side tool. `-e` alone is not the test:
+  # it follows a symlink and is therefore FALSE for a dangling one, so a regression that planted a
+  # dangling slot would satisfy it while having created the path this asserts nothing creates.
   mi_ensure_layout
   [ ! -e "$MYTHICAL_HOME/saga/cli.toml" ]
+  [ ! -L "$MYTHICAL_HOME/saga/cli.toml" ]
 }
 
 @test "mi_digest matches a known sha256" {

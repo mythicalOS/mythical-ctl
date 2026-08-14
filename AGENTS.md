@@ -48,9 +48,10 @@ skipped or failing checks exactly.
   every other byte). Any new write path must fit those zones.
 - **The host-tool slot is user-owned.** `~/.mythical/<product>/cli.toml` is carved out of the
   installer-managed product directory for a product's *host-side* tool, and it holds host-only
-  credentials. Never create, read, write, chmod or delete it — and never remove a product directory
-  wholesale: a reaper deletes the artifacts it created by name, or skips every `user-owned` entry.
-  `docs/CONFIG-FORMAT.md` is the contract.
+  credentials. Never create, modify, chmod, delete or parse it — and never remove a product
+  directory wholesale: a reaper deletes the artifacts it created by name, or skips every
+  `user-owned` entry. `backup` is the one path that reads its bytes (it copies the whole tree), so a
+  backup is secret material. `docs/CONFIG-FORMAT.md` is the contract.
 - **Container launches go through the one launch path** — mount, publish, and secret-injection
   rules live at the single place a container is created, so no caller can express an unsafe
   launch. Do not add a second `docker run` site.

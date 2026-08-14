@@ -27,26 +27,38 @@ mi_ensure_layout() {
 # is bind-mounted into the product's container read-write, which is the last place a host-only bearer
 # token may live.
 #
-# TWO ARMS, NOT ONE, AND THE FIRST OF THEM IS THE GUARD. `case` globs match slashes, so a lone
+# THREE ARMS, NOT ONE, AND THE FIRST TWO ARE GUARDS. `case` globs match slashes, so a lone
 # `*/cli.toml` would also capture `brokkr/generated/cli.toml` (a generated artifact) and
 # `../cli.toml` (not even inside the home) — both of them landing in the one class the installer
 # promises never to touch. `*/*/*` therefore decides everything two or more separators deep FIRST,
-# leaving the slot arm reachable only by a path with exactly one separator; and `[!.]` on the leading
-# component rejects `.` and `..`, so no traversal spelling reaches it either. Both arms keep the
-# class every pre-existing path already had, which is why they can sit above `*/*` safely.
+# leaving the slot arm reachable only by a path with exactly one separator; `mythical/cli.toml` is
+# refused by name; and `[a-z]` on the leading component rejects `.`, `..`, `/`, and every component
+# that could not begin a legal product name. All three keep the class every pre-existing path
+# already had, which is why they can sit above `*/*` safely.
 #
-# The classifier answers about a path's SHAPE. It does not validate that the leading component is a
-# legal product name — no arm here ever has (`Nonsense/compose.yaml` has always classified as
-# `brokkr/compose.yaml` does), and a second, disagreeing authority on what a product is would be
-# worse than none. `_mi_conf_product_name_ok` in lib/config.sh is that authority.
+# The classifier answers about a path's SHAPE, and it stops SHORT of the full product-name grammar
+# on purpose: it refuses a leading component that could not begin a legal name, and it refuses the
+# RESERVED name outright, but it does not re-implement the rest. A path classifier holding a second,
+# drifting copy of what a product is would be worse than one that admits its limit;
+# `_mi_conf_product_name_ok` in lib/config.sh is the authority, and a caller deciding about a real
+# directory calls it (lib/prov.sh's first-use sweep does). What survives is a small overmatch in the
+# safe direction — `fooBAR/cli.toml` reads as user-owned — and preserving one file too many is the
+# error this installer is built to make.
+#
+# `LC_ALL=C` IS LOAD-BEARING ON THE ONE RANGE BELOW, and it is not decoration. Under a non-C
+# collation `[a-z]` matches uppercase: measured here on bash 3.2 under da_DK.UTF-8, `case Brokkr in
+# [a-z]*)` MATCHES, so without this the same path classifies differently on an operator's laptop
+# than in CI. Scoped `local` so nothing else in the process is affected.
 mi_zone() {
   local p="$1"
+  local LC_ALL=C
   case "$p" in
     .state/*)                              printf 'installer-state\n'   ;;
     bin|bin/*)                             printf 'installer-managed\n' ;;
     transcripts|transcripts/*|logs|logs/*) printf 'user-data\n'        ;;
     */*/*)                                 printf 'installer-managed\n' ;;  # 2+ separators: never the slot, always generated
-    [!.]*/cli.toml)                        printf 'user-owned\n'        ;;  # the host-tool slot, one level down, no dot-leading component
+    mythical/cli.toml)                     printf 'installer-managed\n' ;;  # `mythical` is RESERVED — never a product directory
+    [a-z]*/cli.toml)                       printf 'user-owned\n'        ;;  # the host-tool slot, one level down, under a name that could begin a legal product
     */*)                                   printf 'installer-managed\n' ;;  # any other nested path = generated artifacts (brokkr/compose.yaml, brokkr/generated.conf)
     mythical.conf|*.conf)                  printf 'user-owned\n'        ;;  # top-level confs only (no slash reaches here)
     *)                                     printf 'unknown\n'           ;;

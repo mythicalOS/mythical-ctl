@@ -147,10 +147,15 @@ side widens it. The file's own 0600 is the guarantee that does not depend on the
 opens the file. They are requirements **on the host-side tool**, written here so that every such
 tool implements the same ones. What `mythical-ctl` does guarantee is the next section.
 
-### What `mythical-ctl` may do to it: nothing
+### What `mythical-ctl` may do to it: nothing but copy it into a backup
 
-It does not create it, read it, parse it, write it, move it, change its mode or ownership, or delete
-it. Pinned by tests today, and named exactly: a first `install`, a re-install over a populated home,
+It does not create it, modify it, move it, change its mode or ownership, or delete it, and it never
+parses or interprets its contents. **It is not true that nothing here ever reads the bytes**, and the
+one path that does is named in full below: `backup` copies the whole home tree. That is the only
+read, it is a copy rather than an interpretation, and it is stated here rather than glossed because
+"the installer never reads it" would be a false guarantee about a file holding a credential.
+
+Pinned by tests today, and named exactly: a first `install`, a re-install over a populated home,
 `stop`, `start`, `restart`, `recreate`, `uninstall --purge`, and `uninstall --family --purge` — the
 two destructive verbs at their most destructive — leave it **byte-identical and at the mode it
 already had**. The rule is not limited to that list; it binds every verb, including ones not yet
@@ -165,10 +170,14 @@ such reaper exists in this release; the rule is written down before one does.
 
 Two honest exceptions, neither of them a deletion:
 
-- **`backup` captures it.** A backup copies the whole `~/.mythical/` tree, so the slot is inside it —
-  exactly as `mythical.conf`'s host secrets already are. **Treat a backup as secret material.**
-  `restore` does not write that tree back onto the machine; it restores the named volumes and the
-  installer state ledger, and the captured tree is a record.
+- **`backup` reads it and copies it.** A backup walks the whole `~/.mythical/` tree and copies every
+  file in it, so the slot — and the credential in it — is inside the backup, exactly as
+  `mythical.conf`'s host secrets already are. **Treat a backup as secret material and give it the
+  protection you would give the token itself.** It is deliberately not excluded: a backup that
+  silently omitted the operator's own configuration would be a worse failure than one that includes
+  it, because it would restore to a machine that looks complete and is not. `restore` does not write
+  that tree back onto the machine; it restores the named volumes and the installer state ledger, and
+  the captured tree is a record.
 - **First use notices the directory, and is not confused by it.** A machine with no installer state
   ledger is swept for traces of a previous installation, and a product *directory* is one such
   trace. A product directory holding **nothing but** its host-tool slot is not: the host-side tool
@@ -183,21 +192,31 @@ Two honest exceptions, neither of them a deletion:
 ### How the classification is spelled, and what it does not check
 
 `mi_zone` classifies a **home-relative path's shape**. It answers `user-owned` for
-`<component>/cli.toml` when `<component>` is a single path component that does not begin with `.`,
-and leaves everything else nested exactly as it was.
+`<component>/cli.toml` when `<component>` is a single path component that could begin a legal
+product name and is not the reserved `mythical`, and leaves everything else nested exactly as it
+was.
 
-It deliberately does **not** validate that `<component>` is a legal product name. No arm of that
-function ever has — `brokkr/compose.yaml` and `Nonsense/compose.yaml` have always classified alike —
-and teaching a path classifier to validate names would give the layout a second, disagreeing
-authority on what a product is. `_mi_conf_product_name_ok` is that authority. So `Brokkr/cli.toml`
-and `mythical/cli.toml` classify as `user-owned` while being paths this contract does not sanction.
-Nothing creates them, and no caller reads a zone as permission to create.
+It stops **short of the full product-name grammar**, on purpose. It refuses a component that could
+not start a legal name — so `Brokkr/cli.toml`, `1foo/cli.toml`, `-foo/cli.toml`, `.hidden/cli.toml`
+and `../cli.toml` are all installer-managed — and it refuses the reserved name outright, but it does
+not re-check the remaining characters. Re-implementing the grammar in a path classifier would give
+the layout a second copy of it to drift against; `_mi_conf_product_name_ok` is the authority, and a
+caller deciding about a real directory calls it. What survives is a narrow overmatch:
+`fooBAR/cli.toml` and `foo.conf/cli.toml` read as `user-owned` while being names the grammar
+refuses. That is deliberate and it errs in the safe direction — the class means "the installer does
+not own this", so an overmatch preserves a file rather than removing one, and preserving one file
+too many is the mistake this installer is built to make.
+
+The refusal of uppercase depends on `LC_ALL=C`, which `mi_zone` sets for itself: under a non-C
+collation `[a-z]` matches uppercase letters, so without it `Brokkr/cli.toml` classifies one way on
+an operator's laptop and another in CI. Measured on the bash 3.2 floor.
 
 **A caller that is deciding about a real directory validates the name itself**, and the first-use
-sweep does exactly that: a directory called `Brokkr/` or `mythical/` holding a `cli.toml` is *not*
-exempted from it, because there the question is not "what shape is this path" but "is this
-unexplained directory evidence of a previous installation" — and an unsanctioned name is precisely
-what makes it unexplained. `mythical/` matters most, being reserved for the reason given
+sweep does exactly that — which is what closes the overmatch above rather than merely tolerating it.
+A directory called `fooBAR/` or `Brokkr/` or `mythical/` holding a `cli.toml` is *not* exempted from
+that sweep, because there the question is not "what shape is this path" but "is this unexplained
+directory evidence of a previous installation", and an unsanctioned name is precisely what makes it
+unexplained. `mythical/` matters most, being reserved for the reason given
 [above](#what-product-may-be). Read the classifier's answer as a statement about the path, never as
 permission.
 
