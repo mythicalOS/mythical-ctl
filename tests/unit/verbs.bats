@@ -242,6 +242,124 @@ EOF
   assert_contains alias
 }
 
+# --- the host-tool slot survives every verb --------------------------------------------------------
+# docs/CONFIG-FORMAT.md, "Amendment: the host-tool slot" says mythical-ctl does not create, read,
+# write, move, chmod or delete ~/.mythical/<product>/cli.toml. That is a claim about the DESTRUCTIVE
+# verbs above all: the slot lives inside a directory the layout still calls installer-managed, so
+# nothing but this rule stands between a future artifact reaper and a host-only credential.
+#
+# EVERY ASSERTION BELOW NAMES ITSELF, and that is not decoration. These calls run several frames
+# deep under the verbs' own `set -e`, and bats reports such a failure with the stack of the frame
+# errexit unwound through — measured here as `mi_verb_install … line 259` for a mutation that only
+# ever ran a `chmod` inside the FAMILY UNINSTALL, twenty lines later. The reported line is
+# misleading, so the assertion has to say what it was checking or a future failure gets debugged in
+# the wrong function entirely.
+_slot_is() {                      # _slot_is <what-changed-if-this-fires> <digest> <mode> <inode> <uid>
+  local at="$1" want="$2" mode="$3" wantino="$4" wantuid="$5"
+  local slot="$MYTHICAL_HOME/p1/cli.toml" got gotmode gotino gotuid
+  # A SYMLINK IS NOT THE FILE, and `-f` follows one — so it is asked first and separately. Without
+  # this a verb could replace the slot with a link to an identical file elsewhere and every
+  # assertion below would read the target and pass.
+  if [ -L "$slot" ]; then echo "host-tool slot REPLACED BY A SYMLINK by $at" >&2; return 1; fi
+  if [ ! -f "$slot" ]; then echo "host-tool slot GONE after $at" >&2; return 1; fi
+  # IDENTITY, NOT JUST CONTENT. `rm` plus a byte-identical rewrite, or a `mv` into place, changes the
+  # inode while leaving the digest and the mode exactly as they were — and the contract forbids
+  # moving or re-creating this file, not merely altering its bytes. It is the same reason
+  # <product>.conf must never be replaced by rename: a new inode detaches anything bound to the old.
+  gotino="$(_mi_ino "$slot")" || { echo "cannot read the slot's identity after $at" >&2; return 1; }
+  if [ "$gotino" != "$wantino" ]; then
+    echo "host-tool slot REPLACED by $at (inode $wantino -> $gotino)" >&2; return 1; fi
+  gotuid="$(_mi_owner_uid "$slot")" || { echo "cannot read the slot's owner after $at" >&2; return 1; }
+  if [ "$gotuid" != "$wantuid" ]; then
+    echo "host-tool slot CHOWNed by $at ($wantuid -> $gotuid)" >&2; return 1; fi
+  got="$(mi_digest "$slot")"
+  if [ "$got" != "$want" ]; then echo "host-tool slot REWRITTEN by $at ($want -> $got)" >&2; return 1; fi
+  gotmode="$(ls -ld "$slot" | awk 'NR==1{print $1}')"
+  if [ "$gotmode" != "$mode" ]; then echo "host-tool slot CHMOD'd by $at ($mode -> $gotmode)" >&2; return 1; fi
+  return 0
+}
+
+@test "the host-tool slot survives the whole lifecycle, byte-identical and mode-unchanged" {
+  mkdir -p "$MYTHICAL_HOME/p1"
+  printf 'token = "host-only"\n' > "$MYTHICAL_HOME/p1/cli.toml"
+  # DELIBERATELY NOT 0600, which is the mode the contract asks the host-side TOOL to use. The
+  # property under test is that mythical-ctl leaves the mode it FINDS alone, and starting at 0600
+  # cannot show that: a regression that unconditionally ran `chmod 600` would land on the same bits
+  # and the test would pass. Starting somewhere else makes "preserved" and "normalised"
+  # distinguishable, which is the whole point of asserting it.
+  #
+  # 0640 IS NOT BLESSED BY THIS. A slot at 0640 is group-readable and the contract calls that
+  # compromised — but enforcing the mode is the host-side tool's job, and mythical-ctl's job is to
+  # touch nothing, INCLUDING a mode it would not itself have chosen. An installer that silently
+  # "corrected" the file would be writing to a file it promises never to write to. That is the
+  # property this fixture is shaped to catch, not an endorsement of the mode it starts from.
+  chmod 640 "$MYTHICAL_HOME/p1/cli.toml"
+  want="$(mi_digest "$MYTHICAL_HOME/p1/cli.toml")"
+  mode="$(ls -ld "$MYTHICAL_HOME/p1/cli.toml" | awk 'NR==1{print $1}')"
+  [ "$mode" = "-rw-r-----" ] || { echo "fixture mode is '$mode', not the 0640 this test needs" >&2; return 1; }
+  ino="$(_mi_ino "$MYTHICAL_HOME/p1/cli.toml")"
+  uid="$(_mi_owner_uid "$MYTHICAL_HOME/p1/cli.toml")"
+  # `[ -n "$ino" ] && [ -n "$uid" ]` was decorative: MEASURED on bash 3.2, errexit does not abort on
+  # a failing AND-list, so an empty fixture would have sailed past and every later comparison would
+  # have been ""-against-"". Same trap this suite's own hygiene scanner documents for `[[ ]]`, and
+  # the same remedy — an explicit failure handler that says what went wrong.
+  [ -n "$ino" ] || { echo "could not read the fixture's inode" >&2; return 1; }
+  [ -n "$uid" ] || { echo "could not read the fixture's owner uid" >&2; return 1; }
+
+  # A first install, then a re-install over the populated home (§10a's byte-identical rule).
+  mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
+  _slot_is "the first install" "$want" "$mode" "$ino" "$uid"
+  mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
+  _slot_is "a re-install over a populated home" "$want" "$mode" "$ino" "$uid"
+
+  # The whole running lifecycle.
+  mi_verb_stop p1 >/dev/null
+  _slot_is stop "$want" "$mode" "$ino" "$uid"
+  mi_verb_start "$IDX" p1 >/dev/null
+  _slot_is start "$want" "$mode" "$ino" "$uid"
+  mi_verb_restart "$IDX" p1 >/dev/null
+  _slot_is restart "$want" "$mode" "$ino" "$uid"
+  mi_verb_recreate "$IDX" "$POL" "$MAN" p1 >/dev/null
+  _slot_is recreate "$want" "$mode" "$ino" "$uid"
+
+  # And both destructive ends, purge included — the two that remove things on purpose.
+  mi_verb_uninstall p1 --purge >/dev/null
+  _slot_is "uninstall --purge" "$want" "$mode" "$ino" "$uid"
+  MI_CONFIRM=yes mi_verb_uninstall_family --purge >/dev/null
+  _slot_is "uninstall --family --purge" "$want" "$mode" "$ino" "$uid"
+}
+
+@test "no verb ever creates a host-tool slot for a product that has none" {
+  # The slot is the OPERATOR's file. An installer that helpfully created an empty one would be
+  # creating a path it has just promised never to write, and would mask a missing host-side tool.
+  # `-e` ALONE IS NOT THE TEST. It follows a symlink, so it is false for a DANGLING one — and a verb
+  # that planted a dangling `cli.toml` would satisfy it while having created exactly the path this
+  # asserts nothing creates. `-L` is the only test that sees the link itself, which is the same rule
+  # the first-use sweep in lib/prov.sh is built on.
+  _no_slot() {
+    local slot="$MYTHICAL_HOME/p1/cli.toml"
+    if [ -e "$slot" ] || [ -L "$slot" ]; then
+      echo "a host-tool slot was CREATED by $1, for a product that has no host-side tool" >&2
+      return 1
+    fi
+    return 0
+  }
+  mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
+  _no_slot install
+  mi_verb_stop p1 >/dev/null
+  _no_slot stop
+  mi_verb_start "$IDX" p1 >/dev/null
+  _no_slot start
+  mi_verb_restart "$IDX" p1 >/dev/null
+  _no_slot restart
+  mi_verb_recreate "$IDX" "$POL" "$MAN" p1 >/dev/null
+  _no_slot recreate
+  mi_verb_uninstall p1 --purge >/dev/null
+  _no_slot "uninstall --purge"
+  MI_CONFIRM=yes mi_verb_uninstall_family --purge >/dev/null
+  _no_slot "uninstall --family --purge"
+}
+
 @test "product uninstall RETAINS the trust floor and membership (§6c) — the rollback bypass" {
   mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
   floor="$(mi_trust_floor_get manifest:p1)"

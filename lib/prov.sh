@@ -1054,6 +1054,58 @@ mi_prov_authority() {
 }
 
 # --- first use (§6b.3) ----------------------------------------------------------------------------
+# rc 0 iff <rel> — ONE home-relative component — is a real directory holding at least one host-tool
+# slot (docs/CONFIG-FORMAT.md, "Amendment: the host-tool slot") and NOTHING that is not one. Every
+# entry in it is put to mi_zone, so this exemption and the ownership contract cannot drift apart: the
+# day another leaf becomes user-owned, this follows without being edited.
+#
+# FAIL CLOSED, IN BOTH DIRECTIONS THAT MATTER. An unreadable directory returns 1, because "I could
+# not look" must never become "there is nothing here" — that is the fail-open this whole module is
+# written against. An EMPTY directory returns 1 too, and that is not the same rule: an empty product
+# directory has always been a trace, and turning it into a non-trace here would widen the exemption
+# past the file it exists for. Hence `seen`: the slot must be PRESENT, not merely unopposed.
+#
+# The slot must be a plain regular file. A directory or a symlink at that name is not the host-tool
+# config the contract describes (which requires a regular file, not a symlink, link count 1), and
+# exempting a DIRECTORY called `cli.toml` would hide a whole generated subtree behind a reserved
+# name.
+_mi_prov_host_tool_only() {
+  local rel="$1" h d e b seen=0
+  # GLOBIGNORE WOULD HIDE ENTRIES FROM THE VERY SWEEP THAT MUST SEE ALL OF THEM, and the mechanism is
+  # not the obvious one. MEASURED on bash 3.2: a GLOBIGNORE inherited from the ENVIRONMENT does NOT
+  # filter — bash imports the variable but does not arm it — so `GLOBIGNORE=... mythical-ctl` is not
+  # the live vector, and anyone testing that way concludes there is nothing here. But ANY assignment
+  # to it inside the shell arms the inherited value retroactively, even `GLOBIGNORE="$GLOBIGNORE"`.
+  # Nothing in this tree assigns it today; one future line anywhere in the process would turn an
+  # operator-supplied value into a filter on this function, and the failure is silent — a directory
+  # with a generated artifact hidden from the glob reads as "nothing but the host-tool slot" and the
+  # machine reports as fresh. Cleared locally, so it cannot depend on that line never being written.
+  local GLOBIGNORE=
+  h="$(mi_home)"
+  d="$h/$rel"
+  # An `if`, not `A && B || return 1` — SC2015, which local shellcheck misses and CI flags. Stated
+  # here rather than left to `seen` below: an unreadable directory would also fall out as a refusal
+  # because its globs match nothing, but that is a consequence, and the rule deserves to be the
+  # first line of the function rather than a side effect of the last.
+  if [ ! -r "$d" ] || [ ! -x "$d" ]; then return 1; fi
+  # THREE GLOBS, because `*` alone does not match a dotfile and a hidden generated artifact must not
+  # be invisible to a question whose entire job is to notice one. `.[!.]*` covers `.x`, `..?*` covers
+  # `..x`; neither can expand to `.` or `..` themselves. An unmatched glob expands to the literal
+  # pattern, which the presence test below drops.
+  for e in "$d"/* "$d"/.[!.]* "$d"/..?*; do
+    [ -e "$e" ] || [ -L "$e" ] || continue
+    b="${e##*/}"
+    case "$(mi_zone "$rel/$b")" in
+      user-owned)
+        if [ -L "$e" ] || [ ! -f "$e" ]; then return 1; fi
+        seen=1
+        ;;
+      *) return 1 ;;
+    esac
+  done
+  [ "$seen" -eq 1 ]
+}
+
 # "No ledger" is only first use when nothing else is there either. An earlier revision said absence
 # means a fresh installation AND claimed a backup restored without the ledger would be detected —
 # which cannot both hold if absence is unconditionally benign. The distinguishing evidence is not the
@@ -1091,6 +1143,13 @@ mi_first_use() {
   # every entry — file, directory, live link and dangling link alike — and the tests below decide.
   local found=""
   local p b
+  # CLEARED HERE TOO, AND NOT ONLY IN THE HELPER. `_mi_prov_host_tool_only` clears GLOBIGNORE for its
+  # own sweep, but this glob runs FIRST and decides what that helper is ever asked about: a value
+  # hiding `brokkr` removes the whole product directory from the listing, and a home holding
+  # `brokkr/compose.yaml` reports as a genuinely fresh machine. Clearing one and not the other left
+  # the outer, earlier, more consequential sweep open. See the helper for the measured mechanism —
+  # an inherited value does not filter until something assigns it, and then it does.
+  local GLOBIGNORE=
   for p in "$h"/*; do
     b="${p##*/}"
     # PRESENCE, NOT READABILITY. `-e` follows a symlink, so it is false for a dangling one; `-L` is
@@ -1115,6 +1174,27 @@ mi_first_use() {
     esac
     # A per-product directory — or a link standing where one was. `-d` follows the link, so it is
     # true for a link to a live directory and false for a dangling one; `-L` catches what is left.
+    #
+    # ONE EXEMPTION (docs/CONFIG-FORMAT.md, "Amendment: the host-tool slot"): a REAL product
+    # directory holding nothing but `<product>/cli.toml` is not evidence of a previous INSTALLATION.
+    # That file belongs to the product's host-side tool, which an operator can install and configure
+    # before mythical-ctl has ever run here — so counting it would refuse the very first install as
+    # "inconsistent" and send them to 'state repair' over a file they meant to create. A SYMLINK
+    # standing where the directory should be is NOT exempt, whatever it resolves to: the exemption is
+    # about a directory this layout owns, and mi_zone classifies home-relative paths, not link
+    # targets somewhere else on the disk. Everything else in there is still a trace.
+    #
+    # THE NAME IS VALIDATED, ONCE, IN mi_zone. An earlier revision called
+    # `_mi_conf_product_name_ok "$b"` here as well, at a time when the classifier stopped after the
+    # first character; now that it asks the grammar's authority in full, `Brokkr/`, `mythical/` and
+    # `fooBAR/` are not `user-owned` there either, and this call decided nothing that the line below
+    # did not already decide. A guard no input reaches is not defence in depth — it is a guard whose
+    # removal no test would notice, which is worse than not having it. One enforcement point.
+    # No `[ -d "$p" ]` in front of this: it was measured to be MASKED. `[ ! -L ]` already rejects a
+    # link, and for anything else that is not a directory the helper refuses on its own — its globs
+    # match nothing, so `seen` stays 0. A condition that decides no input is a condition whose loss
+    # no test would notice.
+    if [ ! -L "$p" ] && _mi_prov_host_tool_only "$b"; then continue; fi
     if [ -d "$p" ]; then found="${found} ${b}/"; continue; fi
     if [ -L "$p" ]; then found="${found} ${b}"; continue; fi
     # Anything else here is a plain file at a name this installer never creates — not evidence.
