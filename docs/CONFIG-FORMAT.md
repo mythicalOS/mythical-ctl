@@ -204,6 +204,14 @@ Two honest exceptions, neither of them a deletion:
   dangling symlink) — and the install still refuses and names `state repair`. A directory that
   cannot be read is a trace too: "I could not look" is not "there is nothing there".
 
+  **That exemption is not a validation of the file, and must not be read as one.** It asks whether a
+  directory is evidence of a previous *installation*, and it decides on an entry's NAME and TYPE
+  only. It does not check the owner, the mode or the link count, and deliberately does not: a
+  `cli.toml` at mode 0644 is a host-tool config with the wrong permissions, not a trace of an
+  installer that was here, and reporting it as an inconsistent home would send an operator to
+  `state repair` over a `chmod` problem. The ownership requirements above are requirements on the
+  host-side tool; nothing in `mythical-ctl` enforces them, here or anywhere.
+
 ### How the classification is spelled, and what it does not check
 
 `mi_zone` classifies a **home-relative path**. It answers `user-owned` for `<component>/cli.toml`

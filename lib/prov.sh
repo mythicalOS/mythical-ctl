@@ -1143,6 +1143,13 @@ mi_first_use() {
   # every entry — file, directory, live link and dangling link alike — and the tests below decide.
   local found=""
   local p b
+  # CLEARED HERE TOO, AND NOT ONLY IN THE HELPER. `_mi_prov_host_tool_only` clears GLOBIGNORE for its
+  # own sweep, but this glob runs FIRST and decides what that helper is ever asked about: a value
+  # hiding `brokkr` removes the whole product directory from the listing, and a home holding
+  # `brokkr/compose.yaml` reports as a genuinely fresh machine. Clearing one and not the other left
+  # the outer, earlier, more consequential sweep open. See the helper for the measured mechanism —
+  # an inherited value does not filter until something assigns it, and then it does.
+  local GLOBIGNORE=
   for p in "$h"/*; do
     b="${p##*/}"
     # PRESENCE, NOT READABILITY. `-e` follows a symlink, so it is false for a dangling one; `-L` is

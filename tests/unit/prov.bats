@@ -361,6 +361,39 @@ teardown() { mi_lock_release; teardown_test_env; }
   assert_contains "brokkr"
 }
 
+@test "the exemption helper clears GLOBIGNORE for ITSELF, not only via its caller" {
+  # CALLED DIRECTLY, and that is the entire point of the test. `local GLOBIGNORE=` in mi_first_use is
+  # dynamically scoped, so it already covers the helper on the one path that exists today — which
+  # makes the helper's own clear invisible through mi_first_use, and a guard nothing can kill is one
+  # that gets deleted by the next person tidying up. It is kept because relying on a caller's local
+  # for a fail-closed sweep breaks silently the day a second caller appears, and it is asserted here
+  # so that reasoning is enforced rather than written down and forgotten.
+  mkdir -p "$MYTHICAL_HOME/brokkr"
+  printf 'token = "host-only"\n' > "$MYTHICAL_HOME/brokkr/cli.toml"
+  printf 'services: {}\n' > "$MYTHICAL_HOME/brokkr/compose.yaml"
+  GLOBIGNORE='*.yaml:*/compose.yaml'
+  export GLOBIGNORE
+  # rc 1 = "there is more here than the slot", which is only reachable if the artifact was SEEN.
+  run _mi_prov_host_tool_only brokkr
+  unset GLOBIGNORE
+  [ "$status" -eq 1 ] || { echo "the hidden artifact was not seen: rc=$status" >&2; return 1; }
+}
+
+@test "GLOBIGNORE cannot hide the product DIRECTORY from the outer sweep either" {
+  # The outer glob runs before the helper and decides what the helper is ever asked about, so a
+  # value naming the directory itself removes it from the listing entirely — and a home holding a
+  # generated artifact reports as a genuinely fresh machine. Clearing GLOBIGNORE in the helper alone
+  # left this, the earlier and more consequential of the two sweeps, open.
+  mkdir -p "$MYTHICAL_HOME/brokkr"
+  printf 'services: {}\n' > "$MYTHICAL_HOME/brokkr/compose.yaml"
+  GLOBIGNORE="$MYTHICAL_HOME/brokkr:*/brokkr"
+  export GLOBIGNORE
+  run mi_first_use
+  unset GLOBIGNORE
+  [ "$status" -eq 1 ]
+  assert_contains "brokkr"
+}
+
 @test "a directory whose NAME is not a legal product is a trace, slot or no slot" {
   # An unsanctioned name is exactly what makes a directory standing in the home unexplained, and an
   # unexplained directory is what this sweep exists to notice.

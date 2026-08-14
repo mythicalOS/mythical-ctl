@@ -269,9 +269,15 @@ _slot_is() {                      # _slot_is <what-changed-if-this-fires> <expec
 @test "the host-tool slot survives the whole lifecycle, byte-identical and mode-unchanged" {
   mkdir -p "$MYTHICAL_HOME/p1"
   printf 'token = "host-only"\n' > "$MYTHICAL_HOME/p1/cli.toml"
-  chmod 600 "$MYTHICAL_HOME/p1/cli.toml"
+  # DELIBERATELY NOT 0600, which is the mode the contract asks the host-side TOOL to use. The
+  # property under test is that mythical-ctl leaves the mode it FINDS alone, and starting at 0600
+  # cannot show that: a regression that unconditionally ran `chmod 600` would land on the same bits
+  # and the test would pass. Starting somewhere else makes "preserved" and "normalised"
+  # distinguishable, which is the whole point of asserting it.
+  chmod 640 "$MYTHICAL_HOME/p1/cli.toml"
   want="$(mi_digest "$MYTHICAL_HOME/p1/cli.toml")"
   mode="$(ls -ld "$MYTHICAL_HOME/p1/cli.toml" | awk 'NR==1{print $1}')"
+  [ "$mode" = "-rw-r-----" ] || { echo "fixture mode is '$mode', not the 0640 this test needs" >&2; return 1; }
 
   # A first install, then a re-install over the populated home (§10a's byte-identical rule).
   mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
