@@ -27,14 +27,12 @@ mi_ensure_layout() {
 # is bind-mounted into the product's container read-write, which is the last place a host-only bearer
 # token may live.
 #
-# THREE ARMS, NOT ONE, AND THE FIRST TWO ARE GUARDS. `case` globs match slashes, so a lone
-# `*/cli.toml` would also capture `brokkr/generated/cli.toml` (a generated artifact) and
-# `../cli.toml` (not even inside the home) — both of them landing in the one class the installer
-# promises never to touch. `*/*/*` therefore decides everything two or more separators deep FIRST,
-# leaving the slot arm reachable only by a path with exactly one separator; `mythical/cli.toml` is
-# refused by name; and `[a-z]` on the leading component rejects `.`, `..`, `/`, and every component
-# that could not begin a legal product name. All three keep the class every pre-existing path
-# already had, which is why they can sit above `*/*` safely.
+# THE SLOT ARM IS A CANDIDATE FILTER, NOT THE DECISION. `case` globs match slashes, so `*/cli.toml`
+# also catches `brokkr/generated/cli.toml` (a generated artifact) and `../cli.toml` (not even inside
+# the home). Neither may end up in the one class the installer promises never to touch, and neither
+# does: the arm's body re-checks the leaf exactly and puts the leading component to the product-name
+# grammar, and anything that fails either falls out as `installer-managed` — the class it carried
+# before this carve-out existed. The arm sits above `*/*` only to be given the chance to ask.
 #
 # THE SLOT'S LEADING COMPONENT IS A LEGAL PRODUCT NAME OR IT IS NOT THE SLOT, and the grammar is
 # ASKED OF ITS ONE AUTHORITY rather than re-implemented here. An earlier revision stopped at the
@@ -58,6 +56,14 @@ mi_ensure_layout() {
 # guard belongs and where a test can still kill it. A guard no input reaches is not defence in
 # depth; it is a line that looks like protection and is not.
 #
+# WHAT IS STILL EXPOSED, SAID PLAINLY: a caller that has run `shopt -s nocasematch` changes how every
+# `case` in this file matches, and the grammar's authority is a `case` too — measured, under that
+# option `_mi_conf_product_name_ok Brokkr` SUCCEEDS, so `BROKKR/cli.toml` would classify as the slot.
+# The leaf is defended here because it is this amendment's own reserved name; the name half is not,
+# because it would mean hardening a published grammar that the whole CLI depends on, against an
+# option nothing in this tree sets and which is not reachable from the environment. Recorded rather
+# than silently relied upon.
+#
 # `LC_ALL=C` IS LOAD-BEARING ON THE ONE RANGE BELOW, and it is not decoration. Under a non-C
 # collation `[a-z]` matches uppercase: measured here on bash 3.2 under da_DK.UTF-8, `case Brokkr in
 # [a-z]*)` MATCHES, so without this the same path classifies differently on an operator's laptop
@@ -68,9 +74,22 @@ mi_zone() {
     .state/*)                              printf 'installer-state\n'   ;;
     bin|bin/*)                             printf 'installer-managed\n' ;;
     transcripts|transcripts/*|logs|logs/*) printf 'user-data\n'        ;;
-    */*/*)                                 printf 'installer-managed\n' ;;  # 2+ separators: never the slot, always generated
-    */cli.toml)                                                             # candidate slot — the NAME decides, and only the grammar's authority may say
-      if declare -F _mi_conf_product_name_ok >/dev/null 2>&1 \
+    */cli.toml)                                                             # candidate slot — the LEAF is re-checked exactly, then the NAME decides
+      # THE LEAF IS COMPARED WITH `=`, NOT LEFT TO THE GLOB THAT GOT US HERE, and that one comparison
+      # carries two rules at once.
+      #
+      # CASE. `case` honours `nocasematch`, so with a caller having enabled it `brokkr/CLI.TOML`
+      # reaches this arm — and a generated artifact would take the one class that says the installer
+      # does not own it. Measured: a string comparison is unaffected by the option, a `case` glob is.
+      #
+      # DEPTH. `${p#*/}` strips only as far as the FIRST separator, so for anything deeper than one
+      # level the remainder still contains a `/` and can never equal the reserved name:
+      # `brokkr/generated/cli.toml` yields `generated/cli.toml` and is refused here. A separate
+      # `*/*/*` arm used to sit above this and say the same thing; it was measured to be MASKED once
+      # this comparison existed — no input reached a different answer through it — so it is gone
+      # rather than left looking like the thing that enforces depth. This is that thing.
+      if [ "${p#*/}" = cli.toml ] \
+         && declare -F _mi_conf_product_name_ok >/dev/null 2>&1 \
          && _mi_conf_product_name_ok "${p%%/*}"; then
         printf 'user-owned\n'
       else

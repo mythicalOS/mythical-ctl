@@ -224,17 +224,28 @@ Two consequences worth stating, because neither is visible in the pattern:
   before the one holding the validator, and a caller may have sourced it alone. With the validator
   absent the answer is `installer-managed` — the class the path carried before the carve-out — so an
   unanswerable question yields the unprivileged class rather than silently granting the other one.
-- **The uppercase refusal depends on `LC_ALL=C`, which `mi_zone` sets for itself.** Under a
-  dictionary-collating locale `[a-z]` matches uppercase, so without it a path would classify one way
-  on an operator's laptop and another in CI. Measured on the bash 3.2 floor.
+- **The uppercase refusal depends on `LC_ALL=C`, which `_mi_conf_product_name_ok` — the grammar's
+  authority, and the only place a character range still decides anything — pins for itself.** Under
+  a dictionary-collating locale `[a-z]` matches uppercase, so without it a path would classify one
+  way on an operator's laptop and another in CI. Measured on the bash 3.2 floor. `mi_zone`
+  deliberately carries no second copy of that pin: with the authority behind it, a copy would decide
+  nothing and could be removed with nothing going red.
+- **The reserved leaf is compared as a string, not matched as a pattern.** `case` honours bash's
+  `nocasematch`, so a caller that had enabled it would otherwise let `brokkr/CLI.TOML` reach the
+  slot arm. One caveat with it: that option also changes how the grammar's own `case` matches —
+  measured, `BROKKR/cli.toml` would then classify as the slot — and that is not defended here,
+  because it would mean hardening a published grammar the whole CLI depends on against an option
+  nothing sets and which cannot be set from the environment.
 
 Read the classifier's answer as a statement about the path, never as permission to create one.
 
-The depth rule is load-bearing and is not visible in the pattern. `case` globs match `/`, so a bare
-`*/cli.toml` would also match `brokkr/generated/cli.toml` — and `../cli.toml`, which is not even
-inside the home. The classifier therefore decides **every path with two or more separators first**,
-as installer-managed, and the leading-component test rejects `.` and `..`; so neither a nested
-artifact nor a traversal spelling can land in the one class the installer promises never to touch.
+The depth rule is load-bearing and is not visible in the pattern, so it is worth saying where it
+lives. `case` globs match `/`, so the arm that catches candidates also catches
+`brokkr/generated/cli.toml` and `../cli.toml`. What refuses them is the same exact comparison that
+defends the leaf's spelling: the remainder after the FIRST separator must equal `cli.toml`, and for
+anything deeper that remainder still contains a separator (`generated/cli.toml`) and cannot. The
+traversal spellings are then refused a second time over by the grammar, which does not admit `..`
+or `.` as a product name. One comparison, three rules, and no arm that merely looks like a guard.
 
 ## Ownership and identity
 

@@ -56,9 +56,10 @@ load '../lib/test_helper'
   [ "$(mi_zone brokkr/cli.toml)"         = user-owned ]
   [ "$(mi_zone saga/cli.toml)"           = user-owned ]
   [ "$(mi_zone a/cli.toml)"              = user-owned ]
-  # DEPTH. `case` globs match slashes, so without the `*/*/*` guard above it a lone `*/cli.toml`
-  # would swallow every one of these — a generated artifact promoted into the one class the
-  # installer promises never to touch.
+  # DEPTH. `case` globs match slashes, so the candidate arm catches these too; what refuses them is
+  # the exact leaf comparison in its body — the remainder after the FIRST separator is
+  # `nested/cli.toml`, which is not the reserved name. A generated artifact must not be promoted
+  # into the one class the installer promises never to touch.
   [ "$(mi_zone brokkr/nested/cli.toml)"  = installer-managed ]
   [ "$(mi_zone brokkr/a/b/cli.toml)"     = installer-managed ]
   # THE NAME IS RESERVED EXACTLY, not by prefix, suffix or extension.
@@ -75,7 +76,8 @@ load '../lib/test_helper'
   # `../cli.toml` is not inside the home at all. Classifying it user-owned would put a path OUTSIDE
   # ~/.mythical/ into the class that means "the installer never touches this" — a claim about a file
   # this layout does not own. `..`, `.` and `.hidden` are refused because they are not legal product
-  # names; `a/../cli.toml` and the two-slash spellings are refused by the depth guard above.
+  # names; `a/../cli.toml` and the two-slash spellings are refused by the exact leaf comparison,
+  # whose remainder after the first separator still carries a `/`.
   [ "$(mi_zone ../cli.toml)"             = installer-managed ]
   [ "$(mi_zone a/../cli.toml)"           = installer-managed ]
   [ "$(mi_zone ./cli.toml)"              = installer-managed ]
@@ -192,19 +194,61 @@ load '../lib/test_helper'
   done
 }
 
+@test "the reserved leaf is exact even under nocasematch — a case glob would not be" {
+  load_mctl
+  # `case` honours `shopt -s nocasematch`, so with a caller having enabled it `*/cli.toml` matches
+  # `brokkr/CLI.TOML` and a generated artifact takes the one class that says the installer does not
+  # own it. The leaf is therefore compared with `=`, which the option does not affect. Nothing in
+  # this tree sets nocasematch and it cannot be set from the environment, so a test that did not
+  # enable it explicitly would never reach this.
+  shopt -s nocasematch
+  local got_upper got_mixed got_lower
+  got_upper="$(mi_zone brokkr/CLI.TOML)"
+  got_mixed="$(mi_zone brokkr/Cli.Toml)"
+  got_lower="$(mi_zone brokkr/cli.toml)"
+  shopt -u nocasematch
+  [ "$got_upper" = installer-managed ] || { echo "CLI.TOML classified '$got_upper'" >&2; return 1; }
+  [ "$got_mixed" = installer-managed ] || { echo "Cli.Toml classified '$got_mixed'" >&2; return 1; }
+  # ...and the real leaf is still the slot with the option on, so this is about the NAME of the leaf
+  # and not about nocasematch having broken the arm outright.
+  [ "$got_lower" = user-owned ] || { echo "cli.toml classified '$got_lower'" >&2; return 1; }
+}
+
 @test "mi_zone fails CLOSED for the slot when the name authority is not loaded" {
   # mi_zone lives in a module sourced BEFORE lib/config.sh, and a caller may source this file alone.
   # An unanswerable question must yield the class the path carried before the carve-out existed,
   # never the privileged one — otherwise a partial load silently promotes a generated artifact.
+  # stderr is discarded so this asserts the CLASS and not a diagnostic: the class is the contract.
   run env MYTHICAL_HOME="$MYTHICAL_HOME" bash -c \
-    'source "$1/lib/common.sh"; source "$1/lib/layout.sh"; mi_zone brokkr/cli.toml' _ "$_MCTL_ROOT"
+    'source "$1/lib/common.sh"; source "$1/lib/layout.sh"; mi_zone brokkr/cli.toml 2>/dev/null' _ "$_MCTL_ROOT"
   [ "$status" -eq 0 ]
   [ "$output" = installer-managed ] || { echo "unloaded authority gave '$output'" >&2; return 1; }
   # ...and with the authority present the very same call is the slot, so the test above is about the
   # missing module and not about the path.
   run env MYTHICAL_HOME="$MYTHICAL_HOME" bash -c \
-    'source "$1/lib/common.sh"; source "$1/lib/layout.sh"; source "$1/lib/config.sh"; mi_zone brokkr/cli.toml' _ "$_MCTL_ROOT"
+    'source "$1/lib/common.sh"; source "$1/lib/layout.sh"; source "$1/lib/config.sh"; mi_zone brokkr/cli.toml 2>/dev/null' _ "$_MCTL_ROOT"
   [ "$output" = user-owned ] || { echo "loaded authority gave '$output'" >&2; return 1; }
+}
+
+@test "only a shell FUNCTION may answer the name question — a program on PATH may not" {
+  # This is what `declare -F` buys, and it is not the fail-closed class above: with the guard gone
+  # the class is still right, because a failed call fails the `&&` chain. What changes is WHO may
+  # answer. A bare call resolves through PATH, so an executable of that name — a stray build
+  # artifact, a directory an operator put on PATH, anything writable and earlier — could exit 0 and
+  # promote any nested `cli.toml` to the one class the installer never touches. `declare -F` asks
+  # for a function and nothing else.
+  local fake="$BATS_TEST_TMPDIR/fakebin"
+  mkdir -p "$fake"
+  printf '#!/bin/sh\nexit 0\n' > "$fake/_mi_conf_product_name_ok"
+  chmod 755 "$fake/_mi_conf_product_name_ok"
+  # `fooBAR` is refused by the real grammar, so a `user-owned` answer here could only have come from
+  # the impostor. lib/config.sh is deliberately NOT sourced: PATH is the only candidate answerer.
+  run env MYTHICAL_HOME="$MYTHICAL_HOME" PATH="$fake:$PATH" bash -c \
+    'source "$1/lib/common.sh"; source "$1/lib/layout.sh"; mi_zone fooBAR/cli.toml 2>/dev/null' _ "$_MCTL_ROOT"
+  [ "$output" = installer-managed ] || { echo "a program on PATH answered: '$output'" >&2; return 1; }
+  # And the impostor really is reachable, or the assertion above would hold for the wrong reason.
+  run env PATH="$fake:$PATH" bash -c '_mi_conf_product_name_ok anything'
+  [ "$status" -eq 0 ]
 }
 
 @test "the host-tool amendment changed NO pre-existing classification" {
