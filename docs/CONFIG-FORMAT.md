@@ -5,7 +5,8 @@ product's own UI implements when it writes its settings file. It is normative: a
 follow it is rejected, and rejection is not a bug.
 
 The layout holds one further configuration path, `~/.mythical/<product>/cli.toml`, which is **not**
-a `.conf` file and which `mythical-ctl` never reads. It is specified in
+a `.conf` file and which `mythical-ctl` never parses or validates (`backup` copies its bytes; that
+is the only path here that reads them). It is specified in
 [its own section below](#amendment-the-host-tool-slot-mythicalproductclitoml), and nothing else in
 this document applies to it.
 
@@ -126,8 +127,8 @@ happen.
 | Owner | the user running the host-side tool, which is the user running `mythical-ctl` |
 | Mode | **0600** |
 | Group | not constrained — 0600 makes it irrelevant, and it must **not** be the family group |
-| Format | the tool's own (TOML). `mythical-ctl` does not read, parse or validate it |
-| Integrity marker | no — nothing here reads it, so there is nothing here to detect a tear |
+| Format | the tool's own (TOML). `mythical-ctl` does not parse or validate it |
+| Integrity marker | no — nothing here interprets it, so there is nothing here to detect a tear against |
 | Size ceiling | none imposed by this document |
 
 **0600, and specifically not the 0660 + family group that `<product>.conf` uses.** That combination
@@ -205,34 +206,29 @@ Two honest exceptions, neither of them a deletion:
 
 ### How the classification is spelled, and what it does not check
 
-`mi_zone` classifies a **home-relative path's shape**. It answers `user-owned` for
-`<component>/cli.toml` when `<component>` is a single path component that could begin a legal
-product name and is not the reserved `mythical`, and leaves everything else nested exactly as it
-was.
+`mi_zone` classifies a **home-relative path**. It answers `user-owned` for `<component>/cli.toml`
+exactly when `<component>` is a single path component that satisfies the
+[product-name grammar](#what-product-may-be) in full — so the reserved `mythical` is refused, and so
+are `Brokkr/`, `1foo/`, `-foo/`, `fooBAR/`, `foo.conf/`, `foo bar/`, a 65-character name,
+`.hidden/`, and `../`. Everything else nested keeps the class it always had.
 
-It stops **short of the full product-name grammar**, on purpose. It refuses a component that could
-not start a legal name — so `Brokkr/cli.toml`, `1foo/cli.toml`, `-foo/cli.toml`, `.hidden/cli.toml`
-and `../cli.toml` are all installer-managed — and it refuses the reserved name outright, but it does
-not re-check the remaining characters. Re-implementing the grammar in a path classifier would give
-the layout a second copy of it to drift against; `_mi_conf_product_name_ok` is the authority, and a
-caller deciding about a real directory calls it. What survives is a narrow overmatch:
-`fooBAR/cli.toml` and `foo.conf/cli.toml` read as `user-owned` while being names the grammar
-refuses. That is deliberate and it errs in the safe direction — the class means "the installer does
-not own this", so an overmatch preserves a file rather than removing one, and preserving one file
-too many is the mistake this installer is built to make.
+The grammar is **asked of its one authority** (`_mi_conf_product_name_ok`) rather than restated
+here, so the layout cannot end up holding a second copy of it to drift against. An earlier revision
+of this amendment stopped at the first character and documented the rest as an accepted overmatch;
+that was wrong, because `user-owned` is a class that says "the installer does not own this", and no
+path outside the carve-out is entitled to it.
 
-The refusal of uppercase depends on `LC_ALL=C`, which `mi_zone` sets for itself: under a non-C
-collation `[a-z]` matches uppercase letters, so without it `Brokkr/cli.toml` classifies one way on
-an operator's laptop and another in CI. Measured on the bash 3.2 floor.
+Two consequences worth stating, because neither is visible in the pattern:
 
-**A caller that is deciding about a real directory validates the name itself**, and the first-use
-sweep does exactly that — which is what closes the overmatch above rather than merely tolerating it.
-A directory called `fooBAR/` or `Brokkr/` or `mythical/` holding a `cli.toml` is *not* exempted from
-that sweep, because there the question is not "what shape is this path" but "is this unexplained
-directory evidence of a previous installation", and an unsanctioned name is precisely what makes it
-unexplained. `mythical/` matters most, being reserved for the reason given
-[above](#what-product-may-be). Read the classifier's answer as a statement about the path, never as
-permission.
+- **It fails closed when the authority is not loaded.** `mi_zone` lives in a module that is sourced
+  before the one holding the validator, and a caller may have sourced it alone. With the validator
+  absent the answer is `installer-managed` — the class the path carried before the carve-out — so an
+  unanswerable question yields the unprivileged class rather than silently granting the other one.
+- **The uppercase refusal depends on `LC_ALL=C`, which `mi_zone` sets for itself.** Under a
+  dictionary-collating locale `[a-z]` matches uppercase, so without it a path would classify one way
+  on an operator's laptop and another in CI. Measured on the bash 3.2 floor.
+
+Read the classifier's answer as a statement about the path, never as permission to create one.
 
 The depth rule is load-bearing and is not visible in the pattern. `case` globs match `/`, so a bare
 `*/cli.toml` would also match `brokkr/generated/cli.toml` — and `../cli.toml`, which is not even

@@ -74,7 +74,8 @@ load '../lib/test_helper'
   load_mctl
   # `../cli.toml` is not inside the home at all. Classifying it user-owned would put a path OUTSIDE
   # ~/.mythical/ into the class that means "the installer never touches this" — a claim about a file
-  # this layout does not own. The leading `[!.]` is what refuses it; the depth guard refuses the rest.
+  # this layout does not own. `..`, `.` and `.hidden` are refused because they are not legal product
+  # names; `a/../cli.toml` and the two-slash spellings are refused by the depth guard above.
   [ "$(mi_zone ../cli.toml)"             = installer-managed ]
   [ "$(mi_zone a/../cli.toml)"           = installer-managed ]
   [ "$(mi_zone ./cli.toml)"              = installer-managed ]
@@ -116,9 +117,9 @@ load '../lib/test_helper'
 
 @test "a component that could not BEGIN a legal product name is not the slot" {
   load_mctl
-  # The classifier stops short of the full grammar but not at nothing: it refuses anything that
-  # could not start a legal name, and the RESERVED name by name. `mythical` is the one that matters
-  # — it is reserved because ~/.mythical/mythical.conf is the host-only family file.
+  # The leading component decides, and these are the ones that fail at the FIRST character.
+  # `mythical` is in the list because it is RESERVED — ~/.mythical/mythical.conf is the host-only
+  # family file — and the grammar refuses it by name, not by shape.
   [ "$(mi_zone mythical/cli.toml)"       = installer-managed ]
   [ "$(mi_zone Brokkr/cli.toml)"         = installer-managed ]
   [ "$(mi_zone 1foo/cli.toml)"           = installer-managed ]
@@ -130,10 +131,13 @@ load '../lib/test_helper'
   [ "$(mi_zone my-product/cli.toml)"     = user-owned ]
 }
 
-@test "the uppercase refusal survives a non-C collation — mi_zone fixes its own locale" {
+@test "the slot's uppercase refusal survives a non-C collation, end to end" {
   # MEASURED on bash 3.2: under a dictionary-collating locale, `case Brokkr in [a-z]*)` MATCHES, so
-  # without the function's own `local LC_ALL=C` this path classifies one way on an operator's laptop
-  # and another in CI — and the laptop is the one that gets it wrong.
+  # without a pinned `LC_ALL=C` this path classifies one way on an operator's laptop and another in
+  # CI — and the laptop is the one that gets it wrong. The pin lives in `_mi_conf_product_name_ok`,
+  # the grammar's authority and the only place a character range still decides anything; mi_zone
+  # deliberately does not carry a second one, because a copy there would be masked by this and so
+  # could be lost with nothing going red. This asserts the END-TO-END property either way.
   #
   # THE LOCALE HAS TO REACH THE SHELL AT STARTUP. A prefix assignment on the function call
   # (`LC_ALL=xx mi_zone …`) does NOT re-arm collation for a `case` glob in the running shell —
@@ -154,29 +158,53 @@ load '../lib/test_helper'
   fi
 
   run env LC_ALL="$loc" bash -c \
-    'source "$1/lib/common.sh"; source "$1/lib/layout.sh"; mi_zone Brokkr/cli.toml' _ "$_MCTL_ROOT"
+    'source "$1/lib/common.sh"; source "$1/lib/layout.sh"; source "$1/lib/config.sh"; mi_zone Brokkr/cli.toml' _ "$_MCTL_ROOT"
   [ "$status" -eq 0 ]
   [ "$output" = installer-managed ] || { echo "under $loc: got '$output'" >&2; return 1; }
   # The positive case is unaffected by locale either way, asserted so a guard that simply refused
   # everything would not pass this test.
   run env LC_ALL="$loc" bash -c \
-    'source "$1/lib/common.sh"; source "$1/lib/layout.sh"; mi_zone brokkr/cli.toml' _ "$_MCTL_ROOT"
+    'source "$1/lib/common.sh"; source "$1/lib/layout.sh"; source "$1/lib/config.sh"; mi_zone brokkr/cli.toml' _ "$_MCTL_ROOT"
   [ "$output" = user-owned ] || { echo "under $loc: got '$output'" >&2; return 1; }
 }
 
-@test "the residual overmatch is documented, narrow, and in the SAFE direction" {
+@test "the slot's leading component must satisfy the FULL product-name grammar, not just its start" {
   load_mctl
-  # What the classifier does NOT re-check: the characters after the first. These read as user-owned
-  # while the grammar refuses them. Pinned so it stays a decision — and it errs toward PRESERVING a
-  # file, which is the mistake this installer is built to make. The sweep that decides about a real
-  # directory validates the name itself, so nothing acts on the overmatch.
-  [ "$(mi_zone fooBAR/cli.toml)"    = user-owned ]
-  [ "$(mi_zone foo.conf/cli.toml)"  = user-owned ]
-  run _mi_conf_product_name_ok fooBAR
-  [ "$status" -ne 0 ]
-  run _mi_conf_product_name_ok foo.conf
-  [ "$status" -ne 0 ]
-  grep -Faq 'narrow overmatch' "${_MCTL_ROOT}/docs/CONFIG-FORMAT.md"
+  # The cases that separate "checked the first character" from "asked the grammar's authority".
+  # Every one of these was `user-owned` while the classifier stopped at `[a-z]`, and every one of
+  # them is a path outside the documented carve-out.
+  [ "$(mi_zone fooBAR/cli.toml)"                = installer-managed ]
+  [ "$(mi_zone foo.conf/cli.toml)"              = installer-managed ]
+  [ "$(mi_zone "foo bar/cli.toml")"             = installer-managed ]
+  [ "$(mi_zone "foo_bar/cli.toml")"             = installer-managed ]
+  [ "$(mi_zone "$(printf 'x%.0s' $(seq 1 65))/cli.toml")" = installer-managed ]
+  # ...while every legal name still is the slot. Asserted so a validator that refused EVERYTHING
+  # would not pass this test.
+  [ "$(mi_zone brokkr/cli.toml)"                = user-owned ]
+  [ "$(mi_zone a/cli.toml)"                     = user-owned ]
+  [ "$(mi_zone my-product2/cli.toml)"           = user-owned ]
+  [ "$(mi_zone "$(printf 'x%.0s' $(seq 1 64))/cli.toml")" = user-owned ]
+  # And the classifier and the authority agree, rather than the test asserting the grammar twice.
+  local n
+  for n in fooBAR foo.conf foo_bar; do
+    run _mi_conf_product_name_ok "$n"
+    [ "$status" -ne 0 ]
+  done
+}
+
+@test "mi_zone fails CLOSED for the slot when the name authority is not loaded" {
+  # mi_zone lives in a module sourced BEFORE lib/config.sh, and a caller may source this file alone.
+  # An unanswerable question must yield the class the path carried before the carve-out existed,
+  # never the privileged one — otherwise a partial load silently promotes a generated artifact.
+  run env MYTHICAL_HOME="$MYTHICAL_HOME" bash -c \
+    'source "$1/lib/common.sh"; source "$1/lib/layout.sh"; mi_zone brokkr/cli.toml' _ "$_MCTL_ROOT"
+  [ "$status" -eq 0 ]
+  [ "$output" = installer-managed ] || { echo "unloaded authority gave '$output'" >&2; return 1; }
+  # ...and with the authority present the very same call is the slot, so the test above is about the
+  # missing module and not about the path.
+  run env MYTHICAL_HOME="$MYTHICAL_HOME" bash -c \
+    'source "$1/lib/common.sh"; source "$1/lib/layout.sh"; source "$1/lib/config.sh"; mi_zone brokkr/cli.toml' _ "$_MCTL_ROOT"
+  [ "$output" = user-owned ] || { echo "loaded authority gave '$output'" >&2; return 1; }
 }
 
 @test "the host-tool amendment changed NO pre-existing classification" {

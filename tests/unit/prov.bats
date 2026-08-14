@@ -362,8 +362,8 @@ teardown() { mi_lock_release; teardown_test_env; }
 }
 
 @test "a directory whose NAME is not a legal product is a trace, slot or no slot" {
-  # mi_zone stops short of the full grammar; this decision is about a real directory standing in the
-  # home, and an unsanctioned name is exactly what makes such a directory unexplained.
+  # An unsanctioned name is exactly what makes a directory standing in the home unexplained, and an
+  # unexplained directory is what this sweep exists to notice.
   mkdir -p "$MYTHICAL_HOME/Brokkr"
   printf 'token = "host-only"\n' > "$MYTHICAL_HOME/Brokkr/cli.toml"
   run mi_first_use
@@ -371,16 +371,10 @@ teardown() { mi_lock_release; teardown_test_env; }
   assert_contains "Brokkr"
 }
 
-@test "the name check is what closes mi_zone's residual overmatch — 'fooBAR' proves it alone" {
-  # THE ISOLATING TEST, and it exists because the other two stopped isolating anything. `Brokkr` and
-  # `mythical` are refused by mi_zone itself now, so with the name check DELETED they are still
-  # traces and both tests above stay green over a missing guard — measured, exactly the masking this
-  # suite is meant to make impossible.
-  #
-  # `fooBAR` is the case only the name check can decide: mi_zone classifies `fooBAR/cli.toml` as
-  # user-owned (it stops after the first character, by design), and the product-name grammar refuses
-  # it. Nothing else in the chain says no.
-  [ "$(mi_zone fooBAR/cli.toml)" = user-owned ]
+@test "a name that is illegal only PAST its first character is a trace too" {
+  # `fooBAR` is the case that separates "checked the first character" from "asked the grammar": it
+  # starts legally and is refused by the grammar. When the classifier stopped at the first character
+  # this directory was exempted, and the sweep reported the machine as genuinely fresh.
   run _mi_conf_product_name_ok fooBAR
   [ "$status" -ne 0 ]
   mkdir -p "$MYTHICAL_HOME/fooBAR"
