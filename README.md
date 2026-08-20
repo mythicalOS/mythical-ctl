@@ -117,6 +117,16 @@ container runtime. None of that is in this directory. So:
 - **Copying `~/.mythical/` is not a backup.** The data and the runtime secrets are not in it — a
   complete backup has to include the named volumes as well. That is what `mythical-ctl backup`
   is for: it captures the named volumes too, and `restore` puts them back.
+  - **It covers exactly what this tool installed, and nothing else.** Backup walks the installer
+    state ledger and captures the volumes recorded there, so a volume enters its coverage only by
+    having been created through this tool's own install path. A product that installed itself by
+    its own installer holds volumes this ledger has never heard of, and they are **silently absent
+    from the backup** — the run still reports success, because from here there is nothing missing.
+    Volume names are derived from the installation identity and the product identity (see
+    [`docs/DOCUMENT-FORMAT.md`](docs/DOCUMENT-FORMAT.md)), so such a product's volumes do not even
+    share a namespace with these; declaring a manifest role for one would create a **new, empty**
+    volume beside it rather than adopting it. If you run a product that installs itself, use that
+    product's own backup verb for its data, and treat this one as covering the rest.
 - **Deleting `~/.mythical/` is not an uninstall.** The containers keep running.
 
 **Your data must never be collateral — that is the rule the installer is being built to.** It will
