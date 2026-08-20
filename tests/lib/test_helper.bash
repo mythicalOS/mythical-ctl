@@ -127,6 +127,20 @@ a_dead_pid() { local p; sh -c 'exit 0' & p=$!; wait "$p" 2>/dev/null || true; pr
 # manifest, with the index's digests actually matching the files. Overrides are `key=value` pairs that
 # REPLACE the corresponding manifest default (never append a duplicate — mi_doc_load rejects a
 # `one`-cardinality key that appears twice).
+#
+# ROLES ARE PARAMETERIZABLE, via two pseudo-keys that are consumed here rather than written to the
+# manifest verbatim:
+#
+#   extra_role=<role>      adds a third (fourth, …) volume role: permitted AND bindable in the policy
+#                          index, plus a `volume=<role>:/<role>` line in the manifest. Repeatable.
+#   precious_role=<role>   declares a role's data unregenerable (`<p>.precious_role=<role>`).
+#                          Repeatable, and may name a default role as readily as an extra one. The
+#                          policy loader enforces precious ⊆ permitted, so naming a role that is
+#                          neither a default nor an `extra_role` is a REJECTED document — which is
+#                          itself worth testing and is reachable on purpose.
+#
+# The two default roles (`state`, `secrets`) stay exactly as they were, so every existing caller is
+# unaffected: a fixture that asks for nothing gets the same two-role product it always did.
 write_fixture_product() {
   local p="$1"; shift
   local pol="$MYTHICAL_HOME/policy" man="$MYTHICAL_HOME/${p}.manifest" idx="$MYTHICAL_HOME/index"
@@ -138,9 +152,35 @@ write_fixture_product() {
       printf 'expires=%s\n' "$(( $(date +%s) + 86400 ))"
       printf 'family_gid=%s\n' "$gid"; } > "$pol"
   fi
+  # The pseudo-keys are pulled out FIRST, so they never reach the manifest as literal keys (an
+  # unknown manifest key is rejected by the document loader, so a typo here fails loudly rather than
+  # being silently ignored — which is the behaviour we want from a fixture too).
+  local -a extra_roles precious_roles rest_args
+  extra_roles=(); precious_roles=(); rest_args=()
+  local _a
+  for _a in "$@"; do
+    case "$_a" in
+      extra_role=*)    extra_roles+=("${_a#extra_role=}") ;;
+      precious_role=*) precious_roles+=("${_a#precious_role=}") ;;
+      *)               rest_args+=("$_a") ;;
+    esac
+  done
+  # `${arr[@]+"${arr[@]}"}` throughout — bash 3.2 (this codebase's floor) errors under `set -u` on
+  # "${arr[@]}" for an empty array, and every one of these is empty in the common case.
+  set -- ${rest_args[@]+"${rest_args[@]}"}
+
   { printf '%s.permitted_role=state\n' "$p"
     printf '%s.permitted_role=secrets\n' "$p"
     printf '%s.bindable_role=state\n' "$p"
+    local _er
+    for _er in ${extra_roles[@]+"${extra_roles[@]}"}; do
+      printf '%s.permitted_role=%s\n' "$p" "$_er"
+      printf '%s.bindable_role=%s\n' "$p" "$_er"
+    done
+    local _pr
+    for _pr in ${precious_roles[@]+"${precious_roles[@]}"}; do
+      printf '%s.precious_role=%s\n' "$p" "$_pr"
+    done
     printf '%s.permitted_secret=MYTHICAL_TELEMETRY_KEY\n' "$p"
     printf '%s.permitted_mount=transcripts\n' "$p"; } >> "$pol"
 
@@ -160,6 +200,8 @@ write_fixture_product() {
     i=0; while [ "$i" -lt "${#keys[@]}" ]; do printf '%s=%s\n' "${keys[$i]}" "${vals[$i]}"; i=$((i+1)); done
     printf 'volume=state:/data\n'
     printf 'volume=secrets:/secrets\n'
+    local _ev
+    for _ev in ${extra_roles[@]+"${extra_roles[@]}"}; do printf 'volume=%s:/%s\n' "$_ev" "$_ev"; done
     printf 'secret=MYTHICAL_TELEMETRY_KEY\n'
     printf 'mount=transcripts\n'
     printf 'port=7480\n'; } > "$man"

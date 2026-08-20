@@ -59,6 +59,35 @@ _mi_verb_container() {   # <product> → the container name, or rc 1
 # reset the ledger over containers it never removed; uninstall --purge would leave volumes behind and
 # still exit 0. rc 0 (records, possibly none) and rc 3 (no ledger yet) both proceed; rc 1 refuses.
 # Callers MUST capture this and check its status BEFORE the loop — never inline it into `done <<<`.
+# --- volume data class ----------------------------------------------------------------------------
+# One reader for the `precious=` field, used by every path that reports or destroys a volume, so that
+# `status`, product purge and family purge cannot disagree about what a volume holds.
+#
+# ABSENCE IS NOT "REGENERABLE". A record with no `precious` field was written by a version of this
+# installer that had no vocabulary for the distinction, or by an adoption path that lost it — either
+# way this installation does not know, and "unknown" must read as unrecoverable. The opposite default
+# is the one that costs data, and it costs it silently: the operator sees a volume listed as
+# regenerable, purges, and finds out afterwards. Only an EXPLICIT `precious=0` is a claim that the
+# contents can be rebuilt.
+_mi_verb_vol_class() {   # <volume record> → the data class as a phrase for a report
+  if [ "$#" -ne 1 ]; then mi_warn "verbs: _mi_verb_vol_class needs <record>"; return 1; fi
+  local pv
+  if pv="$(mi_led_field "$1" precious)"; then :; else pv=""; fi
+  case "$pv" in
+    0) printf 'regenerable\n' ;;
+    1) printf 'UNREGENERABLE\n' ;;
+    *) printf 'UNREGENERABLE (unclassified)\n' ;;
+  esac
+}
+
+# rc 0 iff this volume must be treated as holding unrecoverable data — including when it says nothing.
+_mi_verb_vol_is_precious() {
+  if [ "$#" -ne 1 ]; then mi_warn "verbs: _mi_verb_vol_is_precious needs <record>"; return 1; fi
+  local pv
+  if pv="$(mi_led_field "$1" precious)"; then :; else pv=""; fi
+  [ "$pv" != "0" ]
+}
+
 _mi_verb_objects() {
   if [ "$#" -ne 1 ]; then mi_warn "verbs: _mi_verb_objects needs <kind>"; return 1; fi
   local kind="$1" recs rc
@@ -117,9 +146,12 @@ _mi_ensure_mount_points() {
 }
 
 # --- confirmation ---------------------------------------------------------------------------------
-# A destructive family-scoped action asks first. MI_CONFIRM short-circuits it non-interactively —
-# `yes` to proceed, `no` to refuse — so the family uninstall is testable without a tty; with neither
-# set, the operator is prompted and anything but an explicit yes refuses.
+# An action that destroys data asks first — the family uninstall, and (since the product-scoped
+# `--purge` acquired the same power over named volumes without ever growing a prompt) that too.
+# MI_CONFIRM short-circuits it non-interactively — `yes` to proceed, `no` to refuse — so both are
+# testable without a tty; with neither set, the operator is prompted and anything but an explicit yes
+# refuses. Note which way the default falls: a bare newline, EOF, or a closed stdin all REFUSE, so a
+# purge cannot be carried by a pipe that happened to be empty.
 mi_confirm() {
   local prompt="${1:-Proceed?}" reply
   case "${MI_CONFIRM:-}" in
@@ -502,11 +534,19 @@ _mi_verb_install_locked() {
   _mi_ensure_mount_points || return 1
 
   # Named volumes for every role with no bind, under write-ahead intent.
-  local v role vol nonce
+  local v role vol nonce vprecious
   while IFS= read -r v; do
     [ -n "$v" ] || continue
     role="${v%%:*}"
     vol="$(mi_name_volume "$(mi_ident_get)" "$product" "$role")" || return 1
+    # The data class, resolved from the AUTHENTICATED policy index and recorded ON the volume, not
+    # re-derived at destruction time. `uninstall --purge` must be able to say which of the volumes it
+    # is about to remove hold unrecoverable data, and it cannot depend on the documents to tell it:
+    # a product being uninstalled may be one whose manifest has been withdrawn or removed, and a
+    # purge that fails closed on a missing policy index cannot uninstall anything, while one that
+    # falls back to "not precious" answers the question in the direction that costs data. Reading it
+    # from the checksummed ledger removes the choice — the classification travels with the object.
+    if mi_policy_precious "$prec" "$product" "$role"; then vprecious=1; else vprecious=0; fi
     # rc 3 (no such record) is the ONLY status that authorizes opening a new intent and creating a
     # volume. rc 0 means it already exists (skip); rc 1 (ambiguous/unreadable) must fail CLOSED — a
     # ledger that cannot say whether the volume is already recorded must not be answered by creating a
@@ -527,7 +567,7 @@ _mi_verb_install_locked() {
       return 1
     else
       nonce="$(mi_nonce_new)" || return 1
-      mi_intent_open volume "$vol" "$nonce" "product=${product}" "role=${role}" || return 1
+      mi_intent_open volume "$vol" "$nonce" "product=${product}" "role=${role}" "precious=${vprecious}" || return 1
       mi_rt_volume_create "$vol" "$nonce" "$(mi_ident_get)" >/dev/null || return 1
       # RE-INSPECT: `volume create` against an existing name succeeds WITHOUT applying the labels, so a
       # create is never evidence of creation — the nonce label is. Capture the STATUS, not just the
@@ -546,7 +586,7 @@ _mi_verb_install_locked() {
         mi_warn "  removed. The intent is retained."
         return 1
       fi
-      mi_intent_confirm volume "$vol" "$nonce" "product=${product}" "role=${role}" || return 1
+      mi_intent_confirm volume "$vol" "$nonce" "product=${product}" "role=${role}" "precious=${vprecious}" || return 1
     fi
   done <<< "$(mi_doc_values "$mrec" volume)"
 
@@ -917,6 +957,71 @@ _mi_verb_uninstall_locked() {
   _objs="$(_mi_verb_objects object)" || return 1
   _imgrecs="$(_mi_verb_objects image)" || return 1
 
+  # --- CONFIRMATION, and only for --purge -------------------------------------------------------
+  # The family path has warned and asked since it existed; the product path asked NOTHING, so
+  # `uninstall <product> --purge` destroyed every one of that product's named volumes with no prompt
+  # and no list. The asymmetry was not a decision — the family verb resets the whole ledger and grew
+  # a prompt for that, and the product verb's `--purge` quietly acquired the same power over data
+  # without one.
+  #
+  # Scoped to `--purge` deliberately. A plain product uninstall KEEPS every volume (it says so, per
+  # volume, in the loop below), so prompting there would train operators to type y at a prompt that
+  # never means anything — and a confirmation that is usually harmless is a confirmation nobody
+  # reads by the time it is not.
+  #
+  # It asks BEFORE the container is removed, which is why the listing is read up front: a prompt that
+  # arrives after the container is already gone is not a decision point, it is a notification. And it
+  # NAMES what will go, with each volume's data class, because "are you sure?" against an unnamed set
+  # is a question the operator has no way to answer.
+  if [ "$purge" -eq 1 ]; then
+    local prec_list="" reg_list="" any=0 unattr=0 vrec vname vrole
+    while IFS= read -r vrec; do
+      [ -n "$vrec" ] || continue
+      _mi_led_record_matches "$vrec" class volume || continue
+      # A volume whose record names no product at all is OUT OF SCOPE here and is counted, not
+      # silently skipped: this verb selects by `product=`, so it has no way to know the volume is
+      # this product's, and acting on it would be acting on a guess. Saying nothing, though, would
+      # let "purge complete" mean "and some volumes were left that I could not attribute". `status`
+      # lists them with the same classification this warning uses.
+      if ! _mi_led_record_matches "$vrec" product "$product"; then
+        if mi_led_field "$vrec" product >/dev/null 2>&1; then : ; else unattr=$((unattr + 1)); fi
+        continue
+      fi
+      vname="$(mi_led_field "$vrec" name)" || vname="(a volume whose record carries no readable name)"
+      vrole="$(mi_led_field "$vrec" role)" || vrole="?"
+      any=1
+      if _mi_verb_vol_is_precious "$vrec"; then
+        prec_list="${prec_list}      ${vname} (role ${vrole}) — $(_mi_verb_vol_class "$vrec")"$'\n'
+      else
+        reg_list="${reg_list}      ${vname} (role ${vrole}) — regenerable"$'\n'
+      fi
+    done <<< "$_objs"
+
+    mi_warn "verbs: PURGE of '$product'. Its container is removed, and so are its named volumes."
+    if [ "$any" -eq 0 ]; then
+      mi_warn "  No volume records are in scope, so this removes the container only."
+    fi
+    if [ -n "$prec_list" ]; then
+      mi_warn "  THESE HOLD DATA THAT CANNOT BE REGENERATED. Removing them is not recoverable by"
+      mi_warn "  reinstalling, and this tool keeps no copy:"
+      local _pl
+      while IFS= read -r _pl; do [ -n "$_pl" ] && mi_warn "$_pl"; done <<< "$prec_list"
+    fi
+    if [ -n "$reg_list" ]; then
+      mi_warn "  These are declared regenerable — a reinstall rebuilds their contents:"
+      local _rl
+      while IFS= read -r _rl; do [ -n "$_rl" ] && mi_warn "$_rl"; done <<< "$reg_list"
+    fi
+    if [ "$unattr" -gt 0 ]; then
+      mi_warn "  NOTE: ${unattr} volume record(s) name no product, so this verb cannot attribute them and"
+      mi_warn "  will NOT remove them. They are left in place. 'mythical-ctl status' lists them."
+    fi
+    mi_warn "  transcripts/, logs/ and any host binds are never touched by any verb."
+    mi_warn "  Without --purge, every volume above is KEPT."
+    mi_confirm "verbs: purge '$product' and remove the volumes listed above?" || {
+      mi_warn "verbs: not confirmed."; return 1; }
+  fi
+
   local c rc=0
   c="$(_mi_verb_container "$product")" || return 1
   if mi_prov_authority container "$c"; then rc=0; else rc=$?; fi
@@ -947,8 +1052,10 @@ _mi_verb_uninstall_locked() {
       mi_warn "  readable name; --purge cannot act on it and it is left in place. Run 'state repair'."
       rc=1; continue; }
     role="$(mi_led_field "$rec" role)" || role="?"
+    local vclass
+    vclass="$(_mi_verb_vol_class "$rec")" || vclass="UNREGENERABLE (unreadable)"
     if [ "$purge" -eq 0 ]; then
-      mi_log "  keeping volume $name (role $role) — your data. 'uninstall --purge' removes it."
+      mi_log "  keeping volume $name (role $role, $vclass) — your data. 'uninstall --purge' removes it."
       continue
     fi
     # rc 3 is "already gone": nothing to remove and nothing to preserve, so the record is tombstoned.
@@ -958,7 +1065,7 @@ _mi_verb_uninstall_locked() {
     if [ "$varc" -eq 0 ]; then
       if mi_rt_volume_rm "$name" >/dev/null 2>&1; then
         mi_prov_tombstone volume "$name" || return 1
-        mi_log "  removed volume $name (role $role)."
+        mi_log "  removed volume $name (role $role, $vclass)."
       else
         mi_warn "  could NOT remove volume $name — its record is kept, so it stays removable later."
         rc=1
@@ -1026,21 +1133,53 @@ _mi_verb_uninstall_family_locked() {
   mi_warn "  Every product's container is removed, and the ledger is reset ENTIRELY: the installation"
   mi_warn "  identity, the initialized-product set, every anti-rollback trust floor, and the"
   mi_warn "  family-index anchor. Afterwards this machine is indistinguishable from a fresh one."
+  # Read the object and image listings ONCE, up front, failing closed if either cannot be fully read.
+  # This is the guard on the ledger reset below: an unreadable 'object' listing must not read as an
+  # empty one, which would remove nothing, leave `preserved` at 0, and let the reset wipe the ledger
+  # over containers and volumes it never touched — stripping their provenance while they still exist.
+  #
+  # READ BEFORE THE PROMPT, not after it. It used to be read after, which meant an unreadable ledger
+  # asked the operator to confirm a family uninstall and only then refused to perform it — a question
+  # asked about work that could not be done either way. It also meant the warning could not name what
+  # --purge was about to destroy, so the one prompt guarding every volume on the machine said "THAT IS
+  # YOUR DATA" without saying which data. Both are fixed by moving the read up; nothing here mutates,
+  # so there is no ordering cost.
+  local _objs _imgrecs
+  _objs="$(_mi_verb_objects object)" || return 1
+  _imgrecs="$(_mi_verb_objects image)" || return 1
+
   if [ "$purge" -eq 1 ]; then
     mi_warn "  --purge: this installation's named volumes are removed too. THAT IS YOUR DATA."
+    # The same enumeration the product-scoped purge shows, over every product at once. Unregenerable
+    # first, and separately, because that is the half a reinstall does not bring back.
+    local fprec="" freg="" frec fname frole
+    while IFS= read -r frec; do
+      [ -n "$frec" ] || continue
+      _mi_led_record_matches "$frec" class volume || continue
+      fname="$(mi_led_field "$frec" name)" || fname="(a volume whose record carries no readable name)"
+      frole="$(mi_led_field "$frec" role)" || frole="?"
+      if _mi_verb_vol_is_precious "$frec"; then
+        fprec="${fprec}      ${fname} (role ${frole}) — $(_mi_verb_vol_class "$frec")"$'\n'
+      else
+        freg="${freg}      ${fname} (role ${frole}) — regenerable"$'\n'
+      fi
+    done <<< "$_objs"
+    if [ -n "$fprec" ]; then
+      mi_warn "  THESE HOLD DATA THAT CANNOT BE REGENERATED. Removing them is not recoverable by"
+      mi_warn "  reinstalling, and this tool keeps no copy:"
+      local _fp
+      while IFS= read -r _fp; do [ -n "$_fp" ] && mi_warn "$_fp"; done <<< "$fprec"
+    fi
+    if [ -n "$freg" ]; then
+      mi_warn "  These are declared regenerable — a reinstall rebuilds their contents:"
+      local _fr
+      while IFS= read -r _fr; do [ -n "$_fr" ] && mi_warn "$_fr"; done <<< "$freg"
+    fi
   else
     mi_warn "  Named volumes are KEPT (your data). 'uninstall --family --purge' removes them."
   fi
   mi_warn "  transcripts/, logs/ and any host binds are never touched by any verb."
   mi_confirm "verbs: uninstall the whole family?" || { mi_warn "verbs: not confirmed."; return 1; }
-
-  # Read the object and image listings ONCE, up front, failing closed if either cannot be fully read.
-  # This is the guard on the ledger reset below: an unreadable 'object' listing must not read as an
-  # empty one, which would remove nothing, leave `preserved` at 0, and let the reset wipe the ledger
-  # over containers and volumes it never touched — stripping their provenance while they still exist.
-  local _objs _imgrecs
-  _objs="$(_mi_verb_objects object)" || return 1
-  _imgrecs="$(_mi_verb_objects image)" || return 1
 
   # Containers first, then volumes, then the network — a network cannot be removed while a container is
   # attached. `preserved` is what stops the ledger reset at the end: wiping the ledger while an object
@@ -1082,8 +1221,9 @@ _mi_verb_uninstall_family_locked() {
       [ -n "$rec" ] || continue
       _mi_led_record_matches "$rec" class volume || continue
       name="$(_mi_verb_rec_name "$rec")" || { preserved=1; continue; }
-      mi_log "  keeping volume $name (your data). After the reset it is orphaned; remove it by hand with"
-      mi_log "    'docker volume rm $name', or re-run with --purge instead of keeping it."
+      mi_log "  keeping volume $name ($(_mi_verb_vol_class "$rec")) — your data. After the reset it is"
+      mi_log "    orphaned; remove it by hand with 'docker volume rm $name', or re-run with --purge"
+      mi_log "    instead of keeping it."
     done <<< "$_objs"
   else
     while IFS= read -r rec; do
@@ -1094,7 +1234,7 @@ _mi_verb_uninstall_family_locked() {
       if mi_prov_authority volume "$name"; then varc=0; else varc=$?; fi
       if [ "$varc" -eq 0 ]; then
         if mi_rt_volume_rm "$name" >/dev/null 2>&1; then
-          mi_log "  removed volume $name."
+          mi_log "  removed volume $name ($(_mi_verb_vol_class "$rec"))."
         else
           mi_warn "  could NOT remove volume $name — its record is kept."
           preserved=1
@@ -1320,6 +1460,54 @@ mi_verb_status() {
         force-install)  mi_log "  installed with --force-install (the manifest said not launched)" ;;
       esac
     done <<< "$_sforced"
+  done <<< "$_sobjs"
+
+  # VOLUMES, which this report used to drop on the floor entirely: the loop above filters to
+  # `class=container`, so every `class=volume` record — for every product — went unreported. That is
+  # the one class whose contents cannot be rebuilt from an image, and `uninstall --purge` is the one
+  # operation that removes them, so an operator deciding whether to purge had no way to see what
+  # they were deciding about. The ledger has carried these records with a `role=` all along
+  # (mi_prov_record's passthrough fields); nothing had to be added to report them.
+  #
+  # Presence, role, unregenerable-or-not, and provenance — deliberately NOT size. The host cannot
+  # read a named volume's contents and `volume inspect` reports no size, so any number here would
+  # have to be invented or obtained by starting a container, and status starts nothing.
+  #
+  # mi_prov_authority is the sanctioned provenance predicate and is reused rather than re-derived.
+  # It is silent when a volume checks out, so its warnings appear only when something genuinely is
+  # wrong — which is precisely what this report exists to surface. Its status is CAPTURED: status is
+  # documented never to be gated by its own findings, and under `pipefail` an uncaptured non-zero
+  # here would abort the report it is part of.
+  local vrec vname vrole vrc vproduct
+  while IFS= read -r vrec; do
+    [ -n "$vrec" ] || continue
+    _mi_led_record_matches "$vrec" class volume || continue
+    if vname="$(mi_led_field "$vrec" name)"; then :; else
+      mi_log "volume:       UNREADABLE — a volume record carries no name. Run 'mythical-ctl state repair'."
+      continue
+    fi
+    if vproduct="$(mi_led_field "$vrec" product)"; then :; else vproduct=""; fi
+    # Same product filter the container loop applies, so `status <product>` stays scoped. A volume
+    # record with no readable product is shown UNFILTERED rather than hidden: it is exactly the
+    # record an operator needs to see, and silently dropping it from a filtered view is how an
+    # unattributable volume becomes invisible.
+    if [ "$#" -gt 0 ] && [ -n "$vproduct" ]; then
+      local vmatch=0 vp
+      for vp in "$@"; do [ "$vp" = "$vproduct" ] && vmatch=1; done
+      [ "$vmatch" -eq 1 ] || continue
+    fi
+    vrole="$(mi_led_field "$vrec" role)" || vrole="?"
+    # Read through the SHARED classifier, so this report and the purge that acts on it can never
+    # disagree about what a volume holds — see _mi_verb_vol_class for why absence reads as
+    # unrecoverable rather than as safe.
+    local vclass
+    vclass="$(_mi_verb_vol_class "$vrec")" || vclass="UNREGENERABLE (unreadable)"
+    if mi_prov_authority volume "$vname" >/dev/null; then vrc=0; else vrc=$?; fi
+    case "$vrc" in
+      0) mi_log "volume ${vname}: role=${vrole} data=${vclass} product=${vproduct:-?} — present, created by this installation" ;;
+      3) mi_log "volume ${vname}: role=${vrole} data=${vclass} product=${vproduct:-?} — recorded but GONE from the runtime" ;;
+      *) mi_log "volume ${vname}: role=${vrole} data=${vclass} product=${vproduct:-?} — provenance NOT established (see above); 'uninstall --purge' will preserve it" ;;
+    esac
   done <<< "$_sobjs"
   fi
 

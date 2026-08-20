@@ -449,6 +449,34 @@ mi_intent_confirm() {
 #
 # rc 0 reconciled · 1 stopped (reported), and the answer for class container · 3 no such intent ·
 # 4 retained for a later run.
+# THE INTENT'S REPORTING FIELDS, so that adopting an object does not silently forget what it is.
+#
+# An intent is opened with the reporting fields its opener knew (`product=`, `role=`, and now
+# `precious=`) and mi_intent_confirm passes any extra fields it is given straight into the provenance
+# record. The DIRECT create path re-supplies them at confirmation time. Both ADOPTION paths below did
+# not, so a volume that came back through reconcile — a reissue, or a create whose confirmation was
+# interrupted — got a provenance record with no `product` and no `role`, while the intent that
+# carried them was consumed.
+#
+# That was not merely cosmetic. `uninstall --purge` selects a product's volumes with
+# `_mi_led_record_matches "$rec" product "$product"`, so a reconciled volume matched nothing and was
+# neither removed NOR reported: the purge said it was done and left data behind. Family purge still
+# caught it (it matches on class alone), which is exactly why the product-scoped miss could persist
+# unnoticed. And the classification this module now carries would have been lost on the same path,
+# turning "unregenerable" into "unclassified" precisely for volumes that went through recovery.
+#
+# Only these three are carried. `key`/`class`/`name`/`nonce`/`gen` are structural and are written by
+# the confirmation itself; `id` is read live from the runtime, because a recorded id from an intent
+# opened before the object existed would be a claim about an object nobody had inspected.
+_mi_intent_reporting_fields() {   # <intent record> → zero or more `key=value` lines
+  if [ "$#" -ne 1 ]; then mi_warn "intent: _mi_intent_reporting_fields needs <record>"; return 1; fi
+  local rec="$1" k v
+  for k in product role precious; do
+    if v="$(mi_led_field "$rec" "$k")"; then printf '%s=%s\n' "$k" "$v"; fi
+  done
+  return 0
+}
+
 mi_intent_reconcile() {
   if [ "$#" -ne 2 ]; then mi_warn "intent: mi_intent_reconcile needs <class> <name>"; return 1; fi
   local class="$1" name="$2" rec nonce ident matches count rc
@@ -560,10 +588,16 @@ mi_intent_reconcile() {
       *) mi_warn "intent: adopting a $class is not implemented — the intent is retained."
          return 4 ;;
     esac
+    # `${rf[@]+"${rf[@]}"}` — under `set -u`, bash 3.2 (this codebase's floor) errors on
+    # "${rf[@]}" for an EMPTY array, and an intent legitimately carries no reporting fields.
+    local -a rf
+    rf=()
+    local rfl
+    while IFS= read -r rfl; do [ -n "$rfl" ] && rf+=("$rfl"); done <<< "$(_mi_intent_reporting_fields "$rec")"
     if [ -n "$id" ]; then
-      mi_intent_confirm "$class" "$name" "$nonce" "id=${id}"
+      mi_intent_confirm "$class" "$name" "$nonce" "id=${id}" ${rf[@]+"${rf[@]}"}
     else
-      mi_intent_confirm "$class" "$name" "$nonce"
+      mi_intent_confirm "$class" "$name" "$nonce" ${rf[@]+"${rf[@]}"}
     fi
     return $?
   fi
@@ -626,7 +660,13 @@ mi_intent_reconcile() {
     *) mi_warn "  The intent for volume '$name' is RETAINED, and nothing was recorded for it."
        return 1 ;;
   esac
-  mi_intent_confirm volume "$name" "$nonce"
+  # Same reporting-field carry-through as the adoption path above — a reissued volume must not lose
+  # the product, role and data-class its intent recorded.
+  local -a rrf
+  rrf=()
+  local rrfl
+  while IFS= read -r rrfl; do [ -n "$rrfl" ] && rrf+=("$rrfl"); done <<< "$(_mi_intent_reporting_fields "$rec")"
+  mi_intent_confirm volume "$name" "$nonce" ${rrf[@]+"${rrf[@]}"}
 }
 
 # --- bounded retention (D39) ----------------------------------------------------------------------

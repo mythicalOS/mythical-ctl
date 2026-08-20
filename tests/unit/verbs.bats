@@ -323,7 +323,7 @@ _slot_is() {                      # _slot_is <what-changed-if-this-fires> <diges
   _slot_is recreate "$want" "$mode" "$ino" "$uid"
 
   # And both destructive ends, purge included — the two that remove things on purpose.
-  mi_verb_uninstall p1 --purge >/dev/null
+  MI_CONFIRM=yes mi_verb_uninstall p1 --purge >/dev/null
   _slot_is "uninstall --purge" "$want" "$mode" "$ino" "$uid"
   MI_CONFIRM=yes mi_verb_uninstall_family --purge >/dev/null
   _slot_is "uninstall --family --purge" "$want" "$mode" "$ino" "$uid"
@@ -354,7 +354,7 @@ _slot_is() {                      # _slot_is <what-changed-if-this-fires> <diges
   _no_slot restart
   mi_verb_recreate "$IDX" "$POL" "$MAN" p1 >/dev/null
   _no_slot recreate
-  mi_verb_uninstall p1 --purge >/dev/null
+  MI_CONFIRM=yes mi_verb_uninstall p1 --purge >/dev/null
   _no_slot "uninstall --purge"
   MI_CONFIRM=yes mi_verb_uninstall_family --purge >/dev/null
   _no_slot "uninstall --family --purge"
@@ -396,7 +396,7 @@ _slot_is() {                      # _slot_is <what-changed-if-this-fires> <diges
 @test "--purge removes the volumes it has authority over and tombstones them" {
   mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
   IDENT="$(mi_ident_get)"
-  mi_verb_uninstall p1 --purge
+  MI_CONFIRM=yes mi_verb_uninstall p1 --purge
   run mi_rt_inspect volume v.nonce "mythical-${IDENT}-p1-state"
   [ "$status" -eq 3 ]
   run mi_led_all tombstone
@@ -405,23 +405,184 @@ _slot_is() {                      # _slot_is <what-changed-if-this-fires> <diges
 
 @test "NO verb removes an image — not uninstall, not --purge" {
   mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
-  mi_verb_uninstall p1 --purge
+  MI_CONFIRM=yes mi_verb_uninstall p1 --purge
   run grep -a 'image rm' "$FAKE_DOCKER_STATE/calls.log"
   [ "$status" -ne 0 ]
 }
 
 @test "--purge OFFERS images as an explicitly confirmed extra step, naming the shared-use risk" {
   mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
-  run mi_verb_uninstall p1 --purge
+  MI_CONFIRM=yes run mi_verb_uninstall p1 --purge
   assert_contains "may be in use"
   assert_contains "docker image"
 }
 
 @test "uninstall with an --image override leaves the override image in place" {
   mi_verb_install "$IDX" "$POL" "$MAN" p1 --image "$(a_digestref local)" >/dev/null
-  mi_verb_uninstall p1 --purge
+  MI_CONFIRM=yes mi_verb_uninstall p1 --purge
   run grep -a 'image rm' "$FAKE_DOCKER_STATE/calls.log"
   [ "$status" -ne 0 ]
+}
+
+# ── the two product-agnostic safety gaps ─────────────────────────────────────────────────────────
+# Neither of these is a regression: the core never had a data-class vocabulary at all, and the
+# product-scoped --purge never had a prompt. They arm themselves the day this tool becomes the front
+# door for a product that keeps unrecoverable data, which is why they are closed before that day.
+
+@test "status REPORTS volumes — it used to filter them out of the ledger loop entirely" {
+  mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
+  IDENT="$(mi_ident_get)"
+  run mi_verb_status "$IDX"
+  [ "$status" -eq 0 ]
+  # Both of p1's volumes, each with its role and its data class. Before this, `status` walked the
+  # object records with `class container || continue`, so no product's volumes were ever named — and
+  # `uninstall --purge` is the operation that destroys them.
+  assert_contains "volume mythical-${IDENT}-p1-state: role=state"
+  assert_contains "volume mythical-${IDENT}-p1-secrets: role=secrets"
+  assert_contains "created by this installation"
+}
+
+@test "status scopes volumes to the named product, like it already scoped containers" {
+  write_fixture_product p2
+  mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
+  mi_verb_install "$IDX" "$MYTHICAL_HOME/policy" "$MYTHICAL_HOME/p2.manifest" p2 >/dev/null
+  IDENT="$(mi_ident_get)"
+  run mi_verb_status "$IDX" p1
+  [ "$status" -eq 0 ]
+  assert_contains "volume mythical-${IDENT}-p1-state"
+  # p2's volumes are out of scope and must not appear.
+  case "$output" in *"mythical-${IDENT}-p2-state"*) echo "p2 volume leaked into a p1-scoped status: $output" >&2; return 1 ;; esac
+}
+
+@test "status distinguishes a volume that is RECORDED but gone from one that is present" {
+  # A real shape, not a contrived one: an ordinary uninstall removes the container and deliberately
+  # RETAINS the volume records (§6b), so an operator who then removes a volume by hand leaves exactly
+  # this state behind — provenance describing something that is no longer there. Reporting it as
+  # present would tell them their data is safe when it is gone.
+  #
+  # The container is removed FIRST because it has to be: the runtime refuses to remove a volume that
+  # is still attached, and an earlier version of this test tried it and was correctly refused.
+  mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
+  IDENT="$(mi_ident_get)"
+  mi_verb_uninstall p1 >/dev/null
+  mi_rt_volume_rm "mythical-${IDENT}-p1-state" >/dev/null
+  run mi_verb_status "$IDX"
+  [ "$status" -eq 0 ]
+  assert_contains "recorded but GONE from the runtime"
+  # And its sibling, untouched, still reads as present — so the distinction is doing work rather than
+  # the report having simply gone pessimistic about everything.
+  assert_contains "volume mythical-${IDENT}-p1-secrets: role=secrets data=regenerable product=p1 — present"
+}
+
+@test "a role declared precious is RECORDED as such on the volume, and reported UNREGENERABLE" {
+  write_fixture_product p2 extra_role=memory precious_role=memory
+  mi_verb_install "$IDX" "$MYTHICAL_HOME/policy" "$MYTHICAL_HOME/p2.manifest" p2 >/dev/null
+  IDENT="$(mi_ident_get)"
+  # The classification travels ON the ledger record, resolved from the authenticated policy index at
+  # creation time — not re-derived at destruction time, when the documents may be gone.
+  run mi_prov_find volume "mythical-${IDENT}-p2-memory"
+  [ "$status" -eq 0 ]
+  assert_contains "precious=1"
+  # An undeclared role on the SAME product is explicitly regenerable, not merely unmentioned.
+  run mi_prov_find volume "mythical-${IDENT}-p2-state"
+  [ "$status" -eq 0 ]
+  assert_contains "precious=0"
+  run mi_verb_status "$IDX" p2
+  assert_contains "volume mythical-${IDENT}-p2-memory: role=memory data=UNREGENERABLE"
+  assert_contains "volume mythical-${IDENT}-p2-state: role=state data=regenerable"
+}
+
+@test "a volume record with NO precious field reads as UNREGENERABLE, never as safe to delete" {
+  # The fail-safe direction, and the one that matters: a record written before this field existed, or
+  # one whose classification was lost, must not read as "a reinstall rebuilds it". Simulated by
+  # replacing the record with one that carries no `precious` field at all.
+  mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
+  IDENT="$(mi_ident_get)"; vol="mythical-${IDENT}-p1-state"
+  n="$(mi_led_field "$(mi_prov_find volume "$vol")" nonce)"
+  mi_lock_acquire
+  { mi_ledger_read | grep -av "name=${vol}"
+    printf 'object	key=volume:%s	class=volume	name=%s	nonce=%s	gen=1	product=p1	role=state
+' "$vol" "$vol" "$n"
+  } | mi_ledger_write
+  mi_lock_release
+  run mi_verb_status "$IDX"
+  assert_contains "UNREGENERABLE (unclassified)"
+  # And the purge warning treats it the same way — it is listed under the unrecoverable heading.
+  MI_CONFIRM=no run mi_verb_uninstall p1 --purge
+  assert_contains "CANNOT BE REGENERATED"
+}
+
+@test "the purge warning separates unrecoverable volumes from regenerable ones, and names both" {
+  write_fixture_product p2 extra_role=memory precious_role=memory
+  mi_verb_install "$IDX" "$MYTHICAL_HOME/policy" "$MYTHICAL_HOME/p2.manifest" p2 >/dev/null
+  IDENT="$(mi_ident_get)"
+  MI_CONFIRM=no run mi_verb_uninstall p2 --purge
+  [ "$status" -ne 0 ]
+  assert_contains "CANNOT BE REGENERATED"
+  assert_contains "mythical-${IDENT}-p2-memory (role memory)"
+  assert_contains "declared regenerable"
+  assert_contains "mythical-${IDENT}-p2-state (role state)"
+}
+
+@test "product uninstall --purge REFUSES without confirmation, and removes NOTHING" {
+  # The gap this closes: the family verb has asked since it existed, and the product-scoped --purge
+  # acquired the same power over named volumes without ever growing a prompt.
+  mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
+  IDENT="$(mi_ident_get)"
+  run mi_verb_uninstall p1 --purge          # no MI_CONFIRM, no tty → refuse
+  [ "$status" -ne 0 ]
+  assert_contains "not confirmed"
+  # NOTHING was removed — and the container proves the prompt came FIRST. A prompt that arrives after
+  # the container is gone is a notification, not a decision.
+  run mi_rt_inspect volume v.nonce "mythical-${IDENT}-p1-state"
+  [ "$status" -eq 0 ]
+  run mi_rt_inspect container c.nonce "mythical-${IDENT}-p1"
+  [ "$status" -eq 0 ]
+}
+
+@test "MI_CONFIRM=no refuses a product purge just as it refuses a family one" {
+  mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
+  IDENT="$(mi_ident_get)"
+  MI_CONFIRM=no run mi_verb_uninstall p1 --purge
+  [ "$status" -ne 0 ]
+  run mi_rt_inspect volume v.nonce "mythical-${IDENT}-p1-state"
+  [ "$status" -eq 0 ]
+}
+
+@test "a plain product uninstall does NOT prompt — the prompt stays meaningful" {
+  # Scoped to --purge on purpose. A plain uninstall KEEPS every volume, so prompting there would
+  # train an operator to type y at a question that never means anything — and a confirmation that is
+  # usually harmless is one nobody reads by the time it is not.
+  mi_verb_install "$IDX" "$POL" "$MAN" p1 >/dev/null
+  IDENT="$(mi_ident_get)"
+  run mi_verb_uninstall p1                 # no MI_CONFIRM at all, and it must still succeed
+  [ "$status" -eq 0 ]
+  assert_contains "keeping volume"
+  run mi_rt_inspect volume v.nonce "mythical-${IDENT}-p1-state"
+  [ "$status" -eq 0 ]
+}
+
+@test "an ADOPTED volume keeps its product, role and data class — so --purge still finds it" {
+  # A PRE-EXISTING defect this closes. Both of mi_intent_reconcile's confirmation paths passed no
+  # passthrough fields, so a volume that came back through adoption or reissue got a provenance
+  # record with no `product` and no `role`, while the intent carrying them was consumed. Product
+  # purge selects volumes by `product=`, so such a volume matched nothing and was neither removed nor
+  # reported: the purge said it was done and left the data behind. (Family purge still caught it — it
+  # matches on class alone — which is why the product-scoped miss could persist unnoticed.)
+  write_fixture_product p2 extra_role=memory precious_role=memory
+  IDENT="$(mi_ident_get)"; vol="mythical-${IDENT}-p2-memory"
+  # Open the intent the way install does, create the volume, then reconcile — the recovery path.
+  n="$(mi_nonce_new)"
+  mi_lock_acquire
+  mi_intent_open volume "$vol" "$n" product=p2 role=memory precious=1
+  mi_rt_volume_create "$vol" "$n" "$IDENT" >/dev/null
+  mi_intent_reconcile volume "$vol"
+  mi_lock_release
+  run mi_prov_find volume "$vol"
+  [ "$status" -eq 0 ]
+  assert_contains "product=p2"
+  assert_contains "role=memory"
+  assert_contains "precious=1"
 }
 
 @test "FAMILY uninstall resets the ledger entirely WITHOUT --purge, and leaves the volumes (§6c)" {
@@ -756,8 +917,12 @@ _slot_is() {                      # _slot_is <what-changed-if-this-fires> <diges
   mi_lock_acquire
   { mi_ledger_read; printf 'object\tmalformed-no-equals\n'; } | mi_ledger_write
   mi_lock_release
-  run mi_verb_uninstall p1 --purge
+  # CONFIRMED on purpose. Without MI_CONFIRM this test would still go red, and would still look like
+  # it was passing — but on the new confirmation prompt, having never reached the enumeration guard
+  # it exists to prove. "It failed" is not the assertion; WHICH failure is.
+  MI_CONFIRM=yes run mi_verb_uninstall p1 --purge
   [ "$status" -ne 0 ]
+  assert_contains "could not be fully read"
 }
 
 @test "install REFUSES to create a volume when its provenance record is unreadable (rc 1 is not rc 3)" {

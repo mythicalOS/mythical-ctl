@@ -127,6 +127,24 @@ container runtime. None of that is in this directory. So:
     share a namespace with these; declaring a manifest role for one would create a **new, empty**
     volume beside it rather than adopting it. If you run a product that installs itself, use that
     product's own backup verb for its data, and treat this one as covering the rest.
+- **`uninstall --purge` destroys named volumes, and now asks first.** A plain `uninstall` keeps every
+  volume and says so per volume; `--purge` is what removes them. Both the product-scoped and the
+  family-scoped form list what they are about to remove — each volume by name, with its role and
+  whether its contents can be rebuilt — and then require an explicit confirmation. A bare newline,
+  EOF, or a closed stdin all **refuse**, so a purge cannot be carried by a pipe that happened to be
+  empty. The listing comes before anything is removed, because a prompt that arrives after the
+  container is gone is a notification rather than a decision.
+  - **A volume whose data class is unknown is treated as unrecoverable.** The family policy index is
+    where a role is declared unregenerable (`<product>.precious_role` — see
+    [`docs/DOCUMENT-FORMAT.md`](docs/DOCUMENT-FORMAT.md)); a product's own manifest deliberately
+    cannot make that claim about itself, because under-declaring would buy it a quieter purge. Where
+    no declaration exists, `status` and `--purge` both report the volume as unregenerable rather than
+    as safe to delete. Only an explicit classification of *regenerable* is read as a statement that a
+    reinstall rebuilds the contents.
+- **`status` reports volumes, not just containers** — presence, role, data class, and whether this
+  installation created them. Deliberately not size: the host cannot read a named volume's contents and
+  the runtime reports no size for one, so any number here would have to be invented or obtained by
+  starting a container, and `status` starts nothing.
 - **Deleting `~/.mythical/` is not an uninstall.** The containers keep running.
 
 **Your data must never be collateral — that is the rule the installer is being built to.** It will

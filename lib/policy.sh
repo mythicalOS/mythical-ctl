@@ -30,6 +30,22 @@ mi_policy_doc_spec() {          # document-level: NEVER product-prefixed
 mi_policy_entitlement_spec() {  # entitlements: ALWAYS product-prefixed
   printf 'permitted_role\tident\tmany\n'
   printf 'bindable_role\tident\tmany\n'
+  # A role whose volume holds data that CANNOT be regenerated. This is a data-class declaration, not
+  # a permission — it grants nothing and denies nothing. It exists because the core had no vocabulary
+  # for the distinction at all: every named volume was removed identically by `--purge`, and layout's
+  # classification covers host paths only and has no volume concept. So the one operation that
+  # destroys unrecoverable data could not say which of the things it was about to destroy were
+  # unrecoverable, and neither could `status`.
+  #
+  # It belongs HERE, in the policy index, for the same reason every other entitlement does: the core
+  # carries no product-specific logic (§7), and a product's own manifest must not be the authority on
+  # how carefully its data is treated — a manifest that under-declares would buy itself a quieter
+  # purge. AUTHENTICITY IS NOT AUTHORIZATION applies to a product's self-description too.
+  #
+  # Deliberately NOT interacting with bindability: precious data is exactly the data an operator most
+  # legitimately wants to relocate onto a larger or backed-up disk, so `precious` and `bindable`
+  # compose freely. The only structural rule is the one below — precious ⊆ permitted.
+  printf 'precious_role\tident\tmany\n'
   printf 'permitted_secret\tstr:128\tmany\n'
   printf 'permitted_mount\tident\tmany\n'
 }
@@ -123,6 +139,22 @@ mi_policy_load() {
     fi
   done <<< "$out"
 
+  # precious ⊆ permitted, for the same reason bindable is: a declaration about a role that is not
+  # permitted describes a volume this installation will never create, so it silently classifies
+  # nothing. On a document whose whole job is authorization, a typo that takes effect nowhere and
+  # reports nothing is the worst failure mode — and here the specific cost is that an operator
+  # believes their unrecoverable data is flagged as such when the purge path will never see the flag.
+  # Rejected as malformed rather than silently ignored.
+  while IFS= read -r line; do
+    case "$line" in *.precious_role$'\t'*) : ;; *) continue ;; esac
+    prod="${line%%.*}"
+    role="${line#*$'\t'}"
+    if ! printf '%s' "$out" | grep -qxF "${prod}.permitted_role"$'\t'"${role}"; then
+      mi_warn "policy: $f: ${prod}'s '$role' role is declared precious but not permitted — precious must be a subset of permitted"
+      rc=1
+    fi
+  done <<< "$out"
+
   [ "$rc" -eq 0 ] || return 1
   if [ -n "$out" ]; then printf '%s' "$out"; fi
   return 0
@@ -183,4 +215,16 @@ mi_accept_policy() {
 mi_policy_bindable() {
   if [ "$#" -ne 3 ]; then mi_warn "policy: mi_policy_bindable needs <records> <product> <role>"; return 1; fi
   printf '%s' "$1" | grep -qxF "${2}.bindable_role"$'\t'"${3}"
+}
+
+# rc 0 iff <role> is declared UNREGENERABLE for <product>. Same whole-record `grep -qxF` match as
+# every other entitlement lookup here: a substring match would let `state` answer for `stat`.
+#
+# rc 1 means "not declared precious", which is NOT the same as "safe to delete" — it only means this
+# policy index made no claim. Callers deciding whether to destroy data must treat the absence of a
+# claim as unknown, and unknown as precious; this predicate answers what the document says, and it is
+# the caller's job not to read silence as permission.
+mi_policy_precious() {
+  if [ "$#" -ne 3 ]; then mi_warn "policy: mi_policy_precious needs <records> <product> <role>"; return 1; fi
+  printf '%s' "$1" | grep -qxF "${2}.precious_role"$'\t'"${3}"
 }

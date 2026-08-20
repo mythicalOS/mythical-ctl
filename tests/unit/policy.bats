@@ -40,6 +40,53 @@ skuld.bindable_role=state'
   [[ "$output" == *permitted* ]]
 }
 
+# ── precious_role: the data class, not a permission ──────────────────────────────────────────────
+# It grants nothing and denies nothing; it exists because the core had NO vocabulary for
+# "unrecoverable" at all, so the one operation that destroys such data (`uninstall --purge`) could not
+# say which of the things it was about to destroy could not be rebuilt.
+
+@test "a precious role that is also permitted loads" {
+  pol "$(printf 'brokkr.permitted_role=state\nbrokkr.permitted_role=memory\nbrokkr.precious_role=memory')"
+  run mi_policy_load "$F"
+  [ "$status" -eq 0 ]
+}
+
+@test "a precious role that is NOT permitted is rejected as malformed, not silently ignored" {
+  # The failure mode this catches: a declaration about a role no volume will ever carry classifies
+  # NOTHING, so an operator believes their unrecoverable data is flagged while the purge path will
+  # never see the flag. Silence is the worst answer a document about data safety can give.
+  pol "$(printf 'brokkr.permitted_role=state\nbrokkr.precious_role=memroy')"
+  run mi_policy_load "$F"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *memroy* ]] || { echo "output missing the offending role: $output" >&2; return 1; }
+  [[ "$output" == *precious* ]]
+}
+
+@test "precious and bindable COMPOSE — precious data is exactly what an operator relocates" {
+  # Deliberately not mutually exclusive: moving unrecoverable data onto a larger or backed-up disk is
+  # the most legitimate reason to bind a role to a host path.
+  pol "$(printf 'brokkr.permitted_role=memory\nbrokkr.bindable_role=memory\nbrokkr.precious_role=memory')"
+  run mi_policy_load "$F"
+  [ "$status" -eq 0 ]
+}
+
+@test "mi_policy_precious matches whole records — never a prefix, and never another product's" {
+  pol "$(printf 'brokkr.permitted_role=memory\nbrokkr.precious_role=memory\nskuld.permitted_role=state')"
+  recs="$(mi_policy_load "$F")"
+  run mi_policy_precious "$recs" brokkr memory
+  [ "$status" -eq 0 ]
+  # A prefix must not answer for the whole value: `mem` is not `memory`.
+  run mi_policy_precious "$recs" brokkr mem
+  [ "$status" -ne 0 ]
+  # Nor may one product's declaration classify another's role.
+  run mi_policy_precious "$recs" skuld memory
+  [ "$status" -ne 0 ]
+  # And a role that is permitted but undeclared is simply not precious HERE — the caller is the one
+  # that must not read that silence as permission to delete.
+  run mi_policy_precious "$recs" skuld state
+  [ "$status" -ne 0 ]
+}
+
 @test "a bindable SECRETS role is rejected outright" {
   pol "$(printf 'brokkr.permitted_role=secrets\nbrokkr.bindable_role=secrets')"
   run mi_policy_load "$F"

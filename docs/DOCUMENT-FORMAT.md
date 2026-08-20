@@ -219,6 +219,7 @@ possible failure.
 |---|---|---|---|
 | `<product>.permitted_role` | `ident` | many | A volume role this product may declare in its manifest. |
 | `<product>.bindable_role` | `ident` | many | A subset of the above: a role this product's own settings UI may additionally point at an operator-chosen bind path, rather than only a named volume. |
+| `<product>.precious_role` | `ident` | many | A subset of `permitted_role`: a role whose volume holds data that **cannot be regenerated**. A data class, not a permission — it grants nothing and denies nothing. See [Precious roles](#precious-roles-precious_role) below. |
 | `<product>.permitted_secret` | `str:128` | many | A bootstrap secret name this product may request. |
 | `<product>.permitted_mount` | `ident` | many | A fixed mount this product may declare. |
 
@@ -235,6 +236,43 @@ managed volume, never from an operator-chosen bind path, because that is the one
 turn into a one-line way to relocate a credential store outside the installer's control. This is not
 softened by any per-product override — the reservation is structural, checked at policy-load time,
 regardless of what any single product's own entries say.
+
+### Precious roles (`precious_role`)
+
+A role listed here holds data that **cannot be rebuilt**. Every other key in this document decides
+what a product may *have*; this one decides nothing at all about permission, and is deliberately not
+a tightening of anything. It exists because there was no vocabulary for the distinction: every named
+volume was removed identically by `uninstall --purge`, and the host-path classification elsewhere in
+this tool has no volume concept at all. So the one operation that destroys unrecoverable data could
+not say which of the things it was about to destroy were unrecoverable — and neither could `status`.
+
+**Why it lives here rather than in the manifest.** For the same reason every entitlement does: this
+tool carries no product-specific logic, and a product's own self-description must not be the
+authority on how carefully its data is treated. A manifest that under-declared would buy itself a
+quieter purge. *Authenticity is not authorization* applies to a product describing its own data as
+readily as to one requesting a sibling's volume.
+
+**`precious ⊆ permitted`, and a policy that violates it is rejected as malformed**, exactly like
+`bindable`. A declaration naming a role that is not permitted classifies a volume this installation
+will never create, so it takes effect nowhere and reports nothing — and here the specific cost of
+that silence is an operator who believes their unrecoverable data is flagged when the purge path will
+never see the flag.
+
+**`precious` and `bindable` compose freely, on purpose.** There is no rule against a role being both.
+Unrecoverable data is exactly the data an operator most legitimately wants to relocate onto a larger
+or backed-up disk, so making the two exclusive would penalise the safest thing they could do with it.
+
+**What consumes it.** The class is resolved at volume-creation time and recorded on the volume's own
+ledger record, rather than re-derived when something is about to be deleted. A product being
+uninstalled may be one whose manifest has been withdrawn, so a purge that needed the documents to
+answer "is this recoverable?" would either fail closed and be unable to uninstall anything, or fall
+back to a default — and the only available default answers in the direction that costs data. Reading
+it from the checksummed ledger removes the choice.
+
+**An absent classification reads as unrecoverable, never as safe.** A record written before this key
+existed makes no claim, and no claim means this tool does not know. `status` reports such a volume as
+`UNREGENERABLE (unclassified)` and `--purge` lists it under the unrecoverable heading. Only an
+explicit classification of *regenerable* is treated as a statement that the contents can be rebuilt.
 
 ### The family gid (`family_gid`)
 
@@ -291,6 +329,11 @@ key, rather than shipping a field that quietly does nothing.
 - **`bindable_role`.** Bindability is an *entitlement*, decided by the family policy index
   (`<product>.bindable_role`), never claimed by the product itself. A manifest that could declare
   its own roles bindable could grant itself a capability no publisher ever authorized.
+- **`precious_role`.** The same rule, applied to something that is not a permission at all. Whether a
+  role's data can be regenerated is decided by the policy index (`<product>.precious_role`), because a
+  manifest that classified its own data could **under**-declare and buy itself a quieter `--purge` —
+  the one direction where a product's self-description costs the operator something irreversible. A
+  product may say which roles it needs; it does not get to say how carefully they are treated.
 - **`network`.** A manifest cannot ask to join a network. Cross-product network reach is exactly the
   boundary the authenticated policy/entitlement model exists to hold — a product declaring which
   network it joins is a product declaring who it can talk to, and that is not this document's
