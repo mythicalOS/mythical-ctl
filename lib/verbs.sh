@@ -1,0 +1,1579 @@
+#!/usr/bin/env bash
+# The lifecycle verbs. Deliberately THIN: each holds the lock, walks a sequence the earlier modules
+# define, and reports. The sequence, the reconciler and the recovery tables are not here.
+#
+# EVERY VERB DECLARES ITS EFFECT ON DESIRED STATE — there is no default (§6b.3's verb table). Two rules
+# with no exception: a verb that stops a container as a MEANS (recreate, migrate) must not overwrite
+# what the operator wants — only install/start/stop express intent — and every transition that leaves a
+# container running ends in a live verification, because "it started" is not evidence its alias
+# resolves.
+#
+# THE FAMILY LOCK IS HELD ACROSS A WHOLE MUTATING VERB THROUGH _mi_with_lock, NOT A `trap … RETURN`.
+# A RETURN trap set in a verb is fired by bash on every NESTED function return when functrace (`set
+# -T`) is on — which is exactly how the test harness runs a test body — so the trap would release the
+# lock on the first inner call and every later ledger write would refuse for want of it. An explicit
+# acquire-run-release is correct whether functrace is on or off, so it is what the verbs use.
+#
+# PURE library — no side effects at source time; no `set -euo pipefail`.
+#
+# ARRAY-TYPED LOCALS DECLARED HERE: `specs`, `wanted`, `vroles`, `codes`, `extra`. tools/bundle.sh
+# flattens every module into one file, after which shellcheck's array tracking is no longer
+# per-function — so a later module using one of these names for an ordinary scalar draws SC2178 plus an
+# SC2128 per use. None collide with the names already spoken for elsewhere (`args`, `pk`, `pv`,
+# `placed`, `fields`, `triples`, `rtargv`, `rtpost`, `hspecs`, `pairs`, `srcs`, `modes`, `bspecs`,
+# `broles`, `ids`, `permitted`).
+
+# --- lock discipline ------------------------------------------------------------------------------
+# Hold the family lock across <fn> <args...>, releasing it on EVERY return path the function takes and
+# preserving its exit status. See the header: this is deliberately NOT a RETURN trap.
+_mi_with_lock() {
+  mi_lock_acquire || return 1
+  local _rc=0
+  "$@" || _rc=$?
+  mi_lock_release
+  return "$_rc"
+}
+
+# The preamble every non-install mutating verb runs INSIDE the lock: layout, probe cleanup, and the
+# §6b.2 unaccounted-object gate that stops a verb before it touches anything.
+_mi_verb_prepare() {
+  mi_ensure_layout || return 1
+  # A probe cleanup that could not verify or remove a stale probe (rc != 0) leaves an unresolved probe
+  # intent. Proceeding to mutate installation state on top of it is exactly the "act on a question that
+  # could not be answered" this codebase refuses everywhere else — so a failed cleanup stops the verb.
+  mi_probe_cleanup || return 1
+  mi_unaccounted_gate || return 1
+  return 0
+}
+
+_mi_verb_container() {   # <product> → the container name, or rc 1
+  local ident
+  ident="$(mi_ident_get)" || { mi_warn "verbs: no installation identity — has anything been installed?"; return 1; }
+  mi_name_container "$ident" "$1"
+}
+
+# Fully read one kind of ledger record for a MUTATING verb, FAILING CLOSED if the listing is not
+# complete. `done <<< "$(mi_led_all <kind>)"` takes the WHILE loop's status, not the listing's — so
+# mi_led_all's rc 1 (a record could not be read) is discarded and reads as an EMPTY listing. A verb that
+# loops over an empty listing then skips every object it should have acted on: family uninstall would
+# reset the ledger over containers it never removed; uninstall --purge would leave volumes behind and
+# still exit 0. rc 0 (records, possibly none) and rc 3 (no ledger yet) both proceed; rc 1 refuses.
+# Callers MUST capture this and check its status BEFORE the loop — never inline it into `done <<<`.
+# --- volume data class ----------------------------------------------------------------------------
+# One reader for the `precious=` field, used by every path that reports or destroys a volume, so that
+# `status`, product purge and family purge cannot disagree about what a volume holds.
+#
+# ABSENCE IS NOT "REGENERABLE". A record with no `precious` field was written by a version of this
+# installer that had no vocabulary for the distinction, or by an adoption path that lost it — either
+# way this installation does not know, and "unknown" must read as unrecoverable. The opposite default
+# is the one that costs data, and it costs it silently: the operator sees a volume listed as
+# regenerable, purges, and finds out afterwards. Only an EXPLICIT `precious=0` is a claim that the
+# contents can be rebuilt.
+_mi_verb_vol_class() {   # <volume record> → the data class as a phrase for a report
+  if [ "$#" -ne 1 ]; then mi_warn "verbs: _mi_verb_vol_class needs <record>"; return 1; fi
+  local pv
+  if pv="$(mi_led_field "$1" precious)"; then :; else pv=""; fi
+  case "$pv" in
+    0) printf 'regenerable\n' ;;
+    1) printf 'UNREGENERABLE\n' ;;
+    *) printf 'UNREGENERABLE (unclassified)\n' ;;
+  esac
+}
+
+# rc 0 iff this volume must be treated as holding unrecoverable data — including when it says nothing.
+_mi_verb_vol_is_precious() {
+  if [ "$#" -ne 1 ]; then mi_warn "verbs: _mi_verb_vol_is_precious needs <record>"; return 1; fi
+  local pv
+  if pv="$(mi_led_field "$1" precious)"; then :; else pv=""; fi
+  [ "$pv" != "0" ]
+}
+
+_mi_verb_objects() {
+  if [ "$#" -ne 1 ]; then mi_warn "verbs: _mi_verb_objects needs <kind>"; return 1; fi
+  local kind="$1" recs rc
+  if recs="$(mi_led_all "$kind")"; then rc=0; else rc=$?; fi
+  if [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ]; then printf '%s' "$recs"; return 0; fi
+  mi_warn "verbs: the ledger's '${kind}' records could not be fully read, so this operation cannot see"
+  mi_warn "  every object it must act on. Refusing rather than acting on a partial view of the ledger."
+  mi_warn "  Run 'mythical-ctl state repair'."
+  return 1
+}
+
+# The name of a class-matched object record, or rc 1 if it has none. A record that passes the listing's
+# field-format check (so _mi_verb_objects accepts it) can still be missing a SEMANTIC field like `name=`
+# — and `name="$(mi_led_field … name)" || continue` silently SKIPPED such a record. In a mutating family
+# verb that meant the object was neither removed nor counted as preserved, so the ledger reset wiped its
+# provenance while it still stood. Callers fail closed on rc 1 (set preserved / rc and continue), never
+# skip. (This is distinct from _mi_verb_objects, which fails on an unreadable LISTING.)
+_mi_verb_rec_name() {
+  local nm
+  if nm="$(mi_led_field "$1" name)"; then printf '%s\n' "$nm"; return 0; fi
+  mi_warn "verbs: an object record carries no readable name — it cannot be acted on. The ledger is not"
+  mi_warn "  reset over it. Run 'mythical-ctl state repair'."
+  return 1
+}
+
+# Prove the container standing under our name is OURS before a start/stop/restart acts on it. A provenance
+# RECORD existing is not enough: after our container was deleted out of band, another installation could
+# stand a container under the same name, and starting/stopping/committing state for it would act on someone
+# else's object. mi_prov_authority checks the running object's nonce against the record — rc 0 = ours
+# (proceed); rc 3 = absent (nothing foreign is there, the verb rebuilds or no-ops); anything else = a
+# container stands under our name that is NOT ours — refuse. Install, recreate and uninstall already gate
+# on this (§6a); start/stop/restart must too.
+_mi_verb_authority_ok() {
+  local arc
+  if mi_prov_authority container "$1"; then arc=0; else arc=$?; fi
+  if [ "$arc" -eq 0 ] || [ "$arc" -eq 3 ]; then return 0; fi
+  mi_warn "verbs: a container stands under this product's name that is not this installation's — refusing"
+  mi_warn "  to start, stop or restart another installation's object. Run 'mythical-ctl state repair'."
+  return 1
+}
+
+# The core-fixed user-data mount points (§4.1a): ~/.mythical/transcripts and ~/.mythical/logs.
+# mi_ensure_layout deliberately leaves these "to appear when a product binds them" — they are the
+# user-data ownership class, not installer state — and binding them is exactly what a launch does. So
+# they are created HERE, before mi_mount_check_fixed validates the core-fixed set (which is always all
+# three, whatever the manifest selects) and before the runtime refuses a bind whose source is missing.
+# Created if absent, never touched otherwise (D9); mkdir makes real directories, which is what the
+# no-symlink / exact-canonical checks in mi_mount_check_fixed require.
+_mi_ensure_mount_points() {
+  local h; h="$(mi_home)" || return 1
+  local d
+  for d in transcripts logs; do
+    [ -d "$h/$d" ] || mkdir -p "$h/$d" || { mi_warn "verbs: cannot create the '$d' mount point under ~/.mythical/"; return 1; }
+  done
+  return 0
+}
+
+# --- confirmation ---------------------------------------------------------------------------------
+# An action that destroys data asks first — the family uninstall, and (since the product-scoped
+# `--purge` acquired the same power over named volumes without ever growing a prompt) that too.
+# MI_CONFIRM short-circuits it non-interactively — `yes` to proceed, `no` to refuse — so both are
+# testable without a tty; with neither set, the operator is prompted and anything but an explicit yes
+# refuses. Note which way the default falls: a bare newline, EOF, or a closed stdin all REFUSE, so a
+# purge cannot be carried by a pipe that happened to be empty.
+mi_confirm() {
+  local prompt="${1:-Proceed?}" reply
+  case "${MI_CONFIRM:-}" in
+    yes) return 0 ;;
+    no)  return 1 ;;
+  esac
+  printf '%s [y/N] ' "$prompt" >&2
+  if ! IFS= read -r reply; then return 1; fi
+  case "$reply" in y|Y|yes|Yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+# --- product context ------------------------------------------------------------------------------
+# Everything a verb needs about one product, derived once from the authenticated documents. Printed as
+# ONE TAB-separated line of `key=value` fields, so a caller reads it with mi_led_field.
+#
+# rc 0 · 1 refused (reported) · 3 the manifest says NOT LAUNCHED (§7.3's contract code, carried
+# straight through from Plan 3's mi_accept_manifest).
+mi_product_ctx() {
+  if [ "$#" -ne 4 ]; then mi_warn "verbs: mi_product_ctx needs <index> <policy> <manifest> <product>"; return 1; fi
+  local idx="$1" pol="$2" man="$3" product="$4" mrec prec rc
+
+  # ONE door (Plan 3): index vouches → digest verified → parse → product identity → freshness →
+  # entitlements → min_core → launch state. Nothing here re-implements any of it.
+  if mrec="$(mi_accept_manifest "$idx" "$pol" "$man" "$product")"; then rc=0; else rc=$?; fi
+  # rc 3 still PRINTS the records — a caller reporting "not launched yet" legitimately wants them, and
+  # the trust floor has already been recorded (§7.3's enumerated exempt side effects).
+  if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then return "$rc"; fi
+  prec="$(mi_accept_policy "$idx" "$pol")" || return 1
+
+  local launched=true
+  [ "$rc" -ne 3 ] || launched=false
+
+  # IDENTITY IS INSTALLATION STATE, AND A NOT-LAUNCHED RESULT MINTS NONE OF IT. §10a's not-launched row
+  # is "message, no product state, no pull" — so learning from an authentic manifest that a product is
+  # unpublished must not be the act that turns a fresh machine into an installation (which is what
+  # mi_ident_ensure does: it is where the ledger itself comes into existence). On the LAUNCHED path we
+  # mint; on the not-launched path we only READ whatever identity already exists — a fresh machine has
+  # none — and the container name, which needs it, is left empty. The trust floor is still recorded by
+  # mi_accept_manifest above; that is §7.3-exempt and unchanged. An explicit --force-install IS a real
+  # install and mints its own identity, loudly, where that choice is made.
+  local ident=""
+  if [ "$launched" = true ]; then
+    ident="$(mi_ident_ensure)" || return 1
+  else
+    local irc
+    if ident="$(mi_ident_get)"; then irc=0; else irc=$?; fi
+    if [ "$irc" -eq 3 ]; then ident=""
+    elif [ "$irc" -ne 0 ]; then return "$irc"; fi
+  fi
+  local container=""
+  if [ -n "$ident" ]; then container="$(mi_name_container "$ident" "$product")" || return 1; fi
+
+  # ONE TAB-SEPARATED LINE, because mi_led_field splits on TAB. Emitting one `key=value` per LINE and
+  # then reading it with mi_led_field — which sets IFS to TAB — sees the whole blob as a single token
+  # and matches nothing else, so every lookup returns absent and the caller proceeds on empty data.
+  # The multi-line records blobs carry TABs of their own (they are `key<TAB>value` lines), so they are
+  # folded: newline → RS (\036), tab → US (\037); the caller reverses both. Nothing carrying either
+  # byte is ever written to the ledger — this record is in-process only.
+  printf 'product=%s' "$product"
+  printf '\tlaunched=%s' "$launched"
+  printf '\tcontainer=%s' "$container"
+  printf '\talias=%s' "$(mi_name_alias "$product")"
+  printf '\timage=%s' "$(mi_manifest_image "$mrec")"
+  # Encode the record blobs, CHECKING the transform: a failed tr yields empty output while the printf
+  # around it succeeds, so a caller would decode an empty manifest as "no volumes, mounts or secrets" and
+  # launch an incomplete container. Capture and check before printing.
+  local _menc _penc
+  _menc="$(printf '%s' "$mrec" | tr '\n\t' '\036\037')" || { mi_warn "verbs: could not encode the manifest records for '$product'."; return 1; }
+  _penc="$(printf '%s' "$prec" | tr '\n\t' '\036\037')" || { mi_warn "verbs: could not encode the policy records for '$product'."; return 1; }
+  printf '\tmanifest_records=%s' "$_menc"
+  printf '\tpolicy_records=%s\n' "$_penc"
+  return "$rc"
+}
+
+# --- launch specs ---------------------------------------------------------------------------------
+# The mount and publish specs for one product, from its manifest, the policy index and mythical.conf.
+# D19's launch-argument invariant in practice: the ONLY sources are the authenticated manifest, the
+# authenticated policy index, and mythical.conf — never <product>.conf.
+#
+# Operator BINDS are produced by lib/bringup.sh's mi_mount_binds, which maps each role to its
+# authenticated container path, asks the bindability entitlement at the point the mount is produced,
+# validates both spec components and applies the pairwise-overlap rule to the whole set. Every role it
+# does NOT emit a bind for falls through here to a NAMED VOLUME (D6). Reusing that one owner is the
+# whole point: a second implementation of the bind rule is one that drifts until the producer accepts
+# what the consumer refuses.
+mi_bringup_specs() {
+  if [ "$#" -ne 3 ]; then mi_warn "verbs: mi_bringup_specs needs <product> <manifest-records> <policy-records>"; return 1; fi
+  local product="$1" mrec="$2" prec="$3" ident up v role target vol port
+  ident="$(mi_ident_get)" || return 1
+  up="$(printf '%s' "$product" | tr 'a-z-' 'A-Z_')" || { mi_warn "verbs: could not derive the port env-var name for '$product' — refusing rather than reading the wrong key."; return 1; }
+
+  # Volume roles the manifest declares.
+  local -a vroles
+  vroles=()
+  while IFS= read -r v; do
+    [ -n "$v" ] || continue
+    case "$v" in *:*) : ;; *) continue ;; esac
+    vroles+=("${v%%:*}")
+  done <<< "$(mi_doc_values "$mrec" volume)"
+
+  # Operator binds for the bound roles — validated, entitled and pairwise-checked by the one owner.
+  # CAPTURED AND CHECKED before the loop: `done <<< "$(mi_mount_binds …)"` takes the WHILE loop's
+  # status, not the substitution's, so a REFUSED bind build (a bind inside the family home, a role the
+  # policy index does not make bindable, two overlapping writable binds) would be silently swallowed.
+  local bound_out=""
+  if [ "${#vroles[@]}" -gt 0 ]; then
+    bound_out="$(mi_mount_binds "$product" "$mrec" "$prec" "${vroles[@]}")" || return 1
+  fi
+
+  local -a specs
+  specs=()
+  # The set of roles that got a bind, and their specs. `role<TAB>bind=…` — role first, carried rather
+  # than parsed back out of the spec (neither of a spec's path components is distinguishable from the
+  # other once it is a string).
+  local bound_roles="" line brole bspec
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    brole="${line%%$'\t'*}"; bspec="${line#*$'\t'}"
+    bound_roles="${bound_roles}${brole}"$'\n'
+    specs+=("$bspec")
+  done <<< "$bound_out"
+
+  # Every role with NO bind → a named volume at its authenticated container path.
+  for role in ${vroles[@]+"${vroles[@]}"}; do
+    case $'\n'"${bound_roles}" in *$'\n'"${role}"$'\n'*) continue ;; esac
+    target="$(_mi_bringup_role_target "$mrec" "$role")" || return 1
+    vol="$(mi_name_volume "$ident" "$product" "$role")" || return 1
+    specs+=("volume=${vol}:${target}:rw")
+  done
+
+  # Core-fixed mounts (§4.1a): the closed allowlist, validated, never manifest-extended. The manifest
+  # only SELECTS from it (`mount=transcripts`), and the policy index must permit the selection.
+  mi_mount_check_fixed "$product" || return 1
+  # The SAME canonical home the check validated — validate and launch against the same resolved path.
+  local h; h="$(mi_home_canon)" || return 1
+  specs+=("bind=${h}/${product}.conf:/etc/mythical/${product}.conf:rw")
+  while IFS= read -r v; do
+    [ -n "$v" ] || continue
+    mi_policy_permits "$prec" "$product" mount "$v" || {
+      mi_warn "verbs: '$product' selects the core-fixed mount '$v', which the policy index does not permit."
+      return 1; }
+    case "$v" in
+      transcripts) specs+=("bind=${h}/transcripts:/home/mythical/transcripts:rw") ;;
+      logs)        specs+=("bind=${h}/logs:/home/mythical/logs:rw") ;;
+      *) mi_warn "verbs: '$v' is not a core-fixed mount"; return 1 ;;
+    esac
+  done <<< "$(mi_doc_values "$mrec" mount)"
+
+  # Ports. The container port comes from the manifest; the HOST port from mythical.conf if set,
+  # otherwise the same number. The 127.0.0.1 host IP is added by the adapter, not here.
+  while IFS= read -r v; do
+    [ -n "$v" ] || continue
+    # ONLY rc 3 (the key is absent) falls back to the manifest's port. Any other status means the file
+    # did not parse or the value did not validate, and quietly publishing a different port than the
+    # operator configured is the wrong answer to "I could not read your configuration".
+    local prc
+    if port="$(mi_conf_get "$(mi_conf_family_path)" "MYTHICAL_${up}_PORT")"; then prc=0; else prc=$?; fi
+    if [ "$prc" -eq 3 ]; then port="$v"
+    elif [ "$prc" -ne 0 ]; then
+      mi_warn "verbs: could not read MYTHICAL_${up}_PORT from mythical.conf — refusing rather than"
+      mi_warn "  silently publishing the manifest's default port instead of your configured one."
+      return 1
+    fi
+    specs+=("publish=${port}:${v}")
+  done <<< "$(mi_doc_values "$mrec" port)"
+
+  printf '%s\n' "${specs[@]}"
+}
+
+# --- <product>.conf ------------------------------------------------------------------------------
+# Create <product>.conf if absent; never modify it thereafter (§6's user-owned class). The gid comes
+# from the AUTHENTICATED policy index (D60), used numerically — `chgrp <gid>` needs no /etc/group
+# entry, so the installer creates no host groups and makes no machine change.
+mi_conf_product_ensure() {
+  if [ "$#" -ne 3 ]; then mi_warn "verbs: mi_conf_product_ensure needs <product> <gid> <manifest-records>"; return 1; fi
+  local product="$1" gid="$2" f
+  f="$(mi_conf_product_path "$product")" || return 1
+  if [ -f "$f" ]; then
+    # Additive only. There is nothing this verb adds today — the product's own UI writes its settings
+    # (D3) — so an existing file is left byte-identical, which is what §10a's re-install case asserts.
+    return 0
+  fi
+  # No KEY VALUE pairs: the file is created with the marker and the mode and NO settings, because the
+  # product's own UI is what writes them (D3). Plan 2 owns the mechanism (its arity was relaxed to
+  # permit a keyless create); this is the one call site that decides WHEN.
+  #
+  # rc 5 is Plan 2's "written, but not to D60's spec": the file exists and is correct, only the
+  # shared-group chgrp did not take — the ordinary outcome for an unprivileged installer whose operator
+  # is not in the family group. That is a REPORTED CONDITION, not an install failure: the product runs;
+  # its settings screen is read-only until the group is fixed.
+  local crc
+  if mi_conf_product_add "$product" "$(printf '')" "$gid"; then crc=0; else crc=$?; fi
+  case "$crc" in
+    0) return 0 ;;
+    5) mi_warn "verbs: ${product}.conf was created, but its group could not be set to ${gid}."
+       mi_warn "  The file is mode 0600 and yours. The product's own settings screen will be"
+       mi_warn "  READ-ONLY until the group is set (§4.5/D60). The install continues."
+       return 0 ;;
+    *) return "$crc" ;;
+  esac
+}
+
+# --- bootstrap secrets (ONE gate, shared by install and recreate) ---------------------------------
+# Collect the manifest's bootstrap secrets, EACH gated on the CURRENT policy grant, and stage them
+# into a 0600 env file (mi_secrets_envfile removes it — the caller does, on every exit path). Prints
+# the env file path, or `-` when the product declares none.
+#
+# THE ENTITLEMENT GATE LIVES HERE, IN ONE PLACE, because install and recreate both inject bootstrap
+# secrets and a second copy of the check is one that drifts: install carried this per-key
+# mi_policy_permits gate and recreate did not, so a secret install would refuse recreate would stage.
+# mi_accept_manifest already refuses a manifest that declares a policy-denied secret, so this is the
+# defence-in-depth layer behind that door — but it must be the SAME layer on both verbs, so it is
+# factored out rather than written twice. rc 0 (prints the path, or `-`) · 1 a declared secret is not
+# granted (reported), or staging failed.
+_mi_verb_secrets_envfile() {
+  if [ "$#" -ne 3 ]; then mi_warn "verbs: _mi_verb_secrets_envfile needs <product> <manifest-records> <policy-records>"; return 1; fi
+  local product="$1" mrec="$2" prec="$3" v
+  local -a wanted
+  wanted=()
+  while IFS= read -r v; do
+    [ -n "$v" ] || continue
+    mi_policy_permits "$prec" "$product" secret "$v" || {
+      mi_warn "verbs: '$product' asks for secret '$v', which the policy index does not grant it."; return 1; }
+    wanted+=("$v")
+  done <<< "$(mi_doc_values "$mrec" secret)"
+  if [ "${#wanted[@]}" -gt 0 ]; then
+    mi_secrets_envfile "$product" "${wanted[@]}" || return 1
+  else
+    printf '%s\n' "-"
+  fi
+}
+
+# Ensure the selected image is present, and record it. PULL ONLY ON CONFIRMED ABSENCE: mi_rt_image_present
+# answers present/not-present but cannot tell "absent" from "the daemon could not answer", and sending the
+# second to a pull is the rc-1→rc-3 fold this plan refuses everywhere — so a not-present answer is
+# disambiguated with mi_rt_ping (a question that does not depend on the image): a daemon that answers means
+# the image is genuinely absent and we pull; a daemon that does NOT answer stops rather than pulling.
+#
+# Both install AND recreate call this BEFORE they stop or remove any existing container, so an image that
+# cannot be made available fails the verb (rc 1) with the working installation PRESERVED, rather than torn
+# down and then un-rebuildable. It used to be install-only; a manifest that advanced to an unpulled image
+# then let recreate destroy the container and fail to recreate it, leaving the operator with nothing.
+_mi_verb_ensure_image() {
+  if [ "$#" -ne 2 ]; then mi_warn "verbs: _mi_verb_ensure_image needs <image> <product>"; return 1; fi
+  local image="$1" product="$2"
+  local present=0
+  if mi_rt_image_present "$image"; then present=1; fi
+  if [ "$present" -eq 0 ]; then
+    if ! mi_rt_ping; then
+      mi_warn "verbs: could not determine whether the image for '$product' is already present — the"
+      mi_warn "  container runtime did not answer. Refusing rather than pulling on a question that"
+      mi_warn "  could not be asked."
+      return 1
+    fi
+    local perr
+    if ! perr="$(mi_rt_image_pull "$image" 2>&1)"; then
+      mi_warn "verbs: the image for '$product' could not be pulled:"
+      mi_warn "    $image"
+      mi_warn "  The runtime said:"
+      mi_warn "    $perr"
+      mi_warn "  The manifest declares this product LAUNCHED, so this is a release or registry problem,"
+      mi_warn "  not a pre-launch state. It is reported as a failure deliberately."
+      return 1
+    fi
+  fi
+  mi_prov_image_record "$image" "$product" || return 1
+}
+
+# --- install (desired state: running) -------------------------------------------------------------
+mi_verb_install() {
+  if [ "$#" -lt 4 ]; then mi_warn "verbs: install needs <index> <policy> <manifest> <product> [--image REF] [--force-install]"; return 2; fi
+  local idx="$1" pol="$2" man="$3" product="$4"; shift 4
+  local override="" forced=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      # GUARD THE VALUE, AND NEVER `shift 2` PAST THE END. As a pure library this loop runs without
+      # errexit, so a failed `shift 2` (only the flag left, $# unchanged) would spin forever and hang
+      # the caller — the CLI's own parser guard cannot save a direct library call. A missing value is
+      # this verb's own usage error (rc 2), not something to fold into the caller's control flow.
+      --image)
+        [ "$#" -ge 2 ] || { mi_warn "verbs: install option '--image' requires a value"; return 2; }
+        override="$2"; shift 2 ;;
+      --force-install) forced=1; shift ;;
+      *) mi_warn "verbs: unknown install option '$1'"; return 2 ;;
+    esac
+  done
+  mi_preflight_daemon || return 1
+  _mi_with_lock _mi_verb_install_locked "$idx" "$pol" "$man" "$product" "$override" "$forced"
+}
+
+_mi_verb_install_locked() {
+  local idx="$1" pol="$2" man="$3" product="$4" override="$5" forced="$6"
+
+  mi_ensure_layout || return 1
+  # if/else, not `mi_first_use; fu=$?` — a bare call would abort a `set -e` caller on rc 3, which is
+  # the ORDINARY "this machine already has a ledger" answer.
+  local fu
+  if mi_first_use; then fu=0; else fu=$?; fi
+  [ "$fu" -ne 1 ] || return 1
+  # A stale probe that could not be verified or removed (rc != 0) stops the install before it mutates
+  # state, exactly as the other verbs do via _mi_verb_prepare.
+  mi_probe_cleanup || return 1
+
+  # THE UNACCOUNTED-OBJECT GATE RUNS BEFORE ANY AUTHENTICATED-STATE WRITE, matching recreate (which runs it
+  # first via _mi_verb_prepare). mi_product_ctx below advances the manifest's anti-rollback trust floor — a
+  # §7.3-exempt side effect — so running the gate AFTER it let a refused install (a stray same-identity
+  # object) still advance the floor, permanently blocking a rollback for an install that was never allowed.
+  # On a fresh machine there is no identity yet, so the scan finds nothing and the gate passes.
+  mi_unaccounted_gate || return 1
+
+  local ctx rc mrec prec
+  if ctx="$(mi_product_ctx "$idx" "$pol" "$man" "$product")"; then rc=0; else rc=$?; fi
+  if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then return 1; fi
+
+  # §7.3's enumerated exempt side effects, and NOTHING else, on the not-launched path — the trust floor
+  # for the manifest that was read has ALREADY been recorded by mi_accept_manifest, before the
+  # launch-state branch, so a withdrawn `launched` manifest cannot be replayed later against a machine
+  # that never established one.
+  if [ "$rc" -eq 3 ]; then
+    if [ "$forced" -eq 0 ]; then
+      mi_log "$product has not launched yet."
+      mi_log "  Its manifest declares it unpublished, so no pull was attempted and nothing was created."
+      mi_log "  Nothing is wrong — this product is not available yet."
+      return 3
+    fi
+    mi_warn "verbs: FORCED install of '$product', whose manifest says it has not launched."
+    mi_warn "  You are asserting the image is published. It is reported by 'status' once the install"
+    mi_warn "  succeeds — the force-install record, like the image-override record, is written AFTER"
+    mi_warn "  bring-up, so a forced install that fails leaves no false annotation behind."
+    # A forced install IS a real install — it pulls and creates a container — so it legitimately
+    # establishes the installation identity here. This is the ONE not-launched path that may mint one,
+    # and only on the operator's explicit override; the unforced path above returned without minting,
+    # and mi_product_ctx did not mint on the not-launched path either.
+    mi_ident_ensure >/dev/null || return 1
+  fi
+
+  # Read then transform — a pipeline's status under `pipefail` is the LEFT side's, so `… | tr` would
+  # abort on a missing field rather than report it.
+  mrec="$(mi_led_field "$ctx" manifest_records)" || { mi_warn "verbs: context has no manifest records"; return 1; }
+  mrec="$(printf '%s' "$mrec" | tr '\036\037' '\n\t')" || { mi_warn "verbs: could not decode the manifest records — refusing rather than launching an incomplete container."; return 1; }
+  prec="$(mi_led_field "$ctx" policy_records)"   || { mi_warn "verbs: context has no policy records"; return 1; }
+  prec="$(printf '%s' "$prec" | tr '\036\037' '\n\t')" || { mi_warn "verbs: could not decode the policy records — refusing rather than launching an incomplete container."; return 1; }
+  local container alias image
+  container="$(mi_led_field "$ctx" container)" || return 1
+  # On a FORCED not-launched install on a brand-new machine, the context was assembled before the
+  # identity existed, so it carries no container name. The forced branch above has now minted the
+  # identity, so derive the name through its one owner rather than launching with an empty one.
+  if [ -z "$container" ]; then container="$(mi_name_container "$(mi_ident_get)" "$product")" || return 1; fi
+  alias="$(mi_led_field "$ctx" alias)" || return 1
+  image="$(mi_led_field "$ctx" image)" || return 1
+
+  if [ -n "$override" ]; then
+    # D22/§13: an override may name ANY reference, including a local build. Loud, and reported by status.
+    # The override LEDGER record is written AFTER bring-up succeeds (see the reconcile below), not here —
+    # a record written before the install completes would survive a failed --image install and be
+    # applied by a later recreate. Only `image` is set now, so this install runs the overridden image.
+    mi_warn "verbs: IMAGE OVERRIDE — '$product' will run '$override' instead of the manifest's image."
+    mi_warn "  The manifest's digest pin does not apply to an overridden reference. It is reported by"
+    mi_warn "  'status' once the install succeeds."
+    image="$override"
+  fi
+
+  local netid
+  netid="$(mi_net_target "$idx")" || return 1
+
+  # The pull, through the SAME entitlement-independent gate recreate uses (so the two cannot drift):
+  # present/absent is disambiguated with a ping, a genuinely-absent image is pulled, an unanswerable
+  # daemon stops rather than pulls, and the image is recorded. Every failure is loud, distinguishable
+  # (§7.3) and exits 1. This is BEFORE the container replacement below, so a missing image never tears
+  # down a working container.
+  _mi_verb_ensure_image "$image" "$product" || return 1
+
+  # <product>.conf, created if absent, additive thereafter (§6/D9), 0660 with the policy index's
+  # canonical family gid (D60/§4.5).
+  local gid
+  gid="$(mi_policy_family_gid "$prec")" || return 1
+  mi_conf_product_ensure "$product" "$gid" "$mrec" || return 1
+
+  # The core-fixed user-data mount points, before the mount check validates them.
+  _mi_ensure_mount_points || return 1
+
+  # Named volumes for every role with no bind, under write-ahead intent.
+  local v role vol nonce vprecious
+  while IFS= read -r v; do
+    [ -n "$v" ] || continue
+    role="${v%%:*}"
+    vol="$(mi_name_volume "$(mi_ident_get)" "$product" "$role")" || return 1
+    # The data class, resolved from the AUTHENTICATED policy index and recorded ON the volume, not
+    # re-derived at destruction time. `uninstall --purge` must be able to say which of the volumes it
+    # is about to remove hold unrecoverable data, and it cannot depend on the documents to tell it:
+    # a product being uninstalled may be one whose manifest has been withdrawn or removed, and a
+    # purge that fails closed on a missing policy index cannot uninstall anything, while one that
+    # falls back to "not precious" answers the question in the direction that costs data. Reading it
+    # from the checksummed ledger removes the choice — the classification travels with the object.
+    if mi_policy_precious "$prec" "$product" "$role"; then vprecious=1; else vprecious=0; fi
+    # rc 3 (no such record) is the ONLY status that authorizes opening a new intent and creating a
+    # volume. rc 0 means it already exists (skip); rc 1 (ambiguous/unreadable) must fail CLOSED — a
+    # ledger that cannot say whether the volume is already recorded must not be answered by creating a
+    # second one. Same split for the intent lookup. (>/dev/null keeps a matched record off stdout; the
+    # rc-1 warning from the reader is left on stderr deliberately.)
+    local pfrc ifrc
+    if mi_prov_find volume "$vol" >/dev/null; then pfrc=0; else pfrc=$?; fi
+    if [ "$pfrc" -eq 0 ]; then continue
+    elif [ "$pfrc" -ne 3 ]; then
+      mi_warn "verbs: the provenance record for volume '$vol' could not be read; refusing to create a"
+      mi_warn "  second volume under the same name on an unreadable ledger."
+      return 1
+    fi
+    if mi_intent_find volume "$vol" >/dev/null; then ifrc=0; else ifrc=$?; fi
+    if [ "$ifrc" -eq 0 ]; then mi_intent_reconcile volume "$vol" || return 1
+    elif [ "$ifrc" -ne 3 ]; then
+      mi_warn "verbs: the intent record for volume '$vol' could not be read; refusing to open a second."
+      return 1
+    else
+      nonce="$(mi_nonce_new)" || return 1
+      mi_intent_open volume "$vol" "$nonce" "product=${product}" "role=${role}" "precious=${vprecious}" || return 1
+      mi_rt_volume_create "$vol" "$nonce" "$(mi_ident_get)" >/dev/null || return 1
+      # RE-INSPECT: `volume create` against an existing name succeeds WITHOUT applying the labels, so a
+      # create is never evidence of creation — the nonce label is. Capture the STATUS, not just the
+      # value: a daemon that could not answer (rc 1) is not the same fact as a volume carrying a
+      # different nonce (rc 0), and the `|| true` that discarded it reported "already existed and does
+      # not carry our nonce" for a daemon that was simply unreachable.
+      local an arc
+      if an="$(mi_rt_inspect volume v.nonce "$vol" 2>/dev/null)"; then arc=0; else arc=$?; fi
+      if [ "$arc" -eq 1 ]; then
+        mi_warn "verbs: could not verify volume '$vol' — the container runtime did not answer. The"
+        mi_warn "  intent is retained so a re-run converges once the runtime is reachable."
+        return 1
+      fi
+      if [ "$an" != "$nonce" ]; then
+        mi_warn "verbs: volume '$vol' already existed and does not carry our nonce. Not adopted, not"
+        mi_warn "  removed. The intent is retained."
+        return 1
+      fi
+      mi_intent_confirm volume "$vol" "$nonce" "product=${product}" "role=${role}" "precious=${vprecious}" || return 1
+    fi
+  done <<< "$(mi_doc_values "$mrec" volume)"
+
+  # CAPTURE AND CHECK FIRST. `done <<< "$(mi_bringup_specs …)"` takes the WHILE loop's status, not the
+  # substitution's — so a REFUSED spec build produced an empty list and the install carried on having
+  # skipped §4.1a entirely. Read line by line so no bind path is word-split or glob-expanded.
+  local -a specs
+  local envfile="" _line _specs
+  _specs="$(mi_bringup_specs "$product" "$mrec" "$prec")" || return 1
+  specs=()
+  while IFS= read -r _line; do
+    [ -n "$_line" ] || continue
+    specs+=("$_line")
+  done <<< "$_specs"
+  # Always non-empty from here (the label is unconditional), so "${specs[@]}" below is safe even
+  # though bash 3.2 errors on an empty array under `set -u`.
+  specs+=("label=product=${product}")
+
+  # Bootstrap secrets, per-key, from the policy index's grant — never the whole file. Collected AND
+  # entitlement-gated by the ONE helper recreate also calls, so the gate cannot drift between the verbs.
+  envfile="$(_mi_verb_secrets_envfile "$product" "$mrec" "$prec")" || return 1
+
+  # INSTALL ALWAYS DECLARES `running` (§6b.3's verb table): install EXPRESSES intent, it never inherits
+  # a prior generation's. Preserving is `recreate`'s job alone — only it carries a stopped product back
+  # to stopped. So a previously-installed container is REPLACED (removed and rebuilt), but the desired
+  # state it is rebuilt into stays `running`, never the `stopped` a prior `stop` may have left behind.
+  # rc 3 (no prior container record) is the ONLY status that proceeds straight to a fresh create. rc 0
+  # enters the replacement authority check; rc 1 (ambiguous/unreadable provenance) must fail CLOSED —
+  # treating it as "no prior container" would let bring-up CREATE a container over a ledger that cannot
+  # say what already exists (the record is ambiguous even though the container may be absent). recreate
+  # already fails closed here; install must too. (>/dev/null keeps a matched record off stdout; the
+  # rc-1 warning is left on stderr.)
+  local desired=running arc pfrc
+  if mi_prov_find container "$container" >/dev/null; then pfrc=0; else pfrc=$?; fi
+  if [ "$pfrc" -eq 0 ]; then
+    # §6a applies to a REPLACEMENT exactly as it applies to an uninstall: prove the container carries
+    # the nonce we recorded before removing it. "We are about to replace it" is not an exemption.
+    if mi_prov_authority container "$container"; then arc=0; else arc=$?; fi
+    case "$arc" in
+      0) mi_rt_container_stop "$container" >/dev/null 2>&1 || true
+         # The removal must SUCCEED before bring-up creates the replacement under the same name. A discarded
+         # rm failure left the old container stopped-but-present, then mi_bringup failed on the name
+         # collision — taking a working installation DOWN for a replacement that could not happen. On an rm
+         # failure, restore the container we just stopped (best effort) and fail rather than proceed.
+         if ! mi_rt_container_rm "$container" >/dev/null 2>&1; then
+           mi_rt_container_start "$container" >/dev/null 2>&1 || true
+           [ "$envfile" = "-" ] || rm -f "$envfile"
+           mi_warn "verbs: could not remove the existing container for '$container' to replace it. It is"
+           mi_warn "  left in place (a restart was attempted) rather than taking your installation down."
+           mi_warn "  Resolve the removal failure — check the container runtime and permissions — then re-run."
+           return 1
+         fi ;;
+      3) : ;;                       # already gone: nothing to remove, nothing to fear
+      *) # A 0600 file of bootstrap secrets must not outlive the run on ANY path — including refusals.
+         [ "$envfile" = "-" ] || rm -f "$envfile"
+         mi_warn "verbs: refusing to replace '$container' (see above). It is preserved, and this"
+         mi_warn "  install stops rather than creating a second container under the same name."
+         return 1 ;;
+    esac
+  elif [ "$pfrc" -ne 3 ]; then
+    [ "$envfile" = "-" ] || rm -f "$envfile"
+    mi_warn "verbs: the provenance record for container '$container' is ambiguous or unreadable, so this"
+    mi_warn "  install cannot tell whether a container already stands under that name. Refusing to create"
+    mi_warn "  over it rather than adopt an unreadable ledger. Run 'mythical-ctl state repair'."
+    return 1
+  fi
+
+  # if/else, NOT `mi_bringup …; rc=$?`: a bare call is a simple command, so a failed bring-up aborts a
+  # `set -e` caller before the cleanup below — leaking a 0600 file of bootstrap secrets on exactly the
+  # path most likely to be hit.
+  if mi_bringup "$idx" "$container" "$image" "$netid" "$alias" "$desired" "$envfile" "${specs[@]}"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  # The env file is removed on EVERY path, including failure — a 0600 file of bootstrap secrets must not
+  # outlive the run that needed it.
+  [ "$envfile" = "-" ] || rm -f "$envfile"
+  [ "$rc" -eq 0 ] || return 1
+
+  # The image-override record reflects the install that SUCCEEDED, reconciled HERE — after bring-up, never
+  # before it. A failed --image install must leave no override for a later recreate to run (recreate runs
+  # the recorded override image) or status to report; and a plain install with no --image reverts to the
+  # manifest image, so it must CLEAR any override a prior install recorded — otherwise recreate and status
+  # would still name the old override while the container now runs the manifest image. mi_led_del is a
+  # no-op when there is nothing to clear.
+  if [ -n "$override" ]; then
+    mi_led_put forced key "${product}:image-override" "key=${product}:image-override" \
+      "product=${product}" "kind=image-override" "ref=${override}" || return 1
+  else
+    mi_led_del forced key "${product}:image-override" || return 1
+  fi
+  # The force-install record has the SAME post-bring-up lifecycle as the override: written only when the
+  # install SUCCEEDED under --force-install, cleared otherwise. Writing it early (in the not-launched
+  # branch) meant a forced install that failed the pull left a record a later NORMAL install never
+  # cleared, so status falsely reported "installed with --force-install".
+  if [ "$forced" -eq 1 ]; then
+    mi_led_put forced key "${product}:force-install" "key=${product}:force-install" \
+      "product=${product}" "kind=force-install" || return 1
+  else
+    mi_led_del forced key "${product}:force-install" || return 1
+  fi
+
+  mi_member_add "$product" || return 1
+  mi_log "$product: installed and running."
+  return 0
+}
+
+# --- start (desired state: running) ---------------------------------------------------------------
+# Intent → set the entry → start → verify live → clear. The `start verify` reconciliation records a
+# resume attempt (mi_state_resume_record) before the start, inside mi_bringup_reconcile.
+mi_verb_start() {
+  if [ "$#" -ne 2 ]; then mi_warn "verbs: start needs <index> <product>"; return 2; fi
+  mi_preflight_daemon || return 1
+  _mi_with_lock _mi_verb_start_locked "$1" "$2"
+}
+_mi_verb_start_locked() {
+  local idx="$1" product="$2" c netid alias
+  _mi_verb_prepare || return 1
+  c="$(_mi_verb_container "$product")" || return 1
+  local pfrc
+  if mi_prov_find container "$c" >/dev/null; then pfrc=0; else pfrc=$?; fi
+  if [ "$pfrc" -eq 3 ]; then mi_warn "verbs: '$product' is not installed"; return 1
+  elif [ "$pfrc" -ne 0 ]; then
+    mi_warn "verbs: the container record for '$product' is ambiguous or unreadable — this is not the same"
+    mi_warn "  as not installed. Run 'mythical-ctl state repair'."
+    return 1
+  fi
+  _mi_verb_authority_ok "$c" || return 1
+  netid="$(mi_net_target "$idx")" || return 1
+  alias="$(mi_name_alias "$product")" || return 1
+  # ONE atomic write: desired=running AND the outstanding alias check it owes. Splitting them leaves a
+  # window where a crash produces a container recovery starts and then considers fully reconciled (D50).
+  mi_state_commit "$c" running alias "$netid" || return 1
+  # NORMALIZE to the verb contract (§7.3 defines only 0/1/2/3): mi_bringup_reconcile returns 4 ("needs a
+  # rebuild") on a plan only install/recreate can carry out. A bare return would leak that undefined code
+  # from a start/restart. Map it — and anything else non-zero — to operational failure 1, naming recovery.
+  local brc
+  if mi_bringup_reconcile "$idx" "$c" "$netid" "$alias"; then brc=0; else brc=$?; fi
+  [ "$brc" -eq 0 ] && return 0
+  [ "$brc" -eq 4 ] && { mi_warn "verbs: '$product' needs a rebuild that start/restart cannot perform — run"
+    mi_warn "  'mythical-ctl recreate $product'."; }
+  return 1
+}
+
+# --- stop (desired state: stopped) ----------------------------------------------------------------
+# Intent FIRST, then act — the ordering is the whole point (D43). mi_state_commit records desired
+# state and PRESERVES the outstanding set (there is no mi_state_desired_set); a `stopped` intent owes
+# no live verification, so it declares none structurally.
+mi_verb_stop() {
+  if [ "$#" -ne 1 ]; then mi_warn "verbs: stop needs <product>"; return 2; fi
+  mi_preflight_daemon || return 1
+  _mi_with_lock _mi_verb_stop_locked "$1"
+}
+_mi_verb_stop_locked() {
+  local product="$1" c
+  _mi_verb_prepare || return 1
+  c="$(_mi_verb_container "$product")" || return 1
+  local pfrc
+  if mi_prov_find container "$c" >/dev/null; then pfrc=0; else pfrc=$?; fi
+  if [ "$pfrc" -eq 3 ]; then mi_warn "verbs: '$product' is not installed"; return 1
+  elif [ "$pfrc" -ne 0 ]; then
+    mi_warn "verbs: the container record for '$product' is ambiguous or unreadable — this is not the same"
+    mi_warn "  as not installed. Run 'mythical-ctl state repair'."
+    return 1
+  fi
+  _mi_verb_authority_ok "$c" || return 1
+  mi_state_commit "$c" stopped || return 1
+  # The stop must actually HAPPEN. `mi_rt_container_stop … || true` folded a daemon/permission/runtime
+  # failure into success, logged "stopped", and exited 0 — leaving the product RUNNING while the CLI
+  # reported completion (§7.3: 0 means it completed). An already-stopped container makes `container
+  # stop` an idempotent no-op that still exits 0, and a container that is not present is nothing to
+  # stop either — both are genuinely stopped. Only a stop that was ATTEMPTED and could not complete is
+  # a failure.
+  if mi_rt_container_stop "$c" >/dev/null 2>&1; then
+    mi_log "$product: stopped."
+    return 0
+  fi
+  # The stop did not succeed. Distinguish "there is nothing there to stop" (rc 3, fine) from "it is
+  # still present and the stop did not complete" (rc 0/1 — it may still be running, a failure).
+  local src
+  if mi_rt_inspect container c.status "$c" >/dev/null 2>&1; then src=0; else src=$?; fi
+  if [ "$src" -eq 3 ]; then
+    mi_log "$product: already stopped (its container is not present)."
+    return 0
+  fi
+  mi_warn "verbs: '$product' could not be stopped — its container is still present and the runtime did"
+  mi_warn "  not complete the stop, so it may still be running. Reported as a failure (§7.3)."
+  return 1
+}
+
+# --- restart (desired state: PRESERVED; refused on a stopped product) -----------------------------
+mi_verb_restart() {
+  if [ "$#" -ne 2 ]; then mi_warn "verbs: restart needs <index> <product>"; return 2; fi
+  mi_preflight_daemon || return 1
+  _mi_with_lock _mi_verb_restart_locked "$1" "$2"
+}
+_mi_verb_restart_locked() {
+  local idx="$1" product="$2" c want netid alias
+  _mi_verb_prepare || return 1
+  c="$(_mi_verb_container "$product")" || return 1
+  want="$(mi_state_desired_get "$c")" || { mi_warn "verbs: '$product' is not installed"; return 1; }
+  _mi_verb_authority_ok "$c" || return 1
+  if [ "$want" = stopped ]; then
+    mi_warn "verbs: '$product' is stopped, so there is nothing to restart."
+    mi_warn "  Refusing rather than starting it: 'restart' preserves what you asked for, and you asked"
+    mi_warn "  for it to be stopped. Use 'start' if you want it running."
+    return 1
+  fi
+  netid="$(mi_net_target "$idx")" || return 1
+  alias="$(mi_name_alias "$product")" || return 1
+  mi_state_commit "$c" running alias "$netid" || return 1
+  # The stop is a MEANS here (restart brings the container down in order to bring it back up), but it
+  # must actually HAPPEN — the same rule mi_verb_stop enforces on its own stop. A swallowed `container
+  # stop` leaves the container RUNNING; mi_bringup_reconcile then sees a live container whose alias
+  # still resolves, clears the outstanding check and returns 0 — a restart that never restarted (§7.3:
+  # 0 means it completed). Only "there is nothing there to stop" (rc 3 on a follow-up status inspect)
+  # is not a failure: the reconciler's `start verify` plan then creates and starts it.
+  if ! mi_rt_container_stop "$c" >/dev/null 2>&1; then
+    local src
+    if mi_rt_inspect container c.status "$c" >/dev/null 2>&1; then src=0; else src=$?; fi
+    if [ "$src" -ne 3 ]; then
+      mi_warn "verbs: '$product' could not be restarted — its container could not be stopped and is"
+      mi_warn "  still present, so it may still be running. Reported as a failure (§7.3)."
+      return 1
+    fi
+  fi
+  # NORMALIZE to the verb contract (§7.3 defines only 0/1/2/3): mi_bringup_reconcile returns 4 ("needs a
+  # rebuild") on a plan only install/recreate can carry out. A bare return would leak that undefined code
+  # from a start/restart. Map it — and anything else non-zero — to operational failure 1, naming recovery.
+  local brc
+  if mi_bringup_reconcile "$idx" "$c" "$netid" "$alias"; then brc=0; else brc=$?; fi
+  [ "$brc" -eq 0 ] && return 0
+  [ "$brc" -eq 4 ] && { mi_warn "verbs: '$product' needs a rebuild that start/restart cannot perform — run"
+    mi_warn "  'mythical-ctl recreate $product'."; }
+  return 1
+}
+
+# --- recreate (desired state: PRESERVED) ----------------------------------------------------------
+# Same path as install's replacement branch, without touching membership, config or volumes. A
+# recreate of a stopped product leaves it stopped; it live-verifies like a fresh install.
+mi_verb_recreate() {
+  if [ "$#" -ne 4 ]; then mi_warn "verbs: recreate needs <index> <policy> <manifest> <product>"; return 2; fi
+  mi_preflight_daemon || return 1
+  _mi_with_lock _mi_verb_recreate_locked "$1" "$2" "$3" "$4"
+}
+_mi_verb_recreate_locked() {
+  local idx="$1" pol="$2" man="$3" product="$4" ctx rc c
+  _mi_verb_prepare || return 1
+  c="$(_mi_verb_container "$product")" || return 1
+  mi_state_desired_get "$c" >/dev/null || { mi_warn "verbs: '$product' is not installed"; return 1; }
+
+  if ctx="$(mi_product_ctx "$idx" "$pol" "$man" "$product")"; then rc=0; else rc=$?; fi
+  # NORMALIZE to the verb contract (§7.3: only 0/1/2/3 may leave a verb), and HONOR a recorded force-install.
+  # rc 3 = the manifest says not-launched. recreate normally refuses (unlike install it has no FRESH
+  # not-launched path, and mi_ex_worst treats 3 as benign, which this is not — so it maps to 1). BUT if the
+  # operator force-installed this product, they asserted the image is published, and recreate honors that
+  # exactly as it honors a recorded --image override: it rebuilds the container they explicitly stood up.
+  # Any OTHER non-zero code (refused 1, an undefined 4 mi_product_ctx can return, …) maps to operational 1.
+  if [ "$rc" -eq 3 ] && mi_led_find forced key "${product}:force-install" >/dev/null 2>&1; then
+    mi_warn "verbs: '$product' was force-installed against a not-launched manifest; recreate honors that"
+    mi_warn "  override and rebuilds the container the operator explicitly stood up."
+    rc=0
+  fi
+  [ "$rc" -eq 0 ] || { mi_warn "verbs: cannot build the context to recreate '$product' — its manifest or"
+    mi_warn "  policy could not be authenticated, or has been withdrawn. Nothing was changed."; return 1; }
+  # `mi_led_field … | tr` under a `pipefail` caller carries the LEFT side's status, so a missing field
+  # aborts instead of being reported. Read the field, then transform it.
+  local mrec prec netid alias image envfile
+  mrec="$(mi_led_field "$ctx" manifest_records)" || { mi_warn "verbs: context has no manifest records"; return 1; }
+  mrec="$(printf '%s' "$mrec" | tr '\036\037' '\n\t')" || { mi_warn "verbs: could not decode the manifest records — refusing rather than launching an incomplete container."; return 1; }
+  prec="$(mi_led_field "$ctx" policy_records)"   || { mi_warn "verbs: context has no policy records"; return 1; }
+  prec="$(printf '%s' "$prec" | tr '\036\037' '\n\t')" || { mi_warn "verbs: could not decode the policy records — refusing rather than launching an incomplete container."; return 1; }
+  image="$(mi_led_field "$ctx" image)" || { mi_warn "verbs: context names no image"; return 1; }
+  # PRESERVE a recorded image override. install may have been given `--image X`, which it recorded as a
+  # `forced` ledger entry and which `status` reports as the running image. recreate takes no --image of
+  # its own and must NOT silently revert to the manifest's image — doing so runs an image `status` does
+  # not name (and, if the manifest's image was never pulled, tears the container down and cannot rebuild
+  # it). So recreate runs the SAME reference install selected: the running image and what `status`
+  # reports then agree. The manifest's digest pin does not apply to an overridden reference (D22/§13),
+  # exactly as at install.
+  local ov ovrc
+  if ov="$(mi_led_find forced key "${product}:image-override")"; then ovrc=0; else ovrc=$?; fi
+  if [ "$ovrc" -eq 0 ]; then
+    image="$(mi_led_field "$ov" ref)" || { mi_warn "verbs: the recorded image override for '$product' names no reference"; return 1; }
+    mi_warn "verbs: image override preserved — '$product' runs '$image' (recorded at install), not the"
+    mi_warn "  manifest's image. recreate does not change the image install selected."
+  elif [ "$ovrc" -ne 3 ]; then
+    mi_warn "verbs: could not read the image-override record for '$product' from the ledger."
+    return 1
+  fi
+  # Ensure the selected image is available BEFORE removing the running container — install's gate, which
+  # recreate previously skipped. A manifest that advanced to an unpulled image (or an unreachable
+  # registry) must fail the recreate here with the working container INTACT, not after it has been torn
+  # down and cannot be rebuilt. Runs before secrets are staged and before any stop/remove below.
+  _mi_verb_ensure_image "$image" "$product" || return 1
+  alias="$(mi_led_field "$ctx" alias)" || { mi_warn "verbs: context names no alias"; return 1; }
+  netid="$(mi_net_target "$idx")" || return 1
+  # The core-fixed user-data mount points, before the mount check validates them (a recreate after a
+  # manual deletion of transcripts/ or logs/ must re-create them rather than refuse).
+  _mi_ensure_mount_points || return 1
+
+  # Captured and CHECKED first — see mi_verb_install.
+  local -a specs; specs=()
+  local _line _specs
+  _specs="$(mi_bringup_specs "$product" "$mrec" "$prec")" || return 1
+  while IFS= read -r _line; do
+    [ -n "$_line" ] || continue
+    specs+=("$_line")
+  done <<< "$_specs"
+  specs+=("label=product=${product}")
+  # Bootstrap secrets through the SAME entitlement-gated helper install uses — the gate that used to be
+  # install-only, so recreate could no longer stage a secret the current policy denies.
+  envfile="$(_mi_verb_secrets_envfile "$product" "$mrec" "$prec")" || return 1
+
+  # §6a: prove it is ours before removing it, on this path too.
+  local arc
+  if mi_prov_authority container "$c"; then arc=0; else arc=$?; fi
+  case "$arc" in
+    0) mi_rt_container_stop "$c" >/dev/null 2>&1 || true
+       # The removal must SUCCEED before bring-up creates the replacement under the same name. A discarded
+       # rm failure left the old container stopped-but-present and then mi_bringup failed on the name
+       # collision — taking a working installation DOWN for a replacement that could not happen. On an rm
+       # failure, restore the container we just stopped (best effort) and fail rather than proceed.
+       if ! mi_rt_container_rm "$c" >/dev/null 2>&1; then
+         mi_rt_container_start "$c" >/dev/null 2>&1 || true
+         [ "$envfile" = "-" ] || rm -f "$envfile"
+         mi_warn "verbs: could not remove the existing container for '$c' to replace it. It is left in"
+         mi_warn "  place (a restart was attempted) rather than taking your installation down. Resolve the"
+         mi_warn "  removal failure — check the container runtime and permissions — then re-run."
+         return 1
+       fi ;;
+    3) : ;;
+    *) [ "$envfile" = "-" ] || rm -f "$envfile"
+       mi_warn "verbs: refusing to recreate '$c' (see above) — it is preserved."
+       return 1 ;;
+  esac
+  # if/else — see mi_verb_install: a bare call would abort before the secret env file is removed.
+  if mi_bringup "$idx" "$c" "$image" "$netid" "$alias" preserve "$envfile" "${specs[@]}"; then rc=0; else rc=$?; fi
+  [ "$envfile" = "-" ] || rm -f "$envfile"
+  return "$rc"
+}
+
+# --- product uninstall ----------------------------------------------------------------------------
+# Removes the CONTAINER; RETAINS volumes, membership and the trust floor (§6c).
+#
+# UNINSTALLING A PRODUCT MUST NOT CLEAR ITS ANTI-ROLLBACK FLOOR. If it did, `uninstall` then `install`
+# would be a supported one-command rollback bypass: drop the floor, replay a withdrawn manifest, recover
+# the vulnerable image. The floor outlives the install that established it and a reinstall inherits it.
+mi_verb_uninstall() {
+  if [ "$#" -lt 1 ]; then mi_warn "verbs: uninstall needs <product> [--purge]"; return 2; fi
+  local product="$1"; shift
+  local purge=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in --purge) purge=1; shift ;; *) mi_warn "verbs: unknown uninstall option '$1'"; return 2 ;; esac
+  done
+  mi_preflight_daemon || return 1
+  _mi_with_lock _mi_verb_uninstall_locked "$product" "$purge"
+}
+_mi_verb_uninstall_locked() {
+  local product="$1" purge="$2"
+  _mi_verb_prepare || return 1
+
+  # Read the object and image listings ONCE, up front, failing closed if either cannot be fully read —
+  # before any removal, so an unreadable ledger refuses the uninstall rather than removing the container
+  # and then silently skipping the volumes it could not enumerate.
+  local _objs _imgrecs
+  _objs="$(_mi_verb_objects object)" || return 1
+  _imgrecs="$(_mi_verb_objects image)" || return 1
+
+  # --- CONFIRMATION, and only for --purge -------------------------------------------------------
+  # The family path has warned and asked since it existed; the product path asked NOTHING, so
+  # `uninstall <product> --purge` destroyed every one of that product's named volumes with no prompt
+  # and no list. The asymmetry was not a decision — the family verb resets the whole ledger and grew
+  # a prompt for that, and the product verb's `--purge` quietly acquired the same power over data
+  # without one.
+  #
+  # Scoped to `--purge` deliberately. A plain product uninstall KEEPS every volume (it says so, per
+  # volume, in the loop below), so prompting there would train operators to type y at a prompt that
+  # never means anything — and a confirmation that is usually harmless is a confirmation nobody
+  # reads by the time it is not.
+  #
+  # It asks BEFORE the container is removed, which is why the listing is read up front: a prompt that
+  # arrives after the container is already gone is not a decision point, it is a notification. And it
+  # NAMES what will go, with each volume's data class, because "are you sure?" against an unnamed set
+  # is a question the operator has no way to answer.
+  if [ "$purge" -eq 1 ]; then
+    local prec_list="" reg_list="" any=0 unattr=0 vrec vname vrole
+    while IFS= read -r vrec; do
+      [ -n "$vrec" ] || continue
+      _mi_led_record_matches "$vrec" class volume || continue
+      # A volume whose record names no product at all is OUT OF SCOPE here and is counted, not
+      # silently skipped: this verb selects by `product=`, so it has no way to know the volume is
+      # this product's, and acting on it would be acting on a guess. Saying nothing, though, would
+      # let "purge complete" mean "and some volumes were left that I could not attribute". `status`
+      # lists them with the same classification this warning uses.
+      if ! _mi_led_record_matches "$vrec" product "$product"; then
+        if mi_led_field "$vrec" product >/dev/null 2>&1; then : ; else unattr=$((unattr + 1)); fi
+        continue
+      fi
+      vname="$(mi_led_field "$vrec" name)" || vname="(a volume whose record carries no readable name)"
+      vrole="$(mi_led_field "$vrec" role)" || vrole="?"
+      any=1
+      if _mi_verb_vol_is_precious "$vrec"; then
+        prec_list="${prec_list}      ${vname} (role ${vrole}) — $(_mi_verb_vol_class "$vrec")"$'\n'
+      else
+        reg_list="${reg_list}      ${vname} (role ${vrole}) — regenerable"$'\n'
+      fi
+    done <<< "$_objs"
+
+    mi_warn "verbs: PURGE of '$product'. Its container is removed, and so are its named volumes."
+    if [ "$any" -eq 0 ]; then
+      mi_warn "  No volume records are in scope, so this removes the container only."
+    fi
+    if [ -n "$prec_list" ]; then
+      mi_warn "  THESE HOLD DATA THAT CANNOT BE REGENERATED. Removing them is not recoverable by"
+      mi_warn "  reinstalling, and this tool keeps no copy:"
+      local _pl
+      while IFS= read -r _pl; do [ -n "$_pl" ] && mi_warn "$_pl"; done <<< "$prec_list"
+    fi
+    if [ -n "$reg_list" ]; then
+      mi_warn "  These are declared regenerable — a reinstall rebuilds their contents:"
+      local _rl
+      while IFS= read -r _rl; do [ -n "$_rl" ] && mi_warn "$_rl"; done <<< "$reg_list"
+    fi
+    if [ "$unattr" -gt 0 ]; then
+      mi_warn "  NOTE: ${unattr} volume record(s) name no product, so this verb cannot attribute them and"
+      mi_warn "  will NOT remove them. They are left in place. 'mythical-ctl status' lists them."
+    fi
+    mi_warn "  transcripts/, logs/ and any host binds are never touched by any verb."
+    mi_warn "  Without --purge, every volume above is KEPT."
+    mi_confirm "verbs: purge '$product' and remove the volumes listed above?" || {
+      mi_warn "verbs: not confirmed."; return 1; }
+  fi
+
+  local c rc=0
+  c="$(_mi_verb_container "$product")" || return 1
+  if mi_prov_authority container "$c"; then rc=0; else rc=$?; fi
+  case "$rc" in
+    0) mi_rt_container_stop "$c" >/dev/null 2>&1 || true
+       # Tombstone ONLY on a removal that actually succeeded. Recording a removal that did not happen
+       # strips the container's authority record while it is still running.
+       if mi_rt_container_rm "$c" >/dev/null 2>&1; then
+         mi_prov_tombstone container "$c" || return 1
+         mi_state_forget "$c" || return 1
+       else
+         mi_warn "verbs: could not remove the container for '$product'. Its record is KEPT so it stays"
+         mi_warn "  removable later; nothing is tombstoned for a removal that did not happen."
+         rc=1
+       fi ;;
+    3) mi_prov_tombstone container "$c" || return 1
+       mi_state_forget "$c" || return 1 ;;
+    *) mi_warn "verbs: the container for '$product' is preserved (see above). Continuing with the rest."
+       rc=1 ;;
+  esac
+
+  local rec name role
+  while IFS= read -r rec; do
+    [ -n "$rec" ] || continue
+    _mi_led_record_matches "$rec" class volume || continue
+    _mi_led_record_matches "$rec" product "$product" || continue
+    name="$(mi_led_field "$rec" name)" || { mi_warn "verbs: a volume record for '$product' carries no"
+      mi_warn "  readable name; --purge cannot act on it and it is left in place. Run 'state repair'."
+      rc=1; continue; }
+    role="$(mi_led_field "$rec" role)" || role="?"
+    local vclass
+    vclass="$(_mi_verb_vol_class "$rec")" || vclass="UNREGENERABLE (unreadable)"
+    if [ "$purge" -eq 0 ]; then
+      mi_log "  keeping volume $name (role $role, $vclass) — your data. 'uninstall --purge' removes it."
+      continue
+    fi
+    # rc 3 is "already gone": nothing to remove and nothing to preserve, so the record is tombstoned.
+    # Only a real refusal (rc 1 — no record, or a nonce that does not match) preserves.
+    local varc
+    if mi_prov_authority volume "$name"; then varc=0; else varc=$?; fi
+    if [ "$varc" -eq 0 ]; then
+      if mi_rt_volume_rm "$name" >/dev/null 2>&1; then
+        mi_prov_tombstone volume "$name" || return 1
+        mi_log "  removed volume $name (role $role, $vclass)."
+      else
+        mi_warn "  could NOT remove volume $name — its record is kept, so it stays removable later."
+        rc=1
+      fi
+    elif [ "$varc" -eq 3 ]; then
+      mi_prov_tombstone volume "$name" || return 1
+      mi_log "  volume $name was already gone; its record is tombstoned."
+    else
+      mi_log "  PRESERVED volume $name — see the reason above."
+      rc=1
+    fi
+  done <<< "$_objs"
+
+  # IMAGES ARE NEVER REMOVED AUTOMATICALLY (D37) — not by uninstall, not by --purge. `--purge` may only
+  # OFFER it, naming the digests and stating plainly that they may be in use elsewhere.
+  if [ "$purge" -eq 1 ]; then
+    local imgs="" iref
+    while IFS= read -r rec; do
+      [ -n "$rec" ] || continue
+      _mi_led_record_matches "$rec" product "$product" || continue
+      iref="$(mi_led_field "$rec" ref)" || continue
+      imgs="${imgs}    ${iref}"$'\n'
+    done <<< "$_imgrecs"
+    if [ -n "$imgs" ]; then
+      mi_log "  Images acquired for $product are NOT removed:"
+      printf '%s' "$imgs"
+      mi_log "  They may be in use by another installation on this daemon, or by your own local work —"
+      mi_log "  the ledger records that this installer PULLED them, which is not the same as owning them."
+      mi_log "  To reclaim the space yourself: docker image rm <digest>   (or: docker image prune)"
+    fi
+  fi
+
+  [ "$rc" -eq 0 ] || return 1
+  # RETAINED, deliberately: membership and the trust floor. Do not add a mi_member_del here.
+  mi_log "$product: uninstalled. Its rollback floor and initialization record are retained, so a"
+  mi_log "  reinstall cannot replay a withdrawn manifest."
+  return 0
+}
+
+# --- family uninstall (§6c) -----------------------------------------------------------------------
+# Deliberately resets everything: afterwards the machine is genuinely indistinguishable from a fresh
+# one — acceptable precisely because it is an explicit operator action rather than a remote input.
+#
+# This is the ONLY caller of mi_rt_network_rm, and the only path that removes identity, membership,
+# trust floors and the family-index anchor. A PRODUCT uninstall removes none of them (the
+# rollback-bypass row), so the two verbs do not share an implementation.
+#
+# USER DATA IS STILL NOT TOUCHED. transcripts/, logs/ and host binds are the user-data ownership class
+# (§6). Named volumes go only with --purge, under the same authority check as a product uninstall.
+mi_verb_uninstall_family() {
+  local purge=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in --purge) purge=1; shift ;; *) mi_warn "verbs: unknown option '$1'"; return 2 ;; esac
+  done
+  mi_preflight_daemon || return 1
+  _mi_with_lock _mi_verb_uninstall_family_locked "$purge"
+}
+_mi_verb_uninstall_family_locked() {
+  local purge="$1"
+  _mi_verb_prepare || return 1
+
+  local ident
+  ident="$(mi_ident_get)" || { mi_warn "verbs: there is no installation to uninstall."; return 1; }
+  mi_warn "verbs: FAMILY UNINSTALL of installation '$ident'."
+  mi_warn "  Every product's container is removed, and the ledger is reset ENTIRELY: the installation"
+  mi_warn "  identity, the initialized-product set, every anti-rollback trust floor, and the"
+  mi_warn "  family-index anchor. Afterwards this machine is indistinguishable from a fresh one."
+  # Read the object and image listings ONCE, up front, failing closed if either cannot be fully read.
+  # This is the guard on the ledger reset below: an unreadable 'object' listing must not read as an
+  # empty one, which would remove nothing, leave `preserved` at 0, and let the reset wipe the ledger
+  # over containers and volumes it never touched — stripping their provenance while they still exist.
+  #
+  # READ BEFORE THE PROMPT, not after it. It used to be read after, which meant an unreadable ledger
+  # asked the operator to confirm a family uninstall and only then refused to perform it — a question
+  # asked about work that could not be done either way. It also meant the warning could not name what
+  # --purge was about to destroy, so the one prompt guarding every volume on the machine said "THAT IS
+  # YOUR DATA" without saying which data. Both are fixed by moving the read up; nothing here mutates,
+  # so there is no ordering cost.
+  local _objs _imgrecs
+  _objs="$(_mi_verb_objects object)" || return 1
+  _imgrecs="$(_mi_verb_objects image)" || return 1
+
+  if [ "$purge" -eq 1 ]; then
+    mi_warn "  --purge: this installation's named volumes are removed too. THAT IS YOUR DATA."
+    # The same enumeration the product-scoped purge shows, over every product at once. Unregenerable
+    # first, and separately, because that is the half a reinstall does not bring back.
+    local fprec="" freg="" frec fname frole
+    while IFS= read -r frec; do
+      [ -n "$frec" ] || continue
+      _mi_led_record_matches "$frec" class volume || continue
+      fname="$(mi_led_field "$frec" name)" || fname="(a volume whose record carries no readable name)"
+      frole="$(mi_led_field "$frec" role)" || frole="?"
+      if _mi_verb_vol_is_precious "$frec"; then
+        fprec="${fprec}      ${fname} (role ${frole}) — $(_mi_verb_vol_class "$frec")"$'\n'
+      else
+        freg="${freg}      ${fname} (role ${frole}) — regenerable"$'\n'
+      fi
+    done <<< "$_objs"
+    if [ -n "$fprec" ]; then
+      mi_warn "  THESE HOLD DATA THAT CANNOT BE REGENERATED. Removing them is not recoverable by"
+      mi_warn "  reinstalling, and this tool keeps no copy:"
+      local _fp
+      while IFS= read -r _fp; do [ -n "$_fp" ] && mi_warn "$_fp"; done <<< "$fprec"
+    fi
+    if [ -n "$freg" ]; then
+      mi_warn "  These are declared regenerable — a reinstall rebuilds their contents:"
+      local _fr
+      while IFS= read -r _fr; do [ -n "$_fr" ] && mi_warn "$_fr"; done <<< "$freg"
+    fi
+  else
+    mi_warn "  Named volumes are KEPT (your data). 'uninstall --family --purge' removes them."
+  fi
+  mi_warn "  transcripts/, logs/ and any host binds are never touched by any verb."
+  mi_confirm "verbs: uninstall the whole family?" || { mi_warn "verbs: not confirmed."; return 1; }
+
+  # Containers first, then volumes, then the network — a network cannot be removed while a container is
+  # attached. `preserved` is what stops the ledger reset at the end: wiping the ledger while an object
+  # it describes is still there would strip that object's provenance, making it permanently
+  # unauthorized for deletion and an unrecorded same-identity object that stops every later operation.
+  local rec name arc preserved=0
+  while IFS= read -r rec; do
+    [ -n "$rec" ] || continue
+    _mi_led_record_matches "$rec" class container || continue
+    name="$(_mi_verb_rec_name "$rec")" || { preserved=1; continue; }
+    if mi_prov_authority container "$name"; then arc=0; else arc=$?; fi
+    if [ "$arc" -eq 0 ]; then
+      mi_rt_container_stop "$name" >/dev/null 2>&1 || true
+      # A removal that FAILED must not be followed by forgetting its state: that would leave the
+      # container running with nothing recording it.
+      if mi_rt_container_rm "$name" >/dev/null 2>&1; then
+        mi_log "  removed container $name."
+        mi_state_forget "$name" || return 1
+      else
+        mi_warn "  could NOT remove container $name — it is left alone and its record is kept."
+        preserved=1
+      fi
+    elif [ "$arc" -eq 3 ]; then
+      mi_state_forget "$name" || return 1      # already gone: nothing to preserve
+    else
+      mi_log "  PRESERVED container $name — see the reason above. Its record is kept."
+      preserved=1
+    fi
+  done <<< "$_objs"
+
+  if [ "$purge" -eq 0 ]; then
+    # Volumes are LEFT IN PLACE without --purge (your data). The family reset still happens — §6c gates
+    # only the VOLUMES' fate on --purge, never the identity/membership/floor/anchor reset — so after the
+    # reset below they carry an identity that no longer exists and read as another installation's on any
+    # later operation: orphaned but PRESERVED, which is what "any mismatch preserves" produces for them.
+    # They are NAMED here while the ledger still records them, because the reset drops those records and
+    # this installer will then have no authority to remove them again.
+    while IFS= read -r rec; do
+      [ -n "$rec" ] || continue
+      _mi_led_record_matches "$rec" class volume || continue
+      name="$(_mi_verb_rec_name "$rec")" || { preserved=1; continue; }
+      mi_log "  keeping volume $name ($(_mi_verb_vol_class "$rec")) — your data. After the reset it is"
+      mi_log "    orphaned; remove it by hand with 'docker volume rm $name', or re-run with --purge"
+      mi_log "    instead of keeping it."
+    done <<< "$_objs"
+  else
+    while IFS= read -r rec; do
+      [ -n "$rec" ] || continue
+      _mi_led_record_matches "$rec" class volume || continue
+      name="$(_mi_verb_rec_name "$rec")" || { preserved=1; continue; }
+      local varc
+      if mi_prov_authority volume "$name"; then varc=0; else varc=$?; fi
+      if [ "$varc" -eq 0 ]; then
+        if mi_rt_volume_rm "$name" >/dev/null 2>&1; then
+          mi_log "  removed volume $name ($(_mi_verb_vol_class "$rec"))."
+        else
+          mi_warn "  could NOT remove volume $name — its record is kept."
+          preserved=1
+        fi
+      elif [ "$varc" -eq 3 ]; then
+        :                                        # already gone: nothing to remove, nothing to preserve
+      else
+        mi_log "  PRESERVED volume $name — see the reason above. Its record is kept."
+        preserved=1
+      fi
+    done <<< "$_objs"
+  fi
+
+  # The network, and ONLY if this installer created it. A non-owned reference (D41) is attach-only and
+  # carries no deletion authority — it is the operator's network and is left alone. mi_prov_authority
+  # cannot see a netref record, so no path can read it as something to remove.
+  while IFS= read -r rec; do
+    [ -n "$rec" ] || continue
+    _mi_led_record_matches "$rec" class network || continue
+    name="$(_mi_verb_rec_name "$rec")" || { preserved=1; continue; }
+    local narc
+    if mi_prov_authority network "$name"; then narc=0; else narc=$?; fi
+    if [ "$narc" -eq 0 ]; then
+      if mi_rt_network_rm "$name" >/dev/null 2>&1; then
+        mi_log "  removed network $name."
+      else
+        mi_warn "  could NOT remove network $name — its record is kept."
+        preserved=1
+      fi
+    elif [ "$narc" -eq 3 ]; then
+      :                                          # already gone
+    else
+      mi_log "  PRESERVED network $name — see the reason above. Its record is kept."
+      preserved=1
+    fi
+  done <<< "$_objs"
+  # rc 0: an operator network is attached (left alone — never ours to remove). rc 3: none configured. rc 1
+  # (a netref record exists but is unreadable) must NOT be flattened into rc 3 — the reset would then wipe
+  # the ledger that records the attachment while unable to read it. Fail closed: block the reset until repair.
+  local nrc
+  if mi_net_ref_get >/dev/null; then nrc=0; else nrc=$?; fi
+  if [ "$nrc" -eq 0 ]; then
+    mi_log "  the operator-supplied network is LEFT ALONE — it was never this installer's to remove."
+  elif [ "$nrc" -ne 3 ]; then
+    mi_warn "family: an operator-network reference is recorded but could not be read; the ledger is NOT"
+    mi_warn "  reset over it. Run 'mythical-ctl state repair', then re-run."
+    preserved=1
+  fi
+
+  # IMAGES ARE STILL NEVER REMOVED (D37). Family uninstall is not an exemption: the ledger proves
+  # acquisition, not ownership, and another installation on this daemon may depend on the same digest.
+  local iref imgs=""
+  while IFS= read -r rec; do
+    [ -n "$rec" ] || continue
+    iref="$(mi_led_field "$rec" ref)" || continue
+    imgs="${imgs}    ${iref}"$'\n'
+  done <<< "$_imgrecs"
+  if [ -n "$imgs" ]; then
+    mi_log "  Images are NOT removed, by this verb or any other:"
+    printf '%s' "$imgs"
+    mi_log "  Reclaim the space yourself with: docker image prune"
+  fi
+
+  # Reset the ledger LAST, and ONLY if nothing that should have been removed was PRESERVED. The reset is
+  # UNCONDITIONAL with respect to --purge: identity, membership, every trust floor and the family-index
+  # anchor go regardless — §6c resets the family state and gates only the volumes' fate on --purge. A
+  # preservation (an object this installer could not prove is still its own) is the one thing that holds
+  # the reset back, because wiping the ledger while such an object stands would strip the only record of
+  # what it is; a volume DELIBERATELY kept without --purge is not that case — it is orphaned on purpose.
+  if [ "$preserved" -eq 1 ]; then
+    mi_warn "family: some objects could not be removed (see above), so the ledger is NOT reset — it is"
+    mi_warn "  the only record of what they are. Resolve them, then re-run."
+    return 1
+  fi
+  printf '' | mi_ledger_write || return 1
+  if [ "$purge" -eq 0 ]; then
+    mi_log "family: uninstalled. Identity, membership, every rollback floor and the network are gone;"
+    mi_log "  this machine is a fresh installation again. Your named volumes were KEPT (your data) and"
+    mi_log "  are now orphaned but preserved — a later installation sees them as another's and never"
+    mi_log "  touches them. ~/.mythical/ still holds your transcripts, logs and config files; remove the"
+    mi_log "  directory by hand to clear those too."
+  else
+    mi_log "family: uninstalled. ~/.mythical/ still holds your transcripts, logs and config files;"
+    mi_log "  remove the directory by hand if you want them gone too."
+  fi
+  return 0
+}
+
+# --- status (READ-ONLY, exits 0 even with bad news) ----------------------------------------------
+# An operator running it in a loop must not have their fleet mutated by the act of looking, and a
+# monitoring wrapper needs it to succeed in order to read its output (the plan's Decisions item 9).
+# It takes NO lock — it mutates nothing — and it must never be gated by its own findings.
+mi_verb_status() {
+  if [ "$#" -lt 1 ]; then mi_warn "verbs: status needs <index> [product...]"; return 2; fi
+  local idx="$1"; shift
+  local ident rec c product
+
+  # rc 3 (absent) is NOT rc 1 (the identity record is present but unreadable — corrupt, ambiguous, or an
+  # empty id). Reporting "nothing installed" for the second tells an operator whose objects are actually
+  # orphaned that they are clean; distinguish them so they are sent to 'state repair' instead. status
+  # still exits 0 either way — it is never gated by its own findings (mi_ident_get already warned to
+  # stderr; this is the stdout line the operator's monitor reads).
+  local irc
+  if ident="$(mi_ident_get)"; then irc=0; else irc=$?; fi
+  if [ "$irc" -eq 3 ]; then
+    mi_log "No installation state found. Nothing has been installed yet."
+    return 0
+  elif [ "$irc" -ne 0 ]; then
+    mi_log "installation: UNREADABLE — an identity is recorded but could not be read (see the warning"
+    mi_log "  above). This is NOT 'nothing installed'; objects this installation named may be orphaned."
+    mi_log "  Run 'mythical-ctl state repair'."
+    return 0
+  fi
+  mi_log "installation: $ident"
+
+  # Same rc distinction for the operator-network reference: rc 3 is "no operator network configured"
+  # (fall through to the installer-owned network below), but rc 1 is "an operator network IS configured
+  # and its record is unreadable" — which must be reported as such, never hidden behind "not created
+  # yet", which would tell the operator to create a network they already pointed the installation at.
+  local nref nrc
+  if nref="$(mi_net_ref_get)"; then nrc=0; else nrc=$?; fi
+  if [ "$nrc" -eq 0 ]; then
+    mi_log "network:      $nref (operator-supplied, attach-only — this installer will never remove it)"
+  elif [ "$nrc" -ne 3 ]; then
+    mi_log "network:      UNREADABLE — an operator network reference is recorded but could not be read"
+    mi_log "  (see the warning above); this is not an absent network. Run 'mythical-ctl state repair'."
+  else
+    # The installer-owned network. Same rc distinction one level in: mi_prov_find rc 3 is "no record —
+    # not created yet", but rc 1 is "a record exists and cannot be read", which must not be flattened
+    # into "not created yet" — that tells an operator with a corrupt network record that no network
+    # exists and invites a second one.
+    local nname prc
+    nname="$(mi_name_network "$ident")"
+    if rec="$(mi_prov_find network "$nname")"; then prc=0; else prc=$?; fi
+    if [ "$prc" -eq 0 ]; then
+      local _nid
+      if _nid="$(mi_led_field "$rec" id)" && [ -n "$_nid" ]; then
+        mi_log "network:      $_nid ($nname, created by this installer)"
+      else
+        mi_log "network:      UNREADABLE — the record for '$nname' exists but carries no id. Run"
+        mi_log "  'mythical-ctl state repair'."
+      fi
+    elif [ "$prc" -eq 3 ]; then
+      mi_log "network:      not created yet"
+    else
+      mi_log "network:      UNREADABLE — the record for '$nname' could not be read (see the warning"
+      mi_log "  above); this is not an absent network. Run 'mythical-ctl state repair'."
+    fi
+  fi
+
+  # rc 3 (no migration recorded) is the normal case and prints nothing; rc 1 (a netmig record exists but
+  # cannot be read) must NOT be silently swallowed like rc 3 — that would let status claim a normal
+  # network while a migration is in progress and its state is unrecoverably unclear.
+  local mig mgrc
+  if mig="$(mi_led_find netmig key family 2>/dev/null)"; then mgrc=0; else mgrc=$?; fi
+  if [ "$mgrc" -eq 0 ]; then
+    # A checksum-valid netmig record can still be missing semantic fields; printing blank phase/source/
+    # target reads as a usable migration. Require all three, else report it unreadable.
+    local _mph _msrc _mtgt
+    if _mph="$(mi_led_field "$mig" phase)" && _msrc="$(mi_led_field "$mig" source)" && _mtgt="$(mi_led_field "$mig" target)"; then
+      mi_log "NETWORK MIGRATION IN PROGRESS — phase $_mph"
+      mi_log "  source $_msrc → target $_mtgt"
+      mi_log "  Containers are on both networks; family DNS resolves on either. Resume with 'net rebind'."
+    else
+      mi_log "NETWORK MIGRATION record UNREADABLE — a migration is recorded but is missing fields, so its"
+      mi_log "  state cannot be trusted. Run 'mythical-ctl state repair'."
+    fi
+  elif [ "$mgrc" -ne 3 ]; then
+    mi_log "NETWORK MIGRATION record UNREADABLE — a migration is recorded but its record could not be"
+    mi_log "  read. Status of the network cannot be trusted. Run 'mythical-ctl state repair'."
+  fi
+
+  # Objects and their forced-record annotations, read with the same rc distinction. status REPORTS an
+  # unreadable listing rather than failing on it (it is never gated by its own findings), but must not
+  # render a corrupt ledger as an EMPTY fleet — a monitor reading "no products" off it is worse than one
+  # reading "UNREADABLE". rc 0/3 proceed; rc 1 says so and shows no products rather than none-because-empty.
+  local _sobjs sorc _sforced sfrc
+  if _sobjs="$(mi_led_all object)"; then sorc=0; else sorc=$?; fi
+  if _sforced="$(mi_led_all forced)"; then sfrc=0; else sfrc=$?; fi
+  if [ "$sfrc" -ne 0 ] && [ "$sfrc" -ne 3 ]; then
+    mi_log "note:         the override / force-install annotations could not be read — repair advised."
+    _sforced=""
+  fi
+  if [ "$sorc" -ne 0 ] && [ "$sorc" -ne 3 ]; then
+    mi_log "products:     UNREADABLE — the installed-object records could not be fully read, so this"
+    mi_log "  listing would omit products. Run 'mythical-ctl state repair'."
+  else
+  while IFS= read -r rec; do
+    [ -n "$rec" ] || continue
+    _mi_led_record_matches "$rec" class container || continue
+    # A container record with no readable name is corrupt, not absent: REPORT it rather than `continue`
+    # past it, which would let status show no product while its provenance stands and needs repair.
+    if ! c="$(mi_led_field "$rec" name)"; then
+      mi_log "product:      UNREADABLE — an installed-container record carries no name. Run 'mythical-ctl"
+      mi_log "  state repair'."
+      continue
+    fi
+    # The container's provenance record does not carry the product — bring-up opens its write-ahead
+    # intent before the product name is in scope, so the confirmation writes no `product` field. Derive
+    # it from the installation-scoped container name (mythical-<ident>-<product>), which is the same
+    # value the product filter and the forced-record lookup below key on.
+    if product="$(mi_led_field "$rec" product)"; then :; else product=""; fi
+    [ -n "$product" ] || product="${c#"${MI_NAME_PREFIX}"-"${ident}"-}"
+    if [ "$#" -gt 0 ]; then
+      local match=0 p
+      for p in "$@"; do [ "$p" = "$product" ] && match=1; done
+      [ "$match" -eq 1 ] || continue
+    fi
+    local desired observed out plan
+    desired="$(mi_state_desired_get "$c" 2>/dev/null || printf '(none)')"
+    observed="$(mi_state_observed "$c" 2>/dev/null || printf '(unknown)')"
+    # `|| true`: under `pipefail` this assignment carries mi_state_outstanding's status, and status is
+    # documented to be read-only and always succeed. A diagnostic that aborts is not a diagnostic.
+    out="$(mi_state_outstanding "$c" 2>/dev/null | cut -f1 | tr '\n' ',' || true)"
+    plan="$(mi_state_plan "$c" 2>/dev/null || printf '?')"
+    mi_log "$product: desired=$desired observed=$observed outstanding=${out:-none} next=$plan"
+    local fr
+    while IFS= read -r fr; do
+      [ -n "$fr" ] || continue
+      _mi_led_record_matches "$fr" product "$product" || continue
+      case "$(mi_led_field "$fr" kind)" in
+        image-override) mi_log "  image override in effect — running $(mi_led_field "$fr" ref) instead of the manifest's pinned image" ;;
+        force-install)  mi_log "  installed with --force-install (the manifest said not launched)" ;;
+      esac
+    done <<< "$_sforced"
+  done <<< "$_sobjs"
+
+  # VOLUMES, which this report used to drop on the floor entirely: the loop above filters to
+  # `class=container`, so every `class=volume` record — for every product — went unreported. That is
+  # the one class whose contents cannot be rebuilt from an image, and `uninstall --purge` is the one
+  # operation that removes them, so an operator deciding whether to purge had no way to see what
+  # they were deciding about. The ledger has carried these records with a `role=` all along
+  # (mi_prov_record's passthrough fields); nothing had to be added to report them.
+  #
+  # Presence, role, unregenerable-or-not, and provenance — deliberately NOT size. The host cannot
+  # read a named volume's contents and `volume inspect` reports no size, so any number here would
+  # have to be invented or obtained by starting a container, and status starts nothing.
+  #
+  # mi_prov_authority is the sanctioned provenance predicate and is reused rather than re-derived.
+  # It is silent when a volume checks out, so its warnings appear only when something genuinely is
+  # wrong — which is precisely what this report exists to surface. Its status is CAPTURED: status is
+  # documented never to be gated by its own findings, and under `pipefail` an uncaptured non-zero
+  # here would abort the report it is part of.
+  local vrec vname vrole vrc vproduct
+  while IFS= read -r vrec; do
+    [ -n "$vrec" ] || continue
+    _mi_led_record_matches "$vrec" class volume || continue
+    if vname="$(mi_led_field "$vrec" name)"; then :; else
+      mi_log "volume:       UNREADABLE — a volume record carries no name. Run 'mythical-ctl state repair'."
+      continue
+    fi
+    if vproduct="$(mi_led_field "$vrec" product)"; then :; else vproduct=""; fi
+    # Same product filter the container loop applies, so `status <product>` stays scoped. A volume
+    # record with no readable product is shown UNFILTERED rather than hidden: it is exactly the
+    # record an operator needs to see, and silently dropping it from a filtered view is how an
+    # unattributable volume becomes invisible.
+    if [ "$#" -gt 0 ] && [ -n "$vproduct" ]; then
+      local vmatch=0 vp
+      for vp in "$@"; do [ "$vp" = "$vproduct" ] && vmatch=1; done
+      [ "$vmatch" -eq 1 ] || continue
+    fi
+    vrole="$(mi_led_field "$vrec" role)" || vrole="?"
+    # Read through the SHARED classifier, so this report and the purge that acts on it can never
+    # disagree about what a volume holds — see _mi_verb_vol_class for why absence reads as
+    # unrecoverable rather than as safe.
+    local vclass
+    vclass="$(_mi_verb_vol_class "$vrec")" || vclass="UNREGENERABLE (unreadable)"
+    if mi_prov_authority volume "$vname" >/dev/null; then vrc=0; else vrc=$?; fi
+    case "$vrc" in
+      0) mi_log "volume ${vname}: role=${vrole} data=${vclass} product=${vproduct:-?} — present, created by this installation" ;;
+      3) mi_log "volume ${vname}: role=${vrole} data=${vclass} product=${vproduct:-?} — recorded but GONE from the runtime" ;;
+      *) mi_log "volume ${vname}: role=${vrole} data=${vclass} product=${vproduct:-?} — provenance NOT established (see above); 'uninstall --purge' will preserve it" ;;
+    esac
+  done <<< "$_sobjs"
+  fi
+
+  # Live intents, so a wedge is visible rather than mysterious. Same rc distinction: an unreadable intent
+  # listing is REPORTED, not shown as "no pending intents".
+  local irec _sint sirc
+  if _sint="$(mi_intent_all)"; then sirc=0; else sirc=$?; fi
+  if [ "$sirc" -ne 0 ] && [ "$sirc" -ne 3 ]; then
+    mi_log "PENDING:      UNREADABLE — the intent records could not be read. Run 'mythical-ctl state repair'."
+  else
+    while IFS= read -r irec; do
+      [ -n "$irec" ] || continue
+      mi_log "PENDING: $(mi_led_field "$irec" class) $(mi_led_field "$irec" name) — created and not yet confirmed"
+    done <<< "$_sint"
+  fi
+
+  # §6b.1/§6b.2's unattributed and unrecorded classes, reported, never actioned.
+  local ln cls kind name
+  while IFS= read -r ln; do
+    [ -n "$ln" ] || continue
+    cls="${ln%%$'\t'*}"
+    kind="$(printf '%s' "$ln" | cut -f2)"; name="$(printf '%s' "$ln" | cut -f3)"
+    case "$cls" in
+      unattributed)
+        mi_log "unattributed $kind: $name"
+        mi_log "  Carries a mythicalOS installation label that is not this installation's. It may belong"
+        mi_log "  to another user on this daemon. Diagnostic only." ;;
+      unrecorded)
+        mi_log "unrecorded $kind: $name"
+        mi_log "  Labelled for THIS installation but absent from the ledger. Mutating operations will"
+        mi_log "  stop until this is resolved — run 'state repair'." ;;
+      colliding)
+        mi_log "name collision, $kind: $name (unlabelled, holds a name this installer would create)" ;;
+    esac
+  done <<< "$(mi_unaccounted_scan)"
+  return 0
+}
+
+# --- the batch driver (§7.3) ----------------------------------------------------------------------
+# Per-product reporting, CONTINUE PAST A FAILURE, worst-wins aggregate.
+mi_verb_batch() {
+  if [ "$#" -lt 5 ]; then mi_warn "verbs: mi_verb_batch needs <verb> <index> <policy> <manifest-dir> <product>..."; return 2; fi
+  local verb="$1" idx="$2" pol="$3" mdir="$4"; shift 4
+  local p rc
+  local -a codes
+  codes=()
+  for p in "$@"; do
+    # EVERY capture is an if/else. `verb …; rc=$?` is a simple command, so under a `set -e` caller the
+    # FIRST product that fails exits the CLI — and this function's entire reason to exist ("failing one
+    # product must not abort the others", §7.3) would be unreachable code.
+    case "$verb" in
+      install)  if mi_verb_install  "$idx" "$pol" "${mdir}/${p}.manifest" "$p"; then rc=0; else rc=$?; fi ;;
+      recreate) if mi_verb_recreate "$idx" "$pol" "${mdir}/${p}.manifest" "$p"; then rc=0; else rc=$?; fi ;;
+      start)    if mi_verb_start    "$idx" "$p"; then rc=0; else rc=$?; fi ;;
+      stop)     if mi_verb_stop     "$p"; then rc=0; else rc=$?; fi ;;
+      restart)  if mi_verb_restart  "$idx" "$p"; then rc=0; else rc=$?; fi ;;
+      *) mi_warn "verbs: '$verb' is not a batchable verb"; return 2 ;;
+    esac
+    # A usage error from ONE product is that product's operational failure from the batch's point of
+    # view: the batch itself was invoked correctly. Mapping it to 1 keeps mi_ex_worst's contract (usage
+    # is never a batch outcome) without losing the failure.
+    [ "$rc" -eq 2 ] && rc=1
+    mi_log "$p: $(mi_ex_name "$rc")"
+    codes+=("$rc")
+  done
+  local agg
+  agg="$(mi_ex_worst "${codes[@]}")" || return 1
+  return "$agg"
+}

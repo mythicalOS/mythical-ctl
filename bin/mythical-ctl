@@ -1,0 +1,341 @@
+#!/usr/bin/env bash
+# mythical-ctl — installer and lifecycle CLI for the mythicalOS family.
+# Copyright 2026 mythicalOS ApS. Licensed under the Apache License, Version 2.0.
+#
+# Shell, deliberately: this runs before any language runtime is guaranteed to
+# exist on the machine. Its only dependencies are bash and a container runtime.
+#
+# Bash specifically, not POSIX sh — `set -o pipefail` below is a bash builtin.
+# Saying "POSIX shell" here while shipping a bash script would be a portability
+# claim the code does not honour.
+#
+# The lifecycle verbs are specified but NOT YET IMPLEMENTED — see README.md.
+# This entrypoint carries the version and the help surface so that packaging,
+# release and installation can be built and tested ahead of them.
+
+set -euo pipefail
+
+# SCRUBBED BEFORE ANYTHING ELSE RUNS (codex gate round 1, HIGH — lib/ledger.sh:13). These two names
+# are lib/ledger.sh's own internal channel for redirecting the ledger reader/writer at the
+# NON-AUTHORITATIVE staging ledger during a restore (§6c/D59) — sanctioned for exactly two call
+# sites in lib/backup.sh, never for a general invocation. Left alone, an inherited
+# `MI_LEDGER_PATH_OVERRIDE=…/ledger.staging mythical-ctl start …` would make this ENTIRE process —
+# every lifecycle command, not just restore's own code — treat an in-progress, not-yet-verified
+# restore as if it were the live installation. Unsetting them here, before any module is even
+# sourced, means that for the rest of this one invocation only lib/backup.sh's own code (which sets
+# them itself, immediately before the one call that needs them, as a shell `VAR=val command` prefix —
+# dynamically scoped to that command alone, never exported, never surviving past it) can ever make
+# either variable non-empty again. See lib/ledger.sh's own note on _mi_ledger_path for the second,
+# independent half of this gate.
+unset MI_LEDGER_PATH_OVERRIDE _MI_LEDGER_STAGING_INTERNAL 2>/dev/null || true
+
+VERSION="0.1.0"
+
+# Resolve lib/ relative to this script (symlink-safe enough for install + repo layouts).
+_MCTL_BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# >>> mctl:modules >>>
+# Dev/repo mode: load the shipped libraries from ../lib. The release bundler REPLACES
+# everything between these two sentinels with the modules inlined verbatim, so the published
+# artifact is a single self-contained file with no ../lib to resolve.
+_MCTL_LIB="${_MCTL_BIN}/../lib"
+for _m in common layout config lock ledger doc trust policy manifest detect runtime preflight exit prov intent state probe bringup netref verbs repair copy migrate backup; do
+  if [ -f "${_MCTL_LIB}/${_m}.sh" ]; then
+    # shellcheck disable=SC1090
+    source "${_MCTL_LIB}/${_m}.sh"
+  fi
+done
+unset _m
+# <<< mctl:modules <<<
+
+usage() {
+  cat <<'EOF'
+mythical-ctl — install and manage mythicalOS products
+
+USAGE
+  mythical-ctl <command> [products...] [options]
+
+COMMANDS
+  install <product>...     install (or converge) one or more products
+  start <product>...       start; sets desired state to running
+  stop <product>...        stop; sets desired state to stopped
+  restart <product>...     restart; refused on a product you have stopped
+  recreate <product>...    replace the container, preserving desired state
+  status [product...]      report desired vs actual, outstanding checks, unattributed objects
+  uninstall <product>      remove the container; keeps your data and the rollback floor
+                             --purge   also remove this product's named volumes
+  uninstall --family       remove EVERY product and reset the ledger entirely - identity,
+                           membership, every rollback floor, the family-index anchor
+                             --purge   also remove every named volume (your data)
+  migrate-storage <product> <role> --to-bind PATH
+                           move a product's storage from its named volume to a host directory
+                             --map-foreign-to-operator   map foreign-uid entries to the operator
+  backup <output-directory>
+                           write the ledger, the tree, and every named volume's contents plus its
+                           per-entry manifest and its recorded identity — copying the directory alone
+                           is not a backup
+  restore <backup-directory>
+                           restore installer state and named volumes from a backup, staging the
+                           incoming ledger before anything is created; refused while an active
+                           installation is present
+                             --abandon   abandon an in-progress restore, removing the partial
+                                         volumes it created under their recorded identity
+
+OPTIONS
+  --index PATH             the family index (default: ~/.mythical/.state/index)
+  --policy PATH            the family policy index
+  --manifest-dir PATH      where <product>.manifest files are
+  --image REF              run this image instead of the manifest's (loud, recorded)
+  --force-install          install a product whose manifest says it has not launched
+  -v, --version            print the version and exit
+  -h, --help               print this help and exit
+
+EXIT CODES
+  0  completed      1  operational failure      2  usage error      3  not launched yet
+
+Documentation: https://docs.mythicalos.ai   Source: https://github.com/mythicalOS/mythical-ctl
+EOF
+}
+
+# Hidden, undocumented, used by the tests: assert the shipped library surface is actually present.
+# Meaningful in both modes — in the release bundle the modules are inlined, so "did it source" is
+# unanswerable, but "are the functions defined" is the real contract. Extracted into a function so
+# main() stays a readable dispatch; every new module appends its key functions to the list.
+selftest() {
+      for _f in mi_log mi_warn mi_die mi_digest mi_home mi_ensure_layout mi_zone \
+                mi_conf_scan mi_conf_load mi_conf_get \
+                mi_conf_family_path mi_conf_family_spec mi_conf_family_load mi_conf_family_add \
+                mi_conf_product_path mi_conf_product_load mi_conf_product_add \
+                mi_lock_acquire mi_lock_release mi_lock_assert_held \
+                mi_ledger_read mi_ledger_write mi_ledger_get \
+                mi_doc_scan mi_doc_load mi_doc_value mi_doc_values mi_doc_version mi_doc_expired \
+                mi_trust_verify_digest mi_trust_floor_get mi_trust_floor_set mi_trust_floor_override \
+                mi_trust_anchor_get mi_trust_anchor_set mi_index_spec mi_index_load mi_accept_index \
+                mi_trust_check_only mi_trust_commit mi_trust_check \
+                mi_policy_doc_spec mi_policy_entitlement_spec mi_policy_load mi_policy_permits \
+                mi_policy_family_gid mi_accept_policy mi_policy_bindable \
+                mi_manifest_spec mi_manifest_load mi_manifest_image mi_manifest_launched \
+                mi_manifest_check mi_manifest_core_ok mi_accept_manifest \
+                mi_name_volume mi_name_container mi_name_network mi_name_alias \
+                mi_detect_field mi_detect_version \
+                mi_rt_ping mi_rt_inspect mi_rt_container_create \
+                mi_rt_container_nets_resolved mi_rt_container_aliases_resolved \
+                mi_ex_worst mi_preflight_daemon \
+                mi_led_put mi_led_del mi_led_find mi_led_all mi_led_field \
+                mi_ident_get mi_ident_ensure mi_member_add mi_member_has mi_member_del \
+                mi_prov_record mi_prov_find mi_prov_tombstone mi_prov_gen \
+                mi_prov_image_record mi_prov_authority mi_first_use \
+                mi_nonce_new mi_intent_open mi_intent_confirm mi_intent_reconcile \
+                mi_intent_abandonable mi_intent_abandon mi_unaccounted_scan mi_unaccounted_gate \
+                mi_state_desired_get mi_state_commit mi_state_outstanding \
+                mi_state_outstanding_clear mi_state_observed mi_state_reconciled mi_state_plan \
+                mi_state_forget mi_state_resume_record \
+                mi_probe_image mi_probe_available mi_probe_selfcheck mi_probe_resolve \
+                mi_probe_egress mi_probe_cleanup \
+                mi_canon mi_home_canon mi_mount_core_fixed mi_mount_check_fixed \
+                mi_mount_check_overlap mi_mount_binds mi_mount_binds_check_pairwise \
+                mi_conf_product_keys mi_conf_spec_for mi_secrets_envfile \
+                mi_bringup mi_bringup_create mi_bringup_verify_attach mi_bringup_verify_live \
+                mi_bringup_recover mi_bringup_reconcile \
+                mi_net_owned_ensure mi_net_ref_get mi_net_ref_resolve mi_net_ref_verify \
+                mi_net_ref_rebind mi_net_target mi_netmig_phase mi_netmig_run mi_netmig_resume \
+                mi_manifest_runtime_uid \
+                mi_copy_image mi_copy_available mi_copy_preflight \
+                mi_copy_run mi_copy_run_verify mi_copy_verify \
+                mi_copy_access_check mi_copy_host_access_check mi_copy_link_escapes \
+                mi_product_ctx mi_bringup_specs mi_conf_product_ensure mi_confirm \
+                mi_verb_install mi_verb_start mi_verb_stop mi_verb_restart mi_verb_recreate \
+                mi_verb_status mi_verb_uninstall mi_verb_uninstall_family mi_verb_batch \
+                mi_schema_migrate mi_repair_candidates mi_repair_run \
+                mi_verb_state_repair mi_verb_abandon_intent mi_verb_net_rebind \
+                mi_conf_family_cas mi_mig_precheck mi_mig_phase mi_mig_stageid mi_mig_resume_phase \
+                mi_mig_run mi_mig_resume mi_mig_check_parent_trust mi_mig_verify_no_escaping_symlinks \
+                mi_mig_staging_path mi_mig_identity mi_mig_is_mountpoint mi_verb_migrate_storage \
+                mi_backup_manifest_write mi_backup_run mi_restore_state mi_restore_run \
+                mi_restore_abandon mi_ledger_staging_activate mi_ledger_staging_read \
+                mi_ledger_staging_write mi_copy_fill mi_verb_backup mi_verb_restore; do
+        if ! declare -F "$_f" >/dev/null 2>&1; then
+          printf 'mythical-ctl: missing library function: %s\n' "$_f" >&2
+          exit 1
+        fi
+      done
+      printf 'ok\n'
+}
+
+# A value-taking option with no value is a USAGE error (exit 2, nothing attempted), not the exit-1 an
+# unchecked `shift 2` produces under this entrypoint's `set -e` when only the flag itself remains
+# ($# is 1, `shift 2` returns non-zero, and errexit turns that into an operational failure). $2 is the
+# remaining count at the option; anything below 2 means the value is missing.
+_need_val() {
+  [ "$2" -ge 2 ] || { printf 'mythical-ctl: option %s requires a value\n' "$1" >&2; exit "$MI_EX_USAGE"; }
+}
+
+main() {
+  [ "$#" -ne 0 ] || { usage; exit 0; }
+
+  local verb="$1"; shift
+  local idx="" pol="" mdir="" purge="" image="" forced="" family="" tobind="" mapforeign="" abandon=""
+  local -a products
+  products=()
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --index)        _need_val "$1" "$#"; idx="$2"; shift 2 ;;
+      --policy)       _need_val "$1" "$#"; pol="$2"; shift 2 ;;
+      --manifest-dir) _need_val "$1" "$#"; mdir="$2"; shift 2 ;;
+      --image)        _need_val "$1" "$#"; image="$2"; shift 2 ;;
+      --purge)        purge=1; shift ;;
+      --family)       family=1; shift ;;
+      --force-install) forced=1; shift ;;
+      --to-bind)      _need_val "$1" "$#"; tobind="$2"; shift 2 ;;
+      --map-foreign-to-operator) mapforeign=1; shift ;;
+      --abandon)      abandon=1; shift ;;
+      -*) printf 'mythical-ctl: unknown option: %s\n' "$1" >&2; exit "$MI_EX_USAGE" ;;
+      *) products+=("$1"); shift ;;
+    esac
+  done
+  # Defaults resolved AFTER parsing so an explicit flag always wins.
+  : "${idx:=$(mi_home)/.state/index}"
+  : "${pol:=$(mi_home)/.state/policy}"
+  : "${mdir:=$(mi_home)/.state}"
+
+  case "$verb" in
+    -v|--version) printf 'mythical-ctl %s\n' "$VERSION" ;;
+    -h|--help)    usage ;;
+    __selftest)   selftest ;;
+    install|start|stop|restart|recreate)
+      # --purge and --family belong to uninstall ONLY; --to-bind/--map-foreign-to-operator belong to
+      # migrate-storage ONLY. Silently ignoring a misplaced option is how `install p1 --purge` returns
+      # 0 having quietly done something other than what was written.
+      # (--image/--force-install are install-only and are enforced per-product below.)
+      [ -z "$purge" ]  || { printf 'mythical-ctl: --purge applies to uninstall only\n' >&2; exit "$MI_EX_USAGE"; }
+      [ -z "$family" ] || { printf 'mythical-ctl: --family applies to uninstall only\n' >&2; exit "$MI_EX_USAGE"; }
+      [ -z "$tobind" ] || { printf 'mythical-ctl: --to-bind applies to migrate-storage only\n' >&2; exit "$MI_EX_USAGE"; }
+      [ -z "$mapforeign" ] || { printf 'mythical-ctl: --map-foreign-to-operator applies to migrate-storage only\n' >&2
+                                exit "$MI_EX_USAGE"; }
+      [ -z "$abandon" ] || { printf 'mythical-ctl: --abandon applies to restore only\n' >&2; exit "$MI_EX_USAGE"; }
+      [ "${#products[@]}" -gt 0 ] || { printf 'mythical-ctl: %s needs at least one product\n\n' "$verb" >&2
+                                       usage >&2; exit "$MI_EX_USAGE"; }
+      local -a extra; extra=()
+      [ -z "$image" ]  || extra+=(--image "$image")
+      [ -z "$forced" ] || extra+=(--force-install)
+      if [ "${#products[@]}" -eq 1 ] && [ "${#extra[@]}" -gt 0 ]; then
+        # Per-product options only make sense for a single product; a batch would apply one override to
+        # all of them, which is never what an operator means.
+        case "$verb" in
+          install)  mi_verb_install "$idx" "$pol" "${mdir}/${products[0]}.manifest" "${products[0]}" "${extra[@]}" ;;
+          *) printf 'mythical-ctl: --image/--force-install apply to install only\n' >&2; exit "$MI_EX_USAGE" ;;
+        esac
+        exit $?
+      fi
+      [ "${#extra[@]}" -eq 0 ] || { printf 'mythical-ctl: --image/--force-install take exactly one product\n' >&2
+                                    exit "$MI_EX_USAGE"; }
+      mi_verb_batch "$verb" "$idx" "$pol" "$mdir" "${products[@]}"
+      exit $? ;;
+    status)
+      # status reads; it accepts only --index and product filters. A stray mutating option is a usage
+      # error, not something to accept and ignore.
+      [ -z "$image$forced$purge$family$tobind$mapforeign$abandon" ] || { printf 'mythical-ctl: status takes no options other than --index\n' >&2
+                                               exit "$MI_EX_USAGE"; }
+      mi_verb_status "$idx" "${products[@]+"${products[@]}"}"; exit $? ;;
+    uninstall)
+      # uninstall does not install and does not migrate storage: those options are refused, not ignored.
+      [ -z "$image$forced$tobind$mapforeign$abandon" ] || { printf 'mythical-ctl: --image/--force-install/--to-bind/--map-foreign-to-operator/--abandon apply elsewhere\n' >&2
+                                  exit "$MI_EX_USAGE"; }
+      if [ -n "$family" ]; then
+        # --family removes the WHOLE family; a product argument alongside it is contradictory. Silently
+        # honouring --family while dropping the product would run a materially MORE destructive
+        # operation than the one written (`uninstall p1 --family` is not "uninstall p1").
+        [ "${#products[@]}" -eq 0 ] || { printf 'mythical-ctl: uninstall --family takes no product\n' >&2
+                                         exit "$MI_EX_USAGE"; }
+        if [ -n "$purge" ]; then mi_verb_uninstall_family --purge; else mi_verb_uninstall_family; fi
+        exit $?
+      fi
+      [ "${#products[@]}" -eq 1 ] || { printf 'mythical-ctl: uninstall takes exactly one product\n' >&2
+                                       exit "$MI_EX_USAGE"; }
+      if [ -n "$purge" ]; then mi_verb_uninstall "${products[0]}" --purge
+      else mi_verb_uninstall "${products[0]}"; fi
+      exit $? ;;
+    migrate-storage)
+      # --purge/--family/--image/--force-install belong to other verbs; refused, not ignored, exactly
+      # as those verbs refuse THIS command's own options above.
+      [ -z "$purge$family$image$forced$abandon" ] || { printf 'mythical-ctl: migrate-storage takes only --to-bind and --map-foreign-to-operator\n' >&2
+                                                exit "$MI_EX_USAGE"; }
+      [ -n "$tobind" ] || { printf 'mythical-ctl: migrate-storage needs --to-bind <path>\n' >&2; exit "$MI_EX_USAGE"; }
+      # EXACTLY <product> <role> — a missing or surplus operand must not be silently dropped and acted
+      # on anyway: this mutates the fleet, the host and mythical.conf, so a malformed invocation is a
+      # usage error with NOTHING attempted, the same discipline already applied to state repair / state
+      # abandon-intent / net rebind above.
+      [ "${#products[@]}" -eq 2 ] || { printf 'mythical-ctl: migrate-storage needs exactly <product> <role> --to-bind <path>\n' >&2
+                                        exit "$MI_EX_USAGE"; }
+      local -a migopts; migopts=(--to-bind "$tobind")
+      [ -z "$mapforeign" ] || migopts+=(--map-foreign-to-operator)
+      mi_verb_migrate_storage "$idx" "$pol" "${mdir}/${products[0]}.manifest" "${products[0]}" "${products[1]}" "${migopts[@]}"
+      exit $? ;;
+    backup)
+      # backup takes --index/--policy/--manifest-dir (needed to authenticate each volume's own
+      # product manifest and resolve its declared runtime uid) and exactly one operand (the output
+      # directory) — every other option belongs to a different verb and is refused, not ignored.
+      [ -z "$purge$family$image$forced$tobind$mapforeign$abandon" ] || {
+        printf 'mythical-ctl: backup takes only --index/--policy/--manifest-dir and an output directory\n' >&2
+        exit "$MI_EX_USAGE"; }
+      [ "${#products[@]}" -eq 1 ] || { printf 'mythical-ctl: backup needs exactly <output-directory>\n' >&2
+                                       exit "$MI_EX_USAGE"; }
+      mi_verb_backup "$idx" "$pol" "$mdir" "${products[0]}"; exit $? ;;
+    restore)
+      # restore takes --index/--policy/--manifest-dir and EITHER exactly one operand (the backup
+      # directory) OR --abandon on its own — never both, never neither.
+      [ -z "$purge$family$image$forced$tobind$mapforeign" ] || {
+        printf 'mythical-ctl: restore takes only --index/--policy/--manifest-dir, --abandon, and a backup directory\n' >&2
+        exit "$MI_EX_USAGE"; }
+      if [ -n "$abandon" ]; then
+        [ "${#products[@]}" -eq 0 ] || { printf 'mythical-ctl: restore --abandon takes no directory\n' >&2
+                                         exit "$MI_EX_USAGE"; }
+        mi_verb_restore "$idx" "$pol" "$mdir" --abandon; exit $?
+      fi
+      [ "${#products[@]}" -eq 1 ] || { printf 'mythical-ctl: restore needs exactly <backup-directory> (or --abandon)\n' >&2
+                                       exit "$MI_EX_USAGE"; }
+      mi_verb_restore "$idx" "$pol" "$mdir" "${products[0]}"; exit $? ;;
+    net)
+      # The rebind verb lands in a later task; the mechanism (mi_net_ref_rebind) is present, the CLI
+      # wrapper is not yet, so this degrades cleanly rather than calling an undefined function.
+      [ "${products[0]:-}" = rebind ] || { printf 'mythical-ctl: net takes "rebind"\n' >&2; exit "$MI_EX_USAGE"; }
+      # EXACTLY ONE OPERAND ("rebind") — a surplus one must not be silently dropped and acted on
+      # anyway: with MI_CONFIRM=yes set (a non-interactive operator, or a script) this moves the whole
+      # fleet's network attachment, so a malformed invocation is a usage error with NOTHING done, the
+      # same discipline already applied to state repair / state abandon-intent above.
+      [ "${#products[@]}" -eq 1 ] || { printf 'mythical-ctl: net rebind takes no further operands\n' >&2; exit "$MI_EX_USAGE"; }
+      if declare -F mi_verb_net_rebind >/dev/null 2>&1; then mi_verb_net_rebind "$idx"; exit $?; fi
+      printf 'mythical-ctl: net rebind is not available in this build yet\n' >&2; exit "$MI_EX_FAIL" ;;
+    state)
+      case "${products[0]:-}" in
+        repair)
+          # At most ONE extra operand (the chosen identity, or --reinitialize) — a third operand is a
+          # malformed invocation and must be rejected outright, not silently dropped and acted on as if
+          # it named nothing.
+          [ "${#products[@]}" -le 2 ] || { printf 'mythical-ctl: state repair takes at most one identity (or --reinitialize)\n' >&2
+                                            exit "$MI_EX_USAGE"; }
+          if declare -F mi_verb_state_repair >/dev/null 2>&1; then
+            mi_verb_state_repair "$idx" "${products[1]:-}"; exit $?
+          fi
+          printf 'mythical-ctl: state repair is not available in this build yet\n' >&2; exit "$MI_EX_FAIL" ;;
+        abandon-intent)
+          # EXACTLY <class> <name> — a surplus operand must not be silently dropped: this command
+          # confirms and then performs a state-deleting action, so a malformed invocation is a usage
+          # error with NOTHING attempted, never "the first two words, whatever came after them".
+          [ "${#products[@]}" -eq 3 ] || { printf 'mythical-ctl: state abandon-intent needs exactly <class> <name>\n' >&2
+                                            exit "$MI_EX_USAGE"; }
+          if declare -F mi_verb_abandon_intent >/dev/null 2>&1; then
+            mi_verb_abandon_intent "${products[1]}" "${products[2]}"; exit $?
+          fi
+          printf 'mythical-ctl: state abandon-intent is not available in this build yet\n' >&2; exit "$MI_EX_FAIL" ;;
+        *) printf 'mythical-ctl: state takes "repair" or "abandon-intent"\n' >&2; exit "$MI_EX_USAGE" ;;
+      esac ;;
+    *) printf 'mythical-ctl: unknown command: %s\n\n' "$verb" >&2; usage >&2; exit "$MI_EX_USAGE" ;;
+  esac
+}
+
+# Run only when executed, not when sourced. Sourcing is how the bundle-equivalence tests load the
+# artifact's functions and exercise them exactly as they do the repo modules.
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  main "$@"
+fi

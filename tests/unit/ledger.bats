@@ -1,0 +1,317 @@
+load '../lib/test_helper'
+
+# Simulate genuinely holding the family lock: publish a lock file and match its token. The ledger
+# writer's guard checks the token against this file, so this is what a real mi_lock_acquire (Task 4)
+# produces — proving the guard, not bypassing it with an env flag. MI_LOCK_TOKEN is exported so a
+# `bash -c` subshell in a test inherits it (alongside MYTHICAL_HOME).
+hold_lock() {
+  printf 'pid=%s start=0 token=testtok\n' "$$" > "$MYTHICAL_HOME/.state/lock"
+  export MI_LOCK_TOKEN=testtok
+}
+setup_ledger() { load_mctl; mi_ensure_layout; hold_lock; }
+
+@test "missing ledger returns 3 and prints nothing" {
+  load_mctl; mi_ensure_layout
+  run bash -c 'source '"$_MCTL_ROOT"'/lib/common.sh; source '"$_MCTL_ROOT"'/lib/layout.sh; source '"$_MCTL_ROOT"'/lib/lock.sh; source '"$_MCTL_ROOT"'/lib/ledger.sh; mi_ledger_read'
+  [ "$status" -eq 3 ]
+  [ -z "$output" ]
+}
+
+@test "write then read round-trips records" {
+  setup_ledger
+  printf 'identity\tid=abc123\ninitialized\tproduct=brokkr\n' | mi_ledger_write
+  run mi_ledger_read
+  assert_ok
+  assert_contains "id=abc123"
+  assert_contains "product=brokkr"
+}
+
+@test "write is refused without the lock held (no token, no lock file)" {
+  load_mctl; mi_ensure_layout
+  # `set -euo pipefail` mirrors the shipped entrypoint: without it the writer's token-read `sed`
+  # on the absent lock file would abort silently and this test would pass for the wrong reason.
+  run bash -c 'set -euo pipefail; unset MI_LOCK_TOKEN; source '"$_MCTL_ROOT"'/lib/common.sh; source '"$_MCTL_ROOT"'/lib/layout.sh; source '"$_MCTL_ROOT"'/lib/lock.sh; source '"$_MCTL_ROOT"'/lib/ledger.sh; printf "x\ty=1\n" | mi_ledger_write'
+  [ "$status" -ne 0 ]
+  assert_contains "lock"
+}
+
+@test "write is refused when the token does not match the lock file" {
+  setup_ledger                            # lock file token=testtok, MI_LOCK_TOKEN=testtok
+  export MI_LOCK_TOKEN=wrong-token        # now our token no longer matches the file on disk
+  run bash -c 'set -euo pipefail; source '"$_MCTL_ROOT"'/lib/common.sh; source '"$_MCTL_ROOT"'/lib/layout.sh; source '"$_MCTL_ROOT"'/lib/lock.sh; source '"$_MCTL_ROOT"'/lib/ledger.sh; printf "x\ty=1\n" | mi_ledger_write'
+  [ "$status" -ne 0 ]
+  assert_contains "lock"
+}
+
+@test "a ledger truncated by its final newline fails closed" {
+  setup_ledger
+  printf 'identity\tid=abc\n' | mi_ledger_write
+  local f="$MYTHICAL_HOME/.state/ledger" nm1
+  nm1=$(( $(wc -c < "$f") - 1 ))
+  dd if="$f" of="$f.trunc" bs=1 count="$nm1" 2>/dev/null
+  mv "$f.trunc" "$f"                       # file no longer ends in a newline
+  run mi_ledger_read
+  [ "$status" -ne 0 ]
+  [ "$status" -ne 3 ]
+  assert_contains "newline"
+}
+
+@test "a torn ledger fails closed" {
+  setup_ledger
+  printf 'identity\tid=abc123\n' | mi_ledger_write
+  # corrupt the body after the checksum was written
+  printf 'tampered\tx=1\n' >> "$MYTHICAL_HOME/.state/ledger"
+  run mi_ledger_read
+  [ "$status" -ne 0 ]
+  [ "$status" -ne 3 ]
+  assert_contains "checksum"
+}
+
+@test "a newer schema is refused, not parsed" {
+  setup_ledger
+  # Build a checksum-valid ledger by hand with a bumped schema, so the ONLY thing wrong is the
+  # schema number. Construct header+body first, checksum that exact byte range, append the sum —
+  # exactly what the writer does, so read and write agree by construction.
+  local f="$MYTHICAL_HOME/.state/ledger"
+  printf '#mythical-ctl-ledger schema=9999\nidentity\tid=abc\n' > "$f"
+  local sum; sum="$(mi_digest "$f")"
+  printf '#sha256=%s\n' "$sum" >> "$f"
+  run mi_ledger_read
+  [ "$status" -ne 0 ]
+  [ "$status" -ne 3 ]
+  assert_contains "schema"
+}
+
+@test "a non-numeric schema is refused (fail closed, not parsed)" {
+  setup_ledger
+  local f="$MYTHICAL_HOME/.state/ledger"
+  printf '#mythical-ctl-ledger schema=garbage\nidentity\tid=abc\n' > "$f"
+  local sum; sum="$(mi_digest "$f")"
+  printf '#sha256=%s\n' "$sum" >> "$f"
+  run mi_ledger_read
+  [ "$status" -ne 0 ]
+  [ "$status" -ne 3 ]
+  assert_contains "schema"
+}
+
+@test "a HUGE numeric schema (past integer range) is still refused" {
+  setup_ledger
+  local f="$MYTHICAL_HOME/.state/ledger"
+  # far beyond any shell integer — a naive [ -gt ] would error and fall through to parsing
+  printf '#mythical-ctl-ledger schema=99999999999999999999999999\nidentity\tid=abc\n' > "$f"
+  local sum; sum="$(mi_digest "$f")"
+  printf '#sha256=%s\n' "$sum" >> "$f"
+  run mi_ledger_read
+  [ "$status" -ne 0 ]
+  [ "$status" -ne 3 ]
+  assert_contains "schema"
+}
+
+@test "the writer refuses to clobber an existing corrupt ledger" {
+  setup_ledger
+  printf 'identity\tid=abc\n' | mi_ledger_write        # valid ledger exists
+  printf 'garbage-appended\n' >> "$MYTHICAL_HOME/.state/ledger"  # now corrupt
+  run bash -c 'source '"$_MCTL_ROOT"'/lib/common.sh; source '"$_MCTL_ROOT"'/lib/layout.sh; source '"$_MCTL_ROOT"'/lib/lock.sh; source '"$_MCTL_ROOT"'/lib/ledger.sh; printf "x\ty=1\n" | mi_ledger_write'
+  [ "$status" -ne 0 ]
+  assert_contains "validate"
+  # the corrupt file must still be there — the writer preserved the evidence
+  grep -q 'garbage-appended' "$MYTHICAL_HOME/.state/ledger"
+}
+
+@test "input records without a trailing newline still produce a readable ledger" {
+  setup_ledger
+  printf 'identity\tid=abc' | mi_ledger_write          # NOTE: no trailing newline
+  run mi_ledger_read
+  assert_ok
+  assert_contains "id=abc"
+}
+
+@test "mi_ledger_get selects by kind and key" {
+  setup_ledger
+  printf 'initialized\tproduct=brokkr\ninitialized\tproduct=skuld\n' | mi_ledger_write
+  run mi_ledger_get initialized product
+  assert_ok
+  assert_contains "brokkr"
+  assert_contains "skuld"
+}
+
+@test "mi_ledger_get fails closed on a corrupt ledger (no ambient pipefail)" {
+  setup_ledger
+  printf 'initialized\tproduct=brokkr\n' | mi_ledger_write
+  printf 'tampered\tx=1\n' >> "$MYTHICAL_HOME/.state/ledger"   # body changed after the checksum
+  # The test shell has no `set -o pipefail`; a bare `mi_ledger_read | while` would swallow the
+  # reader's failure and report success with no records. The captured reader must propagate instead.
+  run bash -c 'set +o pipefail; source '"$_MCTL_ROOT"'/lib/common.sh; source '"$_MCTL_ROOT"'/lib/layout.sh; source '"$_MCTL_ROOT"'/lib/lock.sh; source '"$_MCTL_ROOT"'/lib/ledger.sh; mi_ledger_get initialized'
+  [ "$status" -ne 0 ]
+  [ "$status" -ne 3 ]
+  assert_contains "checksum"
+}
+
+@test "mi_ledger_read leaves no read-snapshot temp behind" {
+  setup_ledger
+  printf 'identity\tid=abc\n' | mi_ledger_write
+  run mi_ledger_read
+  assert_ok
+  # the read path snapshots to a private .state/.ledger.read.* temp and MUST remove it
+  [ -z "$(find "$MYTHICAL_HOME/.state" -name '.ledger.*' -print -quit)" ]
+}
+
+@test "ledger write fails closed when the hasher itself fails (no checksum-empty ledger)" {
+  setup_ledger
+  local badbin="$BATS_TEST_TMPDIR/badbin"; mkdir -p "$badbin"
+  printf '#!/usr/bin/env bash\nexit 3\n' > "$badbin/sha256sum"; chmod +x "$badbin/sha256sum"
+  printf '#!/usr/bin/env bash\nexit 3\n' > "$badbin/shasum";    chmod +x "$badbin/shasum"
+  run env PATH="$badbin:$PATH" bash -c \
+    'source '"$_MCTL_ROOT"'/lib/common.sh; source '"$_MCTL_ROOT"'/lib/layout.sh; source '"$_MCTL_ROOT"'/lib/lock.sh; source '"$_MCTL_ROOT"'/lib/ledger.sh; printf "identity\tid=abc\n" | mi_ledger_write'
+  [ "$status" -ne 0 ]
+  [ ! -f "$MYTHICAL_HOME/.state/ledger" ]     # nothing (esp. no checksum-empty ledger) was published
+}
+
+@test "ledger read fails closed when the hasher itself fails" {
+  setup_ledger
+  printf 'identity\tid=abc\n' | mi_ledger_write        # written with a WORKING hasher
+  local badbin="$BATS_TEST_TMPDIR/badbin2"; mkdir -p "$badbin"
+  printf '#!/usr/bin/env bash\nexit 3\n' > "$badbin/sha256sum"; chmod +x "$badbin/sha256sum"
+  printf '#!/usr/bin/env bash\nexit 3\n' > "$badbin/shasum";    chmod +x "$badbin/shasum"
+  run env PATH="$badbin:$PATH" bash -c \
+    'source '"$_MCTL_ROOT"'/lib/common.sh; source '"$_MCTL_ROOT"'/lib/layout.sh; source '"$_MCTL_ROOT"'/lib/lock.sh; source '"$_MCTL_ROOT"'/lib/ledger.sh; mi_ledger_read'
+  [ "$status" -ne 0 ]
+  [ "$status" -ne 3 ]
+}
+
+# Every construction write in mi_ledger_write is checked, and this is why. Unchecked, a failed write
+# falls through to the `mv -f` and atomically replaces a VALID ledger with a truncated one — the exact
+# inverse of the never-destroy-evidence guarantee the function asserts. Found by a cross-model gate.
+#
+# The shim hands back a temp path that already exists and is mode 0444, so the header write fails while
+# everything after it still "succeeds": mi_digest happily digests the empty file, the checksum append
+# fails silently too, and `mv -f` needs no write permission on its SOURCE — only on the directory — so
+# the empty temp lands on top of the good ledger. Measured against the pre-fix code: rc 0, and the
+# ledger reduced to 0 bytes.
+@test "a failed ledger write refuses instead of replacing a valid ledger" {
+  setup_ledger
+  local shim="$BATS_TEST_TMPDIR/shim" f before
+  mkdir -p "$shim"
+  # Intercept ONLY the WRITER's template. mi_ledger_read makes its own snapshot with
+  # `.ledger.read.XXXXXX`, and a shim that hijacked that too would make the read fail — so the writer
+  # would refuse at its "existing ledger does not validate" gate and never reach the write checks this
+  # test is about. Measured: with a broad shim the test passed against the PRE-FIX code, i.e. it proved
+  # nothing. `*/.ledger.XXXXXX` does not match `.ledger.read.XXXXXX`.
+  cat > "$shim/mktemp" <<EOF
+#!/usr/bin/env bash
+case "\$1" in
+  */.ledger.XXXXXX)
+    p="$MYTHICAL_HOME/readonly.ledger.tmp"
+    : > "\$p"
+    chmod 0444 "\$p"
+    printf '%s\n' "\$p"
+    exit 0 ;;
+esac
+exec /usr/bin/mktemp "\$@"
+EOF
+  chmod +x "$shim/mktemp"
+
+  # a valid ledger to protect
+  printf 'identity\tid=abc\n' | mi_ledger_write
+  f="$MYTHICAL_HOME/.state/ledger"
+  [ -s "$f" ] || { echo "the fixture ledger is empty — this test would prove nothing" >&2; return 1; }
+  before="$(mi_digest "$f")"
+
+  run env PATH="$shim:$PATH" bash -c \
+    'source '"$_MCTL_ROOT"'/lib/common.sh; source '"$_MCTL_ROOT"'/lib/layout.sh; source '"$_MCTL_ROOT"'/lib/lock.sh; source '"$_MCTL_ROOT"'/lib/ledger.sh; printf "identity\tid=xyz\n" | mi_ledger_write'
+  [ "$status" -ne 0 ]
+
+  # the good ledger is byte-identical, and still loads
+  [ "$(mi_digest "$f")" = "$before" ] \
+    || { echo "the valid ledger was replaced — it now holds: $(cat "$f")" >&2; return 1; }
+  mi_ledger_read >/dev/null
+}
+
+@test "a ledger path that is a DIRECTORY is refused by both the reader and the writer" {
+  # `[ -f ]` is false for a directory, so both the reader and the writer read it as "no ledger".
+  # Measured consequence before the fix: the writer's `mv -f "$tmp" "$f"` moved the temp file INTO
+  # the directory and returned 0 — writing nothing, reporting success, and leaving a stray
+  # .ledger.XXXXXX behind on every call. Every read still said "absent", so nothing noticed; the
+  # visible symptom was a NEW installation identity minted on each invocation.
+  setup_ledger
+  rm -f "$MYTHICAL_HOME/.state/ledger"
+  mkdir -p "$MYTHICAL_HOME/.state/ledger"
+
+  run mi_ledger_read
+  [ "$status" -ne 3 ]
+  assert_contains "not a regular file"
+
+  run bash -c 'source '"$_MCTL_ROOT"'/lib/common.sh; source '"$_MCTL_ROOT"'/lib/layout.sh; source '"$_MCTL_ROOT"'/lib/lock.sh; source '"$_MCTL_ROOT"'/lib/ledger.sh; printf "kind\tk=v\n" | mi_ledger_write'
+  [ "$status" -ne 0 ]
+  [ -z "$(ls -A "$MYTHICAL_HOME/.state/ledger")" ] || { echo "the writer wrote INTO the directory" >&2; return 1; }
+}
+
+@test "a ledger path that is a DANGLING SYMLINK is refused, not treated as absent" {
+  # The other half of the same rule. Here `mv -f` would have replaced the link itself, destroying
+  # the only trace of where it pointed.
+  setup_ledger
+  rm -f "$MYTHICAL_HOME/.state/ledger"
+  ln -s "$MYTHICAL_HOME/.state/nowhere" "$MYTHICAL_HOME/.state/ledger"
+
+  run mi_ledger_read
+  [ "$status" -ne 3 ]
+  assert_contains "not a regular file"
+
+  run bash -c 'source '"$_MCTL_ROOT"'/lib/common.sh; source '"$_MCTL_ROOT"'/lib/layout.sh; source '"$_MCTL_ROOT"'/lib/lock.sh; source '"$_MCTL_ROOT"'/lib/ledger.sh; printf "kind\tk=v\n" | mi_ledger_write'
+  [ "$status" -ne 0 ]
+  [ -L "$MYTHICAL_HOME/.state/ledger" ] || { echo "the writer replaced the symlink" >&2; return 1; }
+}
+
+# --- §6c/D59: the staging ledger override -----------------------------------------------------------
+
+@test "the ledger path override refuses anything outside the two paths this code owns" {
+  load_mctl; mi_ensure_layout
+  MI_LEDGER_PATH_OVERRIDE="/tmp/some-arbitrary-file" run _mi_ledger_path
+  [ "$status" -ne 0 ]
+  assert_contains "refusing an out-of-tree ledger path override"
+}
+
+@test "the ledger path override accepts the real ledger path with no further conditions" {
+  load_mctl; mi_ensure_layout
+  MI_LEDGER_PATH_OVERRIDE="$MYTHICAL_HOME/.state/ledger" run _mi_ledger_path
+  assert_ok
+  [ "$output" = "$MYTHICAL_HOME/.state/ledger" ]
+}
+
+# codex gate round 1, fix 1: naming the staging path is no longer enough on its own — a caller must
+# ALSO carry the internal marker that says this is genuinely one of backup.sh's own two sanctioned
+# call sites, never a general invocation that merely knows the path.
+@test "the staging path is refused UNLESS the internal marker is also set (codex gate round 1, fix 1)" {
+  load_mctl; mi_ensure_layout
+  MI_LEDGER_PATH_OVERRIDE="$MYTHICAL_HOME/.state/ledger.staging" run _mi_ledger_path
+  [ "$status" -ne 0 ]
+  assert_contains "naming the path alone is not enough"
+}
+
+@test "the staging path is accepted once BOTH the override and the internal marker are set" {
+  load_mctl; mi_ensure_layout
+  _MI_LEDGER_STAGING_INTERNAL=1 MI_LEDGER_PATH_OVERRIDE="$MYTHICAL_HOME/.state/ledger.staging" run _mi_ledger_path
+  assert_ok
+  [ "$output" = "$MYTHICAL_HOME/.state/ledger.staging" ]
+}
+
+@test "the staging reader/writer round-trip, without touching the real ledger" {
+  setup_ledger
+  printf 'identity\tid=staged123\n' | mi_ledger_staging_write
+  run mi_ledger_staging_read
+  assert_ok
+  assert_contains "id=staged123"
+  # Plan 1's ordinary ledger is untouched — still absent.
+  [ ! -e "$MYTHICAL_HOME/.state/ledger" ]
+  run mi_ledger_read
+  [ "$status" -eq 3 ]
+}
+
+@test "Plan 1's ledger.bats still passes unchanged: an ordinary write/read never sees the override" {
+  setup_ledger
+  printf 'identity\tid=abc123\n' | mi_ledger_write
+  run mi_ledger_read
+  assert_ok
+  assert_contains "id=abc123"
+  [ ! -e "$MYTHICAL_HOME/.state/ledger.staging" ]
+}
