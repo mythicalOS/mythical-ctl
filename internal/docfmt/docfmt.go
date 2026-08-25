@@ -227,6 +227,20 @@ func Parse(data []byte, label string, s Schema) (*Doc, error) {
 	return &Doc{pairs: pairs}, nil
 }
 
+// Keys returns the document's keys in first-appearance order, each once — the enumeration
+// surface consumers with prefix-scoped keys (the policy index) walk.
+func (d *Doc) Keys() []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, p := range d.pairs {
+		if !seen[p.key] {
+			seen[p.key] = true
+			out = append(out, p.key)
+		}
+	}
+	return out
+}
+
 // Value returns the FIRST value for key.
 func (d *Doc) Value(key string) (string, bool) {
 	for _, p := range d.pairs {
