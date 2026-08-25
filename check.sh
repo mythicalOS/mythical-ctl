@@ -24,8 +24,8 @@ cd "$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 # Floors, not exact counts: the tree grows a package per port task, and each task raises these
 # two literals in its commit. Overridable ONLY so a test harness can prove the guard refuses.
-MIN_PACKAGES="${MIN_PACKAGES:-9}"
-MIN_TESTED_PACKAGES="${MIN_TESTED_PACKAGES:-9}"
+MIN_PACKAGES="${MIN_PACKAGES:-10}"
+MIN_TESTED_PACKAGES="${MIN_TESTED_PACKAGES:-10}"
 
 # The reference-boundary rules, one per line: `<guarded-import-path>:<Identifier>=<allowed
 # import path>[,<more allowed>]`. The defining package itself is always allowed. Each rule is
@@ -38,6 +38,11 @@ BOUNDARY_RULES=(
   # module — a lifecycle path that could open staging would treat a not-yet-verified restore
   # as live state.
   "mythicalos.ai/ctl/internal/ledger:OpenStaging=mythicalos.ai/ctl/internal/backup"
+  # parse-verified-boundary (Tasks 10-11): authenticated documents are constructible only by
+  # the trust acceptors — lifecycle code must be unable to hold a policy or manifest that did
+  # not pass through the chain.
+  "mythicalos.ai/ctl/internal/policy:ParseVerified=mythicalos.ai/ctl/internal/trust"
+  "mythicalos.ai/ctl/internal/manifest:ParseVerified=mythicalos.ai/ctl/internal/trust"
 )
 
 die() {
