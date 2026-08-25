@@ -111,13 +111,13 @@ func freshOK(st ledger.Store, docid string, d *docfmt.Doc, nowUnix int64) error 
 		return fmt.Errorf("trust: %s has an unreadable expiry — refusing: %w", docid, err)
 	}
 	if expired {
-		return fmt.Errorf("trust: %s has expired — refusing; a stale document replays indefinitely otherwise", docid)
+		return fmt.Errorf("trust: %s has expired — refusing; a stale document replays indefinitely otherwise (%w)", docid, ErrUntrusted)
 	}
 	cur, err := FloorGet(st, docid)
 	switch {
 	case err == nil:
 		if decGT(cur, ver) {
-			return fmt.Errorf("trust: %s version %s is older than the highest already seen (%s) — refusing as replay", docid, ver, cur)
+			return fmt.Errorf("trust: %s version %s is older than the highest already seen (%s) — refusing as replay (%w)", docid, ver, cur, ErrUntrusted)
 		}
 	case errors.Is(err, ledger.ErrAbsentRecord):
 		// First use (§10a): trust-on-first-use; treating it as an attack would make every
@@ -258,6 +258,14 @@ func checkPolicy(st ledger.Store, indexPath, policyPath string, now int64) (*pol
 	return pol, ix, nil
 }
 
+// CheckManifest is the read-only sibling of AcceptManifest: the full chain — anchor, index,
+// policy, vouch, digest, parse, product match, freshness, entitlement, min_core — with NO
+// floor movement anywhere. ErrNotLaunched still reports (with the manifest) for an authentic
+// not-launched declaration.
+func CheckManifest(st ledger.Store, indexPath, policyPath, manifestPath, product string) (*manifest.Manifest, error) {
+	return acceptManifest(nil, st, indexPath, policyPath, manifestPath, product, false)
+}
+
 // AcceptManifest is THE SINGLE DOOR for a product manifest — the only composition of the
 // steps, because a chain nobody is forced to walk is not a boundary. The order is the
 // contract, transcribed from the reference:
@@ -279,6 +287,10 @@ func checkPolicy(st ledger.Store, indexPath, policyPath string, now int64) (*pol
 //     and it is still an ACCEPTANCE (the floor stays advanced): ErrNotLaunched, with the
 //     manifest still returned for the caller's report.
 func AcceptManifest(h famlock.Held, st ledger.Store, indexPath, policyPath, manifestPath, product string) (*manifest.Manifest, error) {
+	return acceptManifest(h, st, indexPath, policyPath, manifestPath, product, true)
+}
+
+func acceptManifest(h famlock.Held, st ledger.Store, indexPath, policyPath, manifestPath, product string, commit bool) (*manifest.Manifest, error) {
 	now := time.Now().Unix()
 	ix, err := checkIndex(st, indexPath, now)
 	if err != nil {
@@ -317,15 +329,18 @@ func AcceptManifest(h famlock.Held, st ledger.Store, indexPath, policyPath, mani
 		return nil, err
 	}
 	// Every gate that can REFUSE has run: commit the whole chain's floors in this door's one
-	// authoritative pass (index, policy, then the manifest's own).
-	if err := Commit(h, st, "index", ix.doc, ""); err != nil {
-		return nil, err
-	}
-	if err := Commit(h, st, "policy", pol.Doc(), ""); err != nil {
-		return nil, err
-	}
-	if err := Commit(h, st, docid, m.Doc(), ""); err != nil {
-		return nil, err
+	// authoritative pass (index, policy, then the manifest's own) — skipped entirely on the
+	// read-only sibling.
+	if commit {
+		if err := Commit(h, st, "index", ix.doc, ""); err != nil {
+			return nil, err
+		}
+		if err := Commit(h, st, "policy", pol.Doc(), ""); err != nil {
+			return nil, err
+		}
+		if err := Commit(h, st, docid, m.Doc(), ""); err != nil {
+			return nil, err
+		}
 	}
 	if !m.Launched() {
 		return m, ErrNotLaunched

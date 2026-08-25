@@ -28,7 +28,7 @@ import (
 // PORTED: tests/unit/manifest.bats: "a manifest for a product the policy index does not know is rejected" -> TestEntitlementCheck
 // PORTED: tests/unit/manifest.bats: "a manifest declaring bindability is rejected" -> TestSchemaRefusals
 // PORTED: tests/unit/manifest.bats: "a manifest cannot choose a network at all" -> TestSchemaRefusals
-// PORTED: tests/unit/manifest.bats: "a manifest requiring a newer core is refused, even when fully authenticated" -> TestCoreOK
+// PORTED: tests/unit/manifest.bats: "a manifest requiring a newer core is refused, even when fully authenticated" -> internal/trust TestNewerCoreRefusedThroughDoorWithoutFloorMovement (the door wiring; the comparator itself is TestCoreOK)
 // PORTED: tests/unit/manifest.bats: "a manifest with no min_core is refused — unstated must not mean any core" -> TestSchemaRefusals
 // PORTED: tests/unit/manifest.bats: "the version comparator orders components numerically, not lexically" -> TestVersionComparator
 // PORTED: tests/unit/manifest.bats: "the core version tracks the entrypoint's VERSION" -> TestCoreOK (CoreOK takes internal/version.Version itself — there is no second constant to drift; the test compares against that exact value)

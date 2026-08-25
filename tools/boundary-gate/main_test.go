@@ -264,3 +264,39 @@ var f = engine.NewMutator // the guarded binding must still be seen
 		t.Fatalf("guarded reference evaded via alias collision: %v", v)
 	}
 }
+
+// Per-rule self-tests for the PRODUCTION rules check.sh carries: each exact rule string must
+// catch a violation in a fixture tree (an omitted or misspelled permanent rule would
+// otherwise pass silently forever).
+func TestProductionRulesCatchViolations(t *testing.T) {
+	cases := []struct {
+		rule  string
+		files map[string]string
+	}{
+		{"mythicalos.ai/ctl/internal/policy:ParseVerified=mythicalos.ai/ctl/internal/trust",
+			map[string]string{"internal/policy/policy.go": "package policy\n\nfunc ParseVerified() {}\n",
+				"internal/rogue/r.go": "package rogue\n\nimport \"mythicalos.ai/ctl/internal/policy\"\n\nvar _ = policy.ParseVerified\n"}},
+		{"mythicalos.ai/ctl/internal/manifest:ParseVerified=mythicalos.ai/ctl/internal/trust",
+			map[string]string{"internal/manifest/m.go": "package manifest\n\nfunc ParseVerified() {}\n",
+				"internal/rogue/r.go": "package rogue\n\nimport \"mythicalos.ai/ctl/internal/manifest\"\n\nvar _ = manifest.ParseVerified\n"}},
+		{"mythicalos.ai/ctl/internal/ledger:OpenStaging=mythicalos.ai/ctl/internal/backup",
+			map[string]string{"internal/ledger/l.go": "package ledger\n\nfunc OpenStaging() {}\n",
+				"internal/rogue/r.go": "package rogue\n\nimport \"mythicalos.ai/ctl/internal/ledger\"\n\nvar _ = ledger.OpenStaging\n"}},
+		{"method:ReplaceLines=mythicalos.ai/ctl/internal/trust",
+			map[string]string{"internal/rogue/r.go": "package rogue\n\ntype x struct{}\n\nfunc (x) ReplaceLines() {}\n\nvar v x\nvar _ = v.ReplaceLines\n"}},
+	}
+	for _, c := range cases {
+		files := map[string]string{"go.mod": "module mythicalos.ai/ctl\n\ngo 1.24.0\n"}
+		for k, v := range c.files {
+			files[k] = v
+		}
+		root := writeTree(t, files)
+		v, err := run(root, []string{c.rule})
+		if err != nil {
+			t.Fatalf("%s: %v", c.rule, err)
+		}
+		if len(v) == 0 {
+			t.Errorf("production rule %q caught nothing", c.rule)
+		}
+	}
+}

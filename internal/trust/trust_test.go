@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"mythicalos.ai/ctl/internal/cliio"
+	"mythicalos.ai/ctl/internal/docfmt"
 	"mythicalos.ai/ctl/internal/famlock"
 	"mythicalos.ai/ctl/internal/ledger"
 )
@@ -42,7 +43,7 @@ import (
 // PORTED: tests/unit/trust.bats: "D1: an anchor that cannot be READ is refused by mi_accept_index, never re-anchored" -> TestUnreadableAnchorNeverFirstUse
 // PORTED: tests/unit/trust.bats: "T2: mi_accept_index refuses an expired family index even though its digest matches" -> TestAcceptIndex
 // PORTED: tests/unit/trust.bats: "T5: _mi_index_manifest_digest returns THIS product's digest, never merely the first" -> TestIndexManifestDigest
-// PORTED: tests/unit/trust.bats: "a document with no expiry is refused — it would replay forever" -> TestFreshness
+// PORTED: tests/unit/trust.bats: "a document with no expiry is refused — it would replay forever" -> TestFreshnessRequiresExpiry
 // PORTED: tests/unit/trust.bats: "a first-seen document is accepted and records its version" -> TestCheckAndCommit
 // PORTED: tests/unit/trust.bats: "an equal version is accepted; a lower one is refused as replay" -> TestFreshness
 // PORTED: tests/unit/trust.bats: "a refused replay does not lower the floor" -> TestFreshness
@@ -701,5 +702,95 @@ func TestAcceptorRefusals(t *testing.T) {
 	// A missing file is a refusal from the snapshot step, never a pass.
 	if _, err := AcceptIndex(r.h, r.st, filepath.Join(r.dir, "absent")); err == nil {
 		t.Fatal("missing index accepted")
+	}
+}
+
+// Wave-2 gate fixes, pinned:
+
+// The mandatory-expiry refusal, asserted directly (the schemas all require expires, so the
+// gate's own branch needs a schema without it).
+func TestFreshnessRequiresExpiry(t *testing.T) {
+	r := newRig(t)
+	_ = AnchorSet(r.h, r.st, hex64)
+	sch := docfmt.Schema{Type: "index", Fixed: map[string]docfmt.KeySpec{
+		"version": docfmt.Typed(docfmt.One, "docver"),
+	}}
+	d, err := docfmt.Parse([]byte("mythical-index 1\nversion=1\n"), "t", sch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := freshOK(r.st, "index", d, 1000); err == nil || !strings.Contains(err.Error(), "no expiry") {
+		t.Fatalf("expiry-less document passed the gate: %v", err)
+	}
+}
+
+// A fully-authenticated manifest needing a newer core refuses THROUGH THE DOOR, before any
+// floor movement — the door-wiring half the direct CoreOK test cannot prove.
+func TestNewerCoreRefusedThroughDoorWithoutFloorMovement(t *testing.T) {
+	r := newRig(t)
+	man := []byte("mythical-manifest 1\nversion=1\nexpires=99999999999\nproduct=brokkr\nlaunched=true\nimage=ghcr.io/x/b@sha256:" +
+		hex64 + "\nmin_core=99.0.0\nruntime_uid=900\n")
+	pol := policyBytes("1")
+	ix := indexBytes("1", cliio.SHA256Hex(pol), map[string]string{"brokkr": cliio.SHA256Hex(man)})
+	i := r.write(t, "index", ix)
+	p := r.write(t, "policy", pol)
+	m := r.write(t, "manifest", man)
+	_ = AnchorSet(r.h, r.st, cliio.SHA256Hex(ix))
+	if _, err := AcceptManifest(r.h, r.st, i, p, m, "brokkr"); err == nil || !strings.Contains(err.Error(), "or newer") {
+		t.Fatalf("newer-core manifest through the door: %v", err)
+	}
+	if _, err := FloorGet(r.st, "manifest:brokkr"); !errors.Is(err, ledger.ErrAbsentRecord) {
+		t.Fatal("a min_core refusal advanced the floor")
+	}
+}
+
+// The read-only sibling: full chain, no floor movement, not-launched still reported.
+func TestCheckManifestReadOnly(t *testing.T) {
+	r := newRig(t)
+	i, p, m := chain(t, r, nil, nil, "true")
+	if _, err := CheckManifest(r.st, i, p, m, "brokkr"); err != nil {
+		t.Fatal(err)
+	}
+	for _, docid := range []string{"index", "policy", "manifest:brokkr"} {
+		if _, err := FloorGet(r.st, docid); !errors.Is(err, ledger.ErrAbsentRecord) {
+			t.Fatalf("CheckManifest moved the %s floor", docid)
+		}
+	}
+}
+
+// The P1 regression: a restored multi-field trust row is PRESERVED by a floor write for one
+// of its keys (never dropped wholesale — that erased ANOTHER document's rollback floor), and
+// the resulting doubled answer refuses toward repair.
+func TestMultiFieldTrustRowNeverErased(t *testing.T) {
+	r := newRig(t)
+	l := &ledger.Ledger{}
+	l.ReplaceLines([]string{"trust-floor\tpolicy=3\tmanifest:brokkr=7"})
+	if err := ledger.Write(r.h, r.st, l); err != nil {
+		t.Fatal(err)
+	}
+	if err := FloorSet(r.h, r.st, "policy", "5"); err != nil {
+		t.Fatal(err)
+	}
+	// The manifest floor still exists (the row survived) and reads back cleanly.
+	if v, err := FloorGet(r.st, "manifest:brokkr"); err != nil || v != "7" {
+		t.Fatalf("another document's floor was erased: %q %v", v, err)
+	}
+	// The policy floor is now doubled (old row + new single-field row): refused toward repair.
+	if _, err := FloorGet(r.st, "policy"); err == nil || errors.Is(err, ledger.ErrAbsentRecord) {
+		t.Fatalf("doubled floor did not refuse: %v", err)
+	}
+}
+
+// ErrUntrusted classifies content failures distinctly from unreadable ones.
+func TestUntrustedClassification(t *testing.T) {
+	if err := VerifyDigestData([]byte("x"), hex64, "f"); !errors.Is(err, ErrUntrusted) {
+		t.Fatalf("digest mismatch not ErrUntrusted: %v", err)
+	}
+	r := newRig(t)
+	_ = AnchorSet(r.h, r.st, hex64)
+	_ = FloorSet(r.h, r.st, "index", "5")
+	low, _ := parseIndex(indexBytes("4", hex64, nil), "t")
+	if err := freshOK(r.st, "index", low.Doc(), 1000); !errors.Is(err, ErrUntrusted) {
+		t.Fatalf("replay not ErrUntrusted: %v", err)
 	}
 }

@@ -79,6 +79,11 @@ func (s Schema) check() error {
 		if ks.Validate == nil {
 			return fmt.Errorf("docfmt: internal error — schema key %q has no value rule", k)
 		}
+		if ks.Card != One && ks.Card != Opt && ks.Card != Many {
+			// An out-of-vocabulary cardinality silently reads as optional-at-most-once — the
+			// exact required-key relaxation this self-check exists to prevent.
+			return fmt.Errorf("docfmt: internal error — schema key %q has an unknown cardinality", k)
+		}
 	}
 	return nil
 }

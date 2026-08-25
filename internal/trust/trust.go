@@ -25,6 +25,10 @@ const (
 )
 
 var (
+	// ErrUntrusted classifies every refusal where the CONTENT failed the chain — a digest
+	// mismatch, an expired document, a replay below the floor — as distinct from unreadable
+	// (I/O, absence) failures, so callers branch on errors.Is rather than message text.
+	ErrUntrusted = errors.New("untrusted")
 	// ErrNoAnchor (the rc-4 analogue): no family-index anchor has EVER been recorded — first
 	// use, establish one online. NEVER conflated with an unreadable anchor, which is a damaged
 	// trust record: folding the two would tell a damaged installation to re-bootstrap,
@@ -64,7 +68,7 @@ func VerifyDigestData(data []byte, expected, label string) error {
 	}
 	actual := cliio.SHA256Hex(data)
 	if actual != expected {
-		return fmt.Errorf("trust: %s does not match the digest the family index vouches for\n  expected: %s\n  actual:   %s", label, expected, actual)
+		return fmt.Errorf("trust: %s does not match the digest the family index vouches for (%w)\n  expected: %s\n  actual:   %s", label, ErrUntrusted, expected, actual)
 	}
 	return nil
 }
@@ -195,11 +199,16 @@ func putMany(h famlock.Held, st ledger.Store, triples [][3]string) error {
 			out = append(out, line)
 			continue
 		}
+		// Drop ONLY an exact SINGLE-FIELD row for the key being replaced (this writer only
+		// ever writes single-field rows). A restored ledger can hold a multi-field trust row
+		// carrying several keys; dropping it wholesale would erase ANOTHER document's
+		// rollback floor (wave-2 gate P1) — such a row is preserved verbatim, the appended
+		// replacement then makes the read ambiguous, and ambiguity refuses toward repair.
 		pfx := line
 		if i := strings.IndexByte(line, '='); i >= 0 {
 			pfx = line[:i+1]
 		}
-		if drop[pfx] {
+		if drop[pfx] && !strings.Contains(line[strings.IndexByte(line, '\t')+1:], "\t") {
 			continue
 		}
 		out = append(out, line)
