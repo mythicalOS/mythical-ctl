@@ -29,7 +29,7 @@ set -euo pipefail
 # independent half of this gate.
 unset MI_LEDGER_PATH_OVERRIDE _MI_LEDGER_STAGING_INTERNAL 2>/dev/null || true
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 
 # Resolve lib/ relative to this script (symlink-safe enough for install + repo layouts).
 _MCTL_BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

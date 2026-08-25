@@ -197,6 +197,29 @@ man() { { printf 'mythical-manifest 1\nruntime_uid=900\nversion=1\nexpires=41024
   [[ "$output" == *min_core* ]]
 }
 
+# The compat gate pinned at exactly the boundary this core release sets. This is the first core to
+# honor the closed `volatile_mount` runtime, so it advances MI_CORE_VERSION to 0.2.0: a product that
+# needs that runtime declares min_core=0.2.0, and the gate must now ACCEPT exactly that while still
+# refusing anything newer. This is the assertion that makes the raise bite — before this bump a
+# min_core=0.2.0 manifest was refused (the core was its predecessor). The generic "99.0.0 is refused"
+# test above cannot show where the discriminator now sits, because 99.0.0 was already refused by that
+# predecessor core; only a value one step past the current core proves the boundary moved.
+@test "the compat gate accepts a manifest requiring this core (0.2.0) and refuses one requiring newer" {
+  # The boundary is meaningful only if THIS core is the volatile_mount core; assert the premise so a
+  # later core bump fails loudly here rather than silently weakening the two checks below.
+  [ "$MI_CORE_VERSION" = "0.2.0" ] \
+    || { echo "premise: expected core 0.2.0, got '$MI_CORE_VERSION' — revisit this boundary test" >&2; return 1; }
+
+  # A manifest requiring exactly this core is now accepted (it was refused before the bump).
+  run mi_manifest_core_ok "$(printf 'min_core\t0.2.0\n')"
+  [ "$status" -eq 0 ] || { echo "refused a min_core equal to this core (0.2.0): $output" >&2; return 1; }
+
+  # One patch newer than this core is still refused, and the diagnostic names the required version.
+  run mi_manifest_core_ok "$(printf 'min_core\t0.2.1\n')"
+  [ "$status" -eq 1 ] || { echo "accepted a min_core newer than this core (0.2.1): $output" >&2; return 1; }
+  [[ "$output" == *0.2.1* ]] || { echo "refusal did not name the required version: $output" >&2; return 1; }
+}
+
 @test "the version comparator orders components numerically, not lexically" {
   _mi_version_ge 0.1.0 0.1.0
   _mi_version_ge 0.1.0 0.0.9

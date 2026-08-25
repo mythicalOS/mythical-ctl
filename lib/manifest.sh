@@ -250,7 +250,7 @@ mi_accept_manifest() {
 # The core's own version. It MUST track bin/mythical-ctl's VERSION, and a test asserts they are
 # equal: a min_core check against a stale number is worse than none, because it passes while the CLI
 # lacks the semantics the manifest asked for.
-MI_CORE_VERSION="0.1.0"
+MI_CORE_VERSION="0.2.0"
 
 # rc 0 iff <a> >= <b>, comparing MAJOR.MINOR.PATCH component-wise with missing components as 0.
 #
