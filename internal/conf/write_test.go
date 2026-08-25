@@ -914,3 +914,16 @@ func TestProductAddRefusesNegativeGid(t *testing.T) {
 		t.Fatal("refused gid still created a file")
 	}
 }
+
+func TestProductAddRefusesChownSentinelGid(t *testing.T) {
+	home := t.TempDir()
+	h := lockFor(t, home)
+	for _, gid := range []string{"4294967295", "4294967296", "99999999999999999999"} {
+		if err := ProductAdd(h, "brokkr", gid, testSpec, nil); err == nil {
+			t.Fatalf("gid %s accepted — chown would silently change nothing", gid)
+		}
+	}
+	if _, err := os.Lstat(filepath.Join(home, "brokkr.conf")); !os.IsNotExist(err) {
+		t.Fatal("refused gid still created a file")
+	}
+}

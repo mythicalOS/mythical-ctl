@@ -159,6 +159,12 @@ func ProductAdd(h famlock.Held, product, gid string, spec Spec, kvs []KV) error 
 	if err != nil {
 		return fmt.Errorf("config: %q is not a numeric group id", gid)
 	}
+	// 4294967295 is (gid_t)-1 — chown's NO-CHANGE sentinel: it succeeds while changing
+	// nothing, and chmod 0660 then exposes the file to whatever group it already had (the
+	// bash's chgrp fails outright on it). Anything at or past the sentinel refuses.
+	if gidN >= 0xFFFFFFFF {
+		return fmt.Errorf("config: %q is not a usable group id (chown's no-change sentinel or beyond)", gid)
+	}
 	home, herr := famlock.HomeOf(h)
 	if herr != nil {
 		return herr
