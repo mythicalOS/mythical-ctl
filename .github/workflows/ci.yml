@@ -246,12 +246,16 @@ jobs:
           exit "$rc"
 
   # The Go lane. One script, run identically here and locally — see check.sh's header for why.
-  # No setup-go action: the workflow's only action dependency is checkout (kept deliberately),
-  # and the go.mod `go` directive governs the toolchain — under the default GOTOOLCHAIN=auto
-  # the runner's go command fetches the matching toolchain when its own is older.
+  # No setup-go action: the workflow's only action dependency is checkout (kept deliberately).
+  # The toolchain is PINNED, not floating: GOTOOLCHAIN names the exact release, and the go
+  # command downloads precisely that one regardless of what the runner image ships — the same
+  # pin a setup-go version matrix would give, without a second action to trust. Bump the pin
+  # deliberately, in its own commit.
   go:
     name: go
     runs-on: ubuntu-latest
+    env:
+      GOTOOLCHAIN: go1.26.5
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

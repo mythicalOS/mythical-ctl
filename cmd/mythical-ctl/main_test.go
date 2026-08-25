@@ -50,10 +50,11 @@ func TestNoArgsPrintsUsageAndExitsZero(t *testing.T) {
 	}
 }
 
-// The bash dispatcher parses the whole argv before acting, so a trailing operand after a
-// global flag is a usage error there — and must be here (`--version --bogus` exits 2).
-func TestGlobalFlagsRefuseTrailingArgs(t *testing.T) {
-	for _, args := range [][]string{{"--version", "--bogus"}, {"-v", "x"}, {"--help", "y"}} {
+// MEASURED against the frozen dispatcher: a trailing OPTION after a global flag exits 2
+// (`--version --bogus`); a trailing bare OPERAND is collected then ignored, exiting 0
+// (`--version product`). Both halves are parity, so both are pinned.
+func TestGlobalFlagsTrailingArgParity(t *testing.T) {
+	for _, args := range [][]string{{"--version", "--bogus"}, {"-v", "-x"}, {"--help", "--y"}} {
 		var out, errb bytes.Buffer
 		rc := run(args, strings.NewReader(""), &out, &errb)
 		if rc != 2 {
@@ -61,6 +62,12 @@ func TestGlobalFlagsRefuseTrailingArgs(t *testing.T) {
 		}
 		if out.Len() != 0 {
 			t.Fatalf("%v: leaked to stdout: %q", args, out.String())
+		}
+	}
+	for _, args := range [][]string{{"--version", "product"}, {"--help", "product"}} {
+		var out, errb bytes.Buffer
+		if rc := run(args, strings.NewReader(""), &out, &errb); rc != 0 {
+			t.Fatalf("%v: rc = %d, want 0 (bash ignores bare operands here)", args, rc)
 		}
 	}
 }

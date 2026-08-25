@@ -198,3 +198,29 @@ var also = m.ContainerCreate() // same package, WRONG file
 		t.Fatalf("want exactly the other.go violation, got %v", v)
 	}
 }
+
+// An unaliased import binds the file's DECLARED package name, not the path basename:
+// `package daemon` living at internal/engine imports as `daemon`, and `daemon.NewMutator`
+// must not evade the rule on the engine path.
+func TestDeclaredPackageNameResolvesUnaliasedImports(t *testing.T) {
+	root := writeTree(t, map[string]string{
+		"go.mod": fixtureGoMod,
+		"internal/engine/engine.go": `package daemon
+
+func NewMutator() int { return 1 }
+`,
+		"internal/rogue/rogue.go": `package rogue
+
+import "example.test/mod/internal/engine"
+
+var f = daemon.NewMutator
+`,
+	})
+	v, err := run(root, []string{"example.test/mod/internal/engine:NewMutator=example.test/mod/internal/runtime"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(v) != 1 || !strings.Contains(v[0], "NewMutator referenced outside its boundary") {
+		t.Fatalf("declared-name import evaded the rule: %v", v)
+	}
+}

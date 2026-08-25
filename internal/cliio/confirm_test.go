@@ -8,7 +8,7 @@ import (
 
 // Inventory — tests/unit/exit.bats (this package owns only the vocabulary test; the batch
 // worst-wins aggregate is verbs-wave scope and inventoried there):
-// PORTED: tests/unit/exit.bats: "the four codes are exactly §7.3's" -> TestExitContractValues
+// (exit.bats: "the four codes are exactly §7.3's" — the machine-readable PORTED line lives in exit_test.go, its one owner)
 // (exit.bats: "batch precedence is worst-wins: all success is 0" — owned by the verbs wave)
 // (exit.bats: "success plus not-launched is 3" — owned by the verbs wave)
 // (exit.bats: "any operational failure wins over not-launched" — owned by the verbs wave)

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"mythicalos.ai/ctl/internal/cliio"
 	"mythicalos.ai/ctl/internal/version"
@@ -47,11 +48,15 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 	switch args[0] {
 	case "-v", "--version", "-h", "--help":
-		// The bash dispatcher parses the whole argv before acting, so `--version --bogus` is a
-		// usage error there — a trailing operand must not be silently dropped here either.
-		if len(args) > 1 {
-			fmt.Fprintf(stderr, "mythical-ctl: %s takes no further arguments\n", args[0])
-			return cliio.ExitUsage
+		// Parity with the frozen dispatcher, MEASURED: it parses the whole argv before acting,
+		// so a trailing OPTION (`--version --bogus`) is a usage error — but a trailing bare
+		// OPERAND (`--version product`) is collected as a product and then ignored by these
+		// verbs, exiting 0. Refuse exactly what bash refuses, no more.
+		for _, a := range args[1:] {
+			if strings.HasPrefix(a, "-") {
+				fmt.Fprintf(stderr, "mythical-ctl: unknown option: %s\n", a)
+				return cliio.ExitUsage
+			}
 		}
 		if args[0] == "-v" || args[0] == "--version" {
 			fmt.Fprintf(stdout, "mythical-ctl %s\n", version.Version)

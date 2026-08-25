@@ -94,7 +94,11 @@ func modulePath(root string) (string, error) {
 }
 
 // check walks one file and reports each rule violation as "<pos>: <message>".
-func check(fset *token.FileSet, f *ast.File, filePkgPath, fileRel string, rules []rule) []string {
+// declared maps a module-local import path to its DECLARED package name — which Go binds for
+// an unaliased import, and which need not equal the path basename (`package daemon` living at
+// .../engine imports as `daemon`). Falling back to the basename is only for paths the module
+// does not own, which no rule can guard anyway.
+func check(fset *token.FileSet, f *ast.File, filePkgPath, fileRel string, declared map[string]string, rules []rule) []string {
 	var out []string
 	// alias -> import path, for this file.
 	imports := map[string]string{}
@@ -106,6 +110,8 @@ func check(fset *token.FileSet, f *ast.File, filePkgPath, fileRel string, rules 
 		name := ""
 		if imp.Name != nil {
 			name = imp.Name.Name
+		} else if d, ok := declared[path]; ok {
+			name = d
 		} else {
 			name = path[strings.LastIndex(path, "/")+1:]
 		}
@@ -176,6 +182,13 @@ func run(root string, ruleArgs []string) (violations []string, err error) {
 		return nil, err
 	}
 	fset := token.NewFileSet()
+	type parsed struct {
+		f           *ast.File
+		filePkgPath string
+		rel         string
+	}
+	var files []parsed
+	declared := map[string]string{} // module-local import path -> declared package name
 	err = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -203,10 +216,19 @@ func run(root string, ruleArgs []string) (violations []string, err error) {
 		if err != nil {
 			return fmt.Errorf("parse %s: %w", path, err)
 		}
-		violations = append(violations, check(fset, f, filePkgPath, rel, rules)...)
+		if f.Name != nil {
+			declared[filePkgPath] = f.Name.Name
+		}
+		files = append(files, parsed{f: f, filePkgPath: filePkgPath, rel: rel})
 		return nil
 	})
-	return violations, err
+	if err != nil {
+		return nil, err
+	}
+	for _, pf := range files {
+		violations = append(violations, check(fset, pf.f, pf.filePkgPath, pf.rel, declared, rules)...)
+	}
+	return violations, nil
 }
 
 func main() {

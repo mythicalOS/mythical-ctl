@@ -28,7 +28,7 @@ import (
 // PORTED: tests/unit/layout.bats: "the host-tool amendment changed NO pre-existing classification" -> TestZoneClassification (the pre-amendment table is asserted in full)
 // PORTED: tests/unit/layout.bats: "the host-tool slot the document publishes is the one the classifier implements" -> TestSlotMatchesPublishedDocument
 // PORTED: tests/unit/layout.bats: "mi_ensure_layout neither creates nor disturbs a host-tool slot" -> TestEnsureLeavesSlotAlone
-// PORTED: tests/unit/layout.bats: "mi_digest matches a known sha256" -> internal/cliio TestSHA256HexMatchesKnownVector (the abc vector, verbatim)
+// (layout.bats: "mi_digest matches a known sha256" — the machine-readable PORTED line lives in internal/cliio/confirm_test.go, its one owner)
 // PORTED: tests/unit/layout.bats: "mi_ensure_layout fails loudly when it cannot create the subtree" -> TestEnsureFailsLoudly
 
 func TestHomeResolution(t *testing.T) {
@@ -222,8 +222,8 @@ func TestSlotMatchesPublishedDocument(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cannot read the published contract: %v", err)
 	}
-	if !strings.Contains(string(doc), "cli.toml") {
-		t.Fatal("docs/CONFIG-FORMAT.md no longer names the host-tool slot leaf")
+	if !strings.Contains(string(doc), "~/.mythical/<product>/cli.toml") {
+		t.Fatal("docs/CONFIG-FORMAT.md no longer publishes the slot's exact path spelling")
 	}
 	if ZoneOf("brokkr/cli.toml") != ZoneUserOwned {
 		t.Fatal("the classifier does not implement the published slot")
