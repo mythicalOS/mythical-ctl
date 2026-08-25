@@ -25,10 +25,10 @@ var ErrCASMismatch = errors.New("changed between check and write — refusing; r
 // digestOf hashes an on-disk file's bytes, "" for an absent file — the whole-file
 // compare-and-swap baseline. This is the ONE sanctioned live-file read a writer makes besides
 // its own snapshot: it compares a digest and never derives configuration from what it reads,
-// so it cannot become an injection path. The read is BOUNDED (wave-1 gate): <product>.conf is
-// attacker-growable, and an unbounded re-read while holding the family lock is a host
-// allocation the container controls — anything over the ceiling simply reads as "changed".
-func digestOf(path string) (string, error) {
+// so it cannot become an injection path. limit < 0 reads unbounded — the FAMILY file has no
+// byte ceiling and its CAS must not invent one; the PRODUCT file is attacker-growable, so its
+// CAS bounds the re-read at MaxBytes+1 and anything over the ceiling reads as "changed".
+func digestOf(path string, limit int64) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -37,19 +37,29 @@ func digestOf(path string) (string, error) {
 		return "", fmt.Errorf("config: cannot digest %s: %w", path, err)
 	}
 	defer f.Close()
-	data, err := io.ReadAll(io.LimitReader(f, MaxBytes+1))
+	var r io.Reader = f
+	if limit >= 0 {
+		r = io.LimitReader(f, limit+1)
+	}
+	data, err := io.ReadAll(r)
 	if err != nil {
 		return "", fmt.Errorf("config: cannot digest %s: %w", path, err)
 	}
-	if len(data) > MaxBytes {
+	if limit >= 0 && int64(len(data)) > limit {
 		return "over-ceiling", nil // never a real digest: always reads as "changed"
 	}
 	return cliio.SHA256Hex(data), nil
 }
 
-// unchanged reports whether the live file still digests to pre.
+// unchanged (family: unbounded) / unchangedProduct (bounded) report whether the live file
+// still digests to pre.
 func unchanged(path, pre string) bool {
-	now, err := digestOf(path)
+	now, err := digestOf(path, -1)
+	return err == nil && now == pre
+}
+
+func unchangedProduct(path, pre string) bool {
+	now, err := digestOf(path, MaxBytes)
 	return err == nil && now == pre
 }
 
@@ -148,6 +158,16 @@ func FamilyAdd(h famlock.Held, key, value string) error {
 		records, err := ScanData(existing, f)
 		if err != nil {
 			return fmt.Errorf("config: %s does not parse — never modifying a file that does not load cleanly: %w", f, err)
+		}
+		// Gate on the FULL load, not merely the syntax scan (lib/config.sh:558): a file holding
+		// a key outside the core schema scans perfectly and fails the schema check, and
+		// "succeeding" here would produce a file this package's own reader rejects. FROZEN
+		// QUIRK, ported deliberately: the bash validates against the CORE spec only, so a
+		// mythical.conf legitimately carrying a migrate-storage bind key refuses family_add —
+		// the migrate wave re-examines that sequence against migrate.bats; inventing a bind
+		// fallback here would be a divergence, not a fix.
+		if _, verr := Validate(records, f, FamilySpec()); verr != nil {
+			return fmt.Errorf("config: %s does not load cleanly — refusing to modify it; fix or remove it first: %w", f, verr)
 		}
 		for _, r := range records {
 			if r.Key == key {

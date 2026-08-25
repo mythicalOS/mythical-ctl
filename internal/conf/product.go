@@ -149,8 +149,14 @@ func ProductEnsure(h famlock.Held, product, gid string) error {
 // group+mode are re-applied even on content no-ops, which is what makes the documented repair
 // "fix the group and run again" actually work) · any other error: refused, file untouched.
 func ProductAdd(h famlock.Held, product, gid string, spec Spec, kvs []KV) error {
+	// ALL DIGITS, exactly as the bash's `''|*[!0-9]*` refusal: strconv alone accepts "-1",
+	// and os.Chown(path, -1, -1) silently leaves the group UNCHANGED while chmod 0660 then
+	// exposes the file to whatever group it already had.
+	if gid == "" || strings.IndexFunc(gid, func(r rune) bool { return r < '0' || r > '9' }) >= 0 {
+		return fmt.Errorf("config: %q is not a numeric group id", gid)
+	}
 	gidN, err := strconv.Atoi(gid)
-	if err != nil || gid == "" {
+	if err != nil {
 		return fmt.Errorf("config: %q is not a numeric group id", gid)
 	}
 	home, herr := famlock.HomeOf(h)
@@ -229,7 +235,7 @@ func ProductAdd(h famlock.Held, product, gid string, spec Spec, kvs []KV) error 
 
 	// CAS + identity immediately before we MUTATE anything — including the create: a dangling
 	// symlink planted just before it would otherwise make the create write THROUGH the link.
-	if !unchanged(f, pre) {
+	if !unchangedProduct(f, pre) {
 		return fmt.Errorf("config: %s.conf %w", product, ErrCASMismatch)
 	}
 	if err := identityOK(f); err != nil {

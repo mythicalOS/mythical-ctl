@@ -886,3 +886,31 @@ func TestFamilyAddThroughCASRefusal(t *testing.T) {
 		t.Fatal("a stale writer modified the fresh file")
 	}
 }
+
+// Round-2 wave-gate pins: the full-load gate (an off-schema family file is never modified),
+// and the all-digits gid rule (a "-1" gid must refuse, not silently skip the group set).
+func TestFamilyAddRefusesOffSchemaFile(t *testing.T) {
+	home := t.TempDir()
+	h := lockFor(t, home)
+	off := "MYTHICAL_UNKNOWN=x\n"
+	if err := os.WriteFile(FamilyPath(home), []byte(off), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := FamilyAdd(h, "MYTHICAL_NET", "n1"); err == nil {
+		t.Fatal("appended beside an off-schema key")
+	}
+	if b, _ := os.ReadFile(FamilyPath(home)); string(b) != off {
+		t.Fatal("off-schema file modified")
+	}
+}
+
+func TestProductAddRefusesNegativeGid(t *testing.T) {
+	home := t.TempDir()
+	h := lockFor(t, home)
+	if err := ProductAdd(h, "brokkr", "-1", testSpec, nil); err == nil {
+		t.Fatal("gid -1 accepted — os.Chown(-1) would silently skip the group set")
+	}
+	if _, err := os.Lstat(filepath.Join(home, "brokkr.conf")); !os.IsNotExist(err) {
+		t.Fatal("refused gid still created a file")
+	}
+}
