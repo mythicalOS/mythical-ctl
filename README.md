@@ -85,7 +85,7 @@ git clone --recurse-submodules https://github.com/mythicalOS/mythical-ctl.git
 ```sh
 shellcheck -x bin/* lib/*.sh tests/*.sh tests/harness/* tools/*.sh   # lint
 ./tests/smoke.sh                                                     # entrypoint smoke
-vendor/bats-core/bin/bats tests/unit                                 # unit tests
+third_party/bats-core/bin/bats tests/unit                                 # unit tests
 ```
 
 Tests are hermetic (a fake container runtime) — a green suite proves logic, not Docker behaviour. A

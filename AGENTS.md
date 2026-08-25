@@ -21,7 +21,7 @@ This file grants no edit, run, commit, push, or release permission.
 | `tests/unit/` + `tests/harness/` | bats unit tests + test-only helpers (fake container runtime, filesystem-snapshot assertions). **Shipped code never sources anything under `tests/`.** |
 | `tests/smoke.sh` | Entrypoint smoke — also run against the bundled artifact. |
 | `tools/bundle.sh` | Builds the release artifact: inlines `lib/*.sh` into the entrypoint's `mctl:modules` region → one self-contained, byte-reproducible file. |
-| `vendor/bats-core/` | The test runner, vendored as a **git submodule** — clone with `--recurse-submodules` or `git submodule update --init`, or unit tests cannot run. |
+| `third_party/bats-core/` | The test runner, vendored as a **git submodule** — clone with `--recurse-submodules` or `git submodule update --init`, or unit tests cannot run. |
 | `docs/` | `CONFIG-FORMAT.md`, `DOCUMENT-FORMAT.md` — the published config and trust-chain contracts. |
 
 ## Commands
@@ -30,7 +30,7 @@ Run only if your active role permits command execution.
 
 - Lint (zero findings expected): `shellcheck -x bin/* lib/*.sh tests/*.sh tests/harness/* tools/*.sh`
 - Smoke: `./tests/smoke.sh`
-- Unit tests: `vendor/bats-core/bin/bats tests/unit`
+- Unit tests: `third_party/bats-core/bin/bats tests/unit`
 - Release-artifact check: `tools/bundle.sh dist/mythical-ctl && shellcheck dist/mythical-ctl &&
   MCTL_BIN="$PWD/dist/mythical-ctl" ./tests/smoke.sh`
 

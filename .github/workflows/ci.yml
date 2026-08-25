@@ -276,7 +276,7 @@ jobs:
         run: ./tests/smoke.sh
 
       - name: Bats unit tests
-        run: vendor/bats-core/bin/bats tests/unit
+        run: third_party/bats-core/bin/bats tests/unit
 
       # The release publishes ONE self-contained file, not bin/mythical-ctl — so the bundle is what
       # users actually run, and it has to clear the same bars the repository tree does. Building it

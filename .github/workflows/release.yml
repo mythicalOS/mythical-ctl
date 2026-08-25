@@ -60,7 +60,7 @@ jobs:
         run: ./tests/smoke.sh
 
       - name: Bats unit tests
-        run: vendor/bats-core/bin/bats tests/unit
+        run: third_party/bats-core/bin/bats tests/unit
 
       # Public-safety gate — same intent as CI's hygiene job. A tag can be pushed
       # to a commit that never saw a PR, so the release must re-run it or a banned

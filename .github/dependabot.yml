@@ -14,7 +14,7 @@ updates:
       actions:
         patterns: ["*"]
 
-  # vendor/bats-core is the test runner, pinned to a tag's commit for the same
+  # third_party/bats-core is the test runner, pinned to a tag's commit for the same
   # supply-chain reason as the actions above — and frozen for the same reason
   # without this. Test-only: it is never sourced by shipped code.
   - package-ecosystem: gitsubmodule
