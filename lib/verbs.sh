@@ -318,6 +318,26 @@ mi_bringup_specs() {
     specs+=("publish=${port}:${v}")
   done <<< "$(mi_doc_values "$mrec" port)"
 
+  # The volatile credential-home mount (the closed `volatile_mount` wire). At most one, present only
+  # for a product that declares it. On this production bring-up path the declared root must be the
+  # canonical one — production may not point file-auth homes at a state directory, a bind, a named
+  # volume, or the writable layer — so the production-root guard runs here. The tmpfs hardening itself
+  # is fixed by the runtime adapter's `volatile=` spec and is never spelled into the manifest.
+  #
+  # CAPTURED, then branched on the status. mi_doc_value returns 3 when the field is absent (the common
+  # case), 0 when present, and 1 on an argument error; a bare call in an `if` would fold the error
+  # into "absent" and silently drop a mount the manifest asked for.
+  local vmount vrc
+  if vmount="$(mi_doc_value "$mrec" volatile_mount)"; then vrc=0; else vrc=$?; fi
+  if [ "$vrc" -eq 0 ]; then
+    mi_volatile_assert_production_root "$vmount" || return 1
+    local vspec
+    vspec="$(mi_volatile_mount_spec "$vmount")" || return 1
+    specs+=("$vspec")
+  elif [ "$vrc" -ne 3 ]; then
+    return "$vrc"
+  fi
+
   printf '%s\n' "${specs[@]}"
 }
 

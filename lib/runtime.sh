@@ -131,6 +131,10 @@ _mi_rt_tmpl() {
     c.netpairs)   printf '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}={{$v.NetworkID}}={{$v.IPAddress}};{{end}}' ;;
     c.aliaspairs) printf '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}={{$v.NetworkID}}:{{range $v.Aliases}}{{.}},{{end}};{{end}}' ;;
     c.mounts)   printf '{{range .Mounts}}{{.Type}}|{{.Name}}|{{.Source}}|{{.Destination}}|{{.RW}};{{end}}' ;;
+    # The tmpfs mounts and their kernel option strings — where the volatile credential-home mount's
+    # fixed hardening (nodev,nosuid,noexec) is verifiable. `.Mounts` above does not carry those flags;
+    # `.HostConfig.Tmpfs` is the map that does, keyed by mount point. "<path>=<opts>;" per entry.
+    c.tmpfs)    printf '{{range $p,$o := .HostConfig.Tmpfs}}{{$p}}={{$o}};{{end}}' ;;
     c.ports)    printf '{{range $p,$bs := .NetworkSettings.Ports}}{{range $bs}}{{$p}}={{.HostIp}}:{{.HostPort}};{{end}}{{end}}' ;;
     n.id)       printf '{{.Id}}' ;;
     n.driver)   printf '{{.Driver}}' ;;
@@ -460,6 +464,20 @@ mi_rt_container_create() {
           *) mi_warn "runtime: '$p1' is not a label this installer sets"; return 1 ;;
         esac
         rtargv+=(--label "${MI_RT_NS}.${p1}=${p2}")
+        ;;
+      volatile)
+        # The credential-bearing isolated-home mount: a NON-PERSISTENT container tmpfs with the fixed
+        # hardening. `body` is the mount point (the credential-home root); every other property is
+        # fixed by the wire and is NOT declarable — a manifest carries only the path, so a publisher
+        # cannot widen it into a generic mount escape hatch. It is rendered with `--tmpfs`, the one
+        # mount form that carries the kernel security flags, and with those flags in the wire's
+        # canonical order (nodev,nosuid,noexec — from mi_volatile_tmpfs_secopts, the single source)
+        # so a Compose tmpfs option string and this invocation are byte-comparable. The daemon owns
+        # the root and creates the 0700 homes / 0600 files beneath it; the tmpfs being non-persistent
+        # is what makes teardown a wipe — removing the container discards the mount and its contents.
+        mi_volatile_path_ok "$body" || {
+          mi_warn "runtime: volatile mount path '$body' is not a bounded absolute container path"; return 1; }
+        rtargv+=(--tmpfs "${body}:$(mi_volatile_tmpfs_secopts)")
         ;;
       *) mi_warn "runtime: unknown container spec '$s'"; return 1 ;;
     esac

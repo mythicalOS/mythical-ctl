@@ -271,6 +271,26 @@ many_doc_keys() {   # <n> <file> — N "volume=state:/data" lines under a valid 
   done
 }
 
+# cpath is the manifest's bounded-absolute-container-path type, stricter than `path:<n>`: safe
+# segments only, a 2..512-byte bound, no trailing slash, no bare root. It is the type that keeps the
+# `volatile_mount` field a bare mount point with no room for a second token — so it is checked at the
+# manifest door, not only inside lib/volatile.sh's own suite.
+@test "cpath accepts a bounded absolute container path and refuses a widened or traversal one" {
+  local spec; spec="$(printf 'p\tcpath\topt')"
+  local v
+  for v in '/run/mythical/credential-homes' '/a' '/x.y_z-1/w'; do
+    doc "$(printf 'p=%s' "$v")"
+    run mi_doc_load "$F" manifest "$spec"
+    [ "$status" -eq 0 ] || { echo "rejected a valid cpath '$v': $output" >&2; return 1; }
+  done
+  # relative, bare root, trailing slash, traversal, a colon/comma second token, and whitespace.
+  for v in 'relative' '/' '/a/' '/a/../b' '/a:rw' '/a,nodev=false' '/a b'; do
+    doc "$(printf 'p=%s' "$v")"
+    run mi_doc_load "$F" manifest "$spec"
+    [ "$status" -eq 1 ] || { echo "accepted an invalid cpath '$v'" >&2; return 1; }
+  done
+}
+
 @test "docver and epoch are non-negative bounded digits" {
   local v
   for v in '-1' '+1' '1.0' 'x' '' '9999999999999999999'; do

@@ -502,6 +502,8 @@ render() {
                             printf '%s\n' "$(aliases_named "$f")" ;;
     '{{range .Mounts}}{{.Type}}|{{.Name}}|{{.Source}}|{{.Destination}}|{{.RW}};{{end}}')
                             printf '%s\n' "$(rec_get "$f" mounts)" ;;
+    '{{range $p,$o := .HostConfig.Tmpfs}}{{$p}}={{$o}};{{end}}')
+                            printf '%s\n' "$(rec_get "$f" tmpfs)" ;;
     '{{range $p,$bs := .NetworkSettings.Ports}}{{range $bs}}{{$p}}={{.HostIp}}:{{.HostPort}};{{end}}{{end}}')
                             printf '%s\n' "$(rec_get "$f" ports)" ;;
     '{{index .RepoDigests 0}}') printf '%s\n' "$(rec_get "$f" ref)" ;;
@@ -979,7 +981,7 @@ case "${1:-}" in
     shift
     case "${1:-}" in
       create)
-        shift; name=""; image=""; netid=""; alias=""; mounts=""; ports=""; envfile=""
+        shift; name=""; image=""; netid=""; alias=""; mounts=""; ports=""; envfile=""; tmpfs=""
         while [ "$#" -gt 0 ]; do
           case "$1" in
             --name) name="$2"; shift 2 ;;
@@ -989,6 +991,9 @@ case "${1:-}" in
             --label) parse_label "$2"; shift 2 ;;
             --label=*) parse_label "${1#--label=}"; shift ;;
             --mount) mounts="${mounts}${2};"; shift 2 ;;
+            # A tmpfs mount as `<path>:<opts>` — the one mount form carrying the kernel security flags,
+            # recorded so the volatile credential-home mount's fixed hardening is inspectable below.
+            --tmpfs) tmpfs="${tmpfs}${2};"; shift 2 ;;
             -p|--publish) ports="${ports}${2};"; shift 2 ;;
             --) shift ;;
             -*) bad_flag "container create" "$1" ;;
@@ -1056,6 +1061,18 @@ case "${1:-}" in
         done
         rec_set "$f" ports "$pspec"
         rec_set "$f" mounts "$(printf '%s' "$mounts" | sed 's/type=volume,source=\([^,]*\),target=\([^,;]*\)/volume|\1||\2|true/g; s/type=bind,source=\([^,]*\),target=\([^,;]*\)/bind||\1|\2|true/g')"
+        # Tmpfs mounts, recorded as the inspect map `.HostConfig.Tmpfs` reports them: `<path>=<opts>;`
+        # per entry. The mount point has no colon (the safe-segment grammar refuses one) and the
+        # option string has no semicolon, so a split on the first colon is unambiguous.
+        tmpfsrec=""
+        for t in $(printf '%s' "$tmpfs" | tr ';' ' '); do
+          case "$t" in
+            *:*) tp="${t%%:*}"; to="${t#*:}" ;;
+            *)   tp="$t"; to="" ;;
+          esac
+          tmpfsrec="${tmpfsrec}${tp}=${to};"
+        done
+        rec_set "$f" tmpfs "$tmpfsrec"
         rec_get "$f" id
         ;;
       start)

@@ -28,6 +28,13 @@ mi_manifest_spec() {
   printf 'mount\tident\tmany\n'
   printf 'port\tint:1:65535\tmany\n'
   printf 'probe\tstr:256\topt\n'
+  # The credential-bearing isolated-home mount (the closed `volatile_mount` wire). At most one, and
+  # only for a product that needs a file-based credential materialized per session. Its value is a
+  # bare bounded container path (type `cpath`) — every hardening property of the mount is fixed by the
+  # wire and is NOT declarable, so a manifest carries only where the mount lives and can never widen
+  # it. Optional: a product needing no such mount simply omits it, and an attempt to add an options
+  # sibling key falls out of this allowlist as an unknown key rather than relaxing the mount.
+  printf 'volatile_mount\tcpath\topt\n'
   # §8: every manifest declares the minimum core it needs. REQUIRED — a manifest that does not say
   # cannot be checked, and "unstated" would silently mean "any core will do", which is the one
   # answer that is never safe.

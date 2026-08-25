@@ -234,6 +234,14 @@ _mi_doc_type_ok() {
       case "$path" in /*) : ;; *) return 1 ;; esac
       case "/${path}/" in */../*) return 1 ;; esac
       [ "${#path}" -le 4096 ] ;;
+    cpath)
+      # A bounded absolute CONTAINER path of safe segments — the value of a manifest field that names
+      # a single mount point and nothing else. Stricter than `path:<n>`: safe-segment charset only, a
+      # 2..512-byte bound, no trailing slash and no bare root, so the field can carry no second token
+      # or options sub-grammar. The rule lives in lib/volatile.sh (the module that also renders the
+      # mount) and is CALLED here rather than copied, so the manifest door and the launch site cannot
+      # drift into accepting different paths.
+      mi_volatile_path_ok "$v" ;;
     *)
       # Everything else is Plan 2's vocabulary, so there is one implementation of str/int/enum/
       # bool/path/netname rather than a second that can drift from it.

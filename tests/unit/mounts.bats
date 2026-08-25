@@ -363,6 +363,36 @@ teardown() { rm -rf "$OUT"; mi_lock_release; teardown_test_env; }
   esac
 }
 
+# The spec-assembly seam wires the manifest's volatile_mount field to the runtime adapter's typed
+# `volatile=` spec — and it does so on the PRODUCTION bring-up path, where the declared root must be
+# the canonical one. This is the only place the manifest field, the production-root guard, and the
+# emitted spec meet, so it is tested across the seam rather than only in each function's own suite.
+@test "mi_bringup_specs emits the volatile mount for the canonical root" {
+  mi_ident_ensure >/dev/null
+  local mrec; mrec="$(printf 'volatile_mount\t/run/mythical/credential-homes\n')"
+  run mi_bringup_specs brokkr "$mrec" "$PREC"
+  [ "$status" -eq 0 ] || { echo "refused a canonical volatile mount: $output" >&2; return 1; }
+  assert_contains "volatile=/run/mythical/credential-homes"
+}
+
+@test "mi_bringup_specs refuses a non-canonical volatile root and emits no spec for it" {
+  mi_ident_ensure >/dev/null
+  local mrec; mrec="$(printf 'volatile_mount\t/tmp/credential-homes\n')"
+  run mi_bringup_specs brokkr "$mrec" "$PREC"
+  [ "$status" -ne 0 ] || { echo "accepted a non-canonical volatile root" >&2; return 1; }
+  case "$output" in *volatile=*) echo "a spec was emitted for a non-canonical root: $output" >&2; return 1 ;; esac
+}
+
+# A manifest with no volatile_mount emits no volatile spec at all — absence is not a mount. The
+# record is empty so the assembly reads nothing out of the placeholder mythical.conf (its port/bind
+# lookups would trip that fixture's stand-in key); only the volatile branch is under test here.
+@test "mi_bringup_specs emits no volatile spec when the manifest declares none" {
+  mi_ident_ensure >/dev/null
+  run mi_bringup_specs brokkr "" "$PREC"
+  [ "$status" -eq 0 ] || { echo "a manifest with no volatile mount was refused: $output" >&2; return 1; }
+  case "$output" in *volatile=*) echo "a volatile spec appeared for a manifest that declared none: $output" >&2; return 1 ;; esac
+}
+
 @test "a role with no bind key falls through to a named volume rather than failing" {
   printf 'MYTHICAL_NET=n\n' > "$MYTHICAL_HOME/mythical.conf"
   run mi_mount_binds brokkr "$MREC" "$PREC" work

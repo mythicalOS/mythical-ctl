@@ -30,6 +30,25 @@ man() { { printf 'mythical-manifest 1\nruntime_uid=900\nversion=1\nexpires=41024
   [ "$status" -eq 0 ]
 }
 
+# The closed `volatile_mount` field: a valid bounded container path is accepted at the door; a path
+# the wire's grammar rejects fails the whole manifest; and there is deliberately no options
+# sub-grammar, so a sibling key that tries to relax the mount falls out of the allowlist entirely.
+@test "the volatile_mount field is accepted, grammar-checked, and closed to option siblings" {
+  man "volatile_mount=/run/mythical/credential-homes"
+  run mi_manifest_load "$F"
+  [ "$status" -eq 0 ] || { echo "rejected a valid volatile_mount: $output" >&2; return 1; }
+
+  man "volatile_mount=/run/../etc"
+  run mi_manifest_load "$F"
+  [ "$status" -eq 1 ] || { echo "accepted a traversal volatile_mount" >&2; return 1; }
+
+  # No sub-grammar: an options sibling key is an UNKNOWN key, not a way to weaken the fixed mount.
+  man "$(printf 'volatile_mount=/run/mythical/credential-homes\nvolatile_mount_exec=true')"
+  run mi_manifest_load "$F"
+  [ "$status" -eq 1 ] || { echo "accepted an options sibling that would widen the mount" >&2; return 1; }
+  assert_contains "unknown key"
+}
+
 # --- D22: image-reference policy ---
 
 @test "a digest-pinned image is required; a tag is refused" {

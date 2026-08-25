@@ -126,6 +126,56 @@ pulled_image() {
   [ "$output" = "${net}=;" ]                 # released again on stop
 }
 
+# --- the volatile credential-home mount (the closed volatile_mount wire) --------------------------
+
+@test "a volatile spec renders a NON-PERSISTENT tmpfs carrying the fixed nodev,nosuid,noexec" {
+  net="$(mi_rt_network_create mythical-i1-net i1 n-nonce)"
+  run mi_rt_container_create mythical-i1-p1 "$(pulled_image)" "$net" p1 - \
+      volatile=/run/mythical/credential-homes label=nonce=c-nonce
+  [ "$status" -eq 0 ]
+  # The mount exists at the declared root, hardened with EXACTLY the frozen option set. A tmpfs is
+  # RAM-backed and disposable by construction, so "non-persistent" is the mount kind itself, not a flag.
+  run mi_rt_inspect container c.tmpfs mythical-i1-p1
+  [ "$output" = "/run/mythical/credential-homes=nodev,nosuid,noexec;" ] \
+    || { echo "unexpected tmpfs render: $output" >&2; return 1; }
+}
+
+# The whole reason the credential home is a tmpfs is that it is NEVER durable storage. It must not be
+# a named volume (which uninstall/backup would preserve), so the mount record carries no `volume|`
+# entry the volume-backup path could enumerate.
+@test "the volatile mount is not a named volume — nothing for the volume-backup path to see" {
+  net="$(mi_rt_network_create mythical-i1-net i1 n-nonce)"
+  mi_rt_container_create mythical-i1-p1 "$(pulled_image)" "$net" p1 - \
+      volatile=/run/mythical/credential-homes label=nonce=c-nonce
+  run mi_rt_inspect container c.mounts mythical-i1-p1
+  case "$output" in
+    *volume\|*) echo "the volatile mount surfaced as a named volume: $output" >&2; return 1 ;;
+  esac
+}
+
+# Teardown IS a wipe: the tmpfs is non-persistent, so removing the container discards the mount and
+# everything the daemon materialized on it. After rm the object — and its recorded mount — is gone.
+@test "teardown wipes: removing the container discards the volatile tmpfs" {
+  net="$(mi_rt_network_create mythical-i1-net i1 n-nonce)"
+  mi_rt_container_create mythical-i1-p1 "$(pulled_image)" "$net" p1 - \
+      volatile=/run/mythical/credential-homes label=nonce=c-nonce
+  run mi_rt_inspect container c.tmpfs mythical-i1-p1
+  [ "$output" = "/run/mythical/credential-homes=nodev,nosuid,noexec;" ]
+  mi_rt_container_rm mythical-i1-p1
+  run mi_rt_inspect container c.tmpfs mythical-i1-p1
+  [ "$status" -eq 3 ]        # the object is gone (not merely unreadable)
+}
+
+# The launch site is the wall: a manifest cannot smuggle a traversal or unbounded path to the mount,
+# so a `volatile=` spec whose path fails the wire grammar is refused before any container is created.
+@test "a volatile spec with a path the wire rejects is refused at the launch site" {
+  net="$(mi_rt_network_create mythical-i1-net i1 n-nonce)"
+  run mi_rt_container_create c1 "$(pulled_image)" "$net" p1 - \
+      volatile=/run/../etc label=nonce=c
+  [ "$status" -ne 0 ]
+  assert_contains "not a bounded absolute container path"
+}
+
 @test "EVERY published port is on 127.0.0.1 — a caller cannot ask for anything else" {
   # TWO mappings, and the COMPLETE inspect value is asserted. This is the module's single most
   # load-bearing invariant (D26/§4b.1) and it was pinned by a substring: an adapter emitting both
