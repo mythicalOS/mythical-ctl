@@ -235,16 +235,17 @@ func TestAliasCollisionCannotShadowGuardedImport(t *testing.T) {
 		"internal/engine/engine.go": guardedPkg, // declares `package engine`
 		"internal/decoy/decoy.go": `package engine
 
-func NewMutator() int { return 99 } // harmless twin under the SAME declared name
+func NewMutator() int { return 99 } // harmless twin: dir "decoy", DECLARED name "engine" —
+// imported unaliased after the guarded import, it binds the same "engine" alias, and a
+// last-write-wins map would shadow the guarded path (the pre-fix bug this fixture recreates).
 `,
 		"internal/rogue/rogue.go": `package rogue
 
 import (
 	"example.test/mod/internal/engine"
-	engine2 "example.test/mod/internal/decoy"
+	"example.test/mod/internal/decoy"
 )
 
-var _ = engine2.NewMutator
 var f = engine.NewMutator // the guarded binding must still be seen
 `,
 	})
