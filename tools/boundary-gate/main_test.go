@@ -224,3 +224,42 @@ var f = daemon.NewMutator
 		t.Fatalf("declared-name import evaded the rule: %v", v)
 	}
 }
+
+// The collision regression: a decoy directory whose (build-tagged, inactive) file declares the
+// SAME package name the guarded package actively uses. With alias->single-path resolution the
+// later import would shadow the guarded binding and the reference would evade the rule; the
+// alias->path-SET keeps both bindings live and the rule fires.
+func TestAliasCollisionCannotShadowGuardedImport(t *testing.T) {
+	root := writeTree(t, map[string]string{
+		"go.mod":                    fixtureGoMod,
+		"internal/engine/engine.go": guardedPkg, // declares `package engine`
+		"internal/decoy/decoy.go": `package engine
+
+func NewMutator() int { return 99 } // harmless twin under the SAME declared name
+`,
+		"internal/rogue/rogue.go": `package rogue
+
+import (
+	"example.test/mod/internal/engine"
+	engine2 "example.test/mod/internal/decoy"
+)
+
+var _ = engine2.NewMutator
+var f = engine.NewMutator // the guarded binding must still be seen
+`,
+	})
+	v, err := run(root, []string{"example.test/mod/internal/engine:NewMutator=example.test/mod/internal/runtime"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, s := range v {
+		if strings.Contains(s, "internal/engine.NewMutator referenced outside") ||
+			strings.Contains(s, "engine:NewMutator") || strings.Contains(s, "engine.NewMutator") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("guarded reference evaded via alias collision: %v", v)
+	}
+}

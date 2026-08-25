@@ -100,8 +100,12 @@ func modulePath(root string) (string, error) {
 // does not own, which no rule can guard anyway.
 func check(fset *token.FileSet, f *ast.File, filePkgPath, fileRel string, declared map[string]map[string]bool, rules []rule) []string {
 	var out []string
-	// alias -> import path, for this file.
-	imports := map[string]string{}
+	// alias -> SET of import paths, for this file. A set, not a single path: two imports can
+	// bind the same name (a build-tagged decoy file can declare the guarded package's active
+	// name for a harmless path), and last-write-wins would let the guarded binding be
+	// shadowed. A selector matches a rule if ANY path bound to its receiver name is guarded —
+	// overmatch-safe, shadow-proof.
+	imports := map[string]map[string]bool{}
 	for _, imp := range f.Imports {
 		path, err := strconv.Unquote(imp.Path.Value)
 		if err != nil {
@@ -132,7 +136,10 @@ func check(fset *token.FileSet, f *ast.File, filePkgPath, fileRel string, declar
 		}
 		for _, name := range names {
 			if name != "_" && name != "." {
-				imports[name] = path
+				if imports[name] == nil {
+					imports[name] = map[string]bool{}
+				}
+				imports[name][path] = true
 			}
 		}
 	}
@@ -153,12 +160,12 @@ func check(fset *token.FileSet, f *ast.File, filePkgPath, fileRel string, declar
 		if !ok {
 			return true
 		}
-		path, ok := imports[x.Name]
+		paths, ok := imports[x.Name]
 		if !ok {
 			return true
 		}
 		for _, r := range rules {
-			if !r.isMethod() && path == r.pkgPath && sel.Sel.Name == r.ident && !r.allows(filePkgPath, fileRel) {
+			if !r.isMethod() && paths[r.pkgPath] && sel.Sel.Name == r.ident && !r.allows(filePkgPath, fileRel) {
 				out = append(out, fmt.Sprintf("%s: %s.%s referenced outside its boundary (allowed: %s)",
 					fset.Position(sel.Pos()), r.pkgPath, r.ident, strings.Join(allowedList(r), ", ")))
 			}
