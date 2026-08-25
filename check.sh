@@ -24,8 +24,8 @@ cd "$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 # Floors, not exact counts: the tree grows a package per port task, and each task raises these
 # two literals in its commit. Overridable ONLY so a test harness can prove the guard refuses.
-MIN_PACKAGES="${MIN_PACKAGES:-15}"
-MIN_TESTED_PACKAGES="${MIN_TESTED_PACKAGES:-15}"
+MIN_PACKAGES="${MIN_PACKAGES:-16}"
+MIN_TESTED_PACKAGES="${MIN_TESTED_PACKAGES:-16}"
 
 # The reference-boundary rules, one per line: `<guarded-import-path>:<Identifier>=<allowed
 # import path>[,<more allowed>]`. The defining package itself is always allowed. Each rule is
@@ -50,6 +50,11 @@ BOUNDARY_RULES=(
   # Mutator is constructible ONLY by the runtime facade — probes, verbs and data movement
   # reach mutations through it, so no code path can hold an unlocked mutation door.
   "mythicalos.ai/ctl/internal/engine:NewMutator=mythicalos.ai/ctl/internal/runtime"
+  # sole-launch (Task 15): product-spec construction and the create call are pinned to the
+  # facade's launch path — a second launch site would put the mount/publish/secret rules back
+  # at its call sites, which is the one thing the launch module exists to prevent.
+  "mythicalos.ai/ctl/internal/engine:NewContainerSpec=mythicalos.ai/ctl/internal/runtime"
+  "method:ContainerCreate=internal/runtime/launch.go"
 )
 
 die() {

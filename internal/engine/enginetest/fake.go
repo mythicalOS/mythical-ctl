@@ -594,6 +594,13 @@ func (f *Fake) createContainer(w http.ResponseWriter, r *http.Request) {
 			}
 			c.mounts = append(c.mounts, mountRec{typ: "bind", source: m.Source, target: m.Target, rw: !m.ReadOnly})
 		case "volume":
+			// The daemon's name class applies to the auto-create exactly as to an explicit
+			// one — a comma-bearing "name" is refused here, never adopted (the bash fake's
+			// create_missing_volumes calls the same check_name).
+			if !checkName(m.Source) {
+				fail(w, 400, "create %s: %q includes invalid characters for a local volume name, only \"[a-zA-Z0-9][a-zA-Z0-9_.-]\" are allowed", m.Source, m.Source)
+				return
+			}
 			if _, ok := f.volumes[m.Source]; !ok {
 				// Auto-created by the daemon, carrying NO labels — invisible to every
 				// find-by-label sweep, exactly like the real orphan it models.

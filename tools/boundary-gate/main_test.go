@@ -284,6 +284,16 @@ func TestProductionRulesCatchViolations(t *testing.T) {
 				"internal/rogue/r.go": "package rogue\n\nimport \"mythicalos.ai/ctl/internal/ledger\"\n\nvar _ = ledger.OpenStaging\n"}},
 		{"method:ReplaceLines=mythicalos.ai/ctl/internal/trust",
 			map[string]string{"internal/rogue/r.go": "package rogue\n\ntype x struct{}\n\nfunc (x) ReplaceLines() {}\n\nvar v x\nvar _ = v.ReplaceLines\n"}},
+		{"mythicalos.ai/ctl/internal/engine:NewMutator=mythicalos.ai/ctl/internal/runtime",
+			map[string]string{"internal/engine/e.go": "package engine\n\nfunc NewMutator() {}\n",
+				"internal/rogue/r.go": "package rogue\n\nimport \"mythicalos.ai/ctl/internal/engine\"\n\nvar _ = engine.NewMutator\n"}},
+		{"mythicalos.ai/ctl/internal/engine:NewContainerSpec=mythicalos.ai/ctl/internal/runtime",
+			map[string]string{"internal/engine/e.go": "package engine\n\nfunc NewContainerSpec() {}\n",
+				"internal/rogue/r.go": "package rogue\n\nimport \"mythicalos.ai/ctl/internal/engine\"\n\nvar _ = engine.NewContainerSpec\n"}},
+		// The file-level sole-launch pin: a second create call site anywhere — even inside
+		// internal/runtime, in a file that is not launch.go — must trip it.
+		{"method:ContainerCreate=internal/runtime/launch.go",
+			map[string]string{"internal/runtime/other.go": "package runtime\n\ntype m struct{}\n\nfunc (m) ContainerCreate() {}\n\nvar v m\nvar _ = v.ContainerCreate\n"}},
 	}
 	for _, c := range cases {
 		files := map[string]string{"go.mod": "module mythicalos.ai/ctl\n\ngo 1.24.0\n"}
