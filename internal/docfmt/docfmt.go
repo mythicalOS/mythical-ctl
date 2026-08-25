@@ -265,6 +265,11 @@ func (d *Doc) Values(key string) []string {
 // Version returns the document's own `version` value.
 func (d *Doc) Version() (string, bool) { return d.Value("version") }
 
+// HasExpiry reports whether the document carries an `expires` key at all — the trust gate
+// requires one (absence would replay forever), and the schemas already do; this is the
+// belt for a docid whose schema ever relaxed it.
+func (d *Doc) HasExpiry() bool { _, ok := d.Value("expires"); return ok }
+
 // Expired: inclusive of the stated instant — a document expiring at T is valid AT T and
 // invalid after it (stated because "expires" reads either way, and the two differ by one
 // second at exactly the moment someone is debugging). No expiry ⇒ never expires. An

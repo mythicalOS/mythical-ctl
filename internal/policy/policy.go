@@ -157,6 +157,10 @@ func (p *Policy) Precious(product, role string) bool {
 	return p.has(product, "precious_role", role)
 }
 
+// Doc exposes the underlying immutable document for the trust gate's freshness checks —
+// internal wiring, nothing a consumer can mutate.
+func (p *Policy) Doc() *docfmt.Doc { return p.doc }
+
 // FamilyGID is D60's canonical family gid, from the authenticated index and nowhere else.
 // The schema requires it, so a parsed policy always answers.
 func (p *Policy) FamilyGID() (string, bool) { return p.doc.Value("family_gid") }

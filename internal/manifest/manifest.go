@@ -124,6 +124,9 @@ func (m *Manifest) Expired(nowUnix int64) (bool, error) { return m.doc.Expired(n
 // Version returns the document version, for the trust floor.
 func (m *Manifest) Version() string { v, _ := m.doc.Version(); return v }
 
+// Doc exposes the underlying immutable document for the trust gate's freshness checks.
+func (m *Manifest) Doc() *docfmt.Doc { return m.doc }
+
 // Check enforces entitlements: every role, secret and mount the manifest selects must already
 // be granted to its product by the policy index. ALL violations are reported, not just the
 // first — a product author fixing one at a time otherwise learns the next only after another

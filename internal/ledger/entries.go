@@ -35,6 +35,23 @@ var (
 	ErrAmbiguous = errors.New("more than one record answers — preserved; run 'mythical-ctl state repair'")
 )
 
+// Lines returns a COPY of the raw record rows. Read-only raw access exists because the trust
+// module keeps its own record shape (its document ids contain ':' — e.g. manifest:brokkr —
+// which the provenance field-name grammar deliberately refuses), exactly as the bash kept two
+// editors. Everything general still goes through the typed editors below.
+func (l *Ledger) Lines() []string {
+	out := make([]string, len(l.lines))
+	copy(out, l.lines)
+	return out
+}
+
+// ReplaceLines swaps the entire body — the trust module's one-write multi-record replace
+// (floor and anchor must move together or not at all). RESTRICTED: check.sh's boundary gate
+// pins its references to internal/trust; nothing else may bypass the typed editors.
+func (l *Ledger) ReplaceLines(lines []string) {
+	l.lines = append([]string(nil), lines...)
+}
+
 // FieldOK: key=value, lowercase [a-z_]+ name, no TAB, no newline in either half, ≤1024 bytes.
 // A TAB forges a field boundary and a newline forges a whole record — the same
 // serialize-safely-on-write rule the config writer applies; there is no escaping in this

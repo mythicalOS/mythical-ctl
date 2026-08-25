@@ -24,8 +24,8 @@ cd "$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 # Floors, not exact counts: the tree grows a package per port task, and each task raises these
 # two literals in its commit. Overridable ONLY so a test harness can prove the guard refuses.
-MIN_PACKAGES="${MIN_PACKAGES:-11}"
-MIN_TESTED_PACKAGES="${MIN_TESTED_PACKAGES:-11}"
+MIN_PACKAGES="${MIN_PACKAGES:-12}"
+MIN_TESTED_PACKAGES="${MIN_TESTED_PACKAGES:-12}"
 
 # The reference-boundary rules, one per line: `<guarded-import-path>:<Identifier>=<allowed
 # import path>[,<more allowed>]`. The defining package itself is always allowed. Each rule is
@@ -43,6 +43,9 @@ BOUNDARY_RULES=(
   # not pass through the chain.
   "mythicalos.ai/ctl/internal/policy:ParseVerified=mythicalos.ai/ctl/internal/trust"
   "mythicalos.ai/ctl/internal/manifest:ParseVerified=mythicalos.ai/ctl/internal/trust"
+  # raw-lines boundary (Task 12): the trust module keeps its own record shape (docids carry
+  # ':', which the typed editors' field grammar refuses) — nothing else may bypass them.
+  "method:ReplaceLines=mythicalos.ai/ctl/internal/trust"
 )
 
 die() {
