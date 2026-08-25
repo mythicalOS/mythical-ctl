@@ -24,8 +24,8 @@ cd "$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 # Floors, not exact counts: the tree grows a package per port task, and each task raises these
 # two literals in its commit. Overridable ONLY so a test harness can prove the guard refuses.
-MIN_PACKAGES="${MIN_PACKAGES:-16}"
-MIN_TESTED_PACKAGES="${MIN_TESTED_PACKAGES:-16}"
+MIN_PACKAGES="${MIN_PACKAGES:-18}"
+MIN_TESTED_PACKAGES="${MIN_TESTED_PACKAGES:-18}"
 
 # The reference-boundary rules, one per line: `<guarded-import-path>:<Identifier>=<allowed
 # import path>[,<more allowed>]`. The defining package itself is always allowed. Each rule is
