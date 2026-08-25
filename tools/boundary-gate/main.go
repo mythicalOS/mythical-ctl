@@ -98,7 +98,7 @@ func modulePath(root string) (string, error) {
 // an unaliased import, and which need not equal the path basename (`package daemon` living at
 // .../engine imports as `daemon`). Falling back to the basename is only for paths the module
 // does not own, which no rule can guard anyway.
-func check(fset *token.FileSet, f *ast.File, filePkgPath, fileRel string, declared map[string]string, rules []rule) []string {
+func check(fset *token.FileSet, f *ast.File, filePkgPath, fileRel string, declared map[string]map[string]bool, rules []rule) []string {
 	var out []string
 	// alias -> import path, for this file.
 	imports := map[string]string{}
@@ -107,24 +107,33 @@ func check(fset *token.FileSet, f *ast.File, filePkgPath, fileRel string, declar
 		if err != nil {
 			continue
 		}
-		name := ""
+		var names []string
 		if imp.Name != nil {
-			name = imp.Name.Name
-		} else if d, ok := declared[path]; ok {
-			name = d
+			names = []string{imp.Name.Name}
+		} else if ds := declared[path]; len(ds) > 0 {
+			// EVERY declared name in the directory binds: a build-constrained or ignored file
+			// with a different package name must widen the match, never shadow it — for a
+			// gate, overmatching is safe and undermatching is the failure mode.
+			for d := range ds {
+				names = append(names, d)
+			}
 		} else {
-			name = path[strings.LastIndex(path, "/")+1:]
+			names = []string{path[strings.LastIndex(path, "/")+1:]}
 		}
 		for _, r := range rules {
 			if !r.isMethod() && path == r.pkgPath && !r.allows(filePkgPath, fileRel) {
-				if name == "." {
-					out = append(out, fmt.Sprintf("%s: dot-import of guarded package %s",
-						fset.Position(imp.Pos()), r.pkgPath))
+				for _, name := range names {
+					if name == "." {
+						out = append(out, fmt.Sprintf("%s: dot-import of guarded package %s",
+							fset.Position(imp.Pos()), r.pkgPath))
+					}
 				}
 			}
 		}
-		if name != "_" && name != "." {
-			imports[name] = path
+		for _, name := range names {
+			if name != "_" && name != "." {
+				imports[name] = path
+			}
 		}
 	}
 	ast.Inspect(f, func(n ast.Node) bool {
@@ -188,7 +197,7 @@ func run(root string, ruleArgs []string) (violations []string, err error) {
 		rel         string
 	}
 	var files []parsed
-	declared := map[string]string{} // module-local import path -> declared package name
+	declared := map[string]map[string]bool{} // module-local import path -> declared package NAMES (a set: build-constrained files may declare differently)
 	err = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -217,7 +226,10 @@ func run(root string, ruleArgs []string) (violations []string, err error) {
 			return fmt.Errorf("parse %s: %w", path, err)
 		}
 		if f.Name != nil {
-			declared[filePkgPath] = f.Name.Name
+			if declared[filePkgPath] == nil {
+				declared[filePkgPath] = map[string]bool{}
+			}
+			declared[filePkgPath][f.Name.Name] = true
 		}
 		files = append(files, parsed{f: f, filePkgPath: filePkgPath, rel: rel})
 		return nil

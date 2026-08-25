@@ -64,11 +64,21 @@ func TestGlobalFlagsTrailingArgParity(t *testing.T) {
 			t.Fatalf("%v: leaked to stdout: %q", args, out.String())
 		}
 	}
-	for _, args := range [][]string{{"--version", "product"}, {"--help", "product"}} {
+	for _, args := range [][]string{{"--version", "product"}, {"--help", "product"},
+		{"--version", "--index", "foo"}, {"--version", "--purge"}} {
 		var out, errb bytes.Buffer
 		if rc := run(args, strings.NewReader(""), &out, &errb); rc != 0 {
-			t.Fatalf("%v: rc = %d, want 0 (bash ignores bare operands here)", args, rc)
+			t.Fatalf("%v: rc = %d, want 0 (bash consumes known options and ignores them here)", args, rc)
 		}
+	}
+	// A value-taking option with no value is a usage error with nothing attempted — bash's
+	// _need_val, measured: `--version --index` exits 2.
+	var out, errb bytes.Buffer
+	if rc := run([]string{"--version", "--index"}, strings.NewReader(""), &out, &errb); rc != 2 {
+		t.Fatalf("--version --index: rc = %d, want 2", rc)
+	}
+	if !strings.Contains(errb.String(), "requires a value") {
+		t.Fatalf("missing-value diagnostic absent: %q", errb.String())
 	}
 }
 

@@ -46,28 +46,104 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprint(stdout, usage)
 		return cliio.ExitOK
 	}
-	switch args[0] {
-	case "-v", "--version", "-h", "--help":
-		// Parity with the frozen dispatcher, MEASURED: it parses the whole argv before acting,
-		// so a trailing OPTION (`--version --bogus`) is a usage error — but a trailing bare
-		// OPERAND (`--version product`) is collected as a product and then ignored by these
-		// verbs, exiting 0. Refuse exactly what bash refuses, no more.
-		for _, a := range args[1:] {
-			if strings.HasPrefix(a, "-") {
-				fmt.Fprintf(stderr, "mythical-ctl: unknown option: %s\n", a)
-				return cliio.ExitUsage
-			}
-		}
-		if args[0] == "-v" || args[0] == "--version" {
-			fmt.Fprintf(stdout, "mythical-ctl %s\n", version.Version)
-		} else {
-			fmt.Fprint(stdout, usage)
-		}
+	verb := args[0]
+	// The option loop, ported from the frozen dispatcher: it runs BEFORE the verb acts, so a
+	// known option after a global flag is consumed (and then ignored by that flag), an unknown
+	// option is a usage error, and a value-taking option with no value is a usage error with
+	// nothing attempted — all measured behaviors, all pinned by tests.
+	if _, rc := parseOpts(args[1:], stderr); rc >= 0 {
+		return rc
+	}
+	switch verb {
+	case "-v", "--version":
+		fmt.Fprintf(stdout, "mythical-ctl %s\n", version.Version)
+		return cliio.ExitOK
+	case "-h", "--help":
+		fmt.Fprint(stdout, usage)
 		return cliio.ExitOK
 	}
-	fmt.Fprintf(stderr, "mythical-ctl: unknown command: %s\n\n", args[0])
+	fmt.Fprintf(stderr, "mythical-ctl: unknown command: %s\n\n", verb)
 	fmt.Fprint(stderr, usage)
 	return cliio.ExitUsage
+}
+
+// opts is the parsed option set — the bash loop's locals. Verbs consume it as they land; the
+// global flags ignore it, exactly as the frozen dispatcher does.
+type opts struct {
+	index, policy, manifestDir, image, toBind  string
+	purge, family, forced, mapForeign, abandon bool
+	products                                   []string
+}
+
+// parseOpts ports the frozen dispatcher's while-loop verbatim: known value-taking options
+// (--index --policy --manifest-dir --image --to-bind) require a value (`_need_val` — a missing
+// one is a usage error, nothing attempted); known flags set booleans; an unknown `-*` is a
+// usage error; anything else is an operand. Returns (parsed, -1) on success, or (zero, rc≥0)
+// when the caller must exit with rc.
+func parseOpts(args []string, stderr io.Writer) (opts, int) {
+	var o opts
+	i := 0
+	for i < len(args) {
+		a := args[i]
+		needVal := func() (string, bool) {
+			if i+1 >= len(args) {
+				fmt.Fprintf(stderr, "mythical-ctl: option %s requires a value\n", a)
+				return "", false
+			}
+			i++
+			return args[i], true
+		}
+		switch a {
+		case "--index":
+			v, ok := needVal()
+			if !ok {
+				return opts{}, cliio.ExitUsage
+			}
+			o.index = v
+		case "--policy":
+			v, ok := needVal()
+			if !ok {
+				return opts{}, cliio.ExitUsage
+			}
+			o.policy = v
+		case "--manifest-dir":
+			v, ok := needVal()
+			if !ok {
+				return opts{}, cliio.ExitUsage
+			}
+			o.manifestDir = v
+		case "--image":
+			v, ok := needVal()
+			if !ok {
+				return opts{}, cliio.ExitUsage
+			}
+			o.image = v
+		case "--to-bind":
+			v, ok := needVal()
+			if !ok {
+				return opts{}, cliio.ExitUsage
+			}
+			o.toBind = v
+		case "--purge":
+			o.purge = true
+		case "--family":
+			o.family = true
+		case "--force-install":
+			o.forced = true
+		case "--map-foreign-to-operator":
+			o.mapForeign = true
+		case "--abandon":
+			o.abandon = true
+		default:
+			if strings.HasPrefix(a, "-") {
+				fmt.Fprintf(stderr, "mythical-ctl: unknown option: %s\n", a)
+				return opts{}, cliio.ExitUsage
+			}
+			o.products = append(o.products, a)
+		}
+		i++
+	}
+	return o, -1
 }
 
 func main() {

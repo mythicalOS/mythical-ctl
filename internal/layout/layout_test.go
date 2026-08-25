@@ -154,8 +154,12 @@ func TestZoneClassification(t *testing.T) {
 		{".hidden/cli.toml", ZoneInstallerManaged},          // dot-leading directory is not the slot
 		{"9lives/cli.toml", ZoneInstallerManaged},           // cannot BEGIN a legal product name
 		{"mythical/cli.toml", ZoneInstallerManaged},         // reserved product name
-		{".state", ZoneUnknown},                             // bare .state matches no arm, like bash
-		{"something-else", ZoneUnknown},                     // the bats path, verbatim
+		{"bin/a/b/c", ZoneInstallerManaged},                 // the pre-amendment depths, verbatim
+		{".state/a/b", ZoneInstallerState},
+		{"brokkr/a/b/c", ZoneInstallerManaged},
+		{"", ZoneUnknown},
+		{".state", ZoneUnknown},         // bare .state matches no arm, like bash
+		{"something-else", ZoneUnknown}, // the bats path, verbatim
 		{"README", ZoneUnknown},
 	}
 	for _, c := range cases {
