@@ -108,12 +108,16 @@ teardown() { teardown_test_env; }
 # put credential bytes on persistent storage inside the tmpfs tree.
 @test "path disjointness catches equal, child, and ancestor overlaps but allows a sibling" {
   local root=/run/mythical/credential-homes
-  # Overlapping (rc 1): identical, a child, and an ancestor.
+  # Overlapping (rc 1): identical, a child, an ancestor, and the container root `/` itself (an ancestor
+  # of everything — the normalized-root boundary case that a naive prefix check misses).
   local bad
-  for bad in /run/mythical/credential-homes /run/mythical/credential-homes/session /run/mythical /run; do
+  for bad in /run/mythical/credential-homes /run/mythical/credential-homes/session /run/mythical /run /; do
     run mi_volatile_path_disjoint "$root" "$bad"
     [ "$status" -ne 0 ] || { echo "missed an overlap with '$bad'" >&2; return 1; }
   done
+  # And symmetric: the root as the FIRST argument overlaps anything beneath it.
+  run mi_volatile_path_disjoint / /run/mythical/credential-homes
+  [ "$status" -ne 0 ] || { echo "the container root was not treated as an ancestor" >&2; return 1; }
   # Disjoint (rc 0): a sibling and an unrelated tree — and a name that only shares a prefix STRING but
   # not a path boundary (…-homes-2 is not under …-homes).
   local ok

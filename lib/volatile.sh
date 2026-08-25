@@ -118,8 +118,15 @@ mi_volatile_path_disjoint() {
   a="$(mi_volatile_path_norm "$1")"
   b="$(mi_volatile_path_norm "$2")"
   [ "$a" != "$b" ] || return 1                       # identical mount points
-  case "${b}/" in "${a}/"*) return 1 ;; esac         # b is at or under a
-  case "${a}/" in "${b}/"*) return 1 ;; esac         # a is at or under b
+  # The container root `/` is an ancestor of everything, so it overlaps any mount. It is handled
+  # explicitly: after normalization the root is a lone `/`, and appending a boundary slash to it (as
+  # the pattern below does for every other path) would make `//`, which prefix-matches nothing — so a
+  # target of `/` would otherwise read as disjoint from a root beneath it.
+  if [ "$a" = / ] || [ "$b" = / ]; then return 1; fi
+  # Non-root paths carry no trailing slash after normalization, so `${x}/` is the exact path boundary:
+  # this matches a true child (…/homes/session) but not a mere prefix STRING (…/homes-2).
+  case "$b" in "${a}/"*) return 1 ;; esac            # b is at or under a
+  case "$a" in "${b}/"*) return 1 ;; esac            # a is at or under b
   return 0
 }
 

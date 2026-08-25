@@ -407,6 +407,13 @@ teardown() { rm -rf "$OUT"; mi_lock_release; teardown_test_env; }
   [ "$status" -ne 0 ] || { echo "an equivalently-spelled overlapping mount was accepted: $output" >&2; return 1; }
   assert_contains "overlaps the volatile credential-home mount"
 
+  # The container root `/` is an ancestor of the volatile root, so a mount there overlaps it too — the
+  # normalized-root boundary case. rolemount accepts `/`, so this is reachable and must be refused.
+  mrec="$(printf 'volume\tstate:/\nvolatile_mount\t/run/mythical/credential-homes\n')"
+  run mi_bringup_specs brokkr "$mrec" "$PREC"
+  [ "$status" -ne 0 ] || { echo "a mount at the container root was not caught as overlapping: $output" >&2; return 1; }
+  assert_contains "overlaps the volatile credential-home mount"
+
   # A disjoint volume alongside the volatile mount is fine — the guard rejects overlap, not coexistence.
   mrec="$(printf 'volume\tstate:/data\nvolatile_mount\t/run/mythical/credential-homes\n')"
   run mi_bringup_specs brokkr "$mrec" "$PREC"
