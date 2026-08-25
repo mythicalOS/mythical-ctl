@@ -93,12 +93,11 @@ func OpenStaging(h famlock.Held) (Store, error) {
 }
 
 func unseal(s Store) (*store, error) {
-	if s == nil {
-		return nil, errors.New("ledger: nil store")
-	}
-	t := s.sealedLedgerStore()
-	if t == nil {
-		return nil, errors.New("ledger: invalid store")
+	// Exact dynamic type — an embedding wrapper is refused, and a nil-inner wrapper cannot
+	// panic a promoted method call because no method is called (same rule as famlock).
+	t, ok := s.(*store)
+	if !ok || t == nil {
+		return nil, errors.New("ledger: not a store this package minted — refusing")
 	}
 	return t, nil
 }

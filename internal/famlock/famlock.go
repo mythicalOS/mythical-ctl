@@ -152,20 +152,14 @@ func HomeOf(h Held) (string, error) {
 // and a foreign/embedding implementation all fail. The double check (the sealed method
 // returns the receiver; we then require identity) is what defeats an embedded-delegation
 // wrapper that overrides other methods — the returned *held is ours by construction.
-func concrete(h Held) (t *held) {
-	if h == nil {
-		return nil
-	}
-	// An embedding wrapper around a NIL inner token panics when the promoted method hits the
-	// nil interface — and a broken or hostile wrapper must fail CLOSED, never crash the
-	// process that was refusing it. The recover turns any such panic into "no token".
-	defer func() {
-		if recover() != nil {
-			t = nil
-		}
-	}()
-	t = h.sealedFamlockToken()
-	if t == nil || t.released {
+func concrete(h Held) *held {
+	// EXACT dynamic type, nothing else (wave-1 gate): an embedding wrapper — even one carrying
+	// a real token it would faithfully delegate to — is refused outright. Delegation was
+	// arguably harmless (the wrapper could not alter the inner token's home), but "only the
+	// value Acquire returned is a token" is a rule with no judgment calls in it, and the
+	// type assertion cannot panic on a nil-inner wrapper the way a promoted method call did.
+	t, ok := h.(*held)
+	if !ok || t == nil || t.released {
 		return nil
 	}
 	return t

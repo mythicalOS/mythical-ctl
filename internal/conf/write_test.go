@@ -35,12 +35,12 @@ import (
 // PORTED: tests/unit/config_family.bats: "a symlinked mythical.conf is refused, not followed and adopted" -> TestFamilySymlinkRefused
 // PORTED: tests/unit/config_family.bats: "a hardlinked mythical.conf is refused, leaving the other name untouched" -> TestFamilyHardlinkRefused
 // PORTED: tests/unit/config_family.bats: "an existing file that does not parse is never overwritten" -> TestFamilyAddNeverModifiesUnparseable
-// PORTED: tests/unit/config_family.bats: "mi_conf_family_load validates against the core spec" -> (owned by read_test.go: TestLoadFamilyValid / TestValidateUnknownKeyRejects)
+// PORTED: tests/unit/config_family.bats: "mi_conf_family_load validates against the core spec" -> TestLoadFamilyValid
 // PORTED: tests/unit/config_family.bats: "writing without the family lock is refused" -> TestWritesRequireTheLock
 // PORTED: tests/unit/config_family.bats: "a forged lock token does not authorize a write" -> TestWritesRequireTheLock (a nil/foreign Held fails famlock.Assert — the sealed-type port of the token forgery test)
 // N/A: tests/unit/config_family.bats: "mi_lock_assert_held refuses a no-argument call in its own words" -- Go arity is compile-time
 // N/A: tests/unit/config_family.bats: "the ledger's lock refusal is unchanged by the extraction" -- bash source-extraction regression; Go has no extraction seam
-// PORTED: tests/unit/config_family.bats: "a foreign-owned mythical.conf is refused" -> TestForeignOwnedRefused (root-only; skips unprivileged — the decision path is identityOK's uid comparison, also exercised by every identity test)
+// N/A: tests/unit/config_family.bats: "a foreign-owned mythical.conf is refused" -- creating a foreign-owned file needs root; identityOK's uid branch is the refusal, and TestForeignOwnedRefused pins it under a root run
 // PORTED: tests/unit/config_family.bats: "a non-regular mythical.conf is refused" -> TestNonRegularRefused
 //
 // Inventory — tests/unit/config_product.bats:
@@ -54,7 +54,7 @@ import (
 // PORTED: tests/unit/config_product.bats: "an oversized product conf is refused, and leaves no snapshot behind" -> TestProductOversizedRefused (Go's snapshot is in-memory; "no snapshot file behind" has no on-disk artifact to leak)
 // PORTED: tests/unit/config_product.bats: "a retry after rc 5 repairs the mode and the group" -> TestProductOwnershipFailure
 // PORTED: tests/unit/config_product.bats: "a no-op merge does not rewrite the file" -> TestProductNoOpKeepsBytesAndInode
-// PORTED: tests/unit/config_product.bats: "a chmod failure after the bytes have landed reports rc 5, not rc 1" -> TestProductOwnershipFailure (the error TYPE distinguishes committed-bytes from refusals)
+// N/A: tests/unit/config_product.bats: "a chmod failure after the bytes have landed reports rc 5, not rc 1" -- an unprivileged process cannot make chmod fail on a file it owns after a successful chgrp (the bash test shimmed chmod); the committed-bytes-vs-refusal distinction the row exists for is asserted by TestProductOwnershipFailure via StateGroupFailed
 // PORTED: tests/unit/config_product.bats: "a rewrite keeps the same inode — a bind mount must not be detached" -> TestProductRewriteKeepsInode
 // PORTED: tests/unit/config_product.bats: "a value containing a newline is refused and nothing is written" -> TestProductAddRefusals
 // PORTED: tests/unit/config_product.bats: "a key outside the product spec is refused on write, leaving no partial file" -> TestProductAddRefusals
@@ -64,14 +64,14 @@ import (
 // PORTED: tests/unit/config_product.bats: "a KEYLESS create produces a valid, marker-terminated, 0660 file that loads empty" -> TestProductEnsureKeylessCreate
 // PORTED: tests/unit/config_product.bats: "adding a key preserves comments, ordering and untouched keys" -> TestProductAddPreservesBytes
 // PORTED: tests/unit/config_product.bats: "adding a key that already holds a different value is refused" -> TestProductAdditiveGate
-// PORTED: tests/unit/config_product.bats: "a marker-prefix line in the body is rejected, not treated as a comment" -> (owned by read_test.go's scanner refusals; the load path is TestProductTornAndMalformed)
+// PORTED: tests/unit/config_product.bats: "a marker-prefix line in the body is rejected, not treated as a comment" -> TestScanRefusals
 // N/A: tests/unit/config_product.bats: "a call with too few arguments refuses instead of aborting under set -u" -- compile-time arity
 // PORTED: tests/unit/config_product.bats: "a set into a torn file is refused rather than re-blessing damage" -> TestProductTornAndMalformed
 // PORTED: tests/unit/config_product.bats: "a launch-spec key is not in the product spec, so reading it is a rejection" -> TestProductAddRefusals (spec-driven: an off-spec key rejects on read and write alike)
 // PORTED: tests/unit/config_product.bats: "a symlinked product conf is refused on both read and write" -> TestProductSymlinkRefused
 // PORTED: tests/unit/config_product.bats: "a product conf hardlinked to mythical.conf is refused" -> TestProductHardlinkRefused
 // PORTED: tests/unit/config_product.bats: "a product conf hardlinked to a file under bin/ is refused" -> TestProductHardlinkRefused
-// PORTED: tests/unit/config_product.bats: "a product conf owned by another uid is refused on both read and write" -> TestForeignOwnedRefused (root-only skip, as above)
+// N/A: tests/unit/config_product.bats: "a product conf owned by another uid is refused on both read and write" -- creating a foreign-owned file needs root; the refusal is identityOK's uid branch, the same code path every identity test exercises, and TestForeignOwnedRefused pins it under a root run
 // N/A: tests/unit/config_product.bats: "an unreadable owner is refused rather than assumed to be ours" -- the bash parsed `ls` output which could be garbled; os.Lstat's Stat_t either exists or the assertion fails closed (that fail-closed branch is in identityOK and cannot be induced portably)
 // PORTED: tests/unit/config_product.bats: "a matching marker reads silently" -> TestProductLoadRoundTrip
 // PORTED: tests/unit/config_product.bats: "a stale marker over a parseable body is torn, not accepted" -> TestProductTornAndMalformed
@@ -98,7 +98,7 @@ import (
 // PORTED: tests/unit/config_contract.bats: "a file built by hand from the document is accepted by the CLI" -> TestMarkerRecipeAgreesWithDoc
 // N/A: tests/unit/config_contract.bats: "the command-substitution shortcut the document warns against really does differ" -- a bash-pipeline pitfall (command substitution strips trailing newlines); Go's hashing takes explicit bytes and has no such shortcut to warn against
 // PORTED: tests/unit/config_contract.bats: "the marker prefix in the document matches the constant in the code" -> TestMarkerRecipeAgreesWithDoc
-// PORTED: tests/unit/config_contract.bats: "the documented value rules match what the parser enforces" -> (owned by read_test.go: TestValueMetacharactersRefused / TestValueSpaceRules)
+// PORTED: tests/unit/config_contract.bats: "the documented value rules match what the parser enforces" -> TestValueMetacharactersRefused
 // PORTED: tests/unit/config_contract.bats: "an UPPERCASE marker is rejected even when the digest itself is correct" -> TestProductTornAndMalformed
 // PORTED: tests/unit/config_contract.bats: "a marker-only file is valid and loads as an empty configuration" -> TestProductEnsureKeylessCreate
 // PORTED: tests/unit/config_contract.bats: "a zero-byte file is torn, not an empty configuration" -> TestProductTornAndMalformed
@@ -106,7 +106,7 @@ import (
 // PORTED: tests/unit/config_contract.bats: "a <product>.conf of 1048577 bytes is refused outright, marker or no marker" -> TestProductOversizedRefused
 // PORTED: tests/unit/config_contract.bats: "the doc path in the shipped torn-file message resolves to a real file" -> TestTornMessageNamesRealDoc
 // PORTED: tests/unit/config_contract.bats: "every row of the document's marker-precedence table matches the CLI" -> TestProductTornAndMalformed (the table's rows: match+parse=accept, absent/mismatch=torn, match+broken=malformed)
-// PORTED: tests/unit/config_contract.bats: "the product-name grammar the document publishes is the grammar the CLI enforces" -> (owned by internal/layout: TestProductNameGrammar)
+// PORTED: tests/unit/config_contract.bats: "the product-name grammar the document publishes is the grammar the CLI enforces" -> internal/layout TestProductNameGrammar
 
 func lockFor(t *testing.T, home string) famlock.Held {
 	t.Helper()
@@ -849,5 +849,40 @@ func TestFamilyCASAttemptTable(t *testing.T) {
 	h, _ = setup("")
 	if err := FamilyCAS(h, "MYTHICAL_NET", "n2", "n1", AttemptNone, nil); err == nil {
 		t.Fatal("CAS accepted a core key")
+	}
+}
+
+// Through-FamilyAdd concurrency: the reader seam hands back a STALE snapshot while the disk
+// holds newer bytes — both the same-value no-op and the append must refuse with
+// ErrCASMismatch rather than reporting success (or overwriting) from bytes that are no longer
+// the file.
+func TestFamilyAddThroughCASRefusal(t *testing.T) {
+	home := t.TempDir()
+	h := lockFor(t, home)
+	f := FamilyPath(home)
+	stale := []byte("MYTHICAL_NET=n1\n")
+	fresh := []byte("MYTHICAL_NET=n1\n# operator note landed here\n")
+	if err := os.WriteFile(f, fresh, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	orig := osReadFile
+	osReadFile = func(path string) ([]byte, error) {
+		if path == f {
+			return stale, nil // the writer's one read sees yesterday's bytes
+		}
+		return orig(path)
+	}
+	t.Cleanup(func() { osReadFile = orig })
+
+	// Same-value no-op: must NOT report success from the stale snapshot.
+	if err := FamilyAdd(h, "MYTHICAL_NET", "n1"); !errors.Is(err, ErrCASMismatch) {
+		t.Fatalf("stale same-value no-op: %v", err)
+	}
+	// Append: must refuse rather than overwrite the operator's landed note.
+	if err := FamilyAdd(h, "MYTHICAL_TELEMETRY_KEY", "k"); !errors.Is(err, ErrCASMismatch) {
+		t.Fatalf("stale append: %v", err)
+	}
+	if b, _ := os.ReadFile(f); string(b) != string(fresh) {
+		t.Fatal("a stale writer modified the fresh file")
 	}
 }

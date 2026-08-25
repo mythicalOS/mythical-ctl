@@ -230,7 +230,7 @@ func ProductAdd(h famlock.Held, product, gid string, spec Spec, kvs []KV) error 
 	// CAS + identity immediately before we MUTATE anything — including the create: a dangling
 	// symlink planted just before it would otherwise make the create write THROUGH the link.
 	if !unchanged(f, pre) {
-		return fmt.Errorf("config: %s.conf changed while we were reading it — refusing to overwrite that change; re-run", product)
+		return fmt.Errorf("config: %s.conf %w", product, ErrCASMismatch)
 	}
 	if err := identityOK(f); err != nil {
 		return err

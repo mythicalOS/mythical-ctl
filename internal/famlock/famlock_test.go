@@ -175,8 +175,10 @@ func TestReleaseNoOpWhenNotHeld(t *testing.T) {
 	}
 }
 
-// The sealed-type regression the plan requires: an embedding wrapper can only DELEGATE to a
-// real token — it cannot alter the home it authorizes, and a wrapper around nothing fails.
+// The sealed-type regression the plan requires: EVERY wrapper is refused — only the exact
+// value Acquire returned is a token. (Round-2 wave gate: delegation through an embedding
+// wrapper was arguably harmless, but a rule with no judgment calls beats one with a safe
+// exception, and the exact-type check cannot panic on a nil-inner wrapper.)
 type wrapper struct{ Held }
 
 func TestEmbeddingWrapperCannotForgeAuthority(t *testing.T) {
@@ -192,12 +194,37 @@ func TestEmbeddingWrapperCannotForgeAuthority(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer Release(h)
-	w := wrapper{h}
-	// A wrapper carrying a REAL token carries exactly that token's authority — the home is
-	// the inner token's and nothing the wrapper does can change it.
-	got, err := HomeOf(w)
-	if err != nil || got != home {
-		t.Fatalf("wrapped HomeOf = %q, %v", got, err)
+	if err := Assert(wrapper{h}, "write"); err == nil {
+		t.Fatal("a wrapper around a real token asserted — only Acquire's exact value is a token")
+	}
+	if _, err := HomeOf(wrapper{h}); err == nil {
+		t.Fatal("a wrapper around a real token resolved a home")
+	}
+	// The real token is unharmed by the refusals.
+	if err := Assert(h, "write"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The malformed-record contract, ported to the flock world: the lock FILE's content grants
+// nothing and breaks nothing — garbage scribbled into it leaves the holder's authority intact
+// (the flock is the authority) and still refuses every other comer.
+func TestLockFileContentGrantsNothing(t *testing.T) {
+	home := t.TempDir()
+	h, err := Acquire(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer Release(h)
+	lf := filepath.Join(home, ".state", "lock")
+	if err := os.WriteFile(lf, []byte("pid=999999 pid=1\ngarbage\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := Assert(h, "write"); err != nil {
+		t.Fatal("garbage in the lock file broke the holder's authority")
+	}
+	if _, err := Acquire(home); !errors.Is(err, ErrBusy) {
+		t.Fatalf("garbage in the lock file granted a second acquire: %v", err)
 	}
 }
 

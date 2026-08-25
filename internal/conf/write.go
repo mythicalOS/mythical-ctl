@@ -3,6 +3,7 @@ package conf
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,17 +17,32 @@ import (
 // own earlier value.
 var ErrKeyConflict = errors.New("key already set to a different value — refusing to overwrite it")
 
+// ErrCASMismatch: a compare-and-swap's expectation no longer holds — the file (or the key)
+// changed between this call's check and its write. Distinct from every operational failure,
+// so a caller can offer "re-run" rather than diagnose.
+var ErrCASMismatch = errors.New("changed between check and write — refusing; re-run")
+
 // digestOf hashes an on-disk file's bytes, "" for an absent file — the whole-file
 // compare-and-swap baseline. This is the ONE sanctioned live-file read a writer makes besides
 // its own snapshot: it compares a digest and never derives configuration from what it reads,
-// so it cannot become an injection path.
+// so it cannot become an injection path. The read is BOUNDED (wave-1 gate): <product>.conf is
+// attacker-growable, and an unbounded re-read while holding the family lock is a host
+// allocation the container controls — anything over the ceiling simply reads as "changed".
 func digestOf(path string) (string, error) {
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return "", nil
 		}
 		return "", fmt.Errorf("config: cannot digest %s: %w", path, err)
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, MaxBytes+1))
+	if err != nil {
+		return "", fmt.Errorf("config: cannot digest %s: %w", path, err)
+	}
+	if len(data) > MaxBytes {
+		return "over-ceiling", nil // never a real digest: always reads as "changed"
 	}
 	return cliio.SHA256Hex(data), nil
 }
@@ -112,11 +128,12 @@ func FamilyAdd(h famlock.Held, key, value string) error {
 	}
 
 	// ONE read serves the scan, the additive gate, and the CAS baseline — the same bytes
-	// decide everything (strictly stronger than the bash, which read per purpose).
-	existing, err := os.ReadFile(f)
+	// decide everything (strictly stronger than the bash, which read per purpose). Through the
+	// package's one read seam, so tests can interpose the stale-snapshot race.
+	existing, err := osReadFile(f)
 	switch {
 	case err == nil:
-	case os.IsNotExist(err):
+	case isNotExist(err):
 		existing = nil
 	default:
 		return fmt.Errorf("config: cannot read %s: %w", f, err)
@@ -135,7 +152,16 @@ func FamilyAdd(h famlock.Held, key, value string) error {
 		for _, r := range records {
 			if r.Key == key {
 				if r.Value == value {
-					return nil // already exactly this value: a no-op success
+					// A no-op success must not be reported from a STALE snapshot (the bash
+					// pins this): re-verify the file still holds the bytes that said "already
+					// set" before saying anything.
+					if !unchanged(f, cliio.SHA256Hex(existing)) {
+						return fmt.Errorf("config: %s %w", f, ErrCASMismatch)
+					}
+					if err := identityOK(f); err != nil {
+						return err
+					}
+					return nil
 				}
 				return fmt.Errorf("config: %s is already set to %q in %s: %w", key, r.Value, f, ErrKeyConflict)
 			}
@@ -152,7 +178,7 @@ func FamilyAdd(h famlock.Held, key, value string) error {
 	// write must be refused, not silently discarded, and a symlink swapped in after the first
 	// identity check must not be adopted by the rename.
 	if !unchanged(f, pre) {
-		return fmt.Errorf("config: %s changed while we were reading it — refusing to overwrite that change; re-run", f)
+		return fmt.Errorf("config: %s %w", f, ErrCASMismatch)
 	}
 	if err := identityOK(f); err != nil {
 		return err
@@ -218,7 +244,7 @@ func FamilyCAS(h famlock.Held, key, value, prior string, attempt Attempt, confir
 		case !haveCur && prior == "":
 		case haveCur && cur == prior:
 		default:
-			return fmt.Errorf("config: %s holds %q, not the expected prior value %q — refusing", key, cur, prior)
+			return fmt.Errorf("config: %s holds %q, not the expected prior value %q: %w", key, cur, prior, ErrCASMismatch)
 		}
 	case AttemptStarted:
 		if haveCur && cur == value {
@@ -254,7 +280,7 @@ func FamilyCAS(h famlock.Held, key, value, prior string, attempt Attempt, confir
 			if now, ok := strings.CutPrefix(bare, key+"="); ok {
 				sawKey = true
 				if now != expected {
-					return fmt.Errorf("config: %s now holds %q, not %q as this call verified — it changed between check and rewrite; refusing", key, now, expected)
+					return fmt.Errorf("config: %s now holds %q, not %q as this call verified: %w", key, now, expected, ErrCASMismatch)
 				}
 				out.WriteString(key + "=" + value + "\n")
 				wrote = true
@@ -266,7 +292,7 @@ func FamilyCAS(h famlock.Held, key, value, prior string, attempt Attempt, confir
 		return fmt.Errorf("config: cannot read %s: %w", f, rerr)
 	}
 	if !sawKey && expected != "" {
-		return fmt.Errorf("config: %s is no longer present in %s (expected %q) — it was removed between check and rewrite; refusing", key, f, expected)
+		return fmt.Errorf("config: %s is no longer present in %s (expected %q): %w", key, f, expected, ErrCASMismatch)
 	}
 	if !wrote {
 		out.WriteString(key + "=" + value + "\n")
