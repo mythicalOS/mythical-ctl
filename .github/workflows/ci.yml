@@ -245,6 +245,20 @@ jobs:
           done
           exit "$rc"
 
+  # The Go lane. One script, run identically here and locally — see check.sh's header for why.
+  # No setup-go action: the workflow's only action dependency is checkout (kept deliberately),
+  # and the go.mod `go` directive governs the toolchain — under the default GOTOOLCHAIN=auto
+  # the runner's go command fetches the matching toolchain when its own is older.
+  go:
+    name: go
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: check.sh go
+        run: bash check.sh go
+
   test:
     name: test
     runs-on: ubuntu-latest
