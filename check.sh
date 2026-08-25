@@ -24,8 +24,8 @@ cd "$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 # Floors, not exact counts: the tree grows a package per port task, and each task raises these
 # two literals in its commit. Overridable ONLY so a test harness can prove the guard refuses.
-MIN_PACKAGES="${MIN_PACKAGES:-13}"
-MIN_TESTED_PACKAGES="${MIN_TESTED_PACKAGES:-13}"
+MIN_PACKAGES="${MIN_PACKAGES:-15}"
+MIN_TESTED_PACKAGES="${MIN_TESTED_PACKAGES:-15}"
 
 # The reference-boundary rules, one per line: `<guarded-import-path>:<Identifier>=<allowed
 # import path>[,<more allowed>]`. The defining package itself is always allowed. Each rule is
@@ -46,6 +46,10 @@ BOUNDARY_RULES=(
   # raw-lines boundary (Task 12): the trust module keeps its own record shape (docids carry
   # ':', which the typed editors' field grammar refuses) — nothing else may bypass them.
   "method:ReplaceLines=mythicalos.ai/ctl/internal/trust"
+  # mutator-boundary (Task 14): every engine mutation requires the family lock, and the
+  # Mutator is constructible ONLY by the runtime facade — probes, verbs and data movement
+  # reach mutations through it, so no code path can hold an unlocked mutation door.
+  "mythicalos.ai/ctl/internal/engine:NewMutator=mythicalos.ai/ctl/internal/runtime"
 )
 
 die() {
