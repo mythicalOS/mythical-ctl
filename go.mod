@@ -10,4 +10,6 @@
 // DIRECT dependency is a plan violation — stop and escalate rather than require it.
 module mythicalos.ai/ctl
 
-go 1.24.0
+go 1.25.0
+
+require golang.org/x/sys v0.47.0
