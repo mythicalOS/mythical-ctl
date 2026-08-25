@@ -84,14 +84,39 @@ mi_volatile_assert_production_root() {
   return 0
 }
 
+# Lexically normalize an absolute path: collapse repeated slashes, drop `.` segments, strip a trailing
+# slash (the bare root stays `/`). This does NOT resolve `..` (a traversal is refused upstream by every
+# type that feeds this) and touches no filesystem — it is purely so that two spellings of the SAME
+# container path compare equal in mi_volatile_path_disjoint below. Without it a manifest could write a
+# mount target as `/run/mythical/./credential-homes/session` — which the looser `rolemount` grammar
+# accepts — and slip a durable mount under the volatile root past a lexical prefix check. Walked by
+# parameter expansion, so a value with a glob metacharacter is inert. A relative path is returned
+# unchanged (callers only pass absolute paths; this just refuses to invent a leading slash).
+mi_volatile_path_norm() {
+  local p="$1" out="" seg rest
+  case "$p" in /*) : ;; *) printf '%s\n' "$p"; return 0 ;; esac
+  rest="${p#/}"
+  while [ -n "$rest" ]; do
+    seg="${rest%%/*}"
+    case "$rest" in */*) rest="${rest#*/}" ;; *) rest="" ;; esac
+    case "$seg" in ''|'.') continue ;; esac          # collapse `//` and drop `.` segments
+    out="${out}/${seg}"
+  done
+  [ -n "$out" ] || out="/"                            # the path was all slashes and `.` → the root
+  printf '%s\n' "$out"
+}
+
 # True (rc 0) only when two absolute container paths are DISJOINT — neither equal, nor one a subpath
-# of the other. Used to keep the volatile credential-home root isolated from every other mount: a
-# durable mount (a named volume or a bind) at, under, or over the volatile root would place credential
-# bytes on persistent, backed-up storage inside the tmpfs tree, defeating the non-persistence and
-# backup exclusion the mount exists to guarantee. rc 1 on any overlap. Both inputs are validated
-# safe-segment paths (or fixed literals) with no glob metacharacter, so the prefix patterns are literal.
+# of the other, compared on their NORMALIZED forms so two spellings of the same path cannot slip past.
+# Used to keep the volatile credential-home root isolated from every other mount: a durable mount (a
+# named volume or a bind) at, under, or over the volatile root would place credential bytes on
+# persistent storage inside the tmpfs tree, defeating the non-persistence the mount exists to
+# guarantee. rc 1 on any overlap. Inputs normalize to safe-segment paths, so the prefix patterns below
+# — whose fixed halves are quoted, hence literal — carry no glob metacharacter.
 mi_volatile_path_disjoint() {
-  local a="$1" b="$2"
+  local a b
+  a="$(mi_volatile_path_norm "$1")"
+  b="$(mi_volatile_path_norm "$2")"
   [ "$a" != "$b" ] || return 1                       # identical mount points
   case "${b}/" in "${a}/"*) return 1 ;; esac         # b is at or under a
   case "${a}/" in "${b}/"*) return 1 ;; esac         # a is at or under b

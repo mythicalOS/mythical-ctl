@@ -56,8 +56,7 @@ machinery at a private temporary root, but the real install path enforces the ca
 
 ## The fixed mount
 
-The declared path maps to one fully hardened mount. Every value below is rendered by
-`mythical-ctl`; none is negotiable.
+The declared path maps to one fully hardened mount. Every property below is fixed; none is negotiable.
 
 | Property | Fixed value | Meaning |
 |---|---|---|
@@ -72,13 +71,31 @@ The declared path maps to one fully hardened mount. Every value below is rendere
 | backup / restore | excluded | The mount is excluded from every backup and restore path. |
 
 The three security flags are rendered in one canonical order — **`nodev,nosuid,noexec`** — so a
-Compose tmpfs option string and the `mythical-ctl` mount invocation are byte-comparable. The home and
-credential-file modes describe the directories and files the product's daemon creates **beneath** the
-root, not the root mount itself; the root is daemon-owned so that no session identity can traverse it.
+Compose tmpfs option string and the `mythical-ctl` mount invocation are byte-comparable.
 
 A conformant mount is therefore **never** a durable bind, a named volume, a persistent mount or the
 writable layer, a shared home, a mount missing any of `nodev`/`nosuid`/`noexec`, a mount with a
 widened directory or file mode, or a mount included in backup or restore.
+
+### Who establishes which property
+
+The contract is fulfilled by **two** surfaces, and it is worth being precise about the split, because
+neither can establish the whole of it alone:
+
+- **`mythical-ctl` renders the mount kind and the kernel security flags.** It attaches a
+  **non-persistent tmpfs** at the declared root carrying `nodev,nosuid,noexec`. It does **not** set an
+  owner or a mode on the root, and it deliberately cannot: the identity the root must belong to is the
+  product's own runtime daemon, which the installer does not run as and whose uid is the daemon's to
+  know, not the installer's to guess.
+- **The product's runtime daemon establishes the daemon-owned root and the modes beneath it, and
+  verifies the mount before it enables file-based authentication.** At startup — *before* any session
+  is spawned — it takes ownership of the root, makes it session-private, sweeps it clean, and confirms
+  the mount matches this contract. A container tmpfs is created world-writable by default, so this
+  daemon-side step is what actually makes the root untraversable; there is no window before it,
+  because no session runs until the daemon has armed. The same verification is what catches anything
+  the installer's manifest-level checks cannot see — for example a mount the **image itself** declares
+  at a path beneath the root: a non-conforming mount keeps file-auth **disabled** with an
+  operator-visible error rather than placing a credential on storage that does not match this contract.
 
 ## Materialization and teardown
 
@@ -86,8 +103,11 @@ widened directory or file mode, or a mount included in backup or restore.
 that carries the kernel security flags. Because the mount is a **tmpfs**, it is non-persistent by
 construction:
 
-- **Bring-up** attaches the hardened tmpfs at the declared root; the product's daemon then creates
-  the `0700` homes and `0600` credential files beneath it and owns the root.
+- **Bring-up** attaches the hardened tmpfs at the declared root. `mythical-ctl` additionally refuses
+  any *manifest-declared* mount — a named volume or an operator bind — whose container target sits at,
+  under, or over the root (compared on normalized paths, so an equivalent spelling cannot slip past):
+  a durable mount inside the tree would shadow the tmpfs with persistent storage. The product's daemon
+  then takes ownership of the root and creates the `0700` homes and `0600` credential files beneath it.
 - **Teardown is a wipe.** Removing the container discards the tmpfs and everything on it — no
   credential file survives the container that used it, and there is nothing on durable storage to
   scrub. Replacing the container gives the next launch a fresh, empty root.
@@ -104,7 +124,10 @@ An implementation is conformant when, given a `volatile_mount` value:
   token or an option;
 - on the production path it **requires** the canonical root and refuses any fallback to durable
   storage;
-- it renders a **non-persistent tmpfs** carrying exactly `nodev,nosuid,noexec`, daemon-owned, with
-  `0700` homes and `0600` credential files beneath the root, excluded from backup and restore;
+- it renders a **non-persistent tmpfs** carrying exactly `nodev,nosuid,noexec`, excluded from backup
+  and restore, and it refuses any *manifest-declared* mount whose target overlaps the root;
+- the daemon-owned root and the `0700`/`0600` modes beneath it are established, and the mount
+  verified, by the product's runtime daemon before it enables file-based authentication, as described
+  above;
 - it refuses any mount whose hardening is weakened — a missing flag, a reordered or added option — as
   a *different* mount rather than downgrading silently.

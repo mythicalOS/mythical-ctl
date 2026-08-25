@@ -400,6 +400,13 @@ teardown() { rm -rf "$OUT"; mi_lock_release; teardown_test_env; }
   [ "$status" -ne 0 ] || { echo "accepted a durable mount inside the volatile root: $output" >&2; return 1; }
   assert_contains "overlaps the volatile credential-home mount"
 
+  # The looser volume-target grammar accepts `.` segments, so an equivalent SPELLING of the same child
+  # must be refused too — the overlap check normalizes before comparing, it is not fooled by spelling.
+  mrec="$(printf 'volume\tstate:/run/mythical/./credential-homes/session\nvolatile_mount\t/run/mythical/credential-homes\n')"
+  run mi_bringup_specs brokkr "$mrec" "$PREC"
+  [ "$status" -ne 0 ] || { echo "an equivalently-spelled overlapping mount was accepted: $output" >&2; return 1; }
+  assert_contains "overlaps the volatile credential-home mount"
+
   # A disjoint volume alongside the volatile mount is fine — the guard rejects overlap, not coexistence.
   mrec="$(printf 'volume\tstate:/data\nvolatile_mount\t/run/mythical/credential-homes\n')"
   run mi_bringup_specs brokkr "$mrec" "$PREC"

@@ -111,7 +111,8 @@ selftest() {
                 mi_doc_scan mi_doc_load mi_doc_value mi_doc_values mi_doc_version mi_doc_expired \
                 mi_volatile_root mi_volatile_tmpfs_secopts mi_volatile_path_ok \
                 mi_volatile_is_canonical_root mi_volatile_assert_production_root \
-                mi_volatile_secopts_ok mi_volatile_mount_spec mi_volatile_path_disjoint \
+                mi_volatile_secopts_ok mi_volatile_mount_spec \
+                mi_volatile_path_norm mi_volatile_path_disjoint \
                 mi_trust_verify_digest mi_trust_floor_get mi_trust_floor_set mi_trust_floor_override \
                 mi_trust_anchor_get mi_trust_anchor_set mi_index_spec mi_index_load mi_accept_index \
                 mi_trust_check_only mi_trust_commit mi_trust_check \

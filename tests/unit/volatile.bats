@@ -123,6 +123,26 @@ teardown() { teardown_test_env; }
   done
 }
 
+# Overlap is judged on NORMALIZED paths, so a different SPELLING of a child cannot slip a durable mount
+# under the root. The looser mount-target grammar accepts `.` segments, `//`, and a trailing slash, and
+# a bare lexical prefix check would miss every one of these.
+@test "path normalization defeats equivalent spellings of an overlapping path" {
+  local n
+  n="$(mi_volatile_path_norm /run/mythical/./credential-homes//session/)"
+  [ "$n" = "/run/mythical/credential-homes/session" ] \
+    || { echo "unexpected normalization: '$n'" >&2; return 1; }
+  # All of these RESOLVE beneath the root and must be caught as overlapping despite the spelling.
+  local root=/run/mythical/credential-homes bad
+  for bad in \
+    '/run/mythical/./credential-homes/session' \
+    '/run/mythical/credential-homes//session' \
+    '/run/mythical/credential-homes/session/' \
+    '/run/mythical/credential-homes/.'; do
+    run mi_volatile_path_disjoint "$root" "$bad"
+    [ "$status" -ne 0 ] || { echo "an equivalent spelling '$bad' slipped past the overlap check" >&2; return 1; }
+  done
+}
+
 @test "the typed launch spec is emitted for a valid path and refused for an invalid one" {
   run mi_volatile_mount_spec /run/mythical/credential-homes
   [ "$status" -eq 0 ]
