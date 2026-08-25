@@ -261,17 +261,25 @@ mi_bringup_specs() {
     bound_out="$(mi_mount_binds "$product" "$mrec" "$prec" "${vroles[@]}")" || return 1
   fi
 
-  local -a specs
-  specs=()
+  local -a specs mtargets
+  specs=(); mtargets=()
+  # Every container mount TARGET is also collected in `mtargets`, in step with `specs`, for the volatile
+  # overlap guard below: a durable mount at, under, or over the credential-home root would defeat the
+  # non-persistence and backup exclusion that mount promises, so the target set has to be known here —
+  # the one place it all exists at once — rather than re-cut out of the spec strings later.
   # The set of roles that got a bind, and their specs. `role<TAB>bind=…` — role first, carried rather
   # than parsed back out of the spec (neither of a spec's path components is distinguishable from the
   # other once it is a string).
-  local bound_roles="" line brole bspec
+  local bound_roles="" line brole bspec bt
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     brole="${line%%$'\t'*}"; bspec="${line#*$'\t'}"
     bound_roles="${bound_roles}${brole}"$'\n'
     specs+=("$bspec")
+    # The target from the one authenticated source mi_mount_binds itself used — not re-cut from bspec,
+    # where the two path components are indistinguishable once the spec is a string.
+    bt="$(_mi_bringup_role_target "$mrec" "$brole")" || return 1
+    mtargets+=("$bt")
   done <<< "$bound_out"
 
   # Every role with NO bind → a named volume at its authenticated container path.
@@ -280,6 +288,7 @@ mi_bringup_specs() {
     target="$(_mi_bringup_role_target "$mrec" "$role")" || return 1
     vol="$(mi_name_volume "$ident" "$product" "$role")" || return 1
     specs+=("volume=${vol}:${target}:rw")
+    mtargets+=("$target")
   done
 
   # Core-fixed mounts (§4.1a): the closed allowlist, validated, never manifest-extended. The manifest
@@ -288,14 +297,15 @@ mi_bringup_specs() {
   # The SAME canonical home the check validated — validate and launch against the same resolved path.
   local h; h="$(mi_home_canon)" || return 1
   specs+=("bind=${h}/${product}.conf:/etc/mythical/${product}.conf:rw")
+  mtargets+=("/etc/mythical/${product}.conf")
   while IFS= read -r v; do
     [ -n "$v" ] || continue
     mi_policy_permits "$prec" "$product" mount "$v" || {
       mi_warn "verbs: '$product' selects the core-fixed mount '$v', which the policy index does not permit."
       return 1; }
     case "$v" in
-      transcripts) specs+=("bind=${h}/transcripts:/home/mythical/transcripts:rw") ;;
-      logs)        specs+=("bind=${h}/logs:/home/mythical/logs:rw") ;;
+      transcripts) specs+=("bind=${h}/transcripts:/home/mythical/transcripts:rw"); mtargets+=("/home/mythical/transcripts") ;;
+      logs)        specs+=("bind=${h}/logs:/home/mythical/logs:rw"); mtargets+=("/home/mythical/logs") ;;
       *) mi_warn "verbs: '$v' is not a core-fixed mount"; return 1 ;;
     esac
   done <<< "$(mi_doc_values "$mrec" mount)"
@@ -331,6 +341,19 @@ mi_bringup_specs() {
   if vmount="$(mi_doc_value "$mrec" volatile_mount)"; then vrc=0; else vrc=$?; fi
   if [ "$vrc" -eq 0 ]; then
     mi_volatile_assert_production_root "$vmount" || return 1
+    # NO other mount may sit at, under, or over the credential-home root. A named volume or a bind
+    # whose target overlapped it would shadow part of the tmpfs tree with DURABLE storage — persistent
+    # across teardown and captured by backup — which is exactly the non-persistence and
+    # backup-exclusion this mount exists to guarantee. The manifest is authenticated but the target is
+    # still the manifest's to choose, so this is enforced here rather than trusted.
+    local mt
+    for mt in ${mtargets[@]+"${mtargets[@]}"}; do
+      mi_volatile_path_disjoint "$vmount" "$mt" || {
+        mi_warn "verbs: '$product' mounts '$mt', which overlaps the volatile credential-home mount"
+        mi_warn "  '$vmount'. A durable mount at, under, or over that root would persist past teardown"
+        mi_warn "  and be captured by backup, defeating the mount's whole purpose. Refusing."
+        return 1; }
+    done
     local vspec
     vspec="$(mi_volatile_mount_spec "$vmount")" || return 1
     specs+=("$vspec")

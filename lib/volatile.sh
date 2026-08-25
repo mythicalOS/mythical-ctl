@@ -84,6 +84,20 @@ mi_volatile_assert_production_root() {
   return 0
 }
 
+# True (rc 0) only when two absolute container paths are DISJOINT — neither equal, nor one a subpath
+# of the other. Used to keep the volatile credential-home root isolated from every other mount: a
+# durable mount (a named volume or a bind) at, under, or over the volatile root would place credential
+# bytes on persistent, backed-up storage inside the tmpfs tree, defeating the non-persistence and
+# backup exclusion the mount exists to guarantee. rc 1 on any overlap. Both inputs are validated
+# safe-segment paths (or fixed literals) with no glob metacharacter, so the prefix patterns are literal.
+mi_volatile_path_disjoint() {
+  local a="$1" b="$2"
+  [ "$a" != "$b" ] || return 1                       # identical mount points
+  case "${b}/" in "${a}/"*) return 1 ;; esac         # b is at or under a
+  case "${a}/" in "${b}/"*) return 1 ;; esac         # a is at or under b
+  return 0
+}
+
 # True only when a security-option string is EXACTLY the fixed set, in the canonical order. Reject a
 # weakened set (a missing flag, a reordering, or an added one). This is the fail-closed check for a
 # rendered mount's hardening: any string that is not the frozen one is refused rather than downgraded.

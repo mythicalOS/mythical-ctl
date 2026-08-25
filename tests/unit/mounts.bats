@@ -386,6 +386,28 @@ teardown() { rm -rf "$OUT"; mi_lock_release; teardown_test_env; }
 # A manifest with no volatile_mount emits no volatile spec at all — absence is not a mount. The
 # record is empty so the assembly reads nothing out of the placeholder mythical.conf (its port/bind
 # lookups would trip that fixture's stand-in key); only the volatile branch is under test here.
+# A durable mount inside (or over) the credential-home root would shadow the tmpfs with persistent,
+# backed-up storage — the one thing the volatile mount must never allow. A named volume the manifest
+# places at a CHILD of the volatile root is the reachable form, and it must be refused, not launched
+# alongside the tmpfs. A valid mythical.conf is written so the bind-key lookup does not trip the
+# suite's placeholder file; the STATE role is not bindable, so it falls through to a named volume.
+@test "mi_bringup_specs refuses a mount that overlaps the volatile credential-home root" {
+  mi_ident_ensure >/dev/null
+  printf 'MYTHICAL_NET=n\n' > "$MYTHICAL_HOME/mythical.conf"
+  local mrec
+  mrec="$(printf 'volume\tstate:/run/mythical/credential-homes/session\nvolatile_mount\t/run/mythical/credential-homes\n')"
+  run mi_bringup_specs brokkr "$mrec" "$PREC"
+  [ "$status" -ne 0 ] || { echo "accepted a durable mount inside the volatile root: $output" >&2; return 1; }
+  assert_contains "overlaps the volatile credential-home mount"
+
+  # A disjoint volume alongside the volatile mount is fine — the guard rejects overlap, not coexistence.
+  mrec="$(printf 'volume\tstate:/data\nvolatile_mount\t/run/mythical/credential-homes\n')"
+  run mi_bringup_specs brokkr "$mrec" "$PREC"
+  [ "$status" -eq 0 ] || { echo "a disjoint volume beside the volatile mount was refused: $output" >&2; return 1; }
+  assert_contains "volatile=/run/mythical/credential-homes"
+  assert_contains "volume="
+}
+
 @test "mi_bringup_specs emits no volatile spec when the manifest declares none" {
   mi_ident_ensure >/dev/null
   run mi_bringup_specs brokkr "" "$PREC"

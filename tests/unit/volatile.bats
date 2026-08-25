@@ -103,6 +103,26 @@ teardown() { teardown_test_env; }
   done
 }
 
+# The disjointness predicate keeps the credential-home root isolated from every other mount. Overlap
+# is symmetric — equal, a subpath either way — because a durable mount at, under, OR over the root all
+# put credential bytes on persistent storage inside the tmpfs tree.
+@test "path disjointness catches equal, child, and ancestor overlaps but allows a sibling" {
+  local root=/run/mythical/credential-homes
+  # Overlapping (rc 1): identical, a child, and an ancestor.
+  local bad
+  for bad in /run/mythical/credential-homes /run/mythical/credential-homes/session /run/mythical /run; do
+    run mi_volatile_path_disjoint "$root" "$bad"
+    [ "$status" -ne 0 ] || { echo "missed an overlap with '$bad'" >&2; return 1; }
+  done
+  # Disjoint (rc 0): a sibling and an unrelated tree — and a name that only shares a prefix STRING but
+  # not a path boundary (…-homes-2 is not under …-homes).
+  local ok
+  for ok in /run/mythical/other /data /run/mythical/credential-homes-2; do
+    run mi_volatile_path_disjoint "$root" "$ok"
+    [ "$status" -eq 0 ] || { echo "wrongly flagged '$ok' as overlapping" >&2; return 1; }
+  done
+}
+
 @test "the typed launch spec is emitted for a valid path and refused for an invalid one" {
   run mi_volatile_mount_spec /run/mythical/credential-homes
   [ "$status" -eq 0 ]
