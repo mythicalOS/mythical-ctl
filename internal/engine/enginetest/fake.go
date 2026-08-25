@@ -19,12 +19,16 @@
 //     carrying no labels — the asymmetry is real and deliberate on Docker's part, and the
 //     unlabelled volume is invisible to every find-by-label sweep, which is why it is worth
 //     seeing.
-//   - A resource that is still referenced cannot be removed: a network with an attached
-//     container, a volume a container mounts, a running container without force.
+//   - A resource that is still referenced cannot be removed: a network with a RUNNING
+//     container attached (measured 2026-08-25: a created-or-stopped attachment holds no
+//     active endpoint and does not block), a volume a container mounts (any state), a running
+//     container without force.
 //   - A container joins a network under its own NAME as well as any explicit alias, so an
 //     omitted alias is observable rather than invisible (§9's silent-DNS failure).
-//   - Connecting the SAME network twice is a conflict; a private (`none`) mode container
-//     cannot be connected to any network — the daemon's own refusal, in its words.
+//   - Connecting the SAME network twice to a RUNNING container is a conflict (on a non-running
+//     one the daemon updates the endpoint config — measured 2026-08-25); a private (`none`)
+//     mode container cannot be connected to any network — the daemon's own refusal, in its
+//     words.
 //   - `network create` records the driver it was ASKED for; the duplicate-name knob models
 //     D38 (Docker does not guarantee name-conflict detection there).
 //   - The two name-RESOLUTION surfaces a container has are modelled SEPARATELY: the network
@@ -540,7 +544,9 @@ func (f *Fake) createContainer(w http.ResponseWriter, r *http.Request) {
 	// mount config. Every refusal precedes the record write, or a refused create would leave
 	// a container behind for the next assertion to find.
 	if _, ok := f.images[body.Image]; !ok {
-		fail(w, 404, "Unable to find image '%s' locally", body.Image)
+		// The API's own wording and status — a 404, so the client reports ErrAbsent. (The
+		// CLI's "Unable to find image … locally" is its wrapper, not the daemon's answer.)
+		fail(w, 404, "No such image: %s", body.Image)
 		return
 	}
 	if f.findContainer(name) != nil {
@@ -1056,9 +1062,14 @@ func (f *Fake) removeNetwork(w http.ResponseWriter, seg string) {
 		fail(w, 404, "network %s not found", ref)
 		return
 	}
-	// A network with a container still attached CANNOT be removed — the exact state the
-	// teardown ordering (detach, then remove) exists to avoid.
+	// A network with an ACTIVE endpoint cannot be removed — the state the teardown ordering
+	// (detach, then remove) exists to avoid. MEASURED 2026-08-25 (Engine 28.4.0): only a
+	// RUNNING container holds an active endpoint; a created-or-stopped attachment does not
+	// block removal — the daemon released (or never materialized) its endpoint.
 	for _, c := range f.containers {
+		if c.state != "running" {
+			continue
+		}
 		for _, ep := range c.endpoints {
 			if ep.netID == n.id {
 				fail(w, 409, "error while removing network: network %s id %s has active endpoints", ref, n.id)
@@ -1112,14 +1123,27 @@ func (f *Fake) connectNetwork(w http.ResponseWriter, r *http.Request, seg string
 		fail(w, 403, "container cannot be connected to multiple networks with one of the networks in private (none) mode")
 		return
 	}
-	// Connecting the SAME network twice is a conflict, not a second endpoint: an appended
-	// duplicate would make a reconnect-every-pass loop look idempotent here while erroring
-	// against a real daemon.
-	for _, ep := range c.endpoints {
-		if ep.netID == n.id {
+	// Connecting the SAME network twice: for a RUNNING container it is a conflict, not a
+	// second endpoint — a reconnect-every-pass loop must error here as it does against a real
+	// daemon. MEASURED 2026-08-25 (Engine 28.4.0): on a NON-running container the daemon
+	// accepts the call and updates the stored endpoint config instead (no error observed;
+	// modelled as a config replace).
+	for i, ep := range c.endpoints {
+		if ep.netID != n.id {
+			continue
+		}
+		if c.state == "running" {
 			fail(w, 403, "endpoint with name %s already exists in network %s", c.name, ref)
 			return
 		}
+		c.endpoints[i] = &fakeEndpoint{
+			netID:   n.id,
+			netName: n.name,
+			aliases: append(append([]string(nil), body.EndpointConfig.Aliases...), c.name),
+			gw:      body.EndpointConfig.GwPriority,
+		}
+		ok(w, nil)
+		return
 	}
 	c.endpoints = append(c.endpoints, &fakeEndpoint{
 		netID:   n.id,

@@ -560,7 +560,7 @@ func TestUnpulledImageRefused(t *testing.T) {
 	}
 	spec := launchSpec(t, "c1", "never-pulled:v1", netID, "a1", engine.SpecOpts{})
 	_, err = m.ContainerCreate(ctx, spec)
-	if err == nil || !strings.Contains(err.Error(), "Unable to find image") {
+	if err == nil || !errors.Is(err, engine.ErrAbsent) || !strings.Contains(err.Error(), "No such image") {
 		t.Fatalf("unpulled image: %v", err)
 	}
 	if _, ierr := c.ContainerInspect(ctx, "c1"); !errors.Is(ierr, engine.ErrAbsent) {
@@ -756,9 +756,17 @@ func TestConnectDuplicateAndPrivate(t *testing.T) {
 	f, _, m := newFakePair(t)
 	ctx := context.Background()
 	netID := fakeSetup(t, f, m, ctx)
+	// On a NON-running container the daemon accepts a second connect and updates the endpoint
+	// config (measured 2026-08-25); the CONFLICT is a running-container fact.
+	if err := m.NetworkConnect(ctx, netID, "c1", "replaced", 5); err != nil {
+		t.Fatalf("non-running duplicate connect updates config: %v", err)
+	}
+	if err := m.ContainerStart(ctx, "c1"); err != nil {
+		t.Fatal(err)
+	}
 	err := m.NetworkConnect(ctx, netID, "c1", "again", 0)
 	if err == nil || !strings.Contains(err.Error(), "already exists in network") {
-		t.Fatalf("duplicate endpoint: %v", err)
+		t.Fatalf("duplicate endpoint on a running container: %v", err)
 	}
 	// The private-mode refusal ("container cannot be connected … in private (none) mode") is
 	// asserted in enginetest/fake_test.go's TestPrivateModeConnectRefused: a standing
@@ -821,7 +829,11 @@ func TestReferencedResourcesCannotBeRemoved(t *testing.T) {
 	f, _, m := newFakePair(t)
 	ctx := context.Background()
 	netID := fakeSetup(t, f, m, ctx)
-	// A network with an attached container.
+	// A network with an ACTIVE endpoint — a RUNNING container (measured 2026-08-25: a
+	// created-or-stopped attachment does not block removal; only a live endpoint does).
+	if err := m.ContainerStart(ctx, "c1"); err != nil {
+		t.Fatal(err)
+	}
 	if err := m.NetworkRemove(ctx, netID); err == nil || !strings.Contains(err.Error(), "active endpoints") {
 		t.Fatalf("network with endpoints: %v", err)
 	}

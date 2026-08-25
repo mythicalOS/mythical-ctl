@@ -6,6 +6,10 @@
 #   bash check.sh packages   # only the "does this lane actually cover anything" guard
 #   bash check.sh go         # packages + gofmt + build + vet + boundary + test
 #   bash check.sh boundary   # only the reference-boundary gates
+#   bash check.sh acceptance # the REAL-DAEMON lane: re-measures every behavior the hermetic
+#                            # fake asserts against a live local daemon (needs Docker running,
+#                            # and one busybox pull). Opt-in - NOT in CI's default path; run
+#                            # before every wave gate, divergences fixed in fake+client.
 #
 # WHY THIS FILE EXISTS. CI and any future release gate must run identical checks; spelling the
 # commands out twice guarantees they drift, and the direction they drift is always the same —
@@ -107,6 +111,11 @@ check_boundary() {
   go run ./tools/boundary-gate "${BOUNDARY_RULES[@]}"
 }
 
+check_acceptance() {
+  step "acceptance (real daemon)"
+  GOFLAGS='' GOENV=off go test -tags acceptance ./internal/engine/ -run 'TestAcceptance' -count=1 -v
+}
+
 check_go() {
   check_packages
 
@@ -148,11 +157,12 @@ case "${1:-all}" in
   packages) check_packages ;;
   boundary) check_boundary ;;
   go) check_go ;;
+  acceptance) check_acceptance ;;
   # Reads `go test -json` output on stdin and applies the floor, so a harness can prove the
   # floor refuses; the `go` stage uses the same two functions.
   tested-floor) assert_tested_floor "$(count_ok)" ;;
   all) check_go ;;
-  *) die "unknown stage: $1 (want one of: all, packages, boundary, go, tested-floor)" ;;
+  *) die "unknown stage: $1 (want one of: all, packages, boundary, go, acceptance, tested-floor)" ;;
 esac
 
 printf '\ncheck.sh: OK\n'

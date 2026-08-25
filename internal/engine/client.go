@@ -477,7 +477,17 @@ func (m *Mutator) ContainerCreate(ctx context.Context, spec ContainerSpec) (stri
 	if spec.name == "" {
 		return "", errors.New("engine: an empty ContainerSpec — use NewContainerSpec")
 	}
-	body := containerCreateBody(spec)
+	// The attach reference is resolved to the network NAME before the request is built
+	// (MEASURED 2026-08-25, Engine 28.4.0/API 1.51): the daemon records a never-started
+	// endpoint under WHATEVER STRING keyed EndpointsConfig, and only normalizes to the name
+	// at start — so an id-keyed create would leave the pre-start inspect with no name key,
+	// which is the one identifier the never-started attach check has. Resolving here also
+	// answers an absent network with ErrAbsent before anything is created.
+	ni, err := m.c.NetworkInspect(ctx, spec.attach.network)
+	if err != nil {
+		return "", err
+	}
+	body := containerCreateBody(spec, ni.Name)
 	var resp struct {
 		ID string `json:"Id"`
 	}
@@ -490,7 +500,7 @@ func (m *Mutator) ContainerCreate(ctx context.Context, spec ContainerSpec) (stri
 
 // containerCreateBody serializes a validated spec. THE loopback wall lives here: the host IP
 // in every port binding is the constant 127.0.0.1 (D26/§4b.1).
-func containerCreateBody(spec ContainerSpec) map[string]any {
+func containerCreateBody(spec ContainerSpec, networkName string) map[string]any {
 	exposed := map[string]struct{}{}
 	bindings := map[string][]map[string]string{}
 	for _, p := range spec.ports {
@@ -517,7 +527,7 @@ func containerCreateBody(spec ContainerSpec) map[string]any {
 		},
 		"NetworkingConfig": map[string]any{
 			"EndpointsConfig": map[string]any{
-				spec.attach.network: map[string]any{"Aliases": spec.attach.aliases},
+				networkName: map[string]any{"Aliases": spec.attach.aliases},
 			},
 		},
 	}
@@ -773,12 +783,17 @@ func (m *Mutator) HelperRun(ctx context.Context, h HelperSpec) (int64, []byte, e
 		// Private mode — the copy container's mode (D54): the one legitimate use of `none`.
 		hostConfig["NetworkMode"] = "none"
 	} else {
+		// Same name resolution as ContainerCreate, for the same measured reason.
+		ni, nerr := m.c.NetworkInspect(ctx, h.opts.Network)
+		if nerr != nil {
+			return 0, nil, nerr
+		}
 		ep := map[string]any{}
 		if h.opts.Alias != "" {
 			ep["Aliases"] = []string{h.opts.Alias}
 		}
 		body["NetworkingConfig"] = map[string]any{
-			"EndpointsConfig": map[string]any{h.opts.Network: ep},
+			"EndpointsConfig": map[string]any{ni.Name: ep},
 		}
 	}
 	body["HostConfig"] = hostConfig
