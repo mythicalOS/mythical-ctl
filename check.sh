@@ -24,8 +24,8 @@ cd "$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 # Floors, not exact counts: the tree grows a package per port task, and each task raises these
 # two literals in its commit. Overridable ONLY so a test harness can prove the guard refuses.
-MIN_PACKAGES="${MIN_PACKAGES:-7}"
-MIN_TESTED_PACKAGES="${MIN_TESTED_PACKAGES:-7}"
+MIN_PACKAGES="${MIN_PACKAGES:-8}"
+MIN_TESTED_PACKAGES="${MIN_TESTED_PACKAGES:-8}"
 
 # The reference-boundary rules, one per line: `<guarded-import-path>:<Identifier>=<allowed
 # import path>[,<more allowed>]`. The defining package itself is always allowed. Each rule is
@@ -34,7 +34,10 @@ MIN_TESTED_PACKAGES="${MIN_TESTED_PACKAGES:-7}"
 # AST (selector and identifier use, not call syntax), so a function VALUE of a guarded symbol
 # is caught too — see tools/boundary-gate.
 BOUNDARY_RULES=(
-  # (rules are appended by the tasks that create each boundary)
+  # staging-boundary (Task 8): the restore staging store is constructed ONLY by the backup
+  # module — a lifecycle path that could open staging would treat a not-yet-verified restore
+  # as live state.
+  "mythicalos.ai/ctl/internal/ledger:OpenStaging=mythicalos.ai/ctl/internal/backup"
 )
 
 die() {

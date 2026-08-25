@@ -1,0 +1,5 @@
+#mythical-ctl-ledger schema=1
+identity	id=i0123456789
+product	name=brokkr
+object	key=volume:v1	class=volume	name=v1	nonce=n1	gen=1
+#sha256=1abd97ed5916583b899d3c8f9f77ff5cbe0f691a192d45526f04a5db92ee2afb
