@@ -50,7 +50,7 @@ otherwise. Contributions are accepted under the same licence as the repository y
 contributing to. Do not paste code from a source under an incompatible licence.
 
 Where the open-source product ends and the paid tier begins is stated in that repository's
-README (see its **Licence and the paid tier** section). It is worth reading before you invest time
+README. It is worth reading before you invest time
 in a large contribution: we take no copyright assignment and no relicensing right over your work,
 and we do not move capabilities out of an open repository into the paid tier.
 

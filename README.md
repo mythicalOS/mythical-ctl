@@ -1,254 +1,102 @@
-# mythical-ctl
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/logo-dark.svg">
+    <img src=".github/assets/logo-light.svg" alt="mythicalOS" width="84" height="84">
+  </picture>
+</p>
 
-The installer and lifecycle CLI for the **mythicalOS** family of local-first containers.
+<h1 align="center">mythical-ctl</h1>
 
-> **Status: the lifecycle verbs and data movement are implemented.** `mythical-ctl` installs, starts,
-> stops, restarts, recreates, reports the status of, uninstalls, and repairs the state of mythicalOS
-> products, and moves their data — migrate a volume to a host bind, back a product up, and restore it.
-> On top of the foundation it
-> stands on: the `~/.mythical/` layout and its ownership rules, a single atomic fail-closed state
-> ledger, a family operation lock, the two-config-file layer with its non-executing parser, the
-> authenticated-document trust chain (family index, family policy index, per-product manifests, and
-> the `/detect` version contract), and a hermetic test harness. The products themselves are not
-> published yet, so installing one whose image has not shipped reports that it has not launched yet
-> and creates nothing — that is a recognised state, not a failure.
->
-> The `curl … | bash` install command below is served by
-> [get.mythicalos.ai](https://get.mythicalos.ai), which installs product containers directly; it
-> does not yet download or use `mythical-ctl`.
+<p align="center">
+  <strong>One installer and lifecycle CLI for the mythicalOS family of local-first containers — pure bash, no runtime required.</strong>
+</p>
 
-It is designed to be **product-agnostic**: everything specific to a product (image reference,
-ports, volumes, environment) arrives from a manifest that product ships, never from logic baked
-in here. One command installs a product, keeps its configuration in a predictable place, and
-manages it afterwards — `install`, `start`, `stop`, `restart`, `recreate`, `status`, `uninstall`, and
-`state repair` — and moves data with `migrate-storage`, `backup`, and `restore`.
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache_2.0-blue.svg" alt="License: Apache-2.0"></a>
+  <img src="https://img.shields.io/badge/shell-bash-4EAA25.svg?logo=gnubash&logoColor=white" alt="bash">
+  <a href="https://mythicalos.ai"><img src="https://img.shields.io/badge/part_of-mythicalOS-0F6B66.svg" alt="Part of mythicalOS"></a>
+</p>
+
+---
+
+Installing several products shouldn't mean learning several installers. `mythical-ctl` is the common
+half, written once: container preflight, a predictable `~/.mythical/` layout, config, volume/bind
+lifecycle, and the lifecycle verbs. Everything product-specific — image, ports, volumes, environment —
+arrives from a **manifest the product ships**, never from logic baked in here.
+
+One command installs a product and manages it afterwards:
+
+```
+install · start · stop · restart · recreate · status · uninstall · state repair
+migrate-storage · backup · restore
+```
+
+> **Status:** the lifecycle verbs and data movement are implemented, on top of the `~/.mythical/`
+> layout, a non-executing config parser, an authenticated-document trust chain, and a hermetic test
+> harness. The products themselves aren't published yet — so installing one whose image hasn't
+> shipped reports that it hasn't launched and creates nothing (a recognised state, not a failure).
+
+## Install
+
+The bootstrap below is served by [get.mythicalos.ai](https://get.mythicalos.ai). It downloads to a
+temp file and **checks the HTTP status before executing anything** — deliberately not a
+`curl … | bash` one-liner, because that form can't reject a redirect into your shell. The full
+reasoning is in [`docs/design.md`](docs/design.md#why-this-is-not-a-one-liner).
 
 ```sh
-# fetch, CHECK, run — deliberately not a one-liner (see below).
-# Subshell: without it, a failed download would exit your shell.
-# Explicit gates, not `set -e`: errexit is suppressed inside a subshell used
-# in an if/&&/|| context, so it cannot be relied on here.
 (
   tmp=$(mktemp) || exit 1
   trap 'rm -f "$tmp"' EXIT
-
-  # BOTH gates: curl must succeed AND the status must be exactly 200
-  code=$(curl -fsS --proto '=https' --max-redirs 0 \
-              -o "$tmp" -w '%{http_code}' \
+  code=$(curl -fsS --proto '=https' --max-redirs 0 -o "$tmp" -w '%{http_code}' \
               https://get.mythicalos.ai/brokkr) \
     || { echo "download failed — refusing to run it"; exit 1; }
   [ "$code" = 200 ] || { echo "unexpected HTTP $code — refusing to run it"; exit 1; }
-
   bash "$tmp"
 )
 ```
 
-## Why it exists
+Product images are pinned by content digest (`@sha256:…`) and verified by the container runtime on
+pull; if the bytes don't match, the install stops rather than run unverified bytes.
 
-Installing several products should not mean learning several installers. Before this existed, each
-product carried its own install script with its own conventions — different volume names, different
-environment variables, different ideas about where configuration lives. A user who installed two of
-them met two different models, and the shared parts drifted apart with every change.
+**Requirements:** bash. The lifecycle verbs additionally need a container runtime (rootful Docker
+Engine 28+ or Docker Desktop); installing needs `curl` and `mktemp`.
 
-`mythical-ctl` is that common half, written once: container-runtime preflight, the `~/.mythical/`
-layout, reading and validating configuration, volume and bind lifecycle, the lifecycle verbs, and
-data movement. Products contribute a manifest describing themselves, and nothing more. That is the
-**design**, and it is built and tested today — the preflight, the layout and configuration layer, the
-volume and bind lifecycle, the verbs, and data movement all landed (see the status note at the top).
+## Your data is never collateral
 
-## One place for everything you edit
+The installer creates what's missing and reads what's there — it won't overwrite a config you edited
+or delete a transcript, log, or bound directory. Config writes are additive by construction. Note
+that **copying `~/.mythical/` is not a backup** — product data and runtime secrets live in named
+volumes; use `mythical-ctl backup` (and `restore`) for those.
 
-The layout — the ownership rules below are implemented (`lib/layout.sh`), and the CLI mounts each
-product's configuration and volumes into its container per that product's manifest:
+The layout, ownership zones, config-file model, the authenticated-document trust chain, and the exact
+backup/uninstall/status semantics are documented in **[`docs/design.md`](docs/design.md)**; the config
+and trust-chain contracts are in [`docs/CONFIG-FORMAT.md`](docs/CONFIG-FORMAT.md) and
+[`docs/DOCUMENT-FORMAT.md`](docs/DOCUMENT-FORMAT.md).
 
-```
-~/.mythical/
-  mythical.conf        host-only configuration and bootstrap secrets — to be never mounted
-  <product>.conf       per-product settings — to be mounted into that product's container
-  bin/                 this CLI, and its siblings
-  <product>/           generated artifacts, owned by the installer
-    cli.toml           that product's host-side tool config — yours, host-only, never mounted
-  .state/              lock + ledger, owned by the installer — not an editing surface
-  transcripts/ logs/   product data
-```
+## Develop
 
-Both `.conf` files are `KEY=value` text. They are **never** executed — `mythical-ctl` parses them with a
-strict non-executing reader that allowlists keys and validates values by type, so a line like
-`KEY=$(...)` is refused rather than run. That reader is built and tested today.
-
-The **split between the two files** is the design, not shipped behaviour, for the same reason as
-everything else above: `mythical.conf` is to stay host-only and never be mounted into any container;
-`<product>.conf` is to be the only file a product can see or write; and the code that eventually
-launches a container is to build its arguments without reading any value out of it. That is enforced
-at the launch path the verbs walk: the mount, publish and secret-injection rules live at the one
-place a container is created, so no caller can express an unsafe launch. The format itself is
-specified in [`docs/CONFIG-FORMAT.md`](docs/CONFIG-FORMAT.md).
-
-`<product>/cli.toml` is the **host-tool slot** — the one leaf inside an installer-managed product
-directory that the installer does not own. It is where a product's *host-side* tool, a CLI that runs
-beside this one rather than inside that product's container, keeps its own configuration, including
-host-only credentials. It is yours: mode 0600, owned by you, and never mounted into any container by
-name — which is precisely why such a credential does not go in `<product>.conf`, which is to be
-mounted into the container read-write. Three product names are excluded — `bin`, `logs` and
-`transcripts`, whose directories already mean something else here, and two of which *are* mounted
-into containers — so a host-side tool for a product so named has no slot and must not invent one.
-(`docs/CONFIG-FORMAT.md` has that exclusion in full, and the limit on the never-mounted guarantee,
-which applies equally to `mythical.conf`.) `mythical-ctl` never creates, modifies or removes it, and
-never parses it; the one thing that reads its bytes is `backup`, which copies the whole directory —
-so treat a backup as secret material.
-The slot is specified in [`docs/CONFIG-FORMAT.md`](docs/CONFIG-FORMAT.md), which is also where the
-ownership zones themselves are written down.
-
-Nothing is scattered across your home directory: every file you are expected to read or edit is
-in there.
-
-Beyond those two files, this project also builds and tests a separate, more privileged
-authenticated-document layer the lifecycle commands call on: a family
-index, a family policy index, and each product's manifest, chained back to a single authenticated
-root, plus a small bounded reader for a product's own version out of its `/detect` response. That
-contract — the grammar, the trust model, and exactly which keys a manifest may and may not declare
-— is published in [`docs/DOCUMENT-FORMAT.md`](docs/DOCUMENT-FORMAT.md) for product authors and
-index publishers who need it without reading this repository's source.
-
-**It is not the whole install, though.** Product state — and each product's own secrets store —
-lives in named container volumes, and the containers, images and shared network live in your
-container runtime. None of that is in this directory. So:
-
-- **Copying `~/.mythical/` is not a backup.** The data and the runtime secrets are not in it — a
-  complete backup has to include the named volumes as well. That is what `mythical-ctl backup`
-  is for: it captures the named volumes too, and `restore` puts them back.
-  - **It covers exactly what this tool installed, and nothing else.** Backup walks the installer
-    state ledger and captures the volumes recorded there, so a volume enters its coverage only by
-    having been created through this tool's own install path. A product that installed itself by
-    its own installer holds volumes this ledger has never heard of, and they are **silently absent
-    from the backup** — the run still reports success, because from here there is nothing missing.
-    Volume names are derived from the installation identity and the product identity (see
-    [`docs/DOCUMENT-FORMAT.md`](docs/DOCUMENT-FORMAT.md)), so such a product's volumes do not even
-    share a namespace with these; declaring a manifest role for one would create a **new, empty**
-    volume beside it rather than adopting it. If you run a product that installs itself, use that
-    product's own backup verb for its data, and treat this one as covering the rest.
-- **`uninstall --purge` destroys named volumes, and now asks first.** A plain `uninstall` keeps every
-  volume and says so per volume; `--purge` is what removes them. Both the product-scoped and the
-  family-scoped form list what they are about to remove — each volume by name, with its role and
-  whether its contents can be rebuilt — and then require an explicit confirmation. A bare newline,
-  EOF, or a closed stdin all **refuse**, so a purge cannot be carried by a pipe that happened to be
-  empty. The listing comes before anything is removed, because a prompt that arrives after the
-  container is gone is a notification rather than a decision.
-  - **A volume whose data class is unknown is treated as unrecoverable.** The family policy index is
-    where a role is declared unregenerable (`<product>.precious_role` — see
-    [`docs/DOCUMENT-FORMAT.md`](docs/DOCUMENT-FORMAT.md)); a product's own manifest deliberately
-    cannot make that claim about itself, because under-declaring would buy it a quieter purge. Where
-    no declaration exists, `status` and `--purge` both report the volume as unregenerable rather than
-    as safe to delete. Only an explicit classification of *regenerable* is read as a statement that a
-    reinstall rebuilds the contents.
-- **`status` reports volumes, not just containers** — presence, role, data class, and whether this
-  installation created them. Deliberately not size: the host cannot read a named volume's contents and
-  the runtime reports no size for one, so any number here would have to be invented or obtained by
-  starting a container, and `status` starts nothing.
-- **Deleting `~/.mythical/` is not an uninstall.** The containers keep running.
-
-**Your data must never be collateral — that is the rule the installer is being built to.** It will
-create what is missing and read what already exists; it will not overwrite a configuration file you
-have edited, and it will not delete transcripts, logs, or any directory you bound, so re-installing
-on a machine that has been in use for a year is meant to be safe. Today this is enforced only where
-there is code to enforce it: `mi_zone` classifies every path into an ownership class, the layout
-helper creates missing directories and touches nothing else, and the config layer is additive by
-construction — it appends a key that is absent, refuses to change one that is already set to
-something else, and leaves every other byte, comment and blank line exactly as it found them.
-**Do not read it as a guarantee over your data yet** — nothing here touches a transcript or a log at
-all. The only files it writes are the two configuration files and its own bookkeeping under `.state/`
-(the operation lock and the state ledger), which is the installer's, not an editing surface.
-
-## Siblings
-
-The `mythical-` prefix is a namespace, not just a name. `bin/` is structured so that focused
-companion binaries can live alongside this one rather than accreting into it — the CLI should stay
-small enough to read.
-
-## Requirements
-
-**To run the CLI as it stands:** bash, and nothing else. It answers `--version` and `--help`, and its
-library layer needs only bash builtins, the usual POSIX text tools, and `sha256sum` or `shasum -a 256`.
-
-**A container runtime** (rootful Docker Engine 28+ or Docker Desktop, with a local daemon) is
-required by the lifecycle verbs. It is listed here because it is the reason this is written in shell
-at all: no language runtime is required to install a product.
-
-**To install**, you additionally need **`curl`** and **`mktemp`** — the sequence above downloads the
-bootstrap to a temp file and checks its HTTP status before executing anything, rather than piping a
-response straight into a shell.
-
-**What is verified, and what is not.** The bootstrap installs each product image **pinned by
-content digest** (`@sha256:…`), which the container runtime checks on pull: if the bytes are not the
-bytes that were pinned, the pull fails and the installer **stops rather than installing
-unverified bytes**. A product with no published digest yet is reported as not launched and is not
-installed. The bootstrap script *itself* is authenticated by TLS to a known origin, not by a
-separate signature — that is a deliberate, stated limit of this model, not an oversight.
-
-### Why this is not a one-liner
-
-`curl … | bash` cannot reject a redirect. Without `-L`, curl does not *follow* a redirect — but
-it does not fail on one either: `-f` acts on 4xx and 5xx, so a `3xx` response is transferred
-like any other and **its body goes straight into your shell**. Anyone who controls a redirect
-controls that body. `--max-redirs 0` bounds following, not status handling.
-
-Downloading first makes the status checkable before anything executes. It is one extra line,
-and it is the difference between "we verify everything" and "we verify everything after the
-first thing already ran".
-
-`wget` is not supported here either: no flag constrains every hop of a redirect chain, so an
-`https → http → https` chain is undetectable.
-
-(Bash specifically, not POSIX `sh`: the CLI uses `set -o pipefail` and other bash features. Bash
-is present by default on macOS and every mainstream Linux distribution; where it is not — Alpine,
-some minimal images — it is a one-package install.)
-
-## Development
-
-The test runner is vendored as a git submodule, so **clone with submodules** — a plain `git clone`
-leaves `vendor/bats-core/` empty and the unit tests cannot run:
+The test runner is a git submodule — **clone with submodules**, or the unit tests can't run:
 
 ```sh
 git clone --recurse-submodules https://github.com/mythicalOS/mythical-ctl.git
-# already cloned without it:
-git submodule update --init
+# already cloned: git submodule update --init
 ```
-
-The checks CI runs, which you can run identically:
 
 ```sh
-shellcheck -x bin/* lib/*.sh tests/*.sh tests/harness/* tools/*.sh  # lint (zero findings expected)
-./tests/smoke.sh                                                    # entrypoint smoke
-vendor/bats-core/bin/bats tests/unit                                # unit tests
-
-# and the same smoke suite against the artifact a release actually publishes
-tools/bundle.sh dist/mythical-ctl
-shellcheck dist/mythical-ctl
-MCTL_BIN="$PWD/dist/mythical-ctl" ./tests/smoke.sh
+shellcheck -x bin/* lib/*.sh tests/*.sh tests/harness/* tools/*.sh   # lint
+./tests/smoke.sh                                                     # entrypoint smoke
+vendor/bats-core/bin/bats tests/unit                                 # unit tests
 ```
 
-`lib/` holds the shipped shell libraries; `tests/harness/` holds test-only helpers — a fake
-container runtime and filesystem-snapshot assertions — which shipped code never sources.
+Tests are hermetic (a fake container runtime) — a green suite proves logic, not Docker behaviour. A
+release publishes a single bundled file (`tools/bundle.sh`), byte-reproducible from the tree. See
+[`docs/design.md`](docs/design.md#development) for the release-artifact check.
 
-A release does **not** publish `bin/mythical-ctl` as it sits here. `tools/bundle.sh` inlines
-`lib/*.sh` into the entrypoint's `mctl:modules` region and publishes a single self-contained file,
-because the installed layout is exactly one file — one artifact, one digest, one attestation, and
-no directory beside the installed CLI for it to source code out of on every later run. The bundle
-is byte-reproducible from a given tree, so a published checksum is one anyone can re-derive.
+## License
 
-## Licence and the paid tier
-
-`mythical-ctl` is open source under **Apache-2.0**, and so are the products it installs, as they
-are published. No part of the installer is withheld from the open-source build: there is no reduced
-"community edition" of it, and no feature here is withheld from the open-source build.
-
-The commercial side of mythicalOS is a **separate, private, hosted service** — it is not a
-restricted version of anything in this repository, and nothing here calls into it. Running the
-open-source products, including running them for other people as a paid hosted offering of your
-own, is permitted by Apache-2.0 and is not something this project asks you to license separately.
-
-Contributions are welcome anywhere in this repository. See [CONTRIBUTING.md](CONTRIBUTING.md) —
-we use DCO sign-off, not a CLA.
-
-Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE). The licence covers the code, not the
-names and branding — see [`TRADEMARK.md`](TRADEMARK.md).
+**Apache-2.0** — see [LICENSE](LICENSE) and [NOTICE](NOTICE); the licence covers the code, not the
+mythicalOS name and marks ([TRADEMARK.md](TRADEMARK.md)). The installer and the products it installs
+are open and stay open — there is no reduced community edition. The commercial side of mythicalOS is
+a separate, private, hosted service; nothing here calls into it, and running the open-source products
+(including for others, as a paid offering of your own) is permitted by Apache-2.0. Contributions
+welcome under a DCO sign-off, no CLA — see [CONTRIBUTING.md](CONTRIBUTING.md).
