@@ -28,7 +28,7 @@ import (
 // PORTED: tests/unit/layout.bats: "the host-tool amendment changed NO pre-existing classification" -> TestZoneClassification (the pre-amendment table is asserted in full)
 // PORTED: tests/unit/layout.bats: "the host-tool slot the document publishes is the one the classifier implements" -> TestSlotMatchesPublishedDocument
 // PORTED: tests/unit/layout.bats: "mi_ensure_layout neither creates nor disturbs a host-tool slot" -> TestEnsureLeavesSlotAlone
-// PORTED: tests/unit/layout.bats: "mi_digest matches a known sha256" -> (owned by internal/cliio: TestSHA256HexMatchesKnownVector)
+// PORTED: tests/unit/layout.bats: "mi_digest matches a known sha256" -> internal/cliio TestSHA256HexMatchesKnownVector (the abc vector, verbatim)
 // PORTED: tests/unit/layout.bats: "mi_ensure_layout fails loudly when it cannot create the subtree" -> TestEnsureFailsLoudly
 
 func TestHomeResolution(t *testing.T) {
@@ -60,12 +60,28 @@ func TestEnsureCreatesManagedSubtreeIdempotently(t *testing.T) {
 }
 
 func TestEnsureNeverTouchesUserData(t *testing.T) {
+	// The bats premise, verbatim: an EXISTING transcripts marker survives Ensure untouched.
 	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, "transcripts"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(home, "transcripts", "keep")
+	if err := os.WriteFile(marker, []byte("secret\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if err := Ensure(home); err != nil {
 		t.Fatal(err)
 	}
+	if b, err := os.ReadFile(marker); err != nil || string(b) != "secret\n" {
+		t.Fatalf("transcripts marker disturbed: %q, %v", b, err)
+	}
+	// And absent user-data stays absent: Ensure never creates it either.
+	home2 := t.TempDir()
+	if err := Ensure(home2); err != nil {
+		t.Fatal(err)
+	}
 	for _, d := range []string{"transcripts", "logs"} {
-		if _, err := os.Stat(filepath.Join(home, d)); !os.IsNotExist(err) {
+		if _, err := os.Stat(filepath.Join(home2, d)); !os.IsNotExist(err) {
 			t.Fatalf("%s was created; user-data appears when a product binds it, never here", d)
 		}
 	}
@@ -123,8 +139,10 @@ func TestZoneClassification(t *testing.T) {
 		{"bin", ZoneInstallerManaged},
 		{"bin/mythical-ctl", ZoneInstallerManaged},
 		{"transcripts", ZoneUserData},
+		{"transcripts/x.jsonl", ZoneUserData}, // the bats path, verbatim
 		{"transcripts/2026-08/x.md", ZoneUserData},
 		{"logs", ZoneUserData},
+		{"logs/sessions/y", ZoneUserData}, // the bats path, verbatim
 		{"logs/brokkr.log", ZoneUserData},
 		{"mythical.conf", ZoneUserOwned},
 		{"brokkr.conf", ZoneUserOwned},
@@ -137,6 +155,7 @@ func TestZoneClassification(t *testing.T) {
 		{"9lives/cli.toml", ZoneInstallerManaged},           // cannot BEGIN a legal product name
 		{"mythical/cli.toml", ZoneInstallerManaged},         // reserved product name
 		{".state", ZoneUnknown},                             // bare .state matches no arm, like bash
+		{"something-else", ZoneUnknown},                     // the bats path, verbatim
 		{"README", ZoneUnknown},
 	}
 	for _, c := range cases {

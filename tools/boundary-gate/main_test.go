@@ -131,3 +131,70 @@ func TestMalformedRuleIsAnError(t *testing.T) {
 		t.Fatal("malformed rule accepted")
 	}
 }
+
+// The method: rule form — the round-fix for the finding that a method call or method value has
+// a variable receiver and evades import-alias attribution.
+func TestMethodRuleCatchesCallAndValue(t *testing.T) {
+	root := writeTree(t, map[string]string{
+		"go.mod": fixtureGoMod,
+		"internal/rogue/rogue.go": `package rogue
+
+type mut struct{}
+
+func (mut) ContainerCreate() int { return 1 }
+
+var m mut
+var a = m.ContainerCreate()  // method CALL through a variable receiver
+var b = m.ContainerCreate    // method VALUE
+`,
+		"internal/runtime/launch.go": `package runtime
+
+type mut struct{}
+
+func (mut) ContainerCreate() int { return 1 }
+
+var m mut
+var ok = m.ContainerCreate() // the allowlisted file
+`,
+	})
+	v, err := run(root, []string{"method:ContainerCreate=example.test/mod/internal/runtime"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(v) != 2 {
+		t.Fatalf("want the rogue call AND the rogue value flagged, got %v", v)
+	}
+	for _, s := range v {
+		if !strings.Contains(s, "rogue") {
+			t.Fatalf("flagged outside rogue: %v", v)
+		}
+	}
+}
+
+// A `.go` allow entry pins a symbol to ONE FILE within a package: the same package's other
+// file is a violation.
+func TestFileLevelAllowancePinsToOneFile(t *testing.T) {
+	root := writeTree(t, map[string]string{
+		"go.mod": fixtureGoMod,
+		"internal/runtime/launch.go": `package runtime
+
+type mut struct{}
+
+func (mut) ContainerCreate() int { return 1 }
+
+var m mut
+var ok = m.ContainerCreate()
+`,
+		"internal/runtime/other.go": `package runtime
+
+var also = m.ContainerCreate() // same package, WRONG file
+`,
+	})
+	v, err := run(root, []string{"method:ContainerCreate=internal/runtime/launch.go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(v) != 1 || !strings.Contains(v[0], "other.go") {
+		t.Fatalf("want exactly the other.go violation, got %v", v)
+	}
+}

@@ -46,11 +46,18 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return cliio.ExitOK
 	}
 	switch args[0] {
-	case "-v", "--version":
-		fmt.Fprintf(stdout, "mythical-ctl %s\n", version.Version)
-		return cliio.ExitOK
-	case "-h", "--help":
-		fmt.Fprint(stdout, usage)
+	case "-v", "--version", "-h", "--help":
+		// The bash dispatcher parses the whole argv before acting, so `--version --bogus` is a
+		// usage error there — a trailing operand must not be silently dropped here either.
+		if len(args) > 1 {
+			fmt.Fprintf(stderr, "mythical-ctl: %s takes no further arguments\n", args[0])
+			return cliio.ExitUsage
+		}
+		if args[0] == "-v" || args[0] == "--version" {
+			fmt.Fprintf(stdout, "mythical-ctl %s\n", version.Version)
+		} else {
+			fmt.Fprint(stdout, usage)
+		}
 		return cliio.ExitOK
 	}
 	fmt.Fprintf(stderr, "mythical-ctl: unknown command: %s\n\n", args[0])

@@ -1,7 +1,6 @@
 package cliio
 
 import (
-	"bufio"
 	"io"
 	"strings"
 )
@@ -50,13 +49,36 @@ func Confirm(env []string, r io.Reader, w io.Writer, prompt string) bool {
 	// line with no terminating newline even though it filled the variable, and mi_confirm
 	// returns refusal on that failure. An unterminated "y" is not consent there, so it is not
 	// consent here.
-	line, err := bufio.NewReader(r).ReadString('\n')
+	//
+	// ONE line, read a byte at a time — never through a buffering reader: a bufio.Reader
+	// consumes bytes past the newline, so a second confirmation on the same stdin would find
+	// its answer already swallowed. And ONLY `\n` terminates: bash's `read -r` keeps a
+	// carriage return in the reply, so `y\r\n` is NOT consent there and is not consent here.
+	line, err := readLine(r)
 	if err != nil {
 		return false
 	}
-	line = strings.TrimSuffix(line, "\n")
-	line = strings.TrimSuffix(line, "\r")
 	return AcceptedReply(line)
+}
+
+// readLine reads up to and including one `\n`, one byte at a time, returning the line
+// without the newline. Any error before the newline — EOF included — is a failed read.
+func readLine(r io.Reader) (string, error) {
+	var b strings.Builder
+	buf := make([]byte, 1)
+	for {
+		n, err := r.Read(buf)
+		if n == 1 {
+			if buf[0] == '\n' {
+				return b.String(), nil
+			}
+			b.WriteByte(buf[0])
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+	}
 }
 
 // confirmEnv extracts MI_CONFIRM from an environ slice. Only the exact values `yes` and `no`

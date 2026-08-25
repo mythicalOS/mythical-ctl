@@ -50,6 +50,21 @@ func TestNoArgsPrintsUsageAndExitsZero(t *testing.T) {
 	}
 }
 
+// The bash dispatcher parses the whole argv before acting, so a trailing operand after a
+// global flag is a usage error there — and must be here (`--version --bogus` exits 2).
+func TestGlobalFlagsRefuseTrailingArgs(t *testing.T) {
+	for _, args := range [][]string{{"--version", "--bogus"}, {"-v", "x"}, {"--help", "y"}} {
+		var out, errb bytes.Buffer
+		rc := run(args, strings.NewReader(""), &out, &errb)
+		if rc != 2 {
+			t.Fatalf("%v: rc = %d, want 2", args, rc)
+		}
+		if out.Len() != 0 {
+			t.Fatalf("%v: leaked to stdout: %q", args, out.String())
+		}
+	}
+}
+
 func TestHelpFlag(t *testing.T) {
 	for _, flag := range []string{"-h", "--help"} {
 		var out, errb bytes.Buffer

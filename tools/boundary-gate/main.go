@@ -8,9 +8,21 @@
 // outright, because it makes references unattributable at this level of analysis.
 //
 // Usage: boundary-gate <rule>...
-// Rule grammar: <guarded-import-path>:<Identifier>=<allowed-import-path>[,<more>]
-// The guarded package itself is always allowed; *_test.go files are exempt (tests exercise
-// boundaries deliberately).
+// Rule grammar, two forms:
+//
+//	<guarded-import-path>:<Identifier>=<allowed>[,<more>]   package-level symbol
+//	method:<Identifier>=<allowed>[,<more>]                  METHOD name, receiver-independent
+//
+// The `method:` form exists because a method call — `m.ContainerCreate(...)` — or a method
+// value has a VARIABLE receiver, which import-alias resolution cannot attribute; such a rule
+// therefore flags ANY selector use of the identifier in a non-allowed file. That deliberately
+// overmatches (a same-named method on an unrelated type would trip it); for a gate, a loud
+// false positive beats a silent bypass, and the guarded names are chosen distinctive.
+//
+// An `<allowed>` entry is an import path — or, when it ends in `.go`, a single FILE
+// (module-relative path), so a rule can pin a symbol to one file within a package.
+// The guarded package itself is always allowed (package-level form); *_test.go files are
+// exempt (tests exercise boundaries deliberately).
 //
 // Stdlib only — this tool guards the dependency-minimal tree and must not itself add to it.
 package main
@@ -27,22 +39,36 @@ import (
 )
 
 type rule struct {
-	pkgPath string          // the guarded package's import path
-	ident   string          // the guarded identifier in that package
-	allowed map[string]bool // import paths permitted to reference it
+	pkgPath string          // the guarded package's import path; "" for a method: rule
+	ident   string          // the guarded identifier (or method name)
+	allowed map[string]bool // import paths — or `.go` file paths — permitted to reference it
+}
+
+// isMethod reports the receiver-independent form.
+func (r rule) isMethod() bool { return r.pkgPath == "" }
+
+// allows answers for a file, by its package path and its module-relative file path.
+func (r rule) allows(filePkgPath, fileRel string) bool {
+	return r.allowed[filePkgPath] || r.allowed[filepath.ToSlash(fileRel)]
 }
 
 func parseRule(s string) (rule, error) {
 	colon := strings.LastIndex(strings.SplitN(s, "=", 2)[0], ":")
 	eq := strings.Index(s, "=")
 	if colon < 0 || eq < 0 || eq < colon {
-		return rule{}, fmt.Errorf("malformed rule %q (want <pkg-path>:<Ident>=<allowed>[,<allowed>])", s)
+		return rule{}, fmt.Errorf("malformed rule %q (want [method|<pkg-path>]:<Ident>=<allowed>[,<allowed>])", s)
 	}
 	r := rule{pkgPath: s[:colon], ident: s[colon+1 : eq], allowed: map[string]bool{}}
-	if r.pkgPath == "" || r.ident == "" {
-		return rule{}, fmt.Errorf("malformed rule %q (empty package or identifier)", s)
+	if r.ident == "" {
+		return rule{}, fmt.Errorf("malformed rule %q (empty identifier)", s)
 	}
-	r.allowed[r.pkgPath] = true // the defining package always may
+	if r.pkgPath == "method" {
+		r.pkgPath = ""
+	} else if r.pkgPath == "" {
+		return rule{}, fmt.Errorf("malformed rule %q (empty package; use the method: form for receiver-independent rules)", s)
+	} else {
+		r.allowed[r.pkgPath] = true // the defining package always may
+	}
 	for _, a := range strings.Split(s[eq+1:], ",") {
 		if a = strings.TrimSpace(a); a != "" {
 			r.allowed[a] = true
@@ -68,7 +94,7 @@ func modulePath(root string) (string, error) {
 }
 
 // check walks one file and reports each rule violation as "<pos>: <message>".
-func check(fset *token.FileSet, f *ast.File, filePkgPath string, rules []rule) []string {
+func check(fset *token.FileSet, f *ast.File, filePkgPath, fileRel string, rules []rule) []string {
 	var out []string
 	// alias -> import path, for this file.
 	imports := map[string]string{}
@@ -84,7 +110,7 @@ func check(fset *token.FileSet, f *ast.File, filePkgPath string, rules []rule) [
 			name = path[strings.LastIndex(path, "/")+1:]
 		}
 		for _, r := range rules {
-			if path == r.pkgPath && !r.allowed[filePkgPath] {
+			if !r.isMethod() && path == r.pkgPath && !r.allows(filePkgPath, fileRel) {
 				if name == "." {
 					out = append(out, fmt.Sprintf("%s: dot-import of guarded package %s",
 						fset.Position(imp.Pos()), r.pkgPath))
@@ -100,6 +126,14 @@ func check(fset *token.FileSet, f *ast.File, filePkgPath string, rules []rule) [
 		if !ok {
 			return true
 		}
+		// Method rules first: receiver-independent, so ANY selector spelling of the name in a
+		// non-allowed file trips — method call, method value, or package selector alike.
+		for _, r := range rules {
+			if r.isMethod() && sel.Sel.Name == r.ident && !r.allows(filePkgPath, fileRel) {
+				out = append(out, fmt.Sprintf("%s: method %s referenced outside its boundary (allowed: %s)",
+					fset.Position(sel.Pos()), r.ident, strings.Join(allowedList(r), ", ")))
+			}
+		}
 		x, ok := sel.X.(*ast.Ident)
 		if !ok {
 			return true
@@ -109,7 +143,7 @@ func check(fset *token.FileSet, f *ast.File, filePkgPath string, rules []rule) [
 			return true
 		}
 		for _, r := range rules {
-			if path == r.pkgPath && sel.Sel.Name == r.ident && !r.allowed[filePkgPath] {
+			if !r.isMethod() && path == r.pkgPath && sel.Sel.Name == r.ident && !r.allows(filePkgPath, fileRel) {
 				out = append(out, fmt.Sprintf("%s: %s.%s referenced outside its boundary (allowed: %s)",
 					fset.Position(sel.Pos()), r.pkgPath, r.ident, strings.Join(allowedList(r), ", ")))
 			}
@@ -169,7 +203,7 @@ func run(root string, ruleArgs []string) (violations []string, err error) {
 		if err != nil {
 			return fmt.Errorf("parse %s: %w", path, err)
 		}
-		violations = append(violations, check(fset, f, filePkgPath, rules)...)
+		violations = append(violations, check(fset, f, filePkgPath, rel, rules)...)
 		return nil
 	})
 	return violations, err

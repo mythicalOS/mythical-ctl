@@ -46,6 +46,7 @@ func TestConfirmTriState(t *testing.T) {
 		{"a suffix refuses (yess)", nil, "yess\n", false},
 		{"leading space refuses", nil, " y\n", false},
 		{"immediate EOF refuses", nil, "", false},
+		{"CRLF refuses — bash read -r keeps the carriage return", nil, "y\r\n", false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -89,11 +90,29 @@ func TestConfirmDataThenEOFRefusesLikeBash(t *testing.T) {
 	}
 }
 
+// Two sequential confirmations on ONE reader must each get their own line — a buffering
+// reader would swallow the second answer with the first read.
+func TestConfirmReadsExactlyOneLine(t *testing.T) {
+	r := strings.NewReader("y\nn\n")
+	var w strings.Builder
+	if !Confirm(nil, r, &w, "First?") {
+		t.Fatal("first confirm refused a plain y")
+	}
+	if Confirm(nil, r, &w, "Second?") {
+		t.Fatal("second confirm consumed the first read's leftover and accepted")
+	}
+}
+
 func TestSHA256HexMatchesKnownVector(t *testing.T) {
 	// sha256("") — the well-known vector; also the memory-hazard sentinel: seeing this digest
 	// for real content means you hashed nothing.
 	if got := SHA256Hex(nil); got != "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" {
 		t.Fatalf("SHA256Hex(nil) = %s", got)
+	}
+	// PORTED: tests/unit/layout.bats: "mi_digest matches a known sha256" -> TestSHA256HexMatchesKnownVector
+	// — the bats vector, verbatim: sha256("abc").
+	if got := SHA256Hex([]byte("abc")); got != "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" {
+		t.Fatalf("SHA256Hex(abc) = %s", got)
 	}
 }
 
