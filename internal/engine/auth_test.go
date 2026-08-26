@@ -266,18 +266,39 @@ func TestDockerAuthConfigOverlay(t *testing.T) {
 	if ac := decodeHeader(t, hdr); ac["username"] != "of" {
 		t.Fatalf("file fallback: %v", ac)
 	}
-	// …and the overlay touches ONLY the inline fallback — a credHelpers entry still wins.
+	// …and the overlay is the CLI's memory store WRAPPED AROUND the selected store: it beats
+	// a credHelpers entry AND a credsStore for the registry it names (docker/cli v28.4.0,
+	// configfile.GetCredentialsStore), while the store still answers for registries the
+	// overlay does not name.
 	dir := writeHelper(t, "hlp", `echo '{"Username":"from-helper","Secret":"s"}'`)
-	writeConfig(t, root, `{"credHelpers":{"reg.example":"hlp"}}`)
+	writeConfig(t, root, `{"credHelpers":{"reg.example":"hlp","other.example":"hlp"},"credsStore":"hlp"}`)
 	env = append(env, "PATH="+dir)
 	hdr, err = resolveRegistryAuth(env, home, "reg.example/img")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ac := decodeHeader(t, hdr); ac["username"] != "from-helper" {
-		t.Fatalf("the overlay must not outrank a helper: %v", ac)
+	if ac := decodeHeader(t, hdr); ac["username"] != "overlaid" {
+		t.Fatalf("the overlay outranks a helper and a store for its registry: %v", ac)
 	}
-	// A set-but-unparseable overlay is an ERROR, not a silently-ignored one.
+	hdr, err = resolveRegistryAuth(env, home, "other.example/img")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ac := decodeHeader(t, hdr); ac["username"] != "from-helper" {
+		t.Fatalf("a registry the overlay does not name still resolves from the store: %v", ac)
+	}
+	// The overlay matches by EXACT key only (memorystore.Get): a URL-spelled overlay key is
+	// not a match, and the store answers.
+	env = []string{`DOCKER_AUTH_CONFIG={"auths":{"https://reg.example":{"auth":"` + overlayPair + `"}}}`, "PATH=" + dir}
+	hdr, err = resolveRegistryAuth(env, home, "reg.example/img")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ac := decodeHeader(t, hdr); ac["username"] != "from-helper" {
+		t.Fatalf("a URL-spelled overlay key is not an exact match: %v", ac)
+	}
+	// A set-but-unparseable overlay is an ERROR, not a silently-ignored one (the one
+	// deliberate sharpening over the CLI, which warns and continues).
 	if _, err := resolveRegistryAuth([]string{"DOCKER_AUTH_CONFIG={bad"}, home, "reg.example/img"); err == nil {
 		t.Fatal("bad overlay must refuse")
 	}

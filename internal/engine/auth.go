@@ -15,11 +15,18 @@ import (
 // Registry authentication, resolved the way the docker CLI the reference shells out to does.
 // An API pull without `X-Registry-Auth` fails on authenticated registries the bash handles
 // transparently, so the client resolves credentials from the SAME Docker config root the
-// endpoint resolver uses, with the CLI's full precedence, pinned EXACTLY:
+// endpoint resolver uses, with the CLI's full precedence, pinned EXACTLY against
+// docker/cli v28.4.0 (configfile.GetCredentialsStore + memorystore):
 //
-//	a registry-specific `credHelpers` entry wins, then `credsStore`, and only otherwise the
-//	inline `auths` — with `DOCKER_AUTH_CONFIG` overlaying that FALLBACK when set (it overlays
-//	the inline auths, never the helpers).
+//	`DOCKER_AUTH_CONFIG`, when set, is a memory store WRAPPED AROUND whichever store the
+//	config selects — so an entry there wins over EVERYTHING below it, by exact key; then a
+//	registry-specific `credHelpers` entry (exact key), then `credsStore`, and only otherwise
+//	the inline `auths` (exact key, then a unique legacy spelling).
+//
+// (An earlier reading, and the plan text it produced, had the overlay touching only the
+// inline fallback; the CLI source says otherwise, and this is corrected at the source.)
+// One deliberate sharpening: an unparseable DOCKER_AUTH_CONFIG is a REFUSAL here, where the
+// CLI logs a warning and continues with the store — an operator who set it meant it.
 //
 // Helpers execute as the named `docker-credential-<name>` from PATH — the CLI's own
 // mechanism, no new trust surface. Anonymous when nothing names the registry.
@@ -146,8 +153,8 @@ func runCredHelper(env []string, helper, serverAddress string) (*authConfig, err
 // inlineAuthFor finds the inline `auths` record for a host, matching keys by normalized
 // hostname the way the CLI does, and decodes the base64 `auth` pair when that is the spelling
 // present.
-func inlineAuthFor(auths map[string]configAuthEntry, host string) (*authConfig, error) {
-	key, err := lookupKey(keysOf(auths), host, "inline auths", true)
+func inlineAuthFor(auths map[string]configAuthEntry, host, what string, legacyFallback bool) (*authConfig, error) {
+	key, err := lookupKey(keysOf(auths), host, what, legacyFallback)
 	if err != nil {
 		return nil, err
 	}
@@ -229,38 +236,40 @@ func resolveRegistryAuth(env []string, home string, ref string) (string, error) 
 	}
 
 	var ac *authConfig
-	helperKey, err := lookupKey(keysOf(cfg.CredHelpers), host, "credHelpers", false)
-	if err != nil {
-		return "", err
-	}
-	helper := cfg.CredHelpers[helperKey]
-	switch {
-	case helper != "":
-		ac, err = runCredHelper(env, helper, serverAddressFor(host))
-	case cfg.CredsStore != "":
-		ac, err = runCredHelper(env, cfg.CredsStore, serverAddressFor(host))
-	default:
-		// The inline-auths FALLBACK, with DOCKER_AUTH_CONFIG overlaying it when set. The
-		// overlay wins per-registry; registries it does not name still resolve from the file.
-		auths := cfg.Auths
-		if overlay, ok := envValue(env, "DOCKER_AUTH_CONFIG"); ok && overlay != "" {
-			var oc struct {
-				Auths map[string]configAuthEntry `json:"auths"`
-			}
-			if err := json.Unmarshal([]byte(overlay), &oc); err != nil {
-				return "", fmt.Errorf("engine: DOCKER_AUTH_CONFIG is set but is not valid JSON: %v", err)
-			}
-			if hit, herr := inlineAuthFor(oc.Auths, host); herr != nil {
-				return "", herr
-			} else if hit != nil {
-				ac = hit
-				break
-			}
+	// 1. DOCKER_AUTH_CONFIG — the CLI's memory store, wrapped around the selected store: an
+	//    entry for this registry wins over helpers, credsStore and the file alike (exact key,
+	//    as memorystore.Get is); registries it does not name fall through to the rest.
+	if overlay, ok := envValue(env, "DOCKER_AUTH_CONFIG"); ok && overlay != "" {
+		var oc struct {
+			Auths map[string]configAuthEntry `json:"auths"`
 		}
-		ac, err = inlineAuthFor(auths, host)
+		if err := json.Unmarshal([]byte(overlay), &oc); err != nil {
+			return "", fmt.Errorf("engine: DOCKER_AUTH_CONFIG is set but is not valid JSON: %v", err)
+		}
+		hit, herr := inlineAuthFor(oc.Auths, host, "DOCKER_AUTH_CONFIG", false)
+		if herr != nil {
+			return "", herr
+		}
+		ac = hit
 	}
-	if err != nil {
-		return "", err
+	if ac == nil {
+		// 2. a registry-specific helper (exact key), 3. the store, 4. the inline file entries.
+		helperKey, err := lookupKey(keysOf(cfg.CredHelpers), host, "credHelpers", false)
+		if err != nil {
+			return "", err
+		}
+		helper := cfg.CredHelpers[helperKey]
+		switch {
+		case helper != "":
+			ac, err = runCredHelper(env, helper, serverAddressFor(host))
+		case cfg.CredsStore != "":
+			ac, err = runCredHelper(env, cfg.CredsStore, serverAddressFor(host))
+		default:
+			ac, err = inlineAuthFor(cfg.Auths, host, "inline auths", true)
+		}
+		if err != nil {
+			return "", err
+		}
 	}
 	if ac == nil || (ac.Username == "" && ac.Password == "" && ac.IdentityToken == "") {
 		return "", nil // anonymous: nothing names this registry
