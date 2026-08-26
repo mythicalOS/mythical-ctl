@@ -846,6 +846,9 @@ func (f *Fake) stopContainer(w http.ResponseWriter, seg string) {
 		return
 	}
 	c.state = "exited"
+	// Predicates changed — wake anything blocked on them (a waitContainer for a helper that
+	// never got its stdin, an attach reader parked at the pre-start cap).
+	f.cond.Broadcast()
 	ok(w, nil)
 }
 
@@ -957,6 +960,12 @@ func (f *Fake) removeContainer(w http.ResponseWriter, r *http.Request, seg strin
 		fail(w, 409, "You cannot remove a running container %s. Stop the container before attempting removal or force remove", c.id)
 		return
 	}
+	// Terminalize BEFORE deleting: a waiter blocked on this container holds the pointer, not
+	// the map entry — without flipping the predicates and broadcasting, a force-remove would
+	// strand it (and any attach reader parked at the pre-start cap) forever.
+	c.state = "exited"
+	c.awaitingStdin = false
+	f.cond.Broadcast()
 	delete(f.containers, c.name)
 	ok(w, nil)
 }

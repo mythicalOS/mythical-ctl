@@ -869,7 +869,7 @@ func (m *Mutator) HelperRun(ctx context.Context, h HelperSpec) (HelperResult, er
 	// (which streams concurrently) could never have.
 	var stdin net.Conn
 	if len(h.opts.Stdin) > 0 {
-		sc, aerr := m.c.attachOpen(created.ID)
+		sc, aerr := m.c.attachOpen(ctx, created.ID)
 		if aerr != nil {
 			rmErr := remove()
 			return none, errors.Join(aerr, rmErr)
@@ -938,12 +938,20 @@ func (m *Mutator) sweepOwnHelper(ctx context.Context, h HelperSpec) error {
 
 // attachOpen opens the hijacked stdin attach connection — the API's one stdin vehicle; the
 // alternative the reference design explicitly refuses is a THIRD host mount just to carry
-// input. Opened BEFORE start, written after — see the HelperRun sequence comment.
-func (c *Client) attachOpen(id string) (net.Conn, error) {
+// input. Opened BEFORE start, written after — see the HelperRun sequence comment. The WHOLE
+// handshake is bounded by the caller's context, not only the dial: a daemon that accepts and
+// then stalls would otherwise hold HelperRun (and the family lock behind it) past
+// cancellation.
+func (c *Client) attachOpen(ctx context.Context, id string) (net.Conn, error) {
 	conn, err := net.DialTimeout("unix", c.socket, 10*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("engine: %w: %v", ErrDaemonDown, err)
 	}
+	if d, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(d)
+	}
+	stop := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Unix(1, 0)) })
+	defer stop()
 	req := fmt.Sprintf("POST /%s/containers/%s/attach?stdin=1&stream=1 HTTP/1.1\r\nHost: docker\r\nConnection: Upgrade\r\nUpgrade: tcp\r\nContent-Length: 0\r\n\r\n",
 		APIVersion, url.PathEscape(id))
 	if _, err := io.WriteString(conn, req); err != nil {
@@ -960,6 +968,9 @@ func (c *Client) attachOpen(id string) (net.Conn, error) {
 		conn.Close()
 		return nil, fmt.Errorf("engine: attach refused (%d)", resp.StatusCode)
 	}
+	// The handshake deadline is CLEARED for the post-start write phase — attachWrite sets its
+	// own from the same context.
+	_ = conn.SetDeadline(time.Time{})
 	return conn, nil
 }
 

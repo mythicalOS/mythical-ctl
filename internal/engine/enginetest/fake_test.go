@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"mythicalos.ai/ctl/internal/engine"
 	"mythicalos.ai/ctl/internal/engine/enginetest"
@@ -329,6 +330,44 @@ func TestHelperCrashWindowLeavesContainer(t *testing.T) {
 	}
 	if info.Status != "exited" {
 		t.Fatalf("status: %+v", info)
+	}
+}
+
+// A force-remove (or stop) must WAKE a waiter blocked on a helper that never received its
+// stdin — the waiter holds the container pointer, not the map entry, so removal without a
+// broadcast would strand it forever.
+func TestRemoveWakesStrandedWaiter(t *testing.T) {
+	f, _, m := setup(t)
+	ctx := context.Background()
+	f.PullImage("probe:pinned")
+	f.HelperEntry = func(cmd string, args []string, view enginetest.HelperNetView, stdin []byte) (int, []byte) {
+		return 0, nil
+	}
+	netID, err := m.NetworkCreate(ctx, "family", prov(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawCreate(t, f, "stranded", map[string]any{
+		"Image": "probe:pinned", "Cmd": []string{"egress"}, "OpenStdin": true,
+		"NetworkingConfig": map[string]any{"EndpointsConfig": map[string]any{netID: map[string]any{}}},
+	})
+	if code, out := raw(t, f, http.MethodPost, "/containers/stranded/start", nil); code >= 300 {
+		t.Fatalf("start: %d %s", code, out)
+	}
+	waited := make(chan int, 1)
+	go func() {
+		code, _ := raw(t, f, http.MethodPost, "/containers/stranded/wait", nil)
+		waited <- code
+	}()
+	// Give the waiter time to block on the awaiting-stdin predicate, then remove.
+	time.Sleep(50 * time.Millisecond)
+	if err := m.ContainerRemove(ctx, "stranded"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-waited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a force-remove must wake a blocked waiter, not strand it")
 	}
 }
 

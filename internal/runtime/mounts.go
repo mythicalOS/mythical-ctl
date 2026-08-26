@@ -189,10 +189,21 @@ func protectedIdentities(homeCanon string) (map[string]bool, error) {
 		return nil, fmt.Errorf("runtime: cannot list the family home: %v", err)
 	}
 	for _, k := range kids {
-		if !k.IsDir() || k.Name() == "logs" || k.Name() == "transcripts" {
+		if k.Name() == "logs" || k.Name() == "transcripts" {
 			continue
 		}
 		kp := homeCanon + "/" + k.Name()
+		// Lstat, NOT DirEntry.IsDir(): the entry type comes from readdir's d_type, and a
+		// filesystem answering DT_UNKNOWN makes IsDir() false for a REAL directory — bin/
+		// would silently drop out of the protected set on exactly such filesystems. An entry
+		// that cannot be Lstat'd is a refusal, not one fewer member.
+		st, serr := os.Lstat(kp)
+		if serr != nil {
+			return nil, fmt.Errorf("runtime: %q is in the family home and cannot be examined — refusing rather than leaving it out of the protected set", kp)
+		}
+		if !st.IsDir() {
+			continue
+		}
 		ino, ierr := identity(kp)
 		if ierr != nil {
 			return nil, fmt.Errorf("runtime: %q is an installer-zone directory and its identity cannot be read — refusing rather than leaving it out of the protected set", kp)
