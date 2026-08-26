@@ -178,7 +178,7 @@ func TestInfoFailOnly(t *testing.T) {
 
 func TestPingDown(t *testing.T) {
 	f, c := newFake(t)
-	f.Down = true
+	f.SetDown(true)
 	err := c.Ping(context.Background())
 	if !errors.Is(err, engine.ErrDaemonDown) {
 		t.Fatalf("want ErrDaemonDown, got %v", err)
@@ -204,7 +204,7 @@ func TestAbsentVsDown(t *testing.T) {
 		t.Fatalf("absent image: %v", err)
 	}
 	// Down: the question could not be asked — never folded into absent.
-	f.Down = true
+	f.SetDown(true)
 	_, err = c.ContainerInspect(ctx, "no-such-container")
 	if !errors.Is(err, engine.ErrDaemonDown) || errors.Is(err, engine.ErrAbsent) {
 		t.Fatalf("down: %v", err)

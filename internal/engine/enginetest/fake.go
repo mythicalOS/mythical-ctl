@@ -196,6 +196,22 @@ type Fake struct {
 	nextID     int
 }
 
+// SetDown flips the Down knob under the fake's lock — the form a test MUST use when it
+// toggles the knob after traffic has flowed, because a handler goroutine from an earlier
+// request can still be reading it (a bare field write is a data race under -race).
+func (f *Fake) SetDown(v bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Down = v
+}
+
+// SetDownFrom is SetDown's counterpart for the DownFrom knob, for the same reason.
+func (f *Fake) SetDownFrom(v string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.DownFrom = v
+}
+
 // NewFake starts a fake daemon on a fresh unix socket. Callers own Close.
 func NewFake() *Fake {
 	dir, err := os.MkdirTemp("", "enginetest")

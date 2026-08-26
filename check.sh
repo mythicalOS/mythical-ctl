@@ -35,7 +35,7 @@ MIN_PACKAGES="${MIN_PACKAGES:-18}"
 MIN_TESTED_PACKAGES="${MIN_TESTED_PACKAGES:-18}"
 
 # The reference-boundary rules, one per line: `<guarded-import-path>:<Identifier>=<allowed
-# import path>[,<more allowed>]`. The defining package itself is always allowed. Each rule is
+# import path>[,<more allowed>]`. Each rule is
 # added by the task that creates the boundary and NEVER removed — these survive the bash
 # cutover; a once-run audit protects nothing afterwards. The gate resolves REFERENCES via the
 # AST (selector and identifier use, not call syntax), so a function VALUE of a guarded symbol

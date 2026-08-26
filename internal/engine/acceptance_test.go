@@ -127,13 +127,17 @@ func (r *acceptRig) rawCreate(t *testing.T, name string, body map[string]any) {
 		t.Fatal(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	// Cleanup is registered BEFORE the request goes out: a transport error can arrive after
+	// the daemon created the container (the ambiguous window HelperRun sweeps for), and a
+	// name under this suite's per-process prefix is this suite's to remove by definition —
+	// so the early registration cannot delete anything that is not ours.
+	r.cleanupContainer(t, name)
 	resp, err := hc.Do(req)
 	if err != nil {
 		t.Fatalf("raw create: %v", err)
 	}
 	defer resp.Body.Close()
 	out, _ := io.ReadAll(resp.Body)
-	r.cleanupContainer(t, name)
 	if resp.StatusCode >= 300 {
 		t.Fatalf("raw create: %d %s", resp.StatusCode, out)
 	}
@@ -331,6 +335,45 @@ func TestAcceptanceFidelity(t *testing.T) {
 		// The private-mode (`none`) connect refusal is not measurable through this client: the
 		// only `none`-mode door is HelperRun, which removes its container before returning.
 		// It stays a bash-measured fidelity in the fake until the pinned helper image exists.
+	})
+
+	t.Run("duplicate network name refused; a mounted volume cannot be removed", func(t *testing.T) {
+		// MEASURED 2026-08-26: a second create of the same network name is refused — 409,
+		// "network with name … already exists" — which is the fake's DEFAULT behavior. The
+		// fake's DuplicateNetworkNames knob fabricates D38's both-succeeded state (concurrent
+		// creates, older engines), a state a live daemon cannot be asked to produce on demand.
+		netName := r.pfx + "-net6"
+		netID := r.network(t, ctx, netName)
+		prov, _ := engine.NewProvenance("acceptance", "dup")
+		if _, err := r.m.NetworkCreate(ctx, netName, prov); err == nil || !strings.Contains(err.Error(), "already exists") {
+			t.Fatalf("a duplicate network name must be refused in the daemon's words: %v", err)
+		}
+		// A volume mounted by a CREATED (never-started) container is held — removal refused in
+		// the daemon's words; gone once the container is.
+		volName := r.pfx + "-vol6"
+		if err := r.m.VolumeCreate(ctx, volName, prov); err != nil {
+			t.Fatal(err)
+		}
+		r.cleanupVolume(t, volName)
+		vm, err := engine.NewVolumeMount(volName, "/data")
+		if err != nil {
+			t.Fatal(err)
+		}
+		name := r.pfx + "-c6"
+		spec := launchSpec(t, name, acceptImage, netID, "a6", engine.SpecOpts{Mounts: []engine.Mount{vm}})
+		if _, err := r.m.ContainerCreate(ctx, spec); err != nil {
+			t.Fatal(err)
+		}
+		r.cleanupContainer(t, name)
+		if err := r.m.VolumeRemove(ctx, volName); err == nil || !strings.Contains(err.Error(), "volume is in use") {
+			t.Fatalf("a mounted volume must refuse removal in the daemon's words: %v", err)
+		}
+		if err := r.m.ContainerRemove(ctx, name); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.m.VolumeRemove(ctx, volName); err != nil {
+			t.Fatalf("after the container is gone the volume goes: %v", err)
+		}
 	})
 
 	t.Run("gw-priority round-trips at v1.48 (the rebind case)", func(t *testing.T) {

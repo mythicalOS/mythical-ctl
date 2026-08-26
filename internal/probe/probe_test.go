@@ -338,6 +338,12 @@ func TestStderrReachesTheOperatorOnEveryRun(t *testing.T) {
 	if !strings.Contains(r.diag.String(), "resolver: NXDOMAIN") {
 		t.Fatalf("a FAILING run's stderr must reach the operator too, got %q", r.diag.String())
 	}
+	// ONCE, through the diagnostics writer — not a second time inside the verdict: a verb that
+	// reports the error would otherwise print the stderr twice where the reference's inherited
+	// stderr appeared exactly once.
+	if err := r.p.SelfCheck(ctx, r.ix, r.netID); err == nil || strings.Contains(err.Error(), "resolver: NXDOMAIN") {
+		t.Fatalf("the verdict must not embed the stderr a second time: %v", err)
+	}
 	if err := r.p.SetDiagnostics(nil); err == nil {
 		t.Fatal("a nil diagnostics writer must be refused — discarding stderr is the failure this seam prevents")
 	}
@@ -543,7 +549,7 @@ func TestUnaccountedRun(t *testing.T) {
 	// The daemon dies at the accounting question — the reap's inspect, which addresses the
 	// container by NAME (the run's own calls address it by id).
 	// The selfcheck consumes n1 for its per-run ALIAS; the container's own nonce is n2.
-	r.fake.DownFrom = "GET /containers/mythical-i1-probe-n2/json"
+	r.fake.SetDownFrom("GET /containers/mythical-i1-probe-n2/json")
 	err := r.p.SelfCheck(ctx, r.ix, r.netID)
 	if !errors.Is(err, probe.ErrUnaccounted) {
 		t.Fatalf("an unanswerable accounting question FAILS the run: %v", err)
@@ -630,12 +636,13 @@ func TestCleanupRefusals(t *testing.T) {
 	if len(r.acct.intents) != 1 {
 		t.Fatal("the intent must be preserved")
 	}
-	// A leftover the runtime cannot be asked about: PRESERVED, never forgotten.
-	r.fake.Down = true
+	// A leftover the runtime cannot be asked about: PRESERVED, never forgotten. (SetDown, not a
+	// field write: a handler goroutine from the previous request may still be reading the knob.)
+	r.fake.SetDown(true)
 	if err := r.p.Cleanup(ctx); err == nil {
 		t.Fatal("an unanswerable runtime must refuse cleanup")
 	}
-	r.fake.Down = false
+	r.fake.SetDown(false)
 	// And an intent record that names nothing is preserved and reported.
 	r.acct.intents = []probe.ProbeIntent{{Name: "", Nonce: "x"}}
 	if err := r.p.Cleanup(ctx); err == nil || !strings.Contains(err.Error(), "carries no name") {
