@@ -65,11 +65,12 @@ import (
 // --- fakes ---------------------------------------------------------------------------------------
 
 const (
-	c1   = "mythical-i0123456789-brokkr"
-	net1 = "netid-target"
-	net2 = "netid-source"
-	net3 = "netid-stray"
-	al1  = "brokkr"
+	ident1 = "i0123456789"
+	c1     = "mythical-" + ident1 + "-brokkr"
+	net1   = "netid-target"
+	net2   = "netid-source"
+	net3   = "netid-stray"
+	al1    = "brokkr"
 )
 
 type fakeObjs struct {
@@ -197,7 +198,7 @@ func (l *fakeLauncher) Launch(_ context.Context, container, nonce string) (strin
 	}
 	l.created = container
 	l.objs.nets[container] = l.nets
-	l.objs.labels[container] = map[string]string{prov.LabelNonce: nonce, prov.LabelInstall: "i0123456789"}
+	l.objs.labels[container] = ourLabels(nonce)
 	l.objs.image[container] = "sha256:abc"
 	// Created STOPPED, always — starting is a separate, later step.
 	l.st.down(container)
@@ -207,13 +208,32 @@ func (l *fakeLauncher) Launch(_ context.Context, container, nonce string) (strin
 	return "cid", nil
 }
 
+// ourLabels is the label set of a container THIS installation created.
+//
+// Every fixture that means "ours" must use it. A bare nonce label is not ownership — a nonce says
+// WHICH object and never WHOSE — so a fixture that sets only a nonce is describing a container
+// belonging to nobody, whatever it intended to describe. Several of these fixtures did exactly
+// that, and it went unnoticed for as long as the code under test judged ownership on the nonce
+// alone: the fixture's blind spot and the code's were the same one.
+func ourLabels(nonce string) map[string]string {
+	return map[string]string{prov.LabelInstall: ident1, prov.LabelNonce: nonce}
+}
+
 var fixedNow = time.Unix(1_700_000_000, 0)
 
 func fixture(t *testing.T) (*ledger.Ledger, *fakeObjs, *fakeMut, *fakeProbe, *fakeState, Deps) {
 	t.Helper()
 	l := &ledger.Ledger{}
-	if _, err := l.IdentEnsure(); err != nil {
+	// A FIXED IDENTITY, and the one the constant container names embed. IdentEnsure used to MINT a
+	// random one here while c1 stayed "mythical-i0123456789-brokkr", so the ledger's identity and
+	// the names derived from it disagreed in every test. Nothing noticed while ownership was judged
+	// on the nonce alone; the moment the installation label is read, the fixture describes a fleet
+	// belonging to an installation that is not this one.
+	if err := l.Put("identity", "id", ident1, []ledger.Field{{Key: "id", Value: ident1}}); err != nil {
 		t.Fatal(err)
+	}
+	if got, err := l.IdentEnsure(); err != nil || got != ident1 {
+		t.Fatalf("fixture identity: got %q, %v; want %q", got, err, ident1)
 	}
 	objs, mut, pr, st := newObjs(), &fakeMut{}, &fakeProbe{resolveTo: map[string]string{}}, newStateObjs()
 	n := 0
@@ -617,14 +637,16 @@ func TestRunRemovesWhatDidNotVerify(t *testing.T) {
 		t.Fatalf("the write-ahead intent was consumed by a failed bring-up: %v", ierr)
 	}
 
-	// SOMETHING ELSE HOLDING THE NAME is left alone — the nonce is what says it is ours.
+	// SOMETHING ELSE HOLDING THE NAME is left alone. The nonce is NOT what says it is ours — it
+	// says WHICH object and never WHOSE — so this asserts the ownership reason, not merely that
+	// something was refused.
 	l2, objs2, mut2, _, st2, d2 := fixture(t)
 	// The launcher stamps its own nonce onto the container, so the substitution has to happen
 	// AFTER it runs — which is exactly when it happens in reality: the create succeeded, and by
 	// the time the attach check fails something else holds the name.
 	lau2 := &fakeLauncher{objs: objs2, st: st2, nets: []Attachment{attach(net3, "", al1)}}
 	lau2.after = func() {
-		objs2.labels[c1] = map[string]string{prov.LabelNonce: "someone-elses"}
+		objs2.labels[c1] = ourLabels("someone-elses")
 	}
 	err = Run(ctx, l2, d2, lau2, c1, net1, al1, Running)
 	if err == nil {
@@ -633,8 +655,11 @@ func TestRunRemovesWhatDidNotVerify(t *testing.T) {
 	if len(mut2.removed) != 0 {
 		t.Fatalf("removed a container this bring-up did not create: %v", mut2.removed)
 	}
-	if !strings.Contains(err.Error(), "left alone") {
+	if !strings.Contains(err.Error(), "LEFT ALONE") {
 		t.Fatalf("message: %v", err)
+	}
+	if !strings.Contains(err.Error(), "not the \"n1\" this bring-up created") {
+		t.Fatalf("the refusal did not name the ownership evidence that failed: %v", err)
 	}
 }
 
@@ -653,7 +678,7 @@ func crashedAfterCreate(t *testing.T, l *ledger.Ledger, objs *fakeObjs, st *fake
 		t.Fatal(err)
 	}
 	objs.nets[c1] = nets
-	objs.labels[c1] = map[string]string{prov.LabelNonce: nonce}
+	objs.labels[c1] = ourLabels(nonce)
 	objs.image[c1] = "sha256:abc"
 	st.down(c1)
 	return nonce
@@ -714,7 +739,7 @@ func TestRecoverRefusesIncompleteIntents(t *testing.T) {
 				t.Fatal(err)
 			}
 			objs.nets[c1] = []Attachment{attach(net1, "", al1)}
-			objs.labels[c1] = map[string]string{prov.LabelNonce: "n1"}
+			objs.labels[c1] = ourLabels("n1")
 			st.down(c1)
 			err := Recover(ctx, l, d, c1, net1, al1)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
@@ -787,15 +812,182 @@ func TestRecoverWrongTopology(t *testing.T) {
 	}
 }
 
+// A FOREIGN CONTAINER CARRYING OUR NONCE IS NEITHER CONFIRMED NOR REMOVED — the finding this pair
+// closes. A nonce says WHICH object, never WHOSE: anyone able to reach this daemon can put our
+// nonce on a container of theirs at the name we derive. Judging ownership on the nonce alone let
+// this installation adopt and then drive that container when its topology happened to verify, and
+// DELETE it when it did not. The installation label is the only thing that answers WHOSE, and it is
+// read first.
+func TestRunRefusesAForeignContainerCarryingOurNonce(t *testing.T) {
+	ctx := context.Background()
+	l, objs, mut, _, st, d := fixture(t)
+	lau := &fakeLauncher{objs: objs, st: st, nets: []Attachment{attach(net1, "", al1)}}
+	// The topology VERIFIES. Only the installation label says this is not ours, which is precisely
+	// the case a nonce comparison cannot see.
+	lau.after = func() {
+		objs.labels[c1] = map[string]string{prov.LabelInstall: "i09999999999", prov.LabelNonce: "n1"}
+	}
+	err := Run(ctx, l, d, lau, c1, net1, al1, Running)
+	if err == nil {
+		t.Fatal("a container belonging to another installation was accepted")
+	}
+	if !strings.Contains(err.Error(), "another installation's container") {
+		t.Fatalf("the refusal did not name the reason: %v", err)
+	}
+	if len(mut.removed) != 0 {
+		t.Fatalf("another installation's container was REMOVED: %v", mut.removed)
+	}
+	if len(mut.started) != 0 {
+		t.Fatalf("another installation's container was STARTED: %v", mut.started)
+	}
+	if _, ferr := prov.Find(l, prov.ClassContainer, c1); !errors.Is(ferr, ledger.ErrAbsentRecord) {
+		t.Fatal("another installation's container was confirmed into our provenance")
+	}
+}
+
+func TestRecoverRefusesAForeignContainerCarryingOurNonce(t *testing.T) {
+	ctx := context.Background()
+	l, objs, mut, _, st, d := fixture(t)
+	crashedAfterCreate(t, l, objs, st, state.Running, net1, []Attachment{attach(net1, "", al1)})
+	// Ours by nonce, another installation's by label — and its topology verifies, so nothing else
+	// in the sequence would stop it.
+	objs.labels[c1] = map[string]string{prov.LabelInstall: "i09999999999", prov.LabelNonce: "n1"}
+	err := Recover(ctx, l, d, c1, net1, al1)
+	if err == nil {
+		t.Fatal("a container belonging to another installation was adopted")
+	}
+	if !strings.Contains(err.Error(), "another installation's container") {
+		t.Fatalf("the refusal did not name the reason: %v", err)
+	}
+	if len(mut.removed) != 0 {
+		t.Fatalf("another installation's container was REMOVED: %v", mut.removed)
+	}
+	if _, ferr := prov.Find(l, prov.ClassContainer, c1); !errors.Is(ferr, ledger.ErrAbsentRecord) {
+		t.Fatal("another installation's container was confirmed into our provenance")
+	}
+	if _, ferr := intent.Find(l, prov.ClassContainer, c1); ferr != nil {
+		t.Fatal("the intent was consumed on evidence that proved nothing")
+	}
+}
+
+// AN UNLABELLED CONTAINER IS NOT OURS EITHER. No label proves it is ours, and no provenance proves
+// it is not someone else's, so it is reported rather than adopted or deleted.
+func TestRecoverRefusesAnUnlabelledContainerCarryingOurNonce(t *testing.T) {
+	ctx := context.Background()
+	l, objs, mut, _, st, d := fixture(t)
+	crashedAfterCreate(t, l, objs, st, state.Running, net1, []Attachment{attach(net1, "", al1)})
+	objs.labels[c1] = map[string]string{prov.LabelNonce: "n1"}
+	err := Recover(ctx, l, d, c1, net1, al1)
+	if err == nil || !strings.Contains(err.Error(), "NO installation label") {
+		t.Fatalf("unlabelled container: %v", err)
+	}
+	if len(mut.removed) != 0 {
+		t.Fatalf("an unattributed container was REMOVED: %v", mut.removed)
+	}
+}
+
+// THE CONFIRMATION TRANSACTION IS ALL-OR-NOTHING. The desired state, the owed check and the
+// provenance record are committed and the intent consumed as ONE staged edit, persisted before it
+// is published. Editing the caller's ledger and persisting afterwards was the defect: a write that
+// failed left the caller holding provenance, desired state and no intent, while disk still carried
+// the open intent — the two disagreeing about whether the container was ever built, in the
+// direction that makes the container look accounted for when it is not.
+func TestRunLeavesTheLedgerUntouchedWhenTheConfirmationCannotBePersisted(t *testing.T) {
+	ctx := context.Background()
+	l, objs, mut, _, st, d := fixture(t)
+	// Fail the write that carries the confirmation, and ONLY that one — the write-ahead barriers
+	// before it must still succeed, or this would be testing a bring-up that never got started.
+	dk := &disk{}
+	inner := dk.persist()
+	// The predicate has to name the OBJECT row, not the key: an intent row is keyed
+	// container:<name> too, so matching the key alone fails the very first write-ahead barrier and
+	// the test would be asserting against a bring-up that never opened an intent at all.
+	d.Persist = func(cl *ledger.Ledger) error {
+		for _, ln := range cl.Lines() {
+			if strings.HasPrefix(ln, "object\t") && strings.Contains(ln, "key=container:"+c1) {
+				return errors.New("disk full")
+			}
+		}
+		return inner(cl)
+	}
+	lau := &fakeLauncher{objs: objs, st: st, nets: []Attachment{attach(net1, "", al1)}}
+	err := Run(ctx, l, d, lau, c1, net1, al1, Running)
+	if err == nil {
+		t.Fatal("expected the persist failure to refuse the bring-up")
+	}
+	if !strings.Contains(err.Error(), "could not be persisted") {
+		t.Fatalf("message: %v", err)
+	}
+	// NOTHING of the transaction may have landed in the caller's ledger.
+	if _, ferr := prov.Find(l, prov.ClassContainer, c1); !errors.Is(ferr, ledger.ErrAbsentRecord) {
+		t.Fatal("provenance was published for a confirmation that was never persisted")
+	}
+	if _, derr := state.DesiredGet(l, c1); !errors.Is(derr, ledger.ErrAbsentRecord) {
+		t.Fatal("desired state was published for a confirmation that was never persisted")
+	}
+	// And the intent — the thing that says a bring-up is unfinished — must SURVIVE.
+	if _, ierr := intent.Find(l, prov.ClassContainer, c1); ierr != nil {
+		t.Fatalf("the intent was consumed by a transaction that never reached disk: %v", ierr)
+	}
+	// The container was started by nothing: the start comes after the transaction.
+	if len(mut.started) != 0 {
+		t.Fatalf("a container was started on a record that never reached disk: %v", mut.started)
+	}
+}
+
+// RECOVERY'S TRANSACTION IS ALL-OR-NOTHING TOO, and unlike Run's it is not protected by a persist
+// barrier: Recover mutates the in-memory ledger and its CALLER writes that ledger once. So what it
+// owes is that a refusal leaves the caller's ledger byte-identical. Committing straight into it
+// meant a Confirm that refused left the desired state and the owed check behind — a recovery that
+// reported failure having already half-finished the intent it was recovering, after which the next
+// run reads a container with desired state, no provenance, and an intent still open.
+//
+// The refusal is provoked with two tombstones for the one key. Confirm asks that cardinality
+// question deliberately BEFORE it rewrites the object record, so it is a refusal that arrives
+// after state.Commit has already succeeded — precisely the ordering this asserts.
+func TestRecoverLeavesTheLedgerUntouchedWhenTheConfirmationRefuses(t *testing.T) {
+	ctx := context.Background()
+	l, objs, mut, _, st, d := fixture(t)
+	crashedAfterCreate(t, l, objs, st, state.Running, net1, []Attachment{attach(net1, "", al1)})
+	objs.labels[c1] = ourLabels("n1")
+	for i := 0; i < 2; i++ {
+		if err := l.Append("tombstone", []ledger.Field{
+			{Key: "key", Value: "container:" + c1},
+			{Key: "class", Value: "container"},
+			{Key: "name", Value: c1},
+			{Key: "nonce", Value: "n1"},
+			{Key: "gen", Value: "1"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := strings.Join(l.Lines(), "\n")
+	err := Recover(ctx, l, d, c1, net1, al1)
+	if err == nil {
+		t.Fatal("the confirmation was expected to refuse on contradictory tombstones")
+	}
+	// THE WHOLE LEDGER, byte for byte. Asserting only that desired state is absent would pass a
+	// version that committed something else instead.
+	if after := strings.Join(l.Lines(), "\n"); after != before {
+		t.Fatalf("a refused recovery changed the ledger:\n before: %s\n after:  %s", before, after)
+	}
+	if len(mut.removed) != 0 {
+		t.Fatalf("a refused recovery removed a container: %v", mut.removed)
+	}
+}
+
 func TestRecoverWrongNonce(t *testing.T) {
 	ctx := context.Background()
 	// A CONTAINER STANDING AT THE NAME UNDER A DIFFERENT NONCE is NOT adopted and NOT removed.
 	l, objs, mut, _, st, d := fixture(t)
 	crashedAfterCreate(t, l, objs, st, state.Running, net1, []Attachment{attach(net1, "", al1)})
-	objs.labels[c1] = map[string]string{prov.LabelNonce: "someone-elses"}
+	objs.labels[c1] = ourLabels("someone-elses")
 	err := Recover(ctx, l, d, c1, net1, al1)
-	if err == nil || !strings.Contains(err.Error(), "NOT adopted and NOT removed") {
+	if err == nil || !strings.Contains(err.Error(), "NOT confirmed") || !strings.Contains(err.Error(), "NOT removed") {
 		t.Fatalf("wrong nonce: %v", err)
+	}
+	if !strings.Contains(err.Error(), "carries nonce \"someone-elses\"") {
+		t.Fatalf("the refusal did not name the nonce it saw: %v", err)
 	}
 	if len(mut.removed) != 0 {
 		t.Fatalf("another installation's container was removed: %v", mut.removed)

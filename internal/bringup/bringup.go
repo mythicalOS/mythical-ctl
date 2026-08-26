@@ -12,7 +12,8 @@
 //     built;
 //   - the attachment is verified BEFORE anything is confirmed, and a container that does not
 //     verify is REMOVED (a confirmed-but-detached container is a state this sequence must never
-//     produce) — but only if it still carries the nonce we created it with;
+//     produce) — but ONLY if it can be proven ours, which the nonce alone does not prove: the
+//     installation label is read first, because a nonce says WHICH object and never WHOSE;
 //   - the desired state and the outstanding check are committed BEFORE the confirmation, so a
 //     crash cannot leave a container accounted for with no desired state;
 //   - the check is cleared only AFTER the live verification passes.
@@ -121,6 +122,71 @@ type Deps struct {
 // A nil Persist is refused rather than skipped: silently proceeding would restore exactly the
 // defect this seam closes, and it would do so invisibly — the operation would succeed, and only a
 // crash would reveal that nothing was ever written ahead.
+// errCannotAsk marks an ownership question that was never ANSWERED, as opposed to one answered
+// "no". Neither permits acting on the object, but a caller reporting to an operator must not tell
+// them a container is foreign when the truth is that the runtime did not reply.
+var errCannotAsk = errors.New("bringup: ownership could not be established")
+
+// provenOurs answers "is the thing standing at this name the container this bring-up created, and
+// is it OURS?" — and refuses to answer from the nonce alone.
+//
+// A NONCE SAYS WHICH OBJECT, NEVER WHOSE. Anyone who can put a container on this daemon can put our
+// nonce label on it, so a nonce match by itself is not evidence of ownership. Acting on one lets
+// this installation confirm and then drive a foreign container, or REMOVE it, purely because it
+// carries a label it was handed. intent.ours() draws this line correctly a few files away; this
+// asks the same question in the same order.
+//
+// THE INSTALLATION LABEL IS READ FIRST, because WHOSE has to be settled before WHICH means
+// anything: a nonce comparison against another installation's container is a question about the
+// wrong object. Every non-nil return means DO NOT ACT — do not confirm, do not start, do not
+// remove.
+func provenOurs(ctx context.Context, d Deps, l *ledger.Ledger, container, nonce string) error {
+	ident, err := l.IdentGet()
+	if err != nil {
+		return fmt.Errorf("bringup: this installation's own identity could not be read, so nothing can be shown to\n"+
+			"  belong to it. %q is neither confirmed nor removed: %w",
+			container, errors.Join(errCannotAsk, err))
+	}
+	label, err := d.Objs.Label(ctx, container, prov.LabelInstall)
+	if err != nil {
+		return fmt.Errorf("bringup: the installation label of %q could not be read, so whether it belongs to this\n"+
+			"  installation was never established. It is neither confirmed nor removed: %w",
+			container, errors.Join(errCannotAsk, err))
+	}
+	// The SHARED label rule: a label meaning ABSENT must read as absent here too, or a container
+	// labelled `installation=<no value>` reads as a foreign installation's rather than as unlabelled.
+	// Both refuse, but they refuse for different reasons and an operator needs the right one.
+	label = prov.NormalizeLabel(label)
+	if label == "" {
+		return fmt.Errorf("bringup: %q carries NO installation label, so nothing about the object itself says this\n"+
+			"  installation created it. It is neither confirmed nor removed: no label proves it is ours,\n"+
+			"  and no provenance proves it is not someone else's.", container)
+	}
+	if label != ident {
+		return fmt.Errorf("bringup: %q is labelled for installation %q; this installation is %q.\n"+
+			"  A nonce says WHICH object, never WHOSE — anyone who can put a container on this daemon\n"+
+			"  can put that label on it — so this is another installation's container. It is NOT\n"+
+			"  confirmed, NOT started and NOT removed.", container, label, ident)
+	}
+	actual, err := d.Objs.Label(ctx, container, prov.LabelNonce)
+	if err != nil {
+		return fmt.Errorf("bringup: the nonce of %q could not be read, so whether it is the container this bring-up\n"+
+			"  created was never established. It is neither confirmed nor removed: %w",
+			container, errors.Join(errCannotAsk, err))
+	}
+	shown := prov.NormalizeLabel(actual)
+	if shown != nonce {
+		if shown == "" {
+			shown = "<none>"
+		}
+		return fmt.Errorf("bringup: %q carries nonce %q, not the %q this bring-up created. A create against an\n"+
+			"  existing name SUCCEEDS and returns whatever already holds it without applying our labels,\n"+
+			"  so the name standing here is not evidence that this is the object. It is NOT confirmed\n"+
+			"  and NOT removed.", container, shown, nonce)
+	}
+	return nil
+}
+
 func barrier(d Deps, l *ledger.Ledger, what string) error {
 	if d.Persist == nil {
 		return fmt.Errorf("bringup: refusing to %s with no way to persist the record written ahead of it —\n"+
@@ -383,35 +449,50 @@ func Run(ctx context.Context, l *ledger.Ledger, d Deps, launch Launcher, contain
 		return err
 	}
 	if verr := VerifyAttach(ctx, l, d, container, netID, alias); verr != nil {
-		// REMOVED — but only if it still carries the nonce we created it with. Something else
-		// standing at that name is left alone.
-		actual, lerr := d.Objs.Label(ctx, container, prov.LabelNonce)
-		if lerr == nil && actual == nonce {
-			_ = d.Mut.ContainerRemove(ctx, container)
-			return fmt.Errorf("bringup: removed %q because it did not verify. Nothing was confirmed: %w", container, verr)
+		// REMOVED — but ONLY if it can be PROVEN ours. The nonce match this used to rely on is not
+		// that proof: a nonce says WHICH object, never WHOSE, so removing on one alone deletes
+		// another installation's container whenever it carries our label at our derived name.
+		if oerr := provenOurs(ctx, d, l, container, nonce); oerr != nil {
+			return fmt.Errorf("bringup: %q did not verify, and it could not be proven to be the container this\n"+
+				"  bring-up created and owns — so it is LEFT ALONE and nothing was confirmed.\n"+
+				"  %v\n"+
+				"  It failed to verify because: %w", container, oerr, verr)
 		}
-		return fmt.Errorf("bringup: %q did not verify AND no longer carries the nonce we created it with —\n"+
-			"  something else holds that name. It is left alone. Nothing was confirmed: %w", container, verr)
+		_ = d.Mut.ContainerRemove(ctx, container)
+		return fmt.Errorf("bringup: removed %q because it did not verify. Nothing was confirmed: %w", container, verr)
 	}
-	// THE COMMIT COMES BEFORE THE CONFIRMATION: a crash between them must not leave a container
+	// OWNERSHIP IS RE-ESTABLISHED BEFORE CONFIRMATION rather than assumed from the create. A create
+	// against an existing name SUCCEEDS and returns whatever already holds it without applying our
+	// labels, so what just verified is not necessarily what we made — and confirming it would put a
+	// foreign container under this installation's control.
+	if oerr := provenOurs(ctx, d, l, container, nonce); oerr != nil {
+		return fmt.Errorf("bringup: %q verified, but it could not be proven to be the container this bring-up\n"+
+			"  created and owns. Nothing is confirmed, nothing is started and nothing is removed.\n"+
+			"  %w", container, oerr)
+	}
+	// A STOPPED BRING-UP KEEPS THE OUTSTANDING ENTRY rather than clearing or performing it: a
+	// stopped container has no address for its alias to answer with.
+	what := "start a container"
+	if want == state.Stopped {
+		what = "finish a stopped bring-up"
+	}
+	// THE COMMIT AND THE CONFIRMATION ARE ONE TRANSACTION, staged and persisted together.
+	// Editing the caller's ledger and persisting afterwards was the defect: a barrier failure left
+	// the caller holding desired state, provenance and no intent while disk still carried the open
+	// intent — and a Confirm that refused left the commit behind. The commit still comes before the
+	// confirmation WITHIN the transaction, because a crash between them must not leave a container
 	// accounted for with no desired state.
-	if cerr := state.Commit(l, container, want, []state.Check{{Kind: state.CheckAlias, Param: netID}}, false); cerr != nil {
-		return cerr
-	}
 	image, _ := d.Objs.Image(ctx, container)
-	if cerr := intent.Confirm(l, prov.ClassContainer, container, nonce, ledger.Field{Key: "id", Value: image}); cerr != nil {
-		return cerr
+	if err := staged(d, l, what, func(c *ledger.Ledger) error {
+		if cerr := state.Commit(c, container, want, []state.Check{{Kind: state.CheckAlias, Param: netID}}, false); cerr != nil {
+			return cerr
+		}
+		return intent.Confirm(c, prov.ClassContainer, container, nonce, ledger.Field{Key: "id", Value: image})
+	}); err != nil {
+		return err
 	}
 	if want == state.Stopped {
-		// A STOPPED BRING-UP KEEPS THE OUTSTANDING ENTRY rather than clearing or performing it:
-		// a stopped container has no address for its alias to answer with.
-		return barrier(d, l, "finish a stopped bring-up")
-	}
-	// The confirmation, the desired state and the owed check are made DURABLE before the start —
-	// a crash between them would otherwise leave a running container whose ledger still says it
-	// was mid-creation.
-	if err := barrier(d, l, "start a container"); err != nil {
-		return err
+		return nil
 	}
 	if serr := d.Mut.ContainerStart(ctx, container); serr != nil {
 		return fmt.Errorf("bringup: %q was created and confirmed, but did not start: %w", container, serr)
@@ -488,15 +569,16 @@ func Recover(ctx context.Context, l *ledger.Ledger, d Deps, container, netID, al
 		return fmt.Errorf("bringup: the intent for %q names a container that does not exist; retaining the intent\n"+
 			"  so the verb that opened it can re-create it from the launch spec: %w", container, ErrRetained)
 	}
-	actual, lerr := d.Objs.Label(ctx, container, prov.LabelNonce)
-	if lerr != nil {
-		return fmt.Errorf("bringup: the nonce of %q could not be read, so whether it is the container this intent\n"+
-			"  describes was never established. Nothing is confirmed and nothing is removed: %w", container, lerr)
-	}
-	if actual != nonce {
-		return fmt.Errorf("bringup: %q exists but carries nonce %q, not the recorded %q.\n"+
-			"  It is NOT adopted and NOT removed. Resolve it with the container runtime, then re-run.",
-			container, actual, nonce)
+	// OWNERSHIP BEFORE ANYTHING ELSE, and the installation label BEFORE the nonce. This used to
+	// compare the nonce alone, which is not ownership: a foreign container carrying our recorded
+	// nonce at our derived name was adopted when its topology happened to verify, and REMOVED when
+	// it did not. Both outcomes act on another installation's container on the strength of a label
+	// anyone able to reach this daemon can apply.
+	if oerr := provenOurs(ctx, d, l, container, nonce); oerr != nil {
+		return fmt.Errorf("bringup: the intent for %q could not be finished, because the container standing at that\n"+
+			"  name could not be proven to be the one the intent describes and to belong to this\n"+
+			"  installation. The intent is KEPT, nothing is confirmed and nothing is removed.\n"+
+			"  %w", container, oerr)
 	}
 	if verr := VerifyAttach(ctx, l, d, container, netID, alias); verr != nil {
 		_ = d.Mut.ContainerRemove(ctx, container)
@@ -504,11 +586,20 @@ func Recover(ctx context.Context, l *ledger.Ledger, d Deps, container, netID, al
 			"  confirmed-but-detached container is a state this sequence must never produce: %w",
 			container, errors.Join(ErrRebuild, verr))
 	}
-	if cerr := state.Commit(l, container, want, []state.Check{{Kind: state.CheckAlias, Param: param}}, false); cerr != nil {
+	// ONE TRANSACTION on a clone, published only once BOTH edits succeed. Committing into the
+	// caller's ledger first meant a Confirm that refused left the desired state and the owed check
+	// behind — a recovery that reported failure while having already half-finished the intent it
+	// was recovering. Recover does not persist: its caller writes the ledger once, so what this
+	// owes is that a refusal leaves that ledger byte-identical.
+	image, _ := d.Objs.Image(ctx, container)
+	cp := l.Clone()
+	if cerr := state.Commit(cp, container, want, []state.Check{{Kind: state.CheckAlias, Param: param}}, false); cerr != nil {
 		return cerr
 	}
-	image, _ := d.Objs.Image(ctx, container)
-	return intent.Confirm(l, prov.ClassContainer, container, nonce, ledger.Field{Key: "id", Value: image})
+	if cerr := intent.Confirm(cp, prov.ClassContainer, container, nonce, ledger.Field{Key: "id", Value: image}); cerr != nil {
+		return cerr
+	}
+	return l.Adopt(cp)
 }
 
 // Reconcile acts on the plan the state module computes, and NOTHING else — every branch is one of
