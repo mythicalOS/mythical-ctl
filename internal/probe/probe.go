@@ -177,8 +177,13 @@ func (p *Prober) reap(ctx context.Context, name, nonce string) error {
 	if nonce == "" || actual != nonce {
 		return fmt.Errorf("probe: the container at %q carries nonce %q, which is not the %q this intent recorded — it is a different object standing at the same name; it is NOT removed and the intent is PRESERVED", name, actual, nonce)
 	}
-	if rerr := p.rt.ContainerRemove(ctx, name); rerr != nil {
-		return fmt.Errorf("probe: the leftover probe container %q is this installation's and could not be removed — its intent is preserved, so the object stays accounted for until it can be: %w", name, rerr)
+	// Removed by IMMUTABLE IDENTITY — the id the inspection above verified — never by the
+	// name: a name is reusable, and between that inspection and this removal it could be
+	// reassigned to a container that was never verified (§6a: objects are acted on by the
+	// runtime's own id, never a name). The reference removes by name after the same
+	// verification; that window is closed here, not carried.
+	if rerr := p.rt.ContainerRemove(ctx, info.ID); rerr != nil {
+		return fmt.Errorf("probe: the leftover probe container %q (%s) is this installation's and could not be removed — its intent is preserved, so the object stays accounted for until it can be: %w", name, info.ID, rerr)
 	}
 	return nil
 }

@@ -616,6 +616,38 @@ func TestCleanup(t *testing.T) {
 	}
 }
 
+// The verified leftover is removed by its IMMUTABLE ID, never by the reusable name the
+// intent recorded: a name reassigned between the inspection and the removal would otherwise
+// take an unverified container with it. The DELETE the fake receives must carry the id.
+func TestReapRemovesByIdentity(t *testing.T) {
+	r := newRig(t)
+	ctx := context.Background()
+	r.fake.PullImage(probeRef)
+	standProbe(t, r, "mythical-i1-probe-n7", "i1", "n7")
+	info, err := r.c.ContainerInspect(ctx, "mythical-i1-probe-n7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.acct.OpenProbe("mythical-i1-probe-n7", "n7"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.p.Cleanup(ctx); err != nil {
+		t.Fatalf("a verified leftover is removed: %v", err)
+	}
+	var deletes []string
+	for _, req := range r.fake.Requests {
+		if strings.HasPrefix(req, "DELETE /") && strings.Contains(req, "/containers/") {
+			deletes = append(deletes, req)
+		}
+	}
+	if len(deletes) != 1 {
+		t.Fatalf("exactly one container removal expected, got %v", deletes)
+	}
+	if !strings.Contains(deletes[0], info.ID) || strings.Contains(deletes[0], "mythical-i1-probe-n7") {
+		t.Fatalf("the removal must address the verified id, not the reusable name: %s", deletes[0])
+	}
+}
+
 func TestCleanupRefusals(t *testing.T) {
 	r := newRig(t)
 	ctx := context.Background()

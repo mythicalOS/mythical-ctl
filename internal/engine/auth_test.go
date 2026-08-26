@@ -351,6 +351,24 @@ func TestDefaultStoreDetected(t *testing.T) {
 	}
 }
 
+// A registry-issued bearer token stored inline (`registrytoken`) is credentials: the CLI
+// preserves and sends it, and so must we — a token-only entry is not an anonymous pull.
+func TestInlineRegistryTokenPreserved(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, ".docker")
+	writeConfig(t, root, `{"auths":{"reg.example":{"registrytoken":"rt-xyz"}}}`)
+	hdr, err := resolveRegistryAuth(nil, home, "reg.example/img")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hdr == "" {
+		t.Fatal("a registrytoken-only entry is credentials, not an anonymous pull")
+	}
+	if ac := decodeHeader(t, hdr); ac["registrytoken"] != "rt-xyz" || ac["username"] != "" {
+		t.Fatalf("the registry token must ride the header as-is: %v", ac)
+	}
+}
+
 func TestCredHelperIdentityToken(t *testing.T) {
 	home := t.TempDir()
 	root := filepath.Join(home, ".docker")

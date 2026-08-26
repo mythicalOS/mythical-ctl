@@ -46,6 +46,7 @@ type configAuthEntry struct {
 	Username      string `json:"username"`
 	Password      string `json:"password"`
 	IdentityToken string `json:"identitytoken"`
+	RegistryToken string `json:"registrytoken"` // a bearer token the registry issued; preserved and sent as-is
 }
 
 // authConfig is the moby AuthConfig wire shape carried in X-Registry-Auth.
@@ -53,6 +54,7 @@ type authConfig struct {
 	Username      string `json:"username,omitempty"`
 	Password      string `json:"password,omitempty"`
 	IdentityToken string `json:"identitytoken,omitempty"`
+	RegistryToken string `json:"registrytoken,omitempty"`
 	ServerAddress string `json:"serveraddress,omitempty"`
 }
 
@@ -192,6 +194,7 @@ func inlineAuthFor(auths map[string]configAuthEntry, host, what string, legacyFa
 			Username:      entry.Username,
 			Password:      entry.Password,
 			IdentityToken: entry.IdentityToken,
+			RegistryToken: entry.RegistryToken,
 			ServerAddress: key,
 		}
 		if entry.Auth != "" {
@@ -378,7 +381,7 @@ func resolveRegistryAuth(env []string, home string, ref string) (string, error) 
 			return "", err
 		}
 	}
-	if ac == nil || (ac.Username == "" && ac.Password == "" && ac.IdentityToken == "") {
+	if ac == nil || (ac.Username == "" && ac.Password == "" && ac.IdentityToken == "" && ac.RegistryToken == "") {
 		return "", nil // anonymous: nothing names this registry
 	}
 	payload, err := json.Marshal(ac)
