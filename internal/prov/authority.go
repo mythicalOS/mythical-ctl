@@ -73,7 +73,7 @@ func Authority(ctx context.Context, l *ledger.Ledger, objs Objects, class Class,
 	// Checked here rather than in Find: this is the only function that turns a record into
 	// permission to delete, and a check in Find as well would be a check in neither — the earlier
 	// would shadow the later.
-	if derr := describes(fields, class, name); derr != nil {
+	if derr := Describes(fields, class, name); derr != nil {
 		return derr
 	}
 

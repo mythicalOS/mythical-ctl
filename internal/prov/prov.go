@@ -188,18 +188,19 @@ func (e engineObjects) Names(ctx context.Context, class Class) ([]string, error)
 	return nil, fmt.Errorf("prov: %q is not a listable object kind", string(class))
 }
 
-// describes answers: DOES THIS RECORD DESCRIBE THE OBJECT IT WAS FOUND UNDER?
+// Describes answers: DOES THIS RECORD DESCRIBE THE OBJECT IT WAS FOUND UNDER?
 //
 // A record is retrieved by its `key=` field, but `key`, `class` and `name` are three INDEPENDENT
 // fields and nothing makes them agree. A record keyed `volume:v1` while carrying `class=container`
 // and `name=other` answers the lookup for `volume v1` and then speaks about something else.
 //
-// ONE predicate with TWO call sites — reading a record as permission to delete, and consuming it
-// to build the record that outlives the object. The reference had the check at the first and not
-// the second, so a record deletion authority correctly refused was quietly DESTROYED by the
-// tombstone instead. A second copy of a guard is a guard that can be deleted with nothing
-// observable changing, so there is exactly one.
-func describes(fields []ledger.Field, class Class, name string) error {
+// ONE predicate with THREE call sites — reading a record as permission to delete (Authority),
+// consuming it to build the record that outlives the object (Tombstone), and consuming an intent
+// as the first half of a confirmation (intent.Confirm). The reference had the check at the first
+// and not the second, so a record deletion authority correctly refused was quietly DESTROYED by
+// the tombstone instead. A second copy of a guard is a guard that can be deleted with nothing
+// observable changing, so there is exactly one — EXPORTED rather than duplicated across packages.
+func Describes(fields []ledger.Field, class Class, name string) error {
 	rclass, _ := ledger.FieldOf(fields, "class")
 	rname, _ := ledger.FieldOf(fields, "name")
 	if rclass == string(class) && rname == name {
@@ -383,7 +384,7 @@ func Tombstone(l *ledger.Ledger, class Class, name string) error {
 		// consumed here anyway, its identity copied into a tombstone for the object that was
 		// ASKED about and the record itself dropped. That is conflicting evidence REPLACED, the
 		// one thing this module may never do.
-		if derr := describes(rec, class, name); derr != nil {
+		if derr := Describes(rec, class, name); derr != nil {
 			return derr
 		}
 		// A MISSING `nonce=` loses the same way. PRESENCE is the question, not emptiness: a
@@ -424,6 +425,17 @@ func Tombstone(l *ledger.Ledger, class Class, name string) error {
 		{Key: "nonce", Value: nonce},
 		{Key: "gen", Value: gen},
 	})
+}
+
+// TombstoneDrop retires the tombstone for class/name. A CONFIRMATION drops it: the object is
+// standing again, so the record of its removal is no longer the surviving account of it, and
+// leaving it beside a live object record would give the next reader two answers. Ambiguity refuses
+// here as everywhere — two contradicting tombstones are evidence, not tidying material.
+func TombstoneDrop(l *ledger.Ledger, class Class, name string) error {
+	if err := classCheck(class); err != nil {
+		return err
+	}
+	return l.Del(kindTomb, "key", key(class, name))
 }
 
 // TombstoneFind returns the tombstone for class/name — the surviving record of what was removed.
