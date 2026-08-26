@@ -89,16 +89,68 @@ func acceptClient(t *testing.T) *acceptRig {
 	return r
 }
 
-func (r *acceptRig) cleanupContainer(t *testing.T, name string) {
-	t.Cleanup(func() { _ = r.m.ContainerRemove(context.Background(), name) })
+// Cleanup addresses objects by IMMUTABLE IDENTITY, never by a reusable name (§6a): a name
+// can be reassigned between the moment a test learned it and the moment cleanup runs, and a
+// removal by name would then take a stranger's object. Containers and networks have runtime
+// ids; volumes do not (D56), so their identity is name + the provenance NONCE this test
+// stamped — a same-name volume carrying other labels, or none, is left exactly where it is.
+
+func (r *acceptRig) cleanupContainer(t *testing.T, id string) {
+	t.Cleanup(func() { _ = r.m.ContainerRemove(context.Background(), id) })
 }
 
-func (r *acceptRig) cleanupNetwork(t *testing.T, ref string) {
-	t.Cleanup(func() { _ = r.m.NetworkRemove(context.Background(), ref) })
+// cleanupOwnedContainer is for a name whose id the test never learned (a helper that failed
+// to launch, a create whose response was lost): inspect by name, remove by the inspected id
+// ONLY when the provenance labels are this test's installation and the given nonce.
+func (r *acceptRig) cleanupOwnedContainer(t *testing.T, name, nonce string) {
+	t.Cleanup(func() {
+		bg := context.Background()
+		info, err := r.c.ContainerInspect(bg, name)
+		if err != nil {
+			return
+		}
+		if info.Labels[engine.LabelNS+"installation"] != "acceptance" || info.Labels[engine.LabelNS+"nonce"] != nonce {
+			return
+		}
+		_ = r.m.ContainerRemove(bg, info.ID)
+	})
 }
 
-func (r *acceptRig) cleanupVolume(t *testing.T, name string) {
-	t.Cleanup(func() { _ = r.m.VolumeRemove(context.Background(), name) })
+func (r *acceptRig) cleanupNetwork(t *testing.T, id string) {
+	t.Cleanup(func() { _ = r.m.NetworkRemove(context.Background(), id) })
+}
+
+func (r *acceptRig) cleanupVolume(t *testing.T, name, nonce string) {
+	t.Cleanup(func() {
+		bg := context.Background()
+		info, err := r.c.VolumeInspect(bg, name)
+		if err != nil {
+			return
+		}
+		if info.Labels[engine.LabelNS+"installation"] != "acceptance" || info.Labels[engine.LabelNS+"nonce"] != nonce {
+			return
+		}
+		_ = r.m.VolumeRemove(bg, name)
+	})
+}
+
+// cleanupUnlabelledVolume is for the ONE volume this suite does not create itself: the one
+// the daemon auto-creates for a mount. It carries no provenance, so ownership cannot be
+// proven by label; the argument is stated instead — the caller asserted the name ABSENT
+// before the create that auto-created it, the name is per-process-prefixed, and the removal
+// runs only while the volume STILL carries no provenance labels at all.
+func (r *acceptRig) cleanupUnlabelledVolume(t *testing.T, name string) {
+	t.Cleanup(func() {
+		bg := context.Background()
+		info, err := r.c.VolumeInspect(bg, name)
+		if err != nil {
+			return
+		}
+		if info.Labels[engine.LabelNS+"installation"] != "" || info.Labels[engine.LabelNS+"nonce"] != "" {
+			return
+		}
+		_ = r.m.VolumeRemove(bg, name)
+	})
 }
 
 func (r *acceptRig) network(t *testing.T, ctx context.Context, name string) string {
@@ -108,7 +160,7 @@ func (r *acceptRig) network(t *testing.T, ctx context.Context, name string) stri
 	if err != nil {
 		t.Fatal(err)
 	}
-	r.cleanupNetwork(t, name)
+	r.cleanupNetwork(t, id)
 	return id
 }
 
@@ -175,7 +227,7 @@ func (r *acceptRig) container(t *testing.T, ctx context.Context, name, netID, al
 	if err != nil {
 		t.Fatal(err)
 	}
-	r.cleanupContainer(t, name)
+	r.cleanupContainer(t, id)
 	return id
 }
 
@@ -190,7 +242,7 @@ func TestAcceptanceFidelity(t *testing.T) {
 		if err := r.m.VolumeCreate(ctx, name, provA); err != nil {
 			t.Fatal(err)
 		}
-		r.cleanupVolume(t, name)
+		r.cleanupVolume(t, name, "orig") // the labels the volume KEEPS (the second create does not relabel)
 		provB, _ := engine.NewProvenance("other", "later")
 		if err := r.m.VolumeCreate(ctx, name, provB); err != nil {
 			t.Fatalf("create-on-existing must succeed: %v", err)
@@ -207,8 +259,8 @@ func TestAcceptanceFidelity(t *testing.T) {
 	t.Run("never-started endpoint id, address lifecycle (D48 + the 2026-08-04 lesson)", func(t *testing.T) {
 		netID := r.network(t, ctx, r.pfx+"-net1")
 		name := r.pfx + "-c1"
-		r.container(t, ctx, name, netID, r.pfx+"-alias")
-		info, err := r.c.ContainerInspect(ctx, name)
+		id := r.container(t, ctx, name, netID, r.pfx+"-alias")
+		info, err := r.c.ContainerInspect(ctx, id)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -228,18 +280,18 @@ func TestAcceptanceFidelity(t *testing.T) {
 		if !found {
 			t.Fatalf("the explicit alias must be registered: %v", ep.Aliases)
 		}
-		if err := r.m.ContainerStart(ctx, name); err != nil {
+		if err := r.m.ContainerStart(ctx, id); err != nil {
 			t.Fatal(err)
 		}
-		info, _ = r.c.ContainerInspect(ctx, name)
+		info, _ = r.c.ContainerInspect(ctx, id)
 		started := info.Networks[r.pfx+"-net1"]
 		if started.NetworkID == "" || started.IPAddress == "" {
 			t.Fatalf("start assigns endpoint id and address: %+v", started)
 		}
-		if err := r.m.ContainerStop(ctx, name); err != nil {
+		if err := r.m.ContainerStop(ctx, id); err != nil {
 			t.Fatal(err)
 		}
-		info, _ = r.c.ContainerInspect(ctx, name)
+		info, _ = r.c.ContainerInspect(ctx, id)
 		stopped := info.Networks[r.pfx+"-net1"]
 		if stopped.IPAddress != "" {
 			t.Fatalf("stop RELEASES the address: %+v", stopped)
@@ -271,10 +323,10 @@ func TestAcceptanceFidelity(t *testing.T) {
 		if _, byID := info.Networks[netID]; !byID {
 			t.Fatalf("a never-started create is reported under the SUBMITTED key: %+v", info.Networks)
 		}
-		if err := r.m.ContainerStart(ctx, name); err != nil {
+		if err := r.m.ContainerStart(ctx, info.ID); err != nil {
 			t.Fatal(err)
 		}
-		info, err = r.c.ContainerInspect(ctx, name)
+		info, err = r.c.ContainerInspect(ctx, info.ID)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -315,25 +367,25 @@ func TestAcceptanceFidelity(t *testing.T) {
 		// keeps the model honest.
 		netB := r.network(t, ctx, r.pfx+"-net4b")
 		nameB := r.pfx + "-c4b"
-		r.container(t, ctx, nameB, netB, "a4b")
+		idB := r.container(t, ctx, nameB, netB, "a4b")
 		if err := r.m.NetworkRemove(ctx, netB); err != nil {
 			t.Fatalf("a network whose only attachment is a NEVER-STARTED container is removable (measured 2026-08-25): %v", err)
 		}
-		if err := r.m.ContainerRemove(ctx, nameB); err != nil {
+		if err := r.m.ContainerRemove(ctx, idB); err != nil {
 			t.Fatal(err)
 		}
 		// A RUNNING attachment does block it.
 		netID := r.network(t, ctx, r.pfx+"-net4")
 		name := r.pfx + "-c4"
-		r.container(t, ctx, name, netID, "a4")
-		if err := r.m.ContainerStart(ctx, name); err != nil {
+		id := r.container(t, ctx, name, netID, "a4")
+		if err := r.m.ContainerStart(ctx, id); err != nil {
 			t.Fatal(err)
 		}
 		if err := r.m.NetworkRemove(ctx, netID); err == nil {
 			t.Fatal("a network with a RUNNING container attached must refuse removal")
 		}
 		// The client always force-removes — reconciliation must be able to clear a live one.
-		if err := r.m.ContainerRemove(ctx, name); err != nil {
+		if err := r.m.ContainerRemove(ctx, id); err != nil {
 			t.Fatalf("force-remove of a running container: %v", err)
 		}
 		if err := r.m.NetworkRemove(ctx, netID); err != nil {
@@ -344,17 +396,17 @@ func TestAcceptanceFidelity(t *testing.T) {
 	t.Run("duplicate endpoint and private-mode connect refusals", func(t *testing.T) {
 		netID := r.network(t, ctx, r.pfx+"-net5")
 		name := r.pfx + "-c5"
-		r.container(t, ctx, name, netID, "a5")
+		id := r.container(t, ctx, name, netID, "a5")
 		// MEASURED 2026-08-25: on a NON-running container a second connect of the same network
 		// is ACCEPTED (the stored endpoint config is updated); the conflict is a running-
 		// container fact.
-		if err := r.m.NetworkConnect(ctx, netID, name, "again", 0); err != nil {
+		if err := r.m.NetworkConnect(ctx, netID, id, "again", 0); err != nil {
 			t.Fatalf("non-running duplicate connect is accepted by the daemon: %v", err)
 		}
-		if err := r.m.ContainerStart(ctx, name); err != nil {
+		if err := r.m.ContainerStart(ctx, id); err != nil {
 			t.Fatal(err)
 		}
-		if err := r.m.NetworkConnect(ctx, netID, name, "again2", 0); err == nil {
+		if err := r.m.NetworkConnect(ctx, netID, id, "again2", 0); err == nil {
 			t.Fatal("connecting the same network twice to a RUNNING container must refuse")
 		}
 		// The private-mode (`none`) connect refusal is not measurable through this client: the
@@ -379,7 +431,7 @@ func TestAcceptanceFidelity(t *testing.T) {
 		if err := r.m.VolumeCreate(ctx, volName, prov); err != nil {
 			t.Fatal(err)
 		}
-		r.cleanupVolume(t, volName)
+		r.cleanupVolume(t, volName, "dup")
 		vm, err := engine.NewVolumeMount(volName, "/data")
 		if err != nil {
 			t.Fatal(err)
@@ -399,11 +451,12 @@ func TestAcceptanceFidelity(t *testing.T) {
 		// Registered BEFORE the container exists (and before its cleanup), so on an early
 		// failure the LIFO order removes the container FIRST and this best-effort sweep can
 		// actually take the then-unreferenced volume with it.
-		r.cleanupVolume(t, autoName)
-		if _, err := r.m.ContainerCreate(ctx, spec); err != nil {
+		r.cleanupUnlabelledVolume(t, autoName)
+		id6, err := r.m.ContainerCreate(ctx, spec)
+		if err != nil {
 			t.Fatal(err)
 		}
-		r.cleanupContainer(t, name)
+		r.cleanupContainer(t, id6)
 		autoInfo, err := r.c.VolumeInspect(ctx, autoName)
 		if err != nil {
 			t.Fatalf("the daemon auto-creates a missing named volume (measured): %v", err)
@@ -414,7 +467,7 @@ func TestAcceptanceFidelity(t *testing.T) {
 		if err := r.m.VolumeRemove(ctx, volName); err == nil || !strings.Contains(err.Error(), "volume is in use") {
 			t.Fatalf("a mounted volume must refuse removal in the daemon's words: %v", err)
 		}
-		if err := r.m.ContainerRemove(ctx, name); err != nil {
+		if err := r.m.ContainerRemove(ctx, id6); err != nil {
 			t.Fatal(err)
 		}
 		if err := r.m.VolumeRemove(ctx, volName); err != nil {
@@ -431,16 +484,16 @@ func TestAcceptanceFidelity(t *testing.T) {
 		netA := r.network(t, ctx, r.pfx+"-neta")
 		netB := r.network(t, ctx, r.pfx+"-netb")
 		name := r.pfx + "-c6"
-		r.container(t, ctx, name, netA, "a6")
-		if err := r.m.ContainerStart(ctx, name); err != nil {
+		id := r.container(t, ctx, name, netA, "a6")
+		if err := r.m.ContainerStart(ctx, id); err != nil {
 			t.Fatal(err)
 		}
 		// The target is attached at LOWER priority than the source, so the route must not
 		// move before the migration's final phase — the reason APIVersion is v1.48.
-		if err := r.m.NetworkConnect(ctx, netB, name, "a6", -10); err != nil {
+		if err := r.m.NetworkConnect(ctx, netB, id, "a6", -10); err != nil {
 			t.Fatalf("connect with gw-priority: %v", err)
 		}
-		info, err := r.c.ContainerInspect(ctx, name)
+		info, err := r.c.ContainerInspect(ctx, id)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -451,11 +504,11 @@ func TestAcceptanceFidelity(t *testing.T) {
 		if err := r.m.NetworkDisconnect(ctx, netA, name); err != nil {
 			t.Fatalf("rebind detach: %v", err)
 		}
-		info, _ = r.c.ContainerInspect(ctx, name)
+		info, _ = r.c.ContainerInspect(ctx, id)
 		if _, still := info.Networks[r.pfx+"-neta"]; still {
 			t.Fatal("detached")
 		}
-		if err := r.m.ContainerRemove(ctx, name); err != nil {
+		if err := r.m.ContainerRemove(ctx, id); err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -482,7 +535,7 @@ func TestAcceptanceFidelity(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		r.cleanupContainer(t, r.pfx+"-h1")
+		r.cleanupOwnedContainer(t, r.pfx+"-h1", "h1")
 		_, herr := r.m.HelperRun(ctx, hs)
 		if herr == nil || !strings.Contains(herr.Error(), "resolve") {
 			t.Fatalf("the daemon's own words must ride the launch failure: %v", herr)
@@ -490,6 +543,30 @@ func TestAcceptanceFidelity(t *testing.T) {
 		if _, ierr := r.c.ContainerInspect(ctx, r.pfx+"-h1"); !errors.Is(ierr, engine.ErrAbsent) {
 			t.Fatal("no helper outlives its own invocation — a failed launch included")
 		}
+	})
+
+	t.Run("cleanup helpers prove ownership before removing", func(t *testing.T) {
+		// A same-name volume stamped by a STRANGER (a different nonce) must survive a cleanup
+		// registered for OUR nonce — the ownership proof is the label, never the name. The
+		// verifier is registered FIRST so LIFO runs it LAST, after the cleanup under test.
+		name := r.pfx + "-guardvol"
+		stranger, _ := engine.NewProvenance("acceptance", "stranger")
+		if err := r.m.VolumeCreate(ctx, name, stranger); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			bg := context.Background()
+			info, err := r.c.VolumeInspect(bg, name)
+			if err != nil {
+				t.Errorf("a stranger's same-name volume must survive a cleanup that cannot prove ownership: %v", err)
+				return
+			}
+			if info.Labels[engine.LabelNS+"nonce"] != "stranger" {
+				t.Errorf("the surviving volume must be the stranger's: %v", info.Labels)
+			}
+			_ = r.m.VolumeRemove(bg, name) // the verifier's own removal, by its own proof
+		})
+		r.cleanupVolume(t, name, "mine") // must NOT remove: the nonce is not ours
 	})
 
 	t.Run("authenticated registry pull", func(t *testing.T) {
