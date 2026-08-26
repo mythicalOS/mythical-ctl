@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -146,10 +147,15 @@ func runCredHelper(env []string, helper, serverAddress string) (*authConfig, err
 // hostname the way the CLI does, and decodes the base64 `auth` pair when that is the spelling
 // present.
 func inlineAuthFor(auths map[string]configAuthEntry, host string) (*authConfig, error) {
-	for key, entry := range auths {
-		if normalizeRegistryHost(key) != host {
-			continue
-		}
+	key, err := lookupKey(keysOf(auths), host, "inline auths")
+	if err != nil {
+		return nil, err
+	}
+	if key == "" {
+		return nil, nil
+	}
+	{
+		entry := auths[key]
 		ac := &authConfig{
 			Username:      entry.Username,
 			Password:      entry.Password,
@@ -169,7 +175,44 @@ func inlineAuthFor(auths map[string]configAuthEntry, host string) (*authConfig, 
 		}
 		return ac, nil
 	}
-	return nil, nil
+}
+
+// keysOf lists a map's keys, SORTED — every lookup below walks keys in one order, so two runs
+// over the same config give the same answer.
+func keysOf[V any](m map[string]V) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// lookupKey ports the docker CLI's lookup order and closes its one open door. The CLI tries
+// the EXACT config key first (`AuthConfigs[serverAddress]`, `CredentialHelpers[hostname]`)
+// and only then falls back to matching keys by normalized hostname — where it iterates a Go
+// map, so a config carrying both a canonical and a legacy spelling of one registry answers
+// NONDETERMINISTICALLY. Here: the exact key wins; a normalized fallback is taken only when it
+// is UNIQUE; two legacy spellings that disagree are a REFUSAL, never a coin toss.
+func lookupKey(keys []string, host, what string) (string, error) {
+	exact := serverAddressFor(host)
+	var candidates []string
+	for _, k := range keys {
+		if k == exact || k == host {
+			return k, nil
+		}
+		if normalizeRegistryHost(k) == host {
+			candidates = append(candidates, k)
+		}
+	}
+	switch len(candidates) {
+	case 0:
+		return "", nil
+	case 1:
+		return candidates[0], nil
+	default:
+		return "", fmt.Errorf("engine: the docker config's %s name registry %q under %d equivalent keys (%s) and no exact one — refusing to guess which credentials apply; keep one entry", what, host, len(candidates), strings.Join(candidates, ", "))
+	}
 }
 
 // resolveRegistryAuth resolves the X-Registry-Auth header value for a pull of `ref`, or ""
@@ -182,13 +225,11 @@ func resolveRegistryAuth(env []string, home string, ref string) (string, error) 
 	}
 
 	var ac *authConfig
-	helper := ""
-	for key, h := range cfg.CredHelpers {
-		if normalizeRegistryHost(key) == host {
-			helper = h
-			break
-		}
+	helperKey, err := lookupKey(keysOf(cfg.CredHelpers), host, "credHelpers")
+	if err != nil {
+		return "", err
 	}
+	helper := cfg.CredHelpers[helperKey]
 	switch {
 	case helper != "":
 		ac, err = runCredHelper(env, helper, serverAddressFor(host))

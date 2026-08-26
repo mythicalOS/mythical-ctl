@@ -153,6 +153,70 @@ func TestCredHelperPrecedence(t *testing.T) {
 	}
 }
 
+// The CLI's lookup ORDER, ported and closed: the EXACT config key wins over a legacy spelling
+// of the same registry; a legacy spelling is honored when it is the only one; two legacy
+// spellings that could both apply, with no exact key, are a REFUSAL — the CLI iterates a Go
+// map there and answers nondeterministically, which is the one thing a credential lookup
+// must never do.
+func TestLookupOrderExactBeatsLegacy(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, ".docker")
+	exact := base64.StdEncoding.EncodeToString([]byte("exact:e"))
+	legacy := base64.StdEncoding.EncodeToString([]byte("legacy:l"))
+	other := base64.StdEncoding.EncodeToString([]byte("other:o"))
+	// Exact key present alongside a legacy spelling: exact wins, every time.
+	for i := 0; i < 20; i++ {
+		writeConfig(t, root, `{"auths":{"https://reg.example":{"auth":"`+legacy+`"},"reg.example":{"auth":"`+exact+`"}}}`)
+		hdr, err := resolveRegistryAuth(nil, home, "reg.example/img")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ac := decodeHeader(t, hdr); ac["username"] != "exact" {
+			t.Fatalf("run %d: the exact key must win over a legacy spelling: %v", i, ac)
+		}
+	}
+	// A single legacy spelling and no exact key: honored (the CLI's fallback).
+	writeConfig(t, root, `{"auths":{"https://reg.example":{"auth":"`+legacy+`"}}}`)
+	hdr, err := resolveRegistryAuth(nil, home, "reg.example/img")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ac := decodeHeader(t, hdr); ac["username"] != "legacy" {
+		t.Fatalf("a unique legacy spelling is honored: %v", ac)
+	}
+	// Two legacy spellings, no exact key: REFUSED, never a coin toss.
+	writeConfig(t, root, `{"auths":{"https://reg.example":{"auth":"`+legacy+`"},"http://reg.example/v1/":{"auth":"`+other+`"}}}`)
+	if _, err := resolveRegistryAuth(nil, home, "reg.example/img"); err == nil || !strings.Contains(err.Error(), "refusing to guess") {
+		t.Fatalf("ambiguous legacy spellings must refuse: %v", err)
+	}
+	// The same order for credHelpers: the exact hostname key beats a legacy one; two legacy
+	// keys naming different helpers refuse.
+	hExact := writeHelper(t, "hexact", `echo '{"Username":"from-exact","Secret":"x"}'`)
+	hLegacy := writeHelper(t, "hlegacy", `echo '{"Username":"from-legacy","Secret":"y"}'`)
+	env := []string{"PATH=" + hExact + string(os.PathListSeparator) + hLegacy}
+	writeConfig(t, root, `{"credHelpers":{"https://reg.example":"hlegacy","reg.example":"hexact"}}`)
+	hdr, err = resolveRegistryAuth(env, home, "reg.example/img")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ac := decodeHeader(t, hdr); ac["username"] != "from-exact" {
+		t.Fatalf("credHelpers: exact key must win: %v", ac)
+	}
+	writeConfig(t, root, `{"credHelpers":{"https://reg.example":"hlegacy","http://reg.example":"hexact"}}`)
+	if _, err := resolveRegistryAuth(env, home, "reg.example/img"); err == nil || !strings.Contains(err.Error(), "refusing to guess") {
+		t.Fatalf("credHelpers: ambiguous legacy keys must refuse: %v", err)
+	}
+	// Hub: the legacy URL IS the exact key (what every `docker login` wrote).
+	writeConfig(t, root, `{"auths":{"docker.io":{"auth":"`+legacy+`"},"https://index.docker.io/v1/":{"auth":"`+exact+`"}}}`)
+	hdr, err = resolveRegistryAuth(nil, home, "busybox")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ac := decodeHeader(t, hdr); ac["username"] != "exact" {
+		t.Fatalf("Hub: the legacy URL is the exact key: %v", ac)
+	}
+}
+
 func TestCredHelperIdentityToken(t *testing.T) {
 	home := t.TempDir()
 	root := filepath.Join(home, ".docker")

@@ -11,6 +11,7 @@ import (
 	"mythicalos.ai/ctl/internal/engine/enginetest"
 	"mythicalos.ai/ctl/internal/famlock"
 	"mythicalos.ai/ctl/internal/manifest"
+	"mythicalos.ai/ctl/internal/policy"
 	"mythicalos.ai/ctl/internal/runtime"
 )
 
@@ -62,8 +63,12 @@ func TestLaunchProductMounts(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.writeFamilyConf(t, "MYTHICAL_NET=fam", "MYTHICAL_BROKKR_WORK_BIND="+link)
-	m := man(t, nil, "volume=work:/work", "volume=state:/var/lib/brokkr", "port=7480")
-	p := pol(t, "brokkr.permitted_role=work", "brokkr.permitted_role=state", "brokkr.bindable_role=work")
+	// Both directory core-fixed mounts SELECTED and PERMITTED — the three-present case; the
+	// selection rule itself is TestCoreFixedSelection.
+	m := man(t, nil, "volume=work:/work", "volume=state:/var/lib/brokkr", "port=7480",
+		"mount=transcripts", "mount=logs")
+	p := pol(t, "brokkr.permitted_role=work", "brokkr.permitted_role=state", "brokkr.bindable_role=work",
+		"brokkr.permitted_mount=transcripts", "brokkr.permitted_mount=logs")
 
 	r.fake.PullImage(m.Image())
 	prov, err := engine.NewProvenance("inst1", "netnonce")
@@ -136,7 +141,7 @@ func TestLaunchProductMounts(t *testing.T) {
 	if state == nil || state.Type != "volume" || state.Name != volName {
 		t.Fatalf("volume fallback: %+v", state)
 	}
-	// The three core-fixed mounts are present, rw.
+	// The three core-fixed mounts are present (all selected above), rw.
 	var fixedCount int
 	for _, mt := range mounts {
 		switch mt.Destination {
@@ -234,8 +239,67 @@ func TestMountsForPairwise(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(mounts) != 5 { // three core-fixed + two binds
-		t.Fatalf("want 5 mounts, got %d", len(mounts))
+	if len(mounts) != 3 { // <product>.conf (always) + two binds; no `mount=` selected, so no dirs
+		t.Fatalf("want 3 mounts, got %d", len(mounts))
+	}
+}
+
+// §4.1a SELECTION, as the reference's launch verb does it: <product>.conf is ALWAYS mounted;
+// transcripts and logs ONLY when the manifest selects them (`mount=`) AND the policy permits
+// the selection; anything else a manifest names is a refusal. A product granted neither
+// receives neither — the first port mounted all three unconditionally (gate round-9 P1).
+func TestCoreFixedSelection(t *testing.T) {
+	r := newRig(t, "brokkr")
+	ctx := context.Background()
+	prov, err := engine.NewProvenance("inst1", "netnonce")
+	if err != nil {
+		t.Fatal(err)
+	}
+	netID, err := r.rt.NetworkCreate(ctx, "family", prov)
+	if err != nil {
+		t.Fatal(err)
+	}
+	launchDests := func(t *testing.T, name string, m *manifest.Manifest, p *policy.Policy) map[string]bool {
+		t.Helper()
+		r.fake.PullImage(m.Image())
+		id, err := r.rt.LaunchProduct(ctx, m, p, runtime.LaunchConfig{Identity: name, Nonce: "n-" + name, NetworkID: netID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		info, err := r.c.ContainerInspect(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dests := map[string]bool{}
+		for _, mt := range runtime.MountsOf(info) {
+			dests[mt.Destination] = true
+		}
+		return dests
+	}
+	// No selection: the conf alone.
+	d := launchDests(t, "none", man(t, nil), pol(t))
+	if !d["/etc/mythical/brokkr.conf"] {
+		t.Fatalf("<product>.conf is always mounted: %v", d)
+	}
+	if d["/home/mythical/transcripts"] || d["/home/mythical/logs"] {
+		t.Fatalf("an UNSELECTED directory core-fixed mount must not be mounted: %v", d)
+	}
+	// One selected and permitted: that one, not the other.
+	d = launchDests(t, "one", man(t, nil, "mount=transcripts"), pol(t, "brokkr.permitted_mount=transcripts"))
+	if !d["/home/mythical/transcripts"] || d["/home/mythical/logs"] {
+		t.Fatalf("exactly the selected directory is mounted: %v", d)
+	}
+	// Selected but NOT permitted: a refusal at the selection site (manifest.Check refuses it
+	// too, upstream; MountsFor must not depend on that).
+	if _, err := r.rt.MountsFor(man(t, nil, "mount=logs"), pol(t)); err == nil || !strings.Contains(err.Error(), "does not permit") {
+		t.Fatalf("an unpermitted selection must refuse: %v", err)
+	}
+	// A selection outside the closed set: refused, never invented.
+	if _, err := r.rt.MountsFor(man(t, nil, "mount=secrets"), pol(t, "brokkr.permitted_mount=secrets")); err == nil || !strings.Contains(err.Error(), "not a core-fixed mount") {
+		t.Fatalf("a selection outside the closed set must refuse: %v", err)
+	}
+	if _, err := r.rt.MountsFor(man(t, nil, "mount=conf"), pol(t, "brokkr.permitted_mount=conf")); err == nil || !strings.Contains(err.Error(), "not a core-fixed mount") {
+		t.Fatalf("the conf is not a selectable name: %v", err)
 	}
 }
 

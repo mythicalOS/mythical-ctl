@@ -113,6 +113,7 @@ func nameOK(what, v string) error {
 // FixedMount is one core-fixed mount: a host source, a container target, read-write, of a
 // stated filesystem type.
 type FixedMount struct {
+	Name   string // "conf" | "transcripts" | "logs" — the manifest's `mount=` vocabulary for the two dirs
 	IsDir  bool
 	Source string
 	Target string
@@ -134,9 +135,9 @@ func CoreFixed(homeCanon, product string) ([]FixedMount, error) {
 		return nil, err
 	}
 	return []FixedMount{
-		{IsDir: false, Source: homeCanon + "/" + product + ".conf", Target: "/etc/mythical/" + product + ".conf"},
-		{IsDir: true, Source: homeCanon + "/transcripts", Target: "/home/mythical/transcripts"},
-		{IsDir: true, Source: homeCanon + "/logs", Target: "/home/mythical/logs"},
+		{Name: "conf", IsDir: false, Source: homeCanon + "/" + product + ".conf", Target: "/etc/mythical/" + product + ".conf"},
+		{Name: "transcripts", IsDir: true, Source: homeCanon + "/transcripts", Target: "/home/mythical/transcripts"},
+		{Name: "logs", IsDir: true, Source: homeCanon + "/logs", Target: "/home/mythical/logs"},
 	}, nil
 }
 
@@ -496,8 +497,31 @@ func (r *Runtime) mountsFor(m *manifest.Manifest, p *policy.Policy) ([]rawMount,
 	if err != nil {
 		return nil, nil, err
 	}
-	var mounts []rawMount
+	// §4.1a SELECTION, exactly as the reference's launch verb does it: <product>.conf is ALWAYS
+	// mounted; the two directory mounts are mounted ONLY when the manifest SELECTS them
+	// (`mount=transcripts`, `mount=logs`) AND the policy index PERMITS the selection — a
+	// product granted neither receives neither. The allowlist itself stays closed and fixed
+	// (CheckFixed validated all three above); the manifest only chooses from it, and a
+	// selection outside it is a refusal, never a mount.
+	byName := map[string]FixedMount{}
 	for _, fm := range fixed {
+		byName[fm.Name] = fm
+	}
+	confMount := byName["conf"]
+	mounts := []rawMount{{source: confMount.Source, target: confMount.Target}}
+	seenMount := map[string]bool{}
+	for _, v := range m.Mounts() {
+		if seenMount[v] {
+			continue
+		}
+		seenMount[v] = true
+		fm, selectable := byName[v]
+		if !selectable || v == "conf" {
+			return nil, nil, fmt.Errorf("runtime: %q is not a core-fixed mount a manifest may select — the closed set is transcripts, logs", v)
+		}
+		if !p.PermitsMount(product, v) {
+			return nil, nil, fmt.Errorf("runtime: %q selects the core-fixed mount %q, which the policy index does not permit", product, v)
+		}
 		mounts = append(mounts, rawMount{source: fm.Source, target: fm.Target})
 	}
 
