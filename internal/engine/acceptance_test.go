@@ -134,6 +134,32 @@ func (r *acceptRig) cleanupVolume(t *testing.T, name, nonce string) {
 	})
 }
 
+// removeOwnedVolume is the IN-TEST counterpart of cleanupVolume: a volume is removed only
+// after proving it is this test's — installation AND nonce — and a refusal is reported
+// otherwise, so an assertion never mutates a same-name replacement it did not create.
+func (r *acceptRig) removeOwnedVolume(ctx context.Context, name, nonce string) error {
+	info, err := r.c.VolumeInspect(ctx, name)
+	if err != nil {
+		return err
+	}
+	if info.Labels[engine.LabelNS+"installation"] != "acceptance" || info.Labels[engine.LabelNS+"nonce"] != nonce {
+		return fmt.Errorf("refusing to remove volume %q: its labels %v are not this test's (nonce %q)", name, info.Labels, nonce)
+	}
+	return r.m.VolumeRemove(ctx, name)
+}
+
+// removeUnlabelledVolume is the in-test counterpart of cleanupUnlabelledVolume, same rule.
+func (r *acceptRig) removeUnlabelledVolume(ctx context.Context, name string) error {
+	info, err := r.c.VolumeInspect(ctx, name)
+	if err != nil {
+		return err
+	}
+	if info.Labels[engine.LabelNS+"installation"] != "" || info.Labels[engine.LabelNS+"nonce"] != "" {
+		return fmt.Errorf("refusing to remove volume %q: it carries provenance labels %v and is not the unlabelled auto-created one", name, info.Labels)
+	}
+	return r.m.VolumeRemove(ctx, name)
+}
+
 // cleanupUnlabelledVolume is for the ONE volume this suite does not create itself: the one
 // the daemon auto-creates for a mount. It carries no provenance, so ownership cannot be
 // proven by label; the argument is stated instead — the caller asserted the name ABSENT
@@ -464,18 +490,18 @@ func TestAcceptanceFidelity(t *testing.T) {
 		if autoInfo.Labels[engine.LabelNS+"installation"] != "" {
 			t.Fatalf("an auto-created volume carries NO provenance labels: %v", autoInfo.Labels)
 		}
-		if err := r.m.VolumeRemove(ctx, volName); err == nil || !strings.Contains(err.Error(), "volume is in use") {
+		if err := r.removeOwnedVolume(ctx, volName, "dup"); err == nil || !strings.Contains(err.Error(), "volume is in use") {
 			t.Fatalf("a mounted volume must refuse removal in the daemon's words: %v", err)
 		}
 		if err := r.m.ContainerRemove(ctx, id6); err != nil {
 			t.Fatal(err)
 		}
-		if err := r.m.VolumeRemove(ctx, volName); err != nil {
+		if err := r.removeOwnedVolume(ctx, volName, "dup"); err != nil {
 			t.Fatalf("after the container is gone the volume goes: %v", err)
 		}
 		// The auto-created one is ASSERTED removable too — an undeletable auto-created volume
 		// would otherwise vanish into a discarded best-effort cleanup and never fail the lane.
-		if err := r.m.VolumeRemove(ctx, autoName); err != nil {
+		if err := r.removeUnlabelledVolume(ctx, autoName); err != nil {
 			t.Fatalf("the auto-created volume goes the same way: %v", err)
 		}
 	})
@@ -501,7 +527,7 @@ func TestAcceptanceFidelity(t *testing.T) {
 		if ep.GwPriority != -10 {
 			t.Fatalf("GwPriority must round-trip: %+v", ep)
 		}
-		if err := r.m.NetworkDisconnect(ctx, netA, name); err != nil {
+		if err := r.m.NetworkDisconnect(ctx, netA, id); err != nil {
 			t.Fatalf("rebind detach: %v", err)
 		}
 		info, _ = r.c.ContainerInspect(ctx, id)
@@ -561,11 +587,16 @@ func TestAcceptanceFidelity(t *testing.T) {
 				t.Errorf("a stranger's same-name volume must survive a cleanup that cannot prove ownership: %v", err)
 				return
 			}
-			if info.Labels[engine.LabelNS+"nonce"] != "stranger" {
+			if info.Labels[engine.LabelNS+"installation"] != "acceptance" || info.Labels[engine.LabelNS+"nonce"] != "stranger" {
 				t.Errorf("the surviving volume must be the stranger's: %v", info.Labels)
+				return
 			}
-			_ = r.m.VolumeRemove(bg, name) // the verifier's own removal, by its own proof
+			_ = r.m.VolumeRemove(bg, name) // the verifier's own removal, by its own full proof
 		})
+		// The in-test remover REFUSES too — it must not delete what it cannot prove is ours.
+		if err := r.removeOwnedVolume(ctx, name, "mine"); err == nil || !strings.Contains(err.Error(), "refusing to remove") {
+			t.Fatalf("removeOwnedVolume must refuse a volume whose labels are not ours: %v", err)
+		}
 		r.cleanupVolume(t, name, "mine") // must NOT remove: the nonce is not ours
 	})
 
