@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -184,6 +186,55 @@ func inlineAuthFor(auths map[string]configAuthEntry, host, what string, legacyFa
 	}
 }
 
+// parseEnvAuthConfig is docker/cli v28.4.0's parseEnvConfig, ported field for field: the
+// overlay's SCHEMA is strict — exactly one JSON object, only `auths` at the top level, only
+// `auth` per entry (DisallowUnknownFields on both), `auth` REQUIRED and non-empty, decoded as
+// standard base64 `user:password` with a non-empty user and NUL-trimmed password. A lenient
+// reading (accepting `username`/`password`, ignoring extra keys) would let an overlay the CLI
+// REJECTS outrank the operator's helpers and store. The CLI reports a rejected overlay on
+// stderr and continues with the store; here it is a refusal — the documented sharpening.
+func parseEnvAuthConfig(v string) (map[string]authConfig, error) {
+	var env struct {
+		Auths map[string]struct {
+			Auth string `json:"auth"`
+		} `json:"auths"`
+	}
+	dec := json.NewDecoder(strings.NewReader(v))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&env); err != nil && !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("engine: DOCKER_AUTH_CONFIG is set but is not the CLI's schema ({\"auths\":{\"<registry>\":{\"auth\":\"<base64 user:password>\"}}}): %v", err)
+	}
+	if dec.More() {
+		return nil, errors.New("engine: DOCKER_AUTH_CONFIG does not support more than one JSON object")
+	}
+	out := make(map[string]authConfig, len(env.Auths))
+	for addr, e := range env.Auths {
+		if e.Auth == "" {
+			return nil, fmt.Errorf("engine: DOCKER_AUTH_CONFIG is missing key `auth` for %s", addr)
+		}
+		user, pass, err := decodeAuthPair(e.Auth)
+		if err != nil {
+			return nil, fmt.Errorf("engine: DOCKER_AUTH_CONFIG entry for %s: %v", addr, err)
+		}
+		out[addr] = authConfig{Username: user, Password: pass, ServerAddress: addr}
+	}
+	return out, nil
+}
+
+// decodeAuthPair is the CLI's decodeAuth: standard base64, `user:password`, user non-empty,
+// password trimmed of NULs (a padding artifact the CLI strips too).
+func decodeAuthPair(s string) (string, string, error) {
+	raw, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return "", "", fmt.Errorf("the stored auth is not valid base64: %v", err)
+	}
+	user, pass, ok := strings.Cut(string(raw), ":")
+	if !ok || user == "" {
+		return "", "", errors.New("the stored auth is not a user:password pair")
+	}
+	return user, strings.Trim(pass, "\x00"), nil
+}
+
 // keysOf lists a map's keys, SORTED — every lookup below walks keys in one order, so two runs
 // over the same config give the same answer.
 func keysOf[V any](m map[string]V) []string {
@@ -240,17 +291,18 @@ func resolveRegistryAuth(env []string, home string, ref string) (string, error) 
 	//    entry for this registry wins over helpers, credsStore and the file alike (exact key,
 	//    as memorystore.Get is); registries it does not name fall through to the rest.
 	if overlay, ok := envValue(env, "DOCKER_AUTH_CONFIG"); ok && overlay != "" {
-		var oc struct {
-			Auths map[string]configAuthEntry `json:"auths"`
+		entries, perr := parseEnvAuthConfig(overlay)
+		if perr != nil {
+			return "", perr
 		}
-		if err := json.Unmarshal([]byte(overlay), &oc); err != nil {
-			return "", fmt.Errorf("engine: DOCKER_AUTH_CONFIG is set but is not valid JSON: %v", err)
+		key, kerr := lookupKey(keysOf(entries), host, "DOCKER_AUTH_CONFIG", false)
+		if kerr != nil {
+			return "", kerr
 		}
-		hit, herr := inlineAuthFor(oc.Auths, host, "DOCKER_AUTH_CONFIG", false)
-		if herr != nil {
-			return "", herr
+		if key != "" {
+			e := entries[key]
+			ac = &e
 		}
-		ac = hit
 	}
 	if ac == nil {
 		// 2. a registry-specific helper (exact key), 3. the store, 4. the inline file entries.

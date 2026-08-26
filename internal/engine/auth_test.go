@@ -297,6 +297,29 @@ func TestDockerAuthConfigOverlay(t *testing.T) {
 	if ac := decodeHeader(t, hdr); ac["username"] != "from-helper" {
 		t.Fatalf("a URL-spelled overlay key is not an exact match: %v", ac)
 	}
+	// The overlay's schema is the CLI's STRICT one (parseEnvConfig, DisallowUnknownFields):
+	// anything the CLI would reject is refused here rather than allowed to outrank the store.
+	for _, bad := range []string{
+		`{"auths":{"reg.example":{"username":"u","password":"p"}}}`,                                         // no `auth` key
+		`{"auths":{"reg.example":{"auth":"` + overlayPair + `","x":1}}}`,                                    // extra per-entry key
+		`{"auths":{"reg.example":{"auth":"` + overlayPair + `"}},"psFormat":"x"}`,                           // extra top-level key
+		`{"auths":{"reg.example":{"auth":"` + overlayPair + `"}}} {}`,                                       // a second object
+		`{"auths":{"reg.example":{"auth":"not*base64"}}}`,                                                   // bad base64
+		`{"auths":{"reg.example":{"auth":"` + base64.StdEncoding.EncodeToString([]byte(":nouser")) + `"}}}`, // empty user
+	} {
+		if _, err := resolveRegistryAuth([]string{"DOCKER_AUTH_CONFIG=" + bad, "PATH=" + dir}, home, "reg.example/img"); err == nil {
+			t.Fatalf("an overlay the CLI rejects must refuse here, not outrank the store: %s", bad)
+		}
+	}
+	// A NUL-padded password is trimmed, as the CLI's decodeAuth does.
+	padded := base64.StdEncoding.EncodeToString([]byte("u:pw\x00\x00"))
+	hdr, err = resolveRegistryAuth([]string{`DOCKER_AUTH_CONFIG={"auths":{"reg.example":{"auth":"` + padded + `"}}}`}, home, "reg.example/img")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ac := decodeHeader(t, hdr); ac["password"] != "pw" {
+		t.Fatalf("NUL padding is trimmed: %q", ac["password"])
+	}
 	// A set-but-unparseable overlay is an ERROR, not a silently-ignored one (the one
 	// deliberate sharpening over the CLI, which warns and continues).
 	if _, err := resolveRegistryAuth([]string{"DOCKER_AUTH_CONFIG={bad"}, home, "reg.example/img"); err == nil {
