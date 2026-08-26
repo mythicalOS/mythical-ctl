@@ -401,3 +401,131 @@ func (l *Ledger) MemberHas(product string) error {
 func (l *Ledger) MemberDel(product string) error {
 	return l.Del(memberKind, "name", product)
 }
+
+// --- the SET editors (Task 20) -------------------------------------------------------------------
+// The typed editors above answer "the ONE record whose <field> is <value>". A container's
+// outstanding checks are not that shape: they are a SET keyed by three fields together
+// (container + kind + param), and D52 made them typed precisely so several entries of one kind can
+// coexist with different parameters. Matching them on one field would retire checks nobody
+// performed; synthesizing a composite `key=` would change the on-disk record, which an existing
+// installation's ledger already carries in the three-field form.
+//
+// So the same rules are offered over a MULTI-FIELD match. Every rule is the one above it: a match
+// field is judged by the FIELD rule (it has to equal a serialized field byte for byte), an
+// ill-formed record matches nothing and is preserved, and a listing that cannot read a record of
+// the kind it was asked about REFUSES rather than returning a shorter list.
+
+func matchOK(kind string, match []Field) error {
+	if !kindOK(kind) {
+		return fmt.Errorf("ledger: refusing record kind %q — a kind is lowercase letters and underscore", kind)
+	}
+	if len(match) == 0 {
+		return errors.New("ledger: a set selector with no fields matches every record of its kind — refusing rather than acting on all of them")
+	}
+	seen := map[string]bool{}
+	for _, f := range match {
+		if !FieldOK(f) {
+			return fmt.Errorf("ledger: refusing set selector %s=%s — a selector field is one key=value field", f.Key, f.Value)
+		}
+		if seen[f.Key] {
+			return fmt.Errorf("ledger: a set selector names %q twice — one name, one field", f.Key)
+		}
+		seen[f.Key] = true
+	}
+	return nil
+}
+
+// recordMatches: does this record carry EVERY match field? A record whose field list this module
+// cannot read never reaches here — the callers refuse first.
+func recordMatches(fields []Field, match []Field) bool {
+	for _, want := range match {
+		v, ok := FieldOf(fields, want.Key)
+		if !ok || v != want.Value {
+			return false
+		}
+	}
+	return true
+}
+
+// Select lists every record of kind matching all of match. COMPLETENESS IS THE CONTRACT: one
+// record of that kind it cannot read is a refusal, because a short list of outstanding checks
+// reads as a container that owes fewer than it does.
+func (l *Ledger) Select(kind string, match []Field) ([][]Field, error) {
+	if err := matchOK(kind, match); err != nil {
+		return nil, err
+	}
+	var out [][]Field
+	for _, line := range l.lines {
+		if line == "" {
+			continue
+		}
+		row, ok := rowOf(line, kind)
+		if !ok {
+			continue
+		}
+		fields, err := parseRecord(row)
+		if err != nil {
+			return nil, fmt.Errorf("ledger: a %q record cannot be read, so this listing would be shorter than the truth: %w", kind, err)
+		}
+		if recordMatches(fields, match) {
+			out = append(out, fields)
+		}
+	}
+	return out, nil
+}
+
+// DelAll removes EVERY record of kind matching all of match and reports how many went. Zero is a
+// success — a deletion that finds nothing has achieved its purpose.
+//
+// It refuses BEFORE removing anything if any record of that kind cannot be read: deleting around
+// evidence would leave a ledger that looks tidy and is still wrong. Blank rows and records of
+// every other kind are preserved exactly where they are.
+func (l *Ledger) DelAll(kind string, match []Field) (int, error) {
+	if err := matchOK(kind, match); err != nil {
+		return 0, err
+	}
+	for _, line := range l.lines {
+		if line == "" {
+			continue
+		}
+		row, ok := rowOf(line, kind)
+		if !ok {
+			continue
+		}
+		if _, err := parseRecord(row); err != nil {
+			return 0, fmt.Errorf("ledger: a %q record cannot be read, so this deletion would act around evidence it cannot account for: %w", kind, err)
+		}
+	}
+	out := make([]string, 0, len(l.lines))
+	dropped := 0
+	for _, line := range l.lines {
+		if line != "" {
+			if row, ok := rowOf(line, kind); ok {
+				if fields, err := parseRecord(row); err == nil && recordMatches(fields, match) {
+					dropped++
+					continue
+				}
+			}
+		}
+		out = append(out, line)
+	}
+	l.lines = out
+	return dropped, nil
+}
+
+// Append adds ONE record of kind with no selector at all — a SET member, added only after a
+// Select proved it absent. There is deliberately no keyed replacement here: replacing by one field
+// is what would collapse a container's several same-kind checks into the last one written.
+func (l *Ledger) Append(kind string, fields []Field) error {
+	if !kindOK(kind) {
+		return fmt.Errorf("ledger: refusing record kind %q — a kind is lowercase letters and underscore", kind)
+	}
+	if len(fields) == 0 {
+		return errors.New("ledger: a record with no fields describes nothing — refusing to write one")
+	}
+	if err := fieldsOK(fields); err != nil {
+		return err
+	}
+	l.lines = append(l.lines, serialize(kind, fields))
+	return nil
+}
