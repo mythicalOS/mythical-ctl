@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"testing"
 )
@@ -224,6 +225,102 @@ func TestLookupOrderExactBeatsLegacy(t *testing.T) {
 	writeConfig(t, root, `{"auths":{"docker.io":{"auth":"`+legacy+`"},"index.docker.io":{"auth":"`+other+`"}}}`)
 	if _, err := resolveRegistryAuth(nil, home, "busybox"); err == nil || !strings.Contains(err.Error(), "refusing to guess") {
 		t.Fatalf("Hub: two legacy hostnames and no exact key must refuse: %v", err)
+	}
+}
+
+// Inline entries follow the CLI's LoadFromReader: `auth` decodes with decodeAuth's rules and
+// the entry's ServerAddress is its OWN KEY, verbatim — the header the daemon sees is the one
+// `docker pull` would have sent.
+func TestInlineAuthDecodeParity(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, ".docker")
+	padded := base64.StdEncoding.EncodeToString([]byte("u:pw\x00\x00"))
+	writeConfig(t, root, `{"auths":{"https://reg.example":{"auth":"`+padded+`"}}}`)
+	hdr, err := resolveRegistryAuth(nil, home, "reg.example/img")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ac := decodeHeader(t, hdr)
+	if ac["password"] != "pw" {
+		t.Fatalf("NUL padding is trimmed as decodeAuth does: %q", ac["password"])
+	}
+	if ac["serveraddress"] != "https://reg.example" {
+		t.Fatalf("the entry's own key is its ServerAddress: %q", ac["serveraddress"])
+	}
+	nouser := base64.StdEncoding.EncodeToString([]byte(":secret"))
+	writeConfig(t, root, `{"auths":{"reg.example":{"auth":"`+nouser+`"}}}`)
+	if _, err := resolveRegistryAuth(nil, home, "reg.example/img"); err == nil {
+		t.Fatal("an empty user is refused, as decodeAuth refuses it")
+	}
+}
+
+// platformDefaultStore mirrors defaultCredentialsStore() per platform for the test's
+// expectation; "" means the platform has none and the test skips.
+func platformDefaultStore(env []string) string {
+	switch goruntime.GOOS {
+	case "darwin":
+		return "osxkeychain"
+	case "linux":
+		if _, err := lookPathIn(env, "pass"); err == nil {
+			return "pass"
+		}
+		return "secretservice"
+	}
+	return ""
+}
+
+// A config with NO auth settings gets the platform's default store when its helper is on
+// PATH (LoadDefaultConfigFile's ContainsAuth gate); a config with ANY auth setting does not.
+func TestDefaultStoreDetected(t *testing.T) {
+	name := platformDefaultStore(nil)
+	if name == "" {
+		t.Skip("no platform default credential store on " + goruntime.GOOS)
+	}
+	home := t.TempDir()
+	root := filepath.Join(home, ".docker")
+	dir := writeHelper(t, name, `echo '{"Username":"from-default-store","Secret":"s"}'`)
+	env := []string{"PATH=" + dir}
+	// No config file at all.
+	hdr, err := resolveRegistryAuth(env, home, "reg.example/img")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hdr == "" {
+		t.Fatal("an auth-less config must consult the platform default store: got an anonymous pull")
+	}
+	if ac := decodeHeader(t, hdr); ac["username"] != "from-default-store" {
+		t.Fatalf("an auth-less config must consult the platform default store: %v", ac)
+	}
+	// An empty config file: same.
+	writeConfig(t, root, `{"psFormat":"table"}`)
+	hdr, err = resolveRegistryAuth(env, home, "reg.example/img")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hdr == "" {
+		t.Fatal("a config with no auth settings must consult the platform default store: got an anonymous pull")
+	}
+	if ac := decodeHeader(t, hdr); ac["username"] != "from-default-store" {
+		t.Fatalf("a config with no auth settings must consult the platform default store: %v", ac)
+	}
+	// ANY auth setting — here an inline entry for a DIFFERENT registry — and the default store
+	// is not detected: this registry resolves anonymously, as the CLI would.
+	pair := base64.StdEncoding.EncodeToString([]byte("o:p"))
+	writeConfig(t, root, `{"auths":{"other.example":{"auth":"`+pair+`"}}}`)
+	hdr, err = resolveRegistryAuth(env, home, "reg.example/img")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hdr != "" {
+		t.Fatalf("with auth settings present the default store is NOT detected: %q", hdr)
+	}
+	// The helper missing from PATH: no default, anonymous.
+	hdr, err = resolveRegistryAuth([]string{"PATH=" + t.TempDir()}, t.TempDir(), "reg.example/img")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hdr != "" {
+		t.Fatalf("no helper binary on PATH means no default store: %q", hdr)
 	}
 }
 

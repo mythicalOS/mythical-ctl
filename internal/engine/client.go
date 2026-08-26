@@ -189,6 +189,7 @@ type rawContainerInspect struct {
 	} `json:"State"`
 	Config struct {
 		Labels map[string]string `json:"Labels"`
+		Env    []string          `json:"Env"`
 	} `json:"Config"`
 	NetworkSettings struct {
 		Networks map[string]struct {
@@ -229,6 +230,7 @@ func (c *Client) ContainerInspect(ctx context.Context, id string) (*ContainerInf
 		Running: raw.State.Running,
 		Status:  raw.State.Status,
 		Labels:  raw.Config.Labels,
+		Env:     raw.Config.Env,
 	}
 	if len(raw.NetworkSettings.Networks) > 0 {
 		info.Networks = map[string]NetEndpoint{}

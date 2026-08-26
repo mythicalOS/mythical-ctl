@@ -2,8 +2,12 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
+	"os"
 
+	"mythicalos.ai/ctl/internal/conf"
 	"mythicalos.ai/ctl/internal/engine"
 	"mythicalos.ai/ctl/internal/famlock"
 	"mythicalos.ai/ctl/internal/manifest"
@@ -91,21 +95,71 @@ func (r *Runtime) HelperRun(ctx context.Context, h engine.HelperSpec) (engine.He
 
 // LaunchConfig carries what a launch varies beyond the authenticated documents: the
 // installation identity and the per-object nonce (§6a's WHOSE and WHICH), the family network,
-// the per-key bootstrap secrets the verb layer selected (§4.3 — they ride the request body,
-// never argv), and any host-port overrides the operator configured.
+// and any host-port overrides the operator configured. NO ENVIRONMENT: the bootstrap secrets
+// are assembled INSIDE the facade (secretsFor) from the manifest's declarations — a
+// caller-supplied env was a way to carry any key at all into the container past §4.3's
+// per-key rule, which is the one rule the launch site exists to enforce.
 type LaunchConfig struct {
 	Identity  string
 	Nonce     string
 	NetworkID string
 	// Generation, when non-empty, is recorded as the generation label.
 	Generation string
-	// Env is KEY=value bootstrap secrets — per-key and explicit, exactly the keys the
-	// product's manifest declares, never the whole family file.
-	Env []string
 	// HostPorts maps a declared container port to the host port to publish it at; a declared
 	// port with no entry publishes at its own number. The host IP is not here and not
 	// anywhere: the engine serializer emits 127.0.0.1 unconditionally.
 	HostPorts map[uint16]uint16
+}
+
+// secretsFor is §4.3's injection, ported from the reference's ONE shared gate
+// (_mi_verb_secrets_envfile + mi_secrets_envfile): a product receives EXACTLY the bootstrap
+// secrets its manifest declares — each one granted by the policy index (defence in depth
+// behind manifest.Check), each one a key mythical.conf DEFINES (an unknown key is a manifest
+// error, not a missing value), each one SET (a declared secret with no value is a refusal,
+// never an empty injection). Never the whole file, never the process environment: one
+// product's compromise must not disclose another's credentials. The values ride the create
+// body over the local socket (the reference's 0600 env file is the argv-avoidance vehicle
+// this transport does not need).
+func (r *Runtime) secretsFor(m *manifest.Manifest, p *policy.Policy) ([]string, error) {
+	wanted := m.Secrets()
+	if len(wanted) == 0 {
+		return nil, nil
+	}
+	product := m.Product()
+	home, err := r.home()
+	if err != nil {
+		return nil, err
+	}
+	famPath := conf.FamilyPath(home)
+	spec := conf.FamilySpec()
+	var env []string
+	seen := map[string]bool{}
+	for _, key := range wanted {
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		if !p.PermitsSecret(product, key) {
+			return nil, fmt.Errorf("runtime: %q asks for secret %q, which the policy index does not grant it", product, key)
+		}
+		if _, defined := spec[key]; !defined {
+			return nil, fmt.Errorf("runtime: %q asked for bootstrap secret %q, which mythical.conf does not define — a product selects from what the policy index grants it; it cannot name arbitrary keys", product, key)
+		}
+		val, gerr := "", error(nil)
+		if _, serr := os.Lstat(famPath); errors.Is(serr, fs.ErrNotExist) {
+			gerr = conf.ErrAbsent
+		} else {
+			val, gerr = conf.Get(famPath, key)
+		}
+		if errors.Is(gerr, conf.ErrAbsent) {
+			return nil, fmt.Errorf("runtime: %q requires bootstrap secret %q, which is not set in %s", product, key, famPath)
+		}
+		if gerr != nil {
+			return nil, gerr
+		}
+		env = append(env, key+"="+val)
+	}
+	return env, nil
 }
 
 // LaunchProduct is THE ONE CALL SITE THAT CREATES PRODUCT CONTAINERS (check.sh's sole-launch
@@ -135,6 +189,10 @@ func (r *Runtime) LaunchProduct(ctx context.Context, m *manifest.Manifest, p *po
 		return "", err
 	}
 	raw, bound, err := r.mountsFor(m, p)
+	if err != nil {
+		return "", err
+	}
+	env, err := r.secretsFor(m, p)
 	if err != nil {
 		return "", err
 	}
@@ -190,7 +248,7 @@ func (r *Runtime) LaunchProduct(ctx context.Context, m *manifest.Manifest, p *po
 	spec, err := engine.NewContainerSpec(name, m.Image(), engine.SpecOpts{
 		Network: attach,
 		Labels:  labels,
-		Env:     cfg.Env,
+		Env:     env,
 		Mounts:  mounts,
 		Ports:   ports,
 	})

@@ -539,12 +539,16 @@ type PortBinding struct {
 
 // ContainerInfo is the typed inspect subset, replacing the reference's closed Go-template map.
 type ContainerInfo struct {
-	ID       string
-	Name     string
-	Image    string
-	Running  bool
-	Status   string // "created" | "running" | "exited"
-	Labels   map[string]string
+	ID      string
+	Name    string
+	Image   string
+	Running bool
+	Status  string // "created" | "running" | "exited"
+	Labels  map[string]string
+	// Env is the container's environment as the daemon reports it — the injected bootstrap
+	// secrets INCLUDED (visible in `docker inspect`, the documented and accepted exposure of
+	// §4.3): exposed so a test can assert the injected set is EXACTLY the declared keys.
+	Env      []string
 	Networks map[string]NetEndpoint // keyed by network NAME (the inspect map key)
 	Mounts   []MountRecord
 	Ports    []PortBinding

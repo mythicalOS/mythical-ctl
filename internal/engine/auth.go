@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	goruntime "runtime"
 	"sort"
 	"strings"
 )
@@ -164,21 +165,21 @@ func inlineAuthFor(auths map[string]configAuthEntry, host, what string, legacyFa
 		return nil, nil
 	}
 	{
+		// The CLI's LoadFromReader, field for field: an `auth` pair is decoded with decodeAuth
+		// (non-empty user, NUL-trimmed password) and the entry's ServerAddress is ITS OWN KEY,
+		// verbatim — a legacy `https://…` key stays a legacy URL in the emitted header, as the
+		// CLI emits it; only helpers are handed the canonical server address.
 		entry := auths[key]
 		ac := &authConfig{
 			Username:      entry.Username,
 			Password:      entry.Password,
 			IdentityToken: entry.IdentityToken,
-			ServerAddress: serverAddressFor(host),
+			ServerAddress: key,
 		}
 		if entry.Auth != "" {
-			raw, err := base64.StdEncoding.DecodeString(entry.Auth)
+			user, pass, err := decodeAuthPair(entry.Auth)
 			if err != nil {
-				return nil, fmt.Errorf("engine: the stored auth for %q is not valid base64: %v", key, err)
-			}
-			user, pass, found := strings.Cut(string(raw), ":")
-			if !found {
-				return nil, fmt.Errorf("engine: the stored auth for %q is not a user:password pair", key)
+				return nil, fmt.Errorf("engine: the stored auth for %q: %v", key, err)
 			}
 			ac.Username, ac.Password = user, pass
 		}
@@ -235,6 +236,30 @@ func decodeAuthPair(s string) (string, string, error) {
 	return user, strings.Trim(pass, "\x00"), nil
 }
 
+// detectDefaultStore is credentials.DetectDefaultStore + the per-platform defaults, from
+// docker/cli v28.4.0: darwin → osxkeychain; linux → `pass` when the pass binary is on PATH,
+// else secretservice; other platforms have none. The helper must exist as
+// `docker-credential-<name>` on the GIVEN env's PATH, or there is no default — the same
+// hermetic PATH rule every helper lookup here follows.
+func detectDefaultStore(env []string) string {
+	var name string
+	switch goruntime.GOOS {
+	case "darwin":
+		name = "osxkeychain"
+	case "linux":
+		name = "secretservice"
+		if _, err := lookPathIn(env, "pass"); err == nil {
+			name = "pass"
+		}
+	default:
+		return ""
+	}
+	if _, err := lookPathIn(env, "docker-credential-"+name); err != nil {
+		return ""
+	}
+	return name
+}
+
 // keysOf lists a map's keys, SORTED — every lookup below walks keys in one order, so two runs
 // over the same config give the same answer.
 func keysOf[V any](m map[string]V) []string {
@@ -284,6 +309,13 @@ func resolveRegistryAuth(env []string, home string, ref string) (string, error) 
 	cfg, err := loadDockerConfig(env, home)
 	if err != nil {
 		return "", err
+	}
+	// The CLI's LoadDefaultConfigFile: a config with NO auth settings at all (ContainsAuth
+	// false — no credsStore, no credHelpers, no auths) gets the platform's default store,
+	// PROVIDED its helper binary is on PATH. A machine whose docker login lives only in the
+	// OS keychain would otherwise be read as anonymous here while `docker pull` succeeds.
+	if cfg.CredsStore == "" && len(cfg.CredHelpers) == 0 && len(cfg.Auths) == 0 {
+		cfg.CredsStore = detectDefaultStore(env)
 	}
 
 	var ac *authConfig

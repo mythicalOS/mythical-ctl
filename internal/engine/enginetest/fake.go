@@ -746,6 +746,7 @@ func (f *Fake) inspectContainer(w http.ResponseWriter, seg string) {
 		"State": map[string]any{"Running": c.state == "running", "Status": c.state},
 		"Config": map[string]any{
 			"Labels": c.labels,
+			"Env":    c.env,
 		},
 		"NetworkSettings": map[string]any{"Networks": networks, "Ports": ports},
 		"Mounts":          mounts,

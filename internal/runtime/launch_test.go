@@ -244,6 +244,70 @@ func TestMountsForPairwise(t *testing.T) {
 	}
 }
 
+// §4.3 secret injection — PORTED: tests/unit/bringup.bats: "the secret env file holds ONLY the
+// product's declared keys, is 0600, and outlives the call" -> TestSecretsInjection (the ONLY-
+// declared-keys half; the 0600-file half is N/A — secrets ride the create body over the local
+// socket, no file exists to be 0600 or to outlive anything); PORTED: tests/unit/bringup.bats:
+// "a secret the product is not entitled to is REFUSED, not silently dropped" ->
+// TestSecretsInjection; PORTED: tests/unit/bringup.bats: "a declared secret that is not set
+// REFUSES and leaves no file behind" -> TestSecretsInjection (the refusal; no file to leave).
+func TestSecretsInjection(t *testing.T) {
+	r := newRig(t, "brokkr")
+	ctx := context.Background()
+	prov, err := engine.NewProvenance("inst1", "netnonce")
+	if err != nil {
+		t.Fatal(err)
+	}
+	netID, err := r.rt.NetworkCreate(ctx, "family", prov)
+	if err != nil {
+		t.Fatal(err)
+	}
+	launchEnv := func(t *testing.T, name string, m *manifest.Manifest, p *policy.Policy) ([]string, error) {
+		t.Helper()
+		r.fake.PullImage(m.Image())
+		id, err := r.rt.LaunchProduct(ctx, m, p, runtime.LaunchConfig{Identity: name, Nonce: "n-" + name, NetworkID: netID})
+		if err != nil {
+			return nil, err
+		}
+		info, err := r.c.ContainerInspect(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return info.Env, nil
+	}
+	// The family file holds the telemetry key AND the network name. A product that declares
+	// the secret gets EXACTLY that key — and nothing else from the file.
+	r.writeFamilyConf(t, "MYTHICAL_NET=fam", "MYTHICAL_TELEMETRY_KEY=tk-123")
+	env, err := launchEnv(t, "declared", man(t, nil, "secret=MYTHICAL_TELEMETRY_KEY"), pol(t, "brokkr.permitted_secret=MYTHICAL_TELEMETRY_KEY"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(env) != 1 || env[0] != "MYTHICAL_TELEMETRY_KEY=tk-123" {
+		t.Fatalf("exactly the declared secret, nothing else from the file: %v", env)
+	}
+	// A product that declares NO secret gets NOTHING — the file's other keys never ride in.
+	env, err = launchEnv(t, "none", man(t, nil), pol(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(env) != 0 {
+		t.Fatalf("no declared secret means an empty environment: %v", env)
+	}
+	// Not entitled: REFUSED, not silently dropped.
+	if _, err := launchEnv(t, "denied", man(t, nil, "secret=MYTHICAL_TELEMETRY_KEY"), pol(t)); err == nil || !strings.Contains(err.Error(), "secret") {
+		t.Fatalf("an unentitled secret must refuse: %v", err)
+	}
+	// Declared and granted but NOT SET: refused.
+	r.writeFamilyConf(t, "MYTHICAL_NET=fam")
+	if _, err := launchEnv(t, "unset", man(t, nil, "secret=MYTHICAL_TELEMETRY_KEY"), pol(t, "brokkr.permitted_secret=MYTHICAL_TELEMETRY_KEY")); err == nil || !strings.Contains(err.Error(), "not set") {
+		t.Fatalf("a declared-but-unset secret must refuse: %v", err)
+	}
+	// A key the family file does not DEFINE: a manifest error, refused.
+	if _, err := launchEnv(t, "undefined", man(t, nil, "secret=MYTHICAL_BOGUS"), pol(t, "brokkr.permitted_secret=MYTHICAL_BOGUS")); err == nil || !strings.Contains(err.Error(), "does not define") {
+		t.Fatalf("an undefined key must refuse: %v", err)
+	}
+}
+
 // §4.1a SELECTION, as the reference's launch verb does it: <product>.conf is ALWAYS mounted;
 // transcripts and logs ONLY when the manifest selects them (`mount=`) AND the policy permits
 // the selection; anything else a manifest names is a refusal. A product granted neither
