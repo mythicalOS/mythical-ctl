@@ -383,10 +383,24 @@ func OutstandingClear(l *ledger.Ledger, container string, kind CheckKind, param 
 				"  ledger field, so it could never have matched one. Nothing was written.", string(kind), container, f.Key, f.Value)
 		}
 	}
+	// EVERY QUESTION THIS CLEAR WILL ASK, ASKED BEFORE THE FIRST EDIT. Both deletions can refuse
+	// on their own — DelAll refuses when a record of the kind it is asked about cannot be read —
+	// and discovering that AFTER the outstanding check is already gone leaves the caller holding a
+	// ledger from which a verification has been silently retired, behind an error that says
+	// nothing was written. (Same class as the Commit ordering defect: a refusal must leave the
+	// ledger byte-identical, because the caller's single Write is what makes it durable.)
+	if _, err := l.Select(kindOutstanding, match); err != nil {
+		return err
+	}
+	resumed := []ledger.Field{{Key: "container", Value: container}}
+	if _, err := l.Select(kindResumed, resumed); err != nil {
+		return err
+	}
+	// Nothing above has mutated the ledger; from here on it is the write.
 	if _, err := l.DelAll(kindOutstanding, match); err != nil {
 		return err
 	}
-	_, err := l.DelAll(kindResumed, []ledger.Field{{Key: "container", Value: container}})
+	_, err := l.DelAll(kindResumed, resumed)
 	return err
 }
 
@@ -398,6 +412,21 @@ func Forget(l *ledger.Ledger, container string) error {
 		return fmt.Errorf("state: %q is not a container name this format can hold", container)
 	}
 	match := []ledger.Field{{Key: "container", Value: container}}
+	// THE SAME PREFLIGHT, for the same reason. The desired-row deletion refuses on ambiguity, and
+	// it runs LAST — so without this, two contradicting desired rows would be discovered only
+	// after the whole outstanding set and the resume record had already been dropped. Forget is
+	// the one operation whose failure mode is losing exactly what it was asked to preserve
+	// evidence of.
+	if _, err := l.Select(kindOutstanding, match); err != nil {
+		return err
+	}
+	if _, err := l.Select(kindResumed, match); err != nil {
+		return err
+	}
+	if _, err := l.Find(kindDesired, "container", container); err != nil && !errors.Is(err, ledger.ErrAbsentRecord) {
+		return err
+	}
+	// Nothing above has mutated the ledger; from here on it is the write.
 	if _, err := l.DelAll(kindOutstanding, match); err != nil {
 		return err
 	}

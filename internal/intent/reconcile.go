@@ -147,16 +147,27 @@ func Reconcile(ctx context.Context, l *ledger.Ledger, objs Objects, rt Reissuer,
 		found := matches[0]
 		own, why, oerr := ours(ctx, objs, class, name, found, ident, nonce)
 		if oerr != nil {
+			// COULD NOT ASK: nothing is wrong, the question simply was not answered. Retained.
 			return errors.Join(ErrRetained, oerr)
 		}
 		switch own {
 		case ownOurs:
 		case ownGone:
+			// Already gone: also benign — the object may yet appear on a later run.
 			return fmt.Errorf("intent: the %s carrying nonce %q is already gone. Nothing is adopted; the\n"+
 				"  intent is RETAINED and will be reconciled on a later run: %w", string(class), nonce, ErrRetained)
 		default:
-			return fmt.Errorf("%s\n  The intent for %s %q is RETAINED and will be reconciled on a later run: %w",
-				why, string(class), name, ErrRetained)
+			// CONTRADICTORY OWNERSHIP EVIDENCE IS A REFUSAL, NOT A RETENTION — and to a caller the
+			// two are opposites. ErrRetained says "nothing is wrong, carry on and try again
+			// later", so an ErrRetained-aware caller PROCEEDS. An object labelled for another
+			// installation, one carrying no label at all, or one standing under a different name
+			// is the opposite case: a fact that CONTRADICTS the record, which no later run
+			// resolves on its own. The reference draws exactly this line — its ownership helper
+			// yields rc 4 (retained) for gone and could-not-ask, and rc 1 (refusal) for all three
+			// of these. The intent is still KEPT either way; what differs is whether the caller is
+			// told to carry on.
+			return fmt.Errorf("%s\n  The intent for %s %q is KEPT, and nothing was recorded for it.",
+				why, string(class), name)
 		}
 		var extra []ledger.Field
 		if class == prov.ClassNetwork {
@@ -222,8 +233,11 @@ func Reconcile(ctx context.Context, l *ledger.Ledger, objs Objects, rt Reissuer,
 	case ownGone:
 		return fmt.Errorf("intent: the volume the reissue returned is already gone. The intent is RETAINED: %w", ErrRetained)
 	default:
-		return fmt.Errorf("%s\n  The intent for volume %q is RETAINED, and nothing was recorded for it: %w",
-			why, name, ErrRetained)
+		// The same rule as the single-match branch: what the reissue met is not ours, and that is a
+		// REFUSAL rather than a "try again later". Most often it is an EXISTING same-name volume —
+		// `volume create` against one succeeds and returns whatever already holds the name without
+		// applying our labels — which no number of later runs will turn into ours.
+		return fmt.Errorf("%s\n  The intent for volume %q is KEPT, and nothing was recorded for it.", why, name)
 	}
 	return Confirm(l, prov.ClassVolume, name, nonce, reportingFields(rec)...)
 }

@@ -497,8 +497,14 @@ func TestReconcileReissuesVolume(t *testing.T) {
 		f2.put(prov.ClassVolume, "v1", map[string]string{prov.LabelInstall: id2, prov.LabelNonce: "someone-elses"})
 	}}
 	err := Reconcile(ctx, l2, f2, r2, prov.ClassVolume, "v1")
-	if !errors.Is(err, ErrRetained) || !strings.Contains(err.Error(), "does not match") {
+	if err == nil || !strings.Contains(err.Error(), "does not match") {
 		t.Fatalf("an existing same-name volume was adopted: %v", err)
+	}
+	// AND IT IS A REFUSAL, NOT A RETENTION. ErrRetained tells a caller "nothing is wrong, carry on
+	// and try again later" — which is exactly what must NOT happen here: no number of later runs
+	// turns someone else's volume into ours. The reference draws the same line (rc 1, not rc 4).
+	if errors.Is(err, ErrRetained) {
+		t.Fatal("contradictory ownership evidence was reported as a benign retention")
 	}
 	if _, ferr := Find(l2, prov.ClassVolume, "v1"); ferr != nil {
 		t.Fatal("the intent was dropped despite not adopting")
@@ -621,8 +627,15 @@ func TestReconcileOwnershipRefusals(t *testing.T) {
 			}
 			f.put(prov.ClassVolume, tc.as, labels)
 			err := Reconcile(ctx, l, f, nil, prov.ClassVolume, "v1")
-			if !errors.Is(err, ErrRetained) || !strings.Contains(err.Error(), tc.want) {
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("adopted or refused wrongly: %v", err)
+			}
+			// CONTRADICTORY OWNERSHIP EVIDENCE IS A REFUSAL. All three of these — labelled for
+			// another installation, carrying no label, standing under a different name — are facts
+			// that contradict the record, and a later run does not resolve them. Reporting them as
+			// ErrRetained would tell an ErrRetained-aware caller to carry on.
+			if errors.Is(err, ErrRetained) {
+				t.Fatal("contradictory ownership evidence was reported as a benign retention")
 			}
 			if _, ferr := prov.Find(l, prov.ClassVolume, "v1"); !errors.Is(ferr, ledger.ErrAbsentRecord) {
 				t.Fatal("provenance was written")

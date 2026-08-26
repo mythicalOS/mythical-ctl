@@ -208,6 +208,11 @@ func fixture(t *testing.T) (*ledger.Ledger, *fakeObjs, *fakeMut, *fakeProbe, *fa
 		NewNonce: func() (string, error) { n++; return "n" + string(rune('0'+n)), nil },
 		Now:      func() time.Time { return fixedNow },
 	}
+	// A WORKING PERSISTENCE SEAM BY DEFAULT, so the ordinary cases exercise the ordinary path.
+	// The write-ahead barrier refuses without one — deliberately — so the cases that assert THAT
+	// install their own (a failing disk, or none at all), and the durability cases install a disk
+	// they can read back.
+	d.Persist = (&disk{}).persistFrom(l)
 	return l, objs, mut, pr, st, d
 }
 
@@ -937,5 +942,130 @@ func TestGenericReconcilerRefusesContainers(t *testing.T) {
 	// And THIS package's recovery does finish it.
 	if err := Recover(ctx, l, d, c1, net1, al1); err != nil {
 		t.Fatalf("bring-up recovery: %v", err)
+	}
+}
+
+// --- durability across a crash --------------------------------------------------------------------
+
+// disk models the persisted ledger. Persist snapshots the in-memory body; reload builds a fresh
+// Ledger from that snapshot — which is what a later process sees. The earlier tests in this file
+// reuse ONE in-memory ledger throughout, so they cannot tell a record that was persisted from one
+// that merely exists in memory; that is the distinction these cases exist to make.
+type disk struct {
+	lines  []string
+	writes int
+	err    error
+}
+
+func (dk *disk) persistFrom(l *ledger.Ledger) func() error {
+	return func() error {
+		if dk.err != nil {
+			return dk.err
+		}
+		dk.writes++
+		dk.lines = l.Lines()
+		return nil
+	}
+}
+
+func (dk *disk) reload() *ledger.Ledger {
+	l := &ledger.Ledger{}
+	l.ReplaceLines(dk.lines)
+	return l
+}
+
+func TestIntentIsDurableBeforeTheContainerExists(t *testing.T) {
+	ctx := context.Background()
+	l, objs, _, _, st, d := fixture(t)
+	dk := &disk{}
+	d.Persist = dk.persistFrom(l)
+
+	// THE CRASH: the daemon accepts the create, and the process dies before anything else. What a
+	// later run can do about the container depends entirely on what was on DISK at that moment.
+	crashed := false
+	lau := &fakeLauncher{objs: objs, st: st, nets: []Attachment{attach(net1, "", al1)}}
+	lau.after = func() { crashed = true }
+
+	if _, err := Create(ctx, l, d, lau, c1, net1, state.Running); err != nil {
+		t.Fatal(err)
+	}
+	if !crashed {
+		t.Fatal("the launcher never ran, so this proves nothing about the order")
+	}
+	// The intent must be READABLE FROM DISK — not merely present in the ledger we still hold.
+	reloaded := dk.reload()
+	rec, err := intent.Find(reloaded, prov.ClassContainer, c1)
+	if err != nil {
+		t.Fatalf("the container was created with no durable intent — nothing could account for it: %v", err)
+	}
+	// And it carries what recovery needs: the nonce, the desired state, and the owed check.
+	for _, w := range []struct{ k, v string }{{"nonce", "n1"}, {"desired", "running"}, {"check", "alias"}, {"check_param", net1}} {
+		if got, ok := ledger.FieldOf(rec, w.k); !ok || got != w.v {
+			t.Errorf("durable intent %s = %q (present=%v), want %q", w.k, got, ok, w.v)
+		}
+	}
+	// Recovery on a FRESH ledger read back from disk finishes the bring-up.
+	if err := Recover(ctx, reloaded, d, c1, net1, al1); err != nil {
+		t.Fatalf("recovery from the durable intent failed: %v", err)
+	}
+}
+
+func TestNoRuntimeMutationWithoutADurableRecord(t *testing.T) {
+	ctx := context.Background()
+	// A PERSIST THAT FAILS STOPS THE OPERATION. Proceeding would create exactly the unaccounted
+	// object the record exists to prevent, and the failure would be invisible until a crash.
+	l, objs, mut, _, st, d := fixture(t)
+	dk := &disk{err: errors.New("disk full")}
+	d.Persist = dk.persistFrom(l)
+	lau := &fakeLauncher{objs: objs, st: st, nets: []Attachment{attach(net1, "", al1)}}
+	if _, err := Create(ctx, l, d, lau, c1, net1, state.Running); err == nil {
+		t.Fatal("a container was created with an unpersistable intent")
+	}
+	if lau.calls != 0 {
+		t.Fatal("the launcher ran despite the record not being durable")
+	}
+
+	// A MISSING Persist is refused, not skipped — skipping would restore the defect invisibly.
+	l2, objs2, _, _, st2, d2 := fixture(t)
+	d2.Persist = nil
+	lau2 := &fakeLauncher{objs: objs2, st: st2, nets: []Attachment{attach(net1, "", al1)}}
+	err := Run(ctx, l2, d2, lau2, c1, net1, al1, Running)
+	if err == nil || !strings.Contains(err.Error(), "no way to persist") {
+		t.Fatalf("a bring-up with no persistence seam: %v", err)
+	}
+	if lau2.calls != 0 {
+		t.Fatal("the launcher ran with no persistence seam")
+	}
+	_ = mut
+}
+
+func TestResumeAttemptIsDurableBeforeTheStart(t *testing.T) {
+	ctx := context.Background()
+	// A crash between recording the attempt and making it would leave the next run believing it
+	// had never tried — the restart loop the record exists to stop, reinstated by the very crash
+	// it was meant to survive.
+	l, objs, mut, _, st, d := fixture(t)
+	dk := &disk{}
+	d.Persist = dk.persistFrom(l)
+	if err := state.Commit(l, c1, state.Running, []state.Check{{Kind: state.CheckAlias, Param: net1}}, false); err != nil {
+		t.Fatal(err)
+	}
+	objs.nets[c1] = []Attachment{attach(net1, "10.0.0.2", al1)}
+	st.down(c1)
+	// The start happens, and the process dies immediately after — nothing else is written.
+	if err := Reconcile(ctx, l, d, c1, net1, al1); err == nil {
+		t.Fatal("a container that did not come up reported success")
+	}
+	if len(mut.started) != 1 {
+		t.Fatalf("started %d times", len(mut.started))
+	}
+	// A LATER RUN, reading only what was on disk, must see the attempt.
+	reloaded := dk.reload()
+	plan, err := state.PlanFor(ctx, reloaded, st, c1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan != state.PlanExited {
+		t.Fatalf("plan after a crash-following-start = %q, want exited — the attempt was not durable", plan)
 	}
 }

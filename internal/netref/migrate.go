@@ -33,6 +33,13 @@ import (
 // commit. Phases 4 and 6 additionally REFUSE to run unless the record shows the earlier phases
 // actually ran — a bare phase against an ordinary attached fleet is how the family gets split.
 
+// The six phases, named once. MigResume loops from the recorded phase to phaseLast, so a recorded
+// phase outside this range would make that loop a no-op that reports success.
+const (
+	phaseFirst = 1
+	phaseLast  = 6
+)
+
 // Prober is the live-verification seam: the alias must RESOLVE, on the target network, to the
 // container's own endpoint address there. *probe.Prober satisfies it.
 type Prober interface {
@@ -81,21 +88,36 @@ type Migration struct {
 	Containers []string
 }
 
-// phaseOK: a phase parsed out of the ledger is not a number until it has been checked. A
-// non-numeric phase has no point to resume from, and reading it as 0 would silently restart a
-// migration from the beginning — re-connecting a fleet that may already be detached.
+// phaseOK: a phase parsed out of the ledger is not a number until it has been checked, and it is
+// not a PHASE until it has been checked against the six that exist.
+//
+// The numeric half: reading a non-numeric phase as 0 would silently restart a migration from the
+// beginning — re-connecting a fleet that may already be detached. The RANGE half is the one a
+// numeric check alone misses: a record carrying `phase=7` parses, so MigResume's `for p := 7; p <=
+// 6` runs ZERO iterations and returns success, leaving the recorded migration and the fleet
+// exactly as they were while reporting that recovery completed. A migration that reports success
+// without doing anything is the one outcome resume must never produce.
 func phaseOK(s string) (int, error) {
-	if s == "" || len(s) > 18 {
+	bad := func() (int, error) {
 		return 0, fmt.Errorf("netref: the recorded migration phase %q is not a number, so there is no point to resume\n"+
 			"  from. It is PRESERVED and reported. Run 'mythical-ctl state repair'.", s)
 	}
+	if s == "" || len(s) > 18 {
+		return bad()
+	}
 	for i := 0; i < len(s); i++ {
 		if s[i] < '0' || s[i] > '9' {
-			return 0, fmt.Errorf("netref: the recorded migration phase %q is not a number, so there is no point to resume\n"+
-				"  from. It is PRESERVED and reported. Run 'mythical-ctl state repair'.", s)
+			return bad()
 		}
 	}
-	n, _ := strconv.Atoi(s)
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return bad()
+	}
+	if n < phaseFirst || n > phaseLast {
+		return 0, fmt.Errorf("netref: the recorded migration phase %q is not one of the six phases. It is PRESERVED\n"+
+			"  and reported. Run 'mythical-ctl state repair'.", s)
+	}
 	return n, nil
 }
 
@@ -328,6 +350,14 @@ func MigRun(ctx context.Context, l *ledger.Ledger, d MigDeps, src, tgt string, p
 		if err := migRecord(l, 2, src, tgt, cs); err != nil {
 			return err
 		}
+		// THE PHASE MARKER IS DURABLE BEFORE THE PHASE ACTS. A crash part-way through the connects
+		// with disk still saying phase 1 would re-run phase 2, which is harmless; a crash with
+		// disk saying nothing at all would leave containers attached to the target with no record
+		// that a migration is under way — and bring-up's exact-set check would then refuse every
+		// one of them.
+		if err := barrier(d.Deps, "connect the fleet to the target network"); err != nil {
+			return err
+		}
 		for _, c := range cs {
 			alias, aerr := aliasFor(l, c)
 			if aerr != nil {
@@ -361,6 +391,14 @@ func MigRun(ctx context.Context, l *ledger.Ledger, d MigDeps, src, tgt string, p
 			return err
 		}
 		if err := migRecord(l, 4, src, tgt, cs); err != nil {
+			return err
+		}
+		// THE MARKER IS DURABLE BEFORE THE FIRST DETACH — this is the destructive phase, and the
+		// one where a stale marker wedges the migration. If disk still said phase 3 while some
+		// containers were already detached, a resume would re-run phase 3, whose exact-set check
+		// requires {source,target}, and REFUSE exactly the containers this phase had already
+		// finished. The fleet would be half-migrated with no phase to move forward from.
+		if err := barrier(d.Deps, "detach the fleet from the source network"); err != nil {
 			return err
 		}
 		for _, c := range cs {
@@ -544,7 +582,7 @@ func MigResume(ctx context.Context, l *ledger.Ledger, d MigDeps) error {
 			"  nothing is resumed. A detach planned against a network we could not ask about is a\n"+
 			"  detach planned in the dark: %w", mig.Source, perr)
 	}
-	for p := mig.Phase; p <= 6; p++ {
+	for p := mig.Phase; p <= phaseLast; p++ {
 		if err := MigRun(ctx, l, d, mig.Source, mig.Target, p); err != nil {
 			return err
 		}

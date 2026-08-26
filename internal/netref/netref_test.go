@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"mythicalos.ai/ctl/internal/engine"
+	"mythicalos.ai/ctl/internal/intent"
 	"mythicalos.ai/ctl/internal/ledger"
 	"mythicalos.ai/ctl/internal/manifest"
 	"mythicalos.ai/ctl/internal/prov"
@@ -140,6 +142,8 @@ type fakeMut struct {
 	order       []string
 	connErr     error
 	discSilent  map[string]bool
+	// onDisconnect fires before each detach, so a test can observe what DISK held at that moment.
+	onDisconnect func()
 }
 
 func (m *fakeMut) NetworkCreate(_ context.Context, name string, _ engine.Provenance) (string, error) {
@@ -159,6 +163,9 @@ func (m *fakeMut) NetworkConnect(_ context.Context, netID, c, alias string, gw i
 }
 
 func (m *fakeMut) NetworkDisconnect(_ context.Context, netID, c string) error {
+	if m.onDisconnect != nil {
+		m.onDisconnect()
+	}
 	m.disconnects = append(m.disconnects, conn{net: netID, container: c})
 	m.order = append(m.order, "disconnect "+c)
 	if m.discSilent[c] {
@@ -293,6 +300,7 @@ type rig struct {
 	st   *fakeState
 	d    MigDeps
 	id   string
+	dk   *disk
 }
 
 func newRig(t *testing.T) *rig {
@@ -322,7 +330,38 @@ func newRig(t *testing.T) *rig {
 		Live:   fakeLive{err: map[string]error{}, objs: objs, pr: pr},
 		State:  st,
 	}
+	// A WORKING PERSISTENCE SEAM BY DEFAULT. The write-ahead barrier refuses without one, so the
+	// cases that assert THAT install their own; r.dk is what the durability cases read back.
+	r.dk = &disk{}
+	r.d.Persist = r.dk.persistFrom(l)
 	return r
+}
+
+// disk models the persisted ledger. Persist snapshots the in-memory body; reload builds a fresh
+// Ledger from that snapshot — what a LATER PROCESS sees. Every other test in this file reuses one
+// in-memory ledger, so none of them can tell a record that was persisted from one that merely
+// exists in memory; that is the distinction the durability cases make.
+type disk struct {
+	lines  []string
+	writes int
+	err    error
+}
+
+func (dk *disk) persistFrom(l *ledger.Ledger) func() error {
+	return func() error {
+		if dk.err != nil {
+			return dk.err
+		}
+		dk.writes++
+		dk.lines = l.Lines()
+		return nil
+	}
+}
+
+func (dk *disk) reload() *ledger.Ledger {
+	l := &ledger.Ledger{}
+	l.ReplaceLines(dk.lines)
+	return l
 }
 
 // fleet sets up a two-container installation on `src`, recorded and running.
@@ -355,7 +394,7 @@ func (r *rig) fleet(t *testing.T, containers ...string) {
 func TestOwnedNetwork(t *testing.T) {
 	ctx := context.Background()
 	r := newRig(t)
-	d := Deps{Intent: nil, NewNonce: r.d.NewNonce, Now: r.d.Now}
+	d := r.d.Deps
 	name, _ := manifest.NetworkName(r.id)
 	id, err := OwnedEnsure(ctx, r.l, r.objs, r.mut, d)
 	if err != nil {
@@ -389,7 +428,7 @@ func TestOwnedNetworkNotRecreated(t *testing.T) {
 	if err := prov.Record(r.l, prov.ClassNetwork, name, "n1", ledger.Field{Key: "id", Value: "netid-gone"}); err != nil {
 		t.Fatal(err)
 	}
-	d := Deps{NewNonce: r.d.NewNonce, Now: r.d.Now}
+	d := r.d.Deps
 	_, err := OwnedEnsure(ctx, r.l, r.objs, r.mut, d)
 	if err == nil || !strings.Contains(err.Error(), "no longer exists") {
 		t.Fatalf("a missing owned network: %v", err)
@@ -403,7 +442,7 @@ func TestOwnedNetworkNotRecreated(t *testing.T) {
 	if err := prov.Record(r2.l, prov.ClassNetwork, name2, "n1"); err != nil {
 		t.Fatal(err)
 	}
-	_, err = OwnedEnsure(ctx, r2.l, r2.objs, r2.mut, Deps{NewNonce: r2.d.NewNonce, Now: r2.d.Now})
+	_, err = OwnedEnsure(ctx, r2.l, r2.objs, r2.mut, r2.d.Deps)
 	if err == nil || !strings.Contains(err.Error(), "carries no id") {
 		t.Fatalf("a record with no id: %v", err)
 	}
@@ -1146,5 +1185,143 @@ func TestRebindOffOwnedNetwork(t *testing.T) {
 	err = Rebind(ctx, r2.l, r2.d, nOther)
 	if err == nil || !strings.Contains(err.Error(), "already recorded") {
 		t.Fatalf("second migration: %v", err)
+	}
+}
+
+func TestRecordedPhaseMustBeOneOfTheSix(t *testing.T) {
+	// A NUMERIC CHECK ALONE IS NOT A PHASE CHECK. `phase=7` parses, so the resume loop
+	// (`for p := 7; p <= 6`) runs ZERO iterations and returns success — leaving the recorded
+	// migration and the fleet exactly as they were while reporting that recovery completed. A
+	// migration that reports success without doing anything is the one outcome resume must never
+	// produce.
+	for _, bad := range []string{"0", "7", "99"} {
+		r := newRig(t)
+		r.fleet(t, c1)
+		if err := r.l.Put(kindNetMig, "key", "family", []ledger.Field{
+			{Key: "key", Value: "family"}, {Key: "phase", Value: bad},
+			{Key: "source", Value: src}, {Key: "target", Value: tgt}, {Key: "containers", Value: c1},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := MigGet(r.l); err == nil {
+			t.Errorf("phase %q was read as a phase", bad)
+		}
+		err := MigResume(context.Background(), r.l, r.d)
+		if err == nil {
+			t.Errorf("phase %q resumed successfully without doing anything", bad)
+			continue
+		}
+		if !strings.Contains(err.Error(), "not one of the six phases") {
+			t.Errorf("phase %q refused for the wrong reason: %v", bad, err)
+		}
+		// PRESERVED and reported — never rewritten to something readable.
+		if _, gerr := r.l.Find(kindNetMig, "key", "family"); gerr != nil {
+			t.Errorf("phase %q: the record was not preserved: %v", bad, gerr)
+		}
+	}
+	// And the six real phases are still accepted — the range check must not over-refuse.
+	for p := 1; p <= 6; p++ {
+		if _, err := phaseOK(strconv.Itoa(p)); err != nil {
+			t.Errorf("phase %d refused: %v", p, err)
+		}
+	}
+}
+
+// --- durability across a crash --------------------------------------------------------------------
+
+func TestOwnedNetworkIntentIsDurableBeforeTheCreate(t *testing.T) {
+	ctx := context.Background()
+	r := newRig(t)
+	name, _ := manifest.NetworkName(r.id)
+	// The daemon accepts the create and the process dies. A NETWORK IS NEVER REISSUED (D38), so an
+	// unaccounted one is not something a later run can create its way out of — it has to be found
+	// by the record this barrier makes durable.
+	if _, err := OwnedEnsure(ctx, r.l, r.objs, r.mut, r.d.Deps); err != nil {
+		t.Fatal(err)
+	}
+	if r.dk.writes == 0 {
+		t.Fatal("nothing was ever persisted, so this proves nothing")
+	}
+	// Read back ONLY what was on disk when the create was issued: the first persist is the barrier.
+	firstWrite := &ledger.Ledger{}
+	firstWrite.ReplaceLines(r.dk.lines)
+	if _, err := intent.Find(firstWrite, prov.ClassNetwork, name); err != nil {
+		// The final persist is the confirmation, so an absent intent here is only correct if the
+		// PROVENANCE is there instead — either way the network is accounted for.
+		if _, perr := prov.Find(firstWrite, prov.ClassNetwork, name); perr != nil {
+			t.Fatalf("the network was created with neither a durable intent nor durable provenance: %v / %v", err, perr)
+		}
+	}
+
+	// A PERSIST THAT FAILS STOPS THE CREATE.
+	r2 := newRig(t)
+	r2.dk.err = errors.New("disk full")
+	if _, err := OwnedEnsure(ctx, r2.l, r2.objs, r2.mut, r2.d.Deps); err == nil {
+		t.Fatal("a network was created with an unpersistable intent")
+	}
+	// A MISSING seam is refused, not skipped.
+	r3 := newRig(t)
+	r3.d.Persist = nil
+	_, err := OwnedEnsure(ctx, r3.l, r3.objs, r3.mut, r3.d.Deps)
+	if err == nil || !strings.Contains(err.Error(), "no way to persist") {
+		t.Fatalf("a create with no persistence seam: %v", err)
+	}
+}
+
+func TestPhaseMarkerIsDurableBeforeTheDetach(t *testing.T) {
+	ctx := context.Background()
+	// THE WEDGE THIS CLOSES: if disk still said phase 3 while some containers were already
+	// detached, a resume would re-run phase 3 — whose exact-set check requires {source,target} —
+	// and REFUSE exactly the containers phase 4 had already finished. The fleet would be
+	// half-migrated with no phase to move forward from.
+	r := newRig(t)
+	r.fleet(t, c1, c2)
+	r.runTo(t, 3)
+
+	// Snapshot what disk holds at the moment the first detach is issued.
+	var atFirstDetach []string
+	r.mut.onDisconnect = func() {
+		if atFirstDetach == nil {
+			atFirstDetach = append([]string(nil), r.dk.lines...)
+		}
+	}
+	if err := MigRun(ctx, r.l, r.d, src, tgt, 4); err != nil {
+		t.Fatal(err)
+	}
+	if atFirstDetach == nil {
+		t.Fatal("nothing was detached, so this proves nothing")
+	}
+	disk4 := &ledger.Ledger{}
+	disk4.ReplaceLines(atFirstDetach)
+	mig, err := MigGet(disk4)
+	if err != nil {
+		t.Fatalf("no durable migration record at the first detach: %v", err)
+	}
+	if mig.Phase != 4 {
+		t.Fatalf("disk said phase %d when the first detach was issued, want 4 — a crash there would\n"+
+			"  resume into phase 3, which refuses an already-detached container", mig.Phase)
+	}
+
+	// A PERSIST THAT FAILS STOPS THE PHASE before anything is detached.
+	r2 := newRig(t)
+	r2.fleet(t, c1)
+	r2.runTo(t, 3)
+	r2.dk.err = errors.New("disk full")
+	if err := MigRun(ctx, r2.l, r2.d, src, tgt, 4); err == nil {
+		t.Fatal("phase 4 detached with an unpersistable marker")
+	}
+	if len(r2.mut.disconnects) != 0 {
+		t.Fatal("phase 4 detached despite the marker not being durable")
+	}
+	// And phase 2 is barriered the same way, before it connects anything.
+	r3 := newRig(t)
+	r3.fleet(t, c1)
+	r3.runTo(t, 1)
+	r3.dk.err = errors.New("disk full")
+	if err := MigRun(ctx, r3.l, r3.d, src, tgt, 2); err == nil {
+		t.Fatal("phase 2 connected with an unpersistable marker")
+	}
+	if len(r3.mut.connects) != 0 {
+		t.Fatal("phase 2 connected despite the marker not being durable")
 	}
 }

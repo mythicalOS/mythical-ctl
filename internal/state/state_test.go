@@ -855,3 +855,53 @@ func TestResumeAttemptUnreadable(t *testing.T) {
 		t.Fatal("evidence destroyed")
 	}
 }
+
+func TestRefusalsLeaveNoPartialMutation(t *testing.T) {
+	// A REFUSAL MUST LEAVE THE LEDGER BYTE-IDENTICAL. The caller's single Write is what makes any
+	// of this durable, so an edit landed before a later refusal is an edit the caller may persist
+	// behind an error that says nothing was written.
+	//
+	// The trigger in each case is a record the module cannot READ, placed in a set the operation
+	// touches AFTER the one it edits first. It is reachable from a restored ledger, whose checksum
+	// proves the bytes were not altered — not that this installation wrote them.
+	cases := []struct {
+		name string
+		junk string
+		act  func(*ledger.Ledger) error
+	}{
+		{"clear, with an unreadable resume record",
+			"resumed\tcontainer=" + c1 + "\tnot-a-field",
+			func(l *ledger.Ledger) error { return OutstandingClear(l, c1, CheckAlias, "family") }},
+		{"forget, with an unreadable resume record",
+			"resumed\tcontainer=" + c1 + "\tnot-a-field",
+			func(l *ledger.Ledger) error { return Forget(l, c1) }},
+		{"forget, with two contradicting desired rows",
+			"desired\tcontainer=" + c1 + "\tstate=stopped\tverify=none",
+			func(l *ledger.Ledger) error { return Forget(l, c1) }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			l := &ledger.Ledger{}
+			if err := Commit(l, c1, Running, []Check{{CheckAlias, "family"}}, false); err != nil {
+				t.Fatal(err)
+			}
+			l.ReplaceLines(append(l.Lines(), tc.junk))
+			before := strings.Join(l.Lines(), "\n")
+			if err := tc.act(l); err == nil {
+				t.Fatal("the operation succeeded despite a record it cannot read")
+			}
+			if got := strings.Join(l.Lines(), "\n"); got != before {
+				t.Fatalf("a refused operation mutated the ledger:\n before: %s\n after:  %s", before, got)
+			}
+			// Specifically: the outstanding check is still there. Losing it is losing a
+			// verification nobody performed.
+			out, err := Outstanding(l, c1)
+			if err != nil {
+				t.Fatalf("the outstanding set became unreadable: %v", err)
+			}
+			if len(out) != 1 {
+				t.Fatalf("a refused operation retired a check: %+v", out)
+			}
+		})
+	}
+}

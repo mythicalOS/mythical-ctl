@@ -78,6 +78,35 @@ type Deps struct {
 	NewNonce func() (string, error)
 	// Now reads the clock — the creation time an intent carries.
 	Now func() time.Time
+	// Persist commits the in-memory ledger to disk. REQUIRED, and it is the whole of the
+	// write-ahead guarantee.
+	//
+	// Nothing in this package reaches disk: it mutates a *ledger.Ledger the caller owns. So an
+	// intent "opened before the network is created", and a migration phase "recorded before the
+	// phase acts", are only true if the ledger is PERSISTED in between — and the caller cannot do
+	// that itself, because these functions perform the runtime mutation internally. Without this
+	// seam a crash after the daemon accepts a create leaves an unaccounted network, and a crash
+	// part-way through a detach phase leaves a fleet whose recorded phase is behind reality, which
+	// resume cannot move forward from.
+	//
+	// It lives here rather than being a ledger.Write call because writing requires the family-lock
+	// token, which the caller holds.
+	Persist func() error
+}
+
+// barrier persists the ledger before a runtime mutation, and REFUSES when it cannot. A nil
+// Persist is refused rather than skipped — silently proceeding would restore the defect this seam
+// closes, invisibly.
+func barrier(d Deps, what string) error {
+	if d.Persist == nil {
+		return fmt.Errorf("netref: refusing to %s with no way to persist the record written ahead of it —\n"+
+			"  the record would exist only in memory, and a crash would leave the fleet in a state\n"+
+			"  nothing can resume from", what)
+	}
+	if err := d.Persist(); err != nil {
+		return fmt.Errorf("netref: the record written ahead of %s could not be persisted, so nothing is done: %w", what, err)
+	}
+	return nil
 }
 
 var (
@@ -243,6 +272,12 @@ func OwnedEnsure(ctx context.Context, l *ledger.Ledger, objs Objects, m Mutator,
 	}
 	p, err := engine.NewProvenance(ident, nonce)
 	if err != nil {
+		return "", err
+	}
+	// THE INTENT IS DURABLE BEFORE THE NETWORK EXISTS. A network is never reissued (D38), so an
+	// unaccounted one created by a crashed run is not something a later run can create its way out
+	// of — it has to be found by the record this barrier makes durable.
+	if err := barrier(d, "create the family network"); err != nil {
 		return "", err
 	}
 	id, cerr := m.NetworkCreate(ctx, name, p)
