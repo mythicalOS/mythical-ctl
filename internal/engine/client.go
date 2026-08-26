@@ -861,15 +861,31 @@ func (m *Mutator) HelperRun(ctx context.Context, h HelperSpec) (HelperResult, er
 		defer cancel()
 		return m.c.do(rctx, http.MethodDelete, "/containers/"+url.PathEscape(created.ID), url.Values{"force": {"1"}}, nil, nil)
 	}
+	// CLI-parity stdin sequence: the attach stream is OPENED before start (StdinOnce closes
+	// stdin when the first attached client detaches, so the stream must exist when the process
+	// does) and the payload is WRITTEN after start, to a RUNNING process that drains it —
+	// writing it all before start parked the bytes in daemon buffering nothing drains, a
+	// structural pre-start deadlock under the family lock that the reference's `docker run -i`
+	// (which streams concurrently) could never have.
+	var stdin net.Conn
 	if len(h.opts.Stdin) > 0 {
-		if err := m.c.attachStdin(created.ID, h.opts.Stdin); err != nil {
+		sc, aerr := m.c.attachOpen(created.ID)
+		if aerr != nil {
 			rmErr := remove()
-			return none, errors.Join(err, rmErr)
+			return none, errors.Join(aerr, rmErr)
 		}
+		stdin = sc
+		defer stdin.Close()
 	}
 	if err := m.c.do(ctx, http.MethodPost, "/containers/"+url.PathEscape(created.ID)+"/start", nil, nil, nil); err != nil {
 		rmErr := remove()
 		return none, errors.Join(err, rmErr)
+	}
+	if stdin != nil {
+		if err := attachWrite(ctx, stdin, h.opts.Stdin); err != nil {
+			rmErr := remove()
+			return none, errors.Join(err, rmErr)
+		}
 	}
 	code, err := m.c.ContainerWait(ctx, created.ID)
 	if err != nil {
@@ -920,29 +936,43 @@ func (m *Mutator) sweepOwnHelper(ctx context.Context, h HelperSpec) error {
 	return nil
 }
 
-// attachStdin hands bytes to a created container's stdin over a hijacked attach connection,
-// then half-closes so the process sees EOF. This is the API's one stdin vehicle; the
+// attachOpen opens the hijacked stdin attach connection — the API's one stdin vehicle; the
 // alternative the reference design explicitly refuses is a THIRD host mount just to carry
-// input.
-func (c *Client) attachStdin(id string, data []byte) error {
+// input. Opened BEFORE start, written after — see the HelperRun sequence comment.
+func (c *Client) attachOpen(id string) (net.Conn, error) {
 	conn, err := net.DialTimeout("unix", c.socket, 10*time.Second)
 	if err != nil {
-		return fmt.Errorf("engine: %w: %v", ErrDaemonDown, err)
+		return nil, fmt.Errorf("engine: %w: %v", ErrDaemonDown, err)
 	}
-	defer conn.Close()
 	req := fmt.Sprintf("POST /%s/containers/%s/attach?stdin=1&stream=1 HTTP/1.1\r\nHost: docker\r\nConnection: Upgrade\r\nUpgrade: tcp\r\nContent-Length: 0\r\n\r\n",
 		APIVersion, url.PathEscape(id))
 	if _, err := io.WriteString(conn, req); err != nil {
-		return fmt.Errorf("engine: attach failed: %v", err)
+		conn.Close()
+		return nil, fmt.Errorf("engine: attach failed: %v", err)
 	}
 	br := bufio.NewReader(conn)
 	resp, err := http.ReadResponse(br, nil)
 	if err != nil {
-		return fmt.Errorf("engine: attach failed: %v", err)
+		conn.Close()
+		return nil, fmt.Errorf("engine: attach failed: %v", err)
 	}
 	if resp.StatusCode != http.StatusSwitchingProtocols && resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("engine: attach refused (%d)", resp.StatusCode)
+		conn.Close()
+		return nil, fmt.Errorf("engine: attach refused (%d)", resp.StatusCode)
 	}
+	return conn, nil
+}
+
+// attachWrite hands the payload to the now-running process and half-closes so it sees EOF.
+// The caller's context BOUNDS the write: its deadline becomes the connection deadline, and
+// cancellation snaps it — a helper that never reads its stdin cannot hold this write (and the
+// family lock behind it) forever.
+func attachWrite(ctx context.Context, conn net.Conn, data []byte) error {
+	if d, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(d)
+	}
+	stop := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Unix(1, 0)) })
+	defer stop()
 	if _, err := conn.Write(data); err != nil {
 		return fmt.Errorf("engine: writing helper stdin failed: %v", err)
 	}
@@ -950,5 +980,8 @@ func (c *Client) attachStdin(id string, data []byte) error {
 	if !ok {
 		return errors.New("engine: attach connection is not a unix socket")
 	}
-	return uc.CloseWrite()
+	if err := uc.CloseWrite(); err != nil {
+		return fmt.Errorf("engine: closing helper stdin failed: %v", err)
+	}
+	return nil
 }

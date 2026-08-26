@@ -167,11 +167,38 @@ func nlinkOf(p string) (uint64, error) {
 }
 
 // protectedIdentities is the set NOTHING mounted into a container may share: mythical.conf,
-// and everything under bin/. A path that EXISTS and whose identity cannot be read is a
+// everything under bin/ — and the DIRECTORIES themselves: the family home, bin/, and every
+// other direct-child directory of the home (the product directories holding the user-owned
+// host-tool slot included; logs/ and transcripts/ are excluded because they ARE core-fixed
+// sources). An OS-level bind mount aliases a directory with no symlink and no hardlink in
+// sight (directories cannot be hardlinked), so `logs` bind-mounted over `bin/` keeps the
+// expected path and type while being the CLI's own directory — the reference's set
+// (mythical.conf + bin/*) misses the directories, the same latent class as its root-overlap
+// blind spot; closed here. A path that EXISTS and whose identity cannot be read is a
 // refusal, not one fewer member. An ABSENT mythical.conf is not that case: a family home that
 // has never been configured has no such file, and refusing would refuse every first install.
 func protectedIdentities(homeCanon string) (map[string]bool, error) {
 	out := map[string]bool{}
+	homeIno, err := identity(homeCanon)
+	if err != nil {
+		return nil, fmt.Errorf("runtime: the family home's identity cannot be read: %v", err)
+	}
+	out[homeIno] = true
+	kids, err := os.ReadDir(homeCanon)
+	if err != nil {
+		return nil, fmt.Errorf("runtime: cannot list the family home: %v", err)
+	}
+	for _, k := range kids {
+		if !k.IsDir() || k.Name() == "logs" || k.Name() == "transcripts" {
+			continue
+		}
+		kp := homeCanon + "/" + k.Name()
+		ino, ierr := identity(kp)
+		if ierr != nil {
+			return nil, fmt.Errorf("runtime: %q is an installer-zone directory and its identity cannot be read — refusing rather than leaving it out of the protected set", kp)
+		}
+		out[ino] = true
+	}
 	confPath := homeCanon + "/mythical.conf"
 	if _, err := os.Lstat(confPath); err == nil {
 		ino, ierr := identity(confPath)

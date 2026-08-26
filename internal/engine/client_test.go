@@ -1,11 +1,13 @@
 package engine_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"mythicalos.ai/ctl/internal/engine"
 	"mythicalos.ai/ctl/internal/engine/enginetest"
@@ -26,7 +28,7 @@ import (
 // PORTED: tests/unit/harness.bats: "runtime snapshot captures volumes and their labels" -> TestSnapshot (enginetest/fake_test.go)
 // PORTED: tests/unit/harness.bats: "a name that traverses out of the state directory is refused for every resource kind" -> TestCreateNameValidation (enginetest/fake_test.go; the traversal MECHANICS are structurally absent in map-backed state — what survives is the daemon's own name class on every create, so the fake is never more permissive than the daemon)
 // N/A: tests/unit/harness.bats: "a traversing name cannot read or rewrite a file that already exists outside the state dir" -- map-backed state: no name is ever resolved as a filesystem path
-// PORTED: tests/unit/harness.bats: "every subcommand that takes a name validates it, not only create" -> TestCreateNameValidation (creates refuse the class; lookups of a nonexistent weird name answer 404, a real daemon's answer, exercised by TestAbsentVsDown)
+// PORTED: tests/unit/harness.bats: "every subcommand that takes a name validates it, not only create" -> TestCreateNameValidation (creates refuse the class) + TestWeirdNameLookupsAnswer404 (inspect/start/stop/remove/connect/disconnect of a weird-but-routable name answer 404 — the daemon's own answer for an absent object; a traversal spelling is unroutable at the HTTP layer — real daemon 301-path-cleans (measured), the fake's closed surface hard-errors — and is asserted never to address an object)
 // PORTED: tests/unit/harness.bats: "image records are keyed by the exact reference, not a character-folded one" -> TestImageKeyExactRef (enginetest/fake_test.go)
 // PORTED: tests/unit/harness.bats: "a container cannot be created on a network that does not exist" -> TestCreateUnknownNetwork
 // PORTED: tests/unit/harness.bats: "network connect refuses a network that does not exist, and attaches by ID" -> TestConnectResolvesNetwork
@@ -1110,6 +1112,87 @@ func TestHelperStdin(t *testing.T) {
 	}
 	if string(gotStdin) != string(manifest) {
 		t.Fatalf("stdin: %q", gotStdin)
+	}
+	// The CLI-parity property: stdin streams to a RUNNING process (the reference's
+	// `docker run -i`), never parked in daemon buffering before start — the pre-start write
+	// was a structural deadlock for any payload larger than the buffers.
+	if !f.StdinAfterStart {
+		t.Fatal("stdin must be delivered AFTER start, to a running helper")
+	}
+}
+
+// A payload far beyond the pre-start buffering cap drains through the sequence end-to-end.
+// The context DEADLINE is load-bearing: a client that wrote the payload before /start parks
+// against the fake's bounded pre-start buffer (as it would against the daemon's), and the
+// deadline turns that hang into a clean failure — the deterministic kill for the pre-start
+// write sequence.
+func TestHelperStdinLarge(t *testing.T) {
+	f, c := newFake(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	m, _ := newMutator(t, c)
+	f.PullImage("probe:pinned")
+	var gotLen int
+	f.HelperEntry = func(cmd string, args []string, view enginetest.HelperNetView, stdin []byte) (int, []byte) {
+		gotLen = len(stdin)
+		return 0, []byte("verified=ok\n")
+	}
+	payload := bytes.Repeat([]byte("m"), 1<<20)
+	hs, err := engine.NewHelperSpec("probe:pinned", "h1", engine.HelperVerify, mustProv(t), engine.HelperOpts{
+		Stdin: payload,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := m.HelperRun(ctx, hs)
+	if err != nil || res.Code != 0 {
+		t.Fatalf("large-stdin helper: %d %v", res.Code, err)
+	}
+	if gotLen != len(payload) {
+		t.Fatalf("stdin truncated: %d of %d", gotLen, len(payload))
+	}
+}
+
+// Lookups and mutations of a WEIRD-but-routable name answer 404 — the daemon's own answer for
+// an absent object — never a panic, a path resolution, or a silent no-op. A TRAVERSAL spelling
+// is different: it is unroutable at the HTTP layer — the real daemon path-cleans it into a 301
+// redirect (MEASURED 2026-08-26: GET/POST /containers/..%2F..%2Fescapee/* -> 301), and this
+// fake's closed surface hard-errors — both are loud non-answers, asserted below never to
+// address an object. (The create half of the bats case is TestCreateNameValidation.)
+func TestWeirdNameLookupsAnswer404(t *testing.T) {
+	f, c := newFake(t)
+	ctx := context.Background()
+	m, _ := newMutator(t, c)
+	f.PullImage("img:v1")
+	netID, err := m.NetworkCreate(ctx, "family", mustProv(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.ContainerInspect(ctx, "../../escapee"); err == nil {
+		t.Error("a traversal-spelled inspect must not succeed")
+	}
+	if err := m.ContainerRemove(ctx, "../../escapee"); err == nil {
+		t.Error("a traversal-spelled remove must not succeed")
+	}
+	for _, name := range []string{".hidden", "-leading-dash", "has space"} {
+		if _, err := c.ContainerInspect(ctx, name); !errors.Is(err, engine.ErrAbsent) {
+			t.Errorf("inspect %q: %v", name, err)
+		}
+		if err := m.ContainerStart(ctx, name); !errors.Is(err, engine.ErrAbsent) {
+			t.Errorf("start %q: %v", name, err)
+		}
+		if err := m.ContainerStop(ctx, name); !errors.Is(err, engine.ErrAbsent) {
+			t.Errorf("stop %q: %v", name, err)
+		}
+		if err := m.ContainerRemove(ctx, name); !errors.Is(err, engine.ErrAbsent) {
+			t.Errorf("remove %q: %v", name, err)
+		}
+		if err := m.NetworkConnect(ctx, netID, name, "a", 0); !errors.Is(err, engine.ErrAbsent) {
+			t.Errorf("connect %q: %v", name, err)
+		}
+		if err := m.NetworkDisconnect(ctx, netID, name); !errors.Is(err, engine.ErrAbsent) {
+			t.Errorf("disconnect %q: %v", name, err)
+		}
 	}
 }
 

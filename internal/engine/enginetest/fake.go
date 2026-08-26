@@ -68,6 +68,10 @@ type HelperNetView struct {
 	Hostname string
 }
 
+// preStartStdinCap is the fake's bound on stdin drained before the container starts — the
+// daemon's buffering is likewise finite, which is why stdin must stream to a RUNNING process.
+const preStartStdinCap = 32 * 1024
+
 // HelperEntryFunc is the helper fixture: the closed command word, its arguments, the network
 // views, and any stdin bytes. It answers with an exit code and the container's output.
 type HelperEntryFunc func(cmd string, args []string, view HelperNetView, stdin []byte) (int, []byte)
@@ -100,10 +104,15 @@ type fakeContainer struct {
 	cmd       []string
 	user      string
 	stdin     []byte
-	ran       bool
-	exitCode  int64
-	output    []byte // the helper's stdout (stream 1)
-	stderr    []byte // the helper's stderr (stream 2), from the HelperStderr knob
+	openStdin bool
+	// awaitingStdin: started in the CLI-parity sequence (stdin arrives AFTER start); the
+	// entry runs at attach-EOF and waiters are woken through the fake's cond.
+	awaitingStdin bool
+	stdinDone     bool
+	ran           bool
+	exitCode      int64
+	output        []byte // the helper's stdout (stream 1)
+	stderr        []byte // the helper's stderr (stream 2), from the HelperStderr knob
 }
 
 type mountRec struct {
@@ -143,7 +152,8 @@ type fakeNetwork struct {
 //     an object that vanished, which is a fact a later run may act on; with
 //     InspectMissingAfter, it survives its first N inspections first.
 type Fake struct {
-	mu sync.Mutex
+	mu   sync.Mutex
+	cond *sync.Cond // signals helper completion to blocked waiters (waitContainer)
 
 	dir    string
 	socket string
@@ -177,6 +187,9 @@ type Fake struct {
 	// recorded, and then the connection is aborted before the response carries its id — the
 	// caller cannot tell a refused create from one that succeeded silently.
 	CreateResponseLost bool
+	// StdinAfterStart records, at attach-EOF, whether the container had already been started —
+	// the CLI-parity property (stdin streams to a RUNNING process) a test can assert.
+	StdinAfterStart bool
 
 	// Requests logs "METHOD /path" for every request, INCLUDING ones the Down knobs then
 	// refuse — the post-release Mutator test's "the fake recorded NO request" reads this.
@@ -225,6 +238,7 @@ func NewFake() *Fake {
 		volumes:    map[string]*fakeVolume{},
 		images:     map[string]string{},
 	}
+	f.cond = sync.NewCond(&f.mu)
 	ln, err := net.Listen("unix", f.socket)
 	if err != nil {
 		panic(err)
@@ -408,6 +422,15 @@ func (f *Fake) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The attach route is served OUTSIDE the dispatch lock: its read blocks until the client
+	// half-closes, which — in the CLI-parity sequence — happens only after /start has been
+	// ANSWERED, and /start needs the lock this dispatcher would still be holding.
+	if hseg := strings.Split(strings.TrimPrefix(path, "/"), "/"); r.Method == http.MethodPost &&
+		len(hseg) == 3 && hseg[0] == "containers" && hseg[2] == "attach" {
+		f.attachContainer(w, r, hseg[1])
+		return
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	seg := strings.Split(strings.TrimPrefix(path, "/"), "/")
@@ -447,8 +470,6 @@ func (f *Fake) handle(w http.ResponseWriter, r *http.Request) {
 		f.waitContainer(w, seg[1])
 	case len(seg) == 3 && seg[0] == "containers" && r.Method == http.MethodGet && seg[2] == "logs":
 		f.logsContainer(w, seg[1])
-	case len(seg) == 3 && seg[0] == "containers" && r.Method == http.MethodPost && seg[2] == "attach":
-		f.attachContainer(w, r, seg[1])
 	case len(seg) == 2 && seg[0] == "containers" && r.Method == http.MethodDelete:
 		f.removeContainer(w, r, seg[1])
 
@@ -586,13 +607,14 @@ func (f *Fake) createContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c := &fakeContainer{
-		name:   name,
-		image:  body.Image,
-		state:  "created",
-		labels: body.Labels,
-		env:    body.Env,
-		cmd:    body.Cmd,
-		user:   body.User,
+		name:      name,
+		image:     body.Image,
+		state:     "created",
+		labels:    body.Labels,
+		env:       body.Env,
+		cmd:       body.Cmd,
+		user:      body.User,
+		openStdin: body.OpenStdin,
 	}
 	switch {
 	case body.HostConfig.NetworkMode == "none":
@@ -747,19 +769,37 @@ func (f *Fake) startContainer(w http.ResponseWriter, seg string) {
 			fail(w, 500, "fake engine: no helper fixture is set (Fake.HelperEntry)")
 			return
 		}
+		if c.openStdin && !c.stdinDone {
+			// CLI-parity sequence: the payload arrives AFTER start — the entry runs at
+			// attach-EOF (attachContainer), which wakes any blocked waiter via the cond.
+			c.state = "running"
+			c.awaitingStdin = true
+			f.cond.Broadcast() // wake an attach reader parked at the pre-start cap
+			ok(w, nil)
+			return
+		}
 		c.state = "running"
-		view := f.helperView(c)
-		code, out := f.HelperEntry(c.cmd[0], c.cmd[1:], view, c.stdin)
-		c.exitCode = int64(code)
-		c.output = out
-		c.stderr = append([]byte(nil), f.HelperStderr...)
-		c.ran = true
-		c.state = "exited"
+		f.runHelperEntry(c)
 		ok(w, nil)
 		return
 	}
 	c.state = "running"
+	f.cond.Broadcast()
 	ok(w, nil)
+}
+
+// runHelperEntry executes the fixture entry for a running helper and marks it exited.
+// CALLED UNDER f.mu; wakes waiters blocked in waitContainer.
+func (f *Fake) runHelperEntry(c *fakeContainer) {
+	view := f.helperView(c)
+	code, out := f.HelperEntry(c.cmd[0], c.cmd[1:], view, c.stdin)
+	c.exitCode = int64(code)
+	c.output = out
+	c.stderr = append([]byte(nil), f.HelperStderr...)
+	c.ran = true
+	c.awaitingStdin = false
+	c.state = "exited"
+	f.cond.Broadcast()
 }
 
 // helperView builds the two name-resolution surfaces for a helper at START time: the DNS view
@@ -815,6 +855,11 @@ func (f *Fake) waitContainer(w http.ResponseWriter, seg string) {
 		fail(w, 404, "No such container: %s", pathName(seg))
 		return
 	}
+	// A helper still waiting for its stdin: block until the attach-EOF path has run the
+	// entry (cond.Wait releases the dispatch lock while waiting, so that path can take it).
+	for c.awaitingStdin && c.state == "running" {
+		f.cond.Wait()
+	}
 	if !c.ran && c.state == "running" {
 		fail(w, 500, "fake engine: wait on a running non-helper container is not implemented")
 		return
@@ -846,8 +891,13 @@ func (f *Fake) logsContainer(w http.ResponseWriter, seg string) {
 	frame(2, c.stderr)
 }
 
+// attachContainer runs OUTSIDE the dispatch lock (see handle): the blocking read happens
+// unlocked, and the lock is taken only to record the payload and — for a helper started in
+// the CLI-parity sequence — to run its entry at EOF.
 func (f *Fake) attachContainer(w http.ResponseWriter, r *http.Request, seg string) {
+	f.mu.Lock()
 	c := f.findContainer(pathName(seg))
+	f.mu.Unlock()
 	if c == nil {
 		fail(w, 404, "No such container: %s", pathName(seg))
 		return
@@ -864,16 +914,35 @@ func (f *Fake) attachContainer(w http.ResponseWriter, r *http.Request, seg strin
 	defer conn.Close()
 	_, _ = rw.WriteString("HTTP/1.1 101 UPGRADED\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n")
 	_ = rw.Flush()
+	// BOUNDED pre-start buffering, as the daemon has: while the container has never started,
+	// at most preStartStdinCap bytes are drained off the wire — the rest waits for start.
+	// This is the mechanism that made write-everything-before-start a structural deadlock,
+	// and modelling it is what lets a test KILL that sequence deterministically (a client
+	// writing a large payload before /start blocks here until its context deadline snaps).
 	var data []byte
 	buf := make([]byte, 4096)
 	for {
+		if len(data) >= preStartStdinCap {
+			f.mu.Lock()
+			for c.state == "created" {
+				f.cond.Wait()
+			}
+			f.mu.Unlock()
+		}
 		n, rerr := rw.Read(buf)
 		data = append(data, buf[:n]...)
 		if rerr != nil {
 			break
 		}
 	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	c.stdin = data
+	c.stdinDone = true
+	f.StdinAfterStart = c.state != "created"
+	if c.awaitingStdin && c.state == "running" {
+		f.runHelperEntry(c)
+	}
 }
 
 func (f *Fake) removeContainer(w http.ResponseWriter, r *http.Request, seg string) {
