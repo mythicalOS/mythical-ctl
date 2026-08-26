@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -124,13 +125,31 @@ func TestCredHelperPrecedence(t *testing.T) {
 	if ac := decodeHeader(t, hdr); ac["username"] != "from-store" {
 		t.Fatalf("credsStore beats inline auths: %v", ac)
 	}
-	// A failing helper is an ERROR carrying the helper's own words — never a silent
-	// fall-through to weaker credentials.
-	badDir := writeHelper(t, "bad", `echo "credentials not found in native keychain" >&2; exit 1`)
+	// The store's standardized NOT-FOUND is an absence, not a failure: the pull goes
+	// ANONYMOUS (the CLI's convention) — and the inline entry for the same host is NOT
+	// consulted, because a configured store is authoritative for the host. Helpers print the
+	// message on stdout; the stderr spelling is accepted too.
+	for _, script := range []string{
+		`echo "credentials not found in native keychain"; exit 1`,
+		`echo "credentials not found in native keychain" >&2; exit 1`,
+	} {
+		nfDir := writeHelper(t, "nf", script)
+		writeConfig(t, root, `{"credsStore":"nf","auths":{"reg.example":{"auth":"`+pair+`"}}}`)
+		hdr, err = resolveRegistryAuth([]string{"PATH=" + nfDir}, home, "reg.example/img")
+		if err != nil {
+			t.Fatalf("a store miss must mean anonymous, not failure: %v", err)
+		}
+		if hdr != "" {
+			t.Fatalf("a store miss must not fall through to the inline entry: %q", hdr)
+		}
+	}
+	// Any OTHER helper failure is an ERROR carrying the helper's own words — never a silent
+	// fall-through to weaker credentials, never anonymous.
+	badDir := writeHelper(t, "bad", `echo "keychain is locked" >&2; exit 1`)
 	writeConfig(t, root, `{"credsStore":"bad","auths":{"reg.example":{"auth":"`+pair+`"}}}`)
 	_, err = resolveRegistryAuth([]string{"PATH=" + badDir}, home, "reg.example/img")
-	if err == nil {
-		t.Fatal("a failing helper must not fall through")
+	if err == nil || !strings.Contains(err.Error(), "keychain is locked") {
+		t.Fatalf("a failing helper must surface its words, not fall through: %v", err)
 	}
 }
 

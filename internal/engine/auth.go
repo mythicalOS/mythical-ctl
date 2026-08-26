@@ -98,6 +98,11 @@ func lookPathIn(env []string, name string) (string, error) {
 	return "", fmt.Errorf("engine: credential helper %q not found on PATH", name)
 }
 
+// errCredentialsNotFound is the standardized message every docker-credential-* helper emits
+// (docker-credential-helpers, credentials.ErrCredentialsNotFound) when the store holds no
+// entry for the server; the CLI matches it verbatim.
+const errCredentialsNotFound = "credentials not found in native keychain"
+
 // runCredHelper executes `docker-credential-<name> get` with the server address on stdin and
 // reads the CLI's helper protocol back. A helper answering Username `<token>` is handing back
 // an identity token, not a password — the CLI's own convention.
@@ -112,9 +117,17 @@ func runCredHelper(env []string, helper, serverAddress string) (*authConfig, err
 	var out, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &stderr
 	if err := cmd.Run(); err != nil {
-		// The helper's own words are preserved (§7.3): an operator debugging a broken login
-		// needs "credentials not found in native keychain", not a generic refusal.
-		return nil, fmt.Errorf("engine: credential helper %q failed: %v: %s", helper, err, strings.TrimSpace(stderr.String()))
+		// The CLI's own convention (docker/cli, native_store.go): a helper exiting non-zero
+		// with EXACTLY the standardized not-found message is reporting an ABSENCE, and the
+		// pull proceeds ANONYMOUSLY — a configured credsStore with no entry for a public
+		// registry is the everyday case (Docker Desktop's keychain helper on a public pull).
+		// Inline `auths` are NOT consulted afterwards, exactly as the CLI does not: the store
+		// is authoritative for the host once configured. Every OTHER failure is fatal, in the
+		// helper's own words (§7.3) — never a silent fall-through to weaker credentials.
+		if strings.TrimSpace(out.String()) == errCredentialsNotFound || strings.TrimSpace(stderr.String()) == errCredentialsNotFound {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("engine: credential helper %q failed: %v: %s", helper, err, strings.TrimSpace(stderr.String()+out.String()))
 	}
 	var got struct {
 		Username string `json:"Username"`
