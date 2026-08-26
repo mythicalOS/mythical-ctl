@@ -37,6 +37,11 @@ func ours(ctx context.Context, objs Objects, class prov.Class, name, cand, ident
 			"  Nothing is adopted, aged out or accounted for on the strength of a question that was\n"+
 			"  never answered: %w", string(class), cand, err)
 	}
+	// The SHARED label rule (prov.NormalizeLabel): a label meaning ABSENT must read as absent here
+	// too, or an object labelled `installation=<no value>` reads as a foreign installation's
+	// rather than as unlabelled. Both refuse — but they refuse with different reasons, and the
+	// reference normalizes in its one label reader so every caller agrees.
+	label = prov.NormalizeLabel(label)
 	if label == "" {
 		return ownNotOurs, fmt.Sprintf("intent: %s %q carries this intent's nonce but NO installation label, so nothing\n"+
 			"  about the object itself says this installation created it. It is neither adopted nor\n"+
@@ -64,6 +69,7 @@ func ours(ctx context.Context, objs Objects, class prov.Class, name, cand, ident
 		return 0, "", fmt.Errorf("intent: the container runtime could not be asked for the nonce label of %s %q: %w",
 			string(class), cand, err)
 	}
+	actual = prov.NormalizeLabel(actual)
 	if actual != nonce {
 		shown := actual
 		if shown == "" {

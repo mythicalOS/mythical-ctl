@@ -110,9 +110,17 @@ type fakeMut struct {
 	started, stopped, removed []string
 	startErr, stopErr         error
 	onStart                   func()
+	// atStartEntry fires as the FIRST thing ContainerStart does, so a test can observe what DISK
+	// held at the instant the runtime was asked to act. Inspecting after the call returns cannot
+	// tell "written before" from "written after" — which is what made the first durability tests
+	// unable to fail.
+	atStartEntry func()
 }
 
 func (m *fakeMut) ContainerStart(_ context.Context, id string) error {
+	if m.atStartEntry != nil {
+		m.atStartEntry()
+	}
 	m.started = append(m.started, id)
 	if m.onStart != nil {
 		m.onStart()
@@ -174,9 +182,15 @@ type fakeLauncher struct {
 	// after runs once the container exists, for cases where the world changes between the create
 	// and the verification.
 	after func()
+	// atEntry fires as the FIRST thing Launch does — the instant the daemon would be asked to
+	// create. What disk holds THEN is the whole write-ahead question.
+	atEntry func()
 }
 
 func (l *fakeLauncher) Launch(_ context.Context, container, nonce string) (string, error) {
+	if l.atEntry != nil {
+		l.atEntry()
+	}
 	l.calls++
 	if l.err != nil {
 		return "", l.err
@@ -212,7 +226,7 @@ func fixture(t *testing.T) (*ledger.Ledger, *fakeObjs, *fakeMut, *fakeProbe, *fa
 	// The write-ahead barrier refuses without one — deliberately — so the cases that assert THAT
 	// install their own (a failing disk, or none at all), and the durability cases install a disk
 	// they can read back.
-	d.Persist = (&disk{}).persistFrom(l)
+	d.Persist = (&disk{}).persist()
 	return l, objs, mut, pr, st, d
 }
 
@@ -957,8 +971,8 @@ type disk struct {
 	err    error
 }
 
-func (dk *disk) persistFrom(l *ledger.Ledger) func() error {
-	return func() error {
+func (dk *disk) persist() func(*ledger.Ledger) error {
+	return func(l *ledger.Ledger) error {
 		if dk.err != nil {
 			return dk.err
 		}
@@ -978,22 +992,25 @@ func TestIntentIsDurableBeforeTheContainerExists(t *testing.T) {
 	ctx := context.Background()
 	l, objs, _, _, st, d := fixture(t)
 	dk := &disk{}
-	d.Persist = dk.persistFrom(l)
+	d.Persist = dk.persist()
 
 	// THE CRASH: the daemon accepts the create, and the process dies before anything else. What a
-	// later run can do about the container depends entirely on what was on DISK at that moment.
-	crashed := false
+	// later run can do about the container depends entirely on what was on DISK AT THAT INSTANT —
+	// so the snapshot is taken as the launcher is entered, not after it returns. Reading disk
+	// afterwards cannot distinguish "written before the create" from "written after it", which is
+	// exactly the ordering under test.
+	var atCreate []string
 	lau := &fakeLauncher{objs: objs, st: st, nets: []Attachment{attach(net1, "", al1)}}
-	lau.after = func() { crashed = true }
+	lau.atEntry = func() { atCreate = append([]string(nil), dk.lines...) }
 
 	if _, err := Create(ctx, l, d, lau, c1, net1, state.Running); err != nil {
 		t.Fatal(err)
 	}
-	if !crashed {
+	if lau.calls != 1 {
 		t.Fatal("the launcher never ran, so this proves nothing about the order")
 	}
-	// The intent must be READABLE FROM DISK — not merely present in the ledger we still hold.
-	reloaded := dk.reload()
+	reloaded := &ledger.Ledger{}
+	reloaded.ReplaceLines(atCreate)
 	rec, err := intent.Find(reloaded, prov.ClassContainer, c1)
 	if err != nil {
 		t.Fatalf("the container was created with no durable intent — nothing could account for it: %v", err)
@@ -1016,13 +1033,19 @@ func TestNoRuntimeMutationWithoutADurableRecord(t *testing.T) {
 	// object the record exists to prevent, and the failure would be invisible until a crash.
 	l, objs, mut, _, st, d := fixture(t)
 	dk := &disk{err: errors.New("disk full")}
-	d.Persist = dk.persistFrom(l)
+	d.Persist = dk.persist()
 	lau := &fakeLauncher{objs: objs, st: st, nets: []Attachment{attach(net1, "", al1)}}
 	if _, err := Create(ctx, l, d, lau, c1, net1, state.Running); err == nil {
 		t.Fatal("a container was created with an unpersistable intent")
 	}
 	if lau.calls != 0 {
 		t.Fatal("the launcher ran despite the record not being durable")
+	}
+	// AND THE FAILED WRITE LEFT NOTHING BEHIND IN MEMORY. An intent staged in the caller's ledger
+	// behind an error saying nothing was done is a record for an object that was never created —
+	// and under D38-style rules a retry would then refuse, wedged behind its own debris.
+	if _, ferr := intent.Find(l, prov.ClassContainer, c1); !errors.Is(ferr, ledger.ErrAbsentRecord) {
+		t.Fatalf("a failed persist left an intent in the caller's ledger: %v", ferr)
 	}
 
 	// A MISSING Persist is refused, not skipped — skipping would restore the defect invisibly.
@@ -1046,26 +1069,56 @@ func TestResumeAttemptIsDurableBeforeTheStart(t *testing.T) {
 	// it was meant to survive.
 	l, objs, mut, _, st, d := fixture(t)
 	dk := &disk{}
-	d.Persist = dk.persistFrom(l)
+	d.Persist = dk.persist()
 	if err := state.Commit(l, c1, state.Running, []state.Check{{Kind: state.CheckAlias, Param: net1}}, false); err != nil {
 		t.Fatal(err)
 	}
 	objs.nets[c1] = []Attachment{attach(net1, "10.0.0.2", al1)}
 	st.down(c1)
-	// The start happens, and the process dies immediately after — nothing else is written.
+	// Snapshot disk AT THE START CALL — the instant the container is asked to run. Reading after
+	// the call returns cannot tell whether the marker was written before or after it.
+	var atStart []string
+	mut.atStartEntry = func() { atStart = append([]string(nil), dk.lines...) }
 	if err := Reconcile(ctx, l, d, c1, net1, al1); err == nil {
 		t.Fatal("a container that did not come up reported success")
 	}
 	if len(mut.started) != 1 {
 		t.Fatalf("started %d times", len(mut.started))
 	}
-	// A LATER RUN, reading only what was on disk, must see the attempt.
-	reloaded := dk.reload()
+	// A LATER RUN, reading only what was on disk when the start was issued, must see the attempt.
+	reloaded := &ledger.Ledger{}
+	reloaded.ReplaceLines(atStart)
 	plan, err := state.PlanFor(ctx, reloaded, st, c1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if plan != state.PlanExited {
 		t.Fatalf("plan after a crash-following-start = %q, want exited — the attempt was not durable", plan)
+	}
+}
+
+func TestVerifierUsesThePassedLedger(t *testing.T) {
+	ctx := context.Background()
+	// THE SEAM MUST READ THE LEDGER IT IS HANDED, not one it captured. bring-up's exact-set check
+	// consults the migration record to decide the permitted set, so a verifier answering from a
+	// stale ledger would verify against stale migration bounds while the phase advances a fresh
+	// one — the mismatch the adapter exists to prevent, reintroduced by the adapter itself.
+	//
+	// The instrument: a container legitimately on BOTH networks. Against a ledger that RECORDS the
+	// migration that is correct; against an empty one it is a stray attachment. So the verdict
+	// says which ledger was actually read.
+	_, objs, _, _, _, d := fixture(t)
+	objs.nets[c1] = []Attachment{attach(net2, "10.0.1.2", al1), attach(net1, "10.0.0.2", al1)}
+
+	withMig := &ledger.Ledger{}
+	recordMigration(t, withMig, net2, net1)
+	v := Verifier{D: d}
+	if err := v.VerifyAttach(ctx, withMig, c1, net1, al1); err != nil {
+		t.Fatalf("the verifier refused against the ledger recording the migration: %v", err)
+	}
+	// And handed a ledger with NO migration, the same container must fail — proving the answer
+	// came from the argument.
+	if err := v.VerifyAttach(ctx, &ledger.Ledger{}, c1, net1, al1); err == nil {
+		t.Fatal("the verifier answered from something other than the ledger it was handed")
 	}
 }

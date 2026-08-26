@@ -94,8 +94,14 @@ type Deps struct {
 	NewNonce func() (string, error)
 	// Now is the clock the intent's creation time comes from.
 	Now func() time.Time
-	// Persist commits the in-memory ledger to disk. It is REQUIRED, and it is the whole of the
+	// Persist commits THE LEDGER IT IS GIVEN to disk. It is REQUIRED, and it is the whole of the
 	// write-ahead guarantee.
+	//
+	// IT TAKES THE LEDGER RATHER THAN CLOSING OVER ONE. A closure captured at construction stays
+	// bound to the ledger that existed then, so a caller that reloads (recovery does exactly that)
+	// and reuses its Deps gets a Persist that writes the OLD copy, reports success, and lets the
+	// runtime mutation proceed with the new copy's record never written — the failure this seam
+	// exists to prevent, wearing its own success.
 	//
 	// These functions mutate a *ledger.Ledger the caller owns; nothing here reaches disk. So
 	// "the intent is opened BEFORE the container is created" is only true if the ledger is
@@ -107,7 +113,7 @@ type Deps struct {
 	// It lives in Deps rather than being a ledger.Write call here because writing requires the
 	// family-lock token, which the caller holds — the same reason this package never holds a
 	// Mutator of its own.
-	Persist func() error
+	Persist func(*ledger.Ledger) error
 }
 
 // barrier persists the ledger before a runtime mutation, and REFUSES when it cannot.
@@ -115,16 +121,39 @@ type Deps struct {
 // A nil Persist is refused rather than skipped: silently proceeding would restore exactly the
 // defect this seam closes, and it would do so invisibly — the operation would succeed, and only a
 // crash would reveal that nothing was ever written ahead.
-func barrier(d Deps, what string) error {
+func barrier(d Deps, l *ledger.Ledger, what string) error {
 	if d.Persist == nil {
 		return fmt.Errorf("bringup: refusing to %s with no way to persist the record written ahead of it —\n"+
 			"  the record would exist only in memory, and a crash would leave an object nothing can\n"+
 			"  account for", what)
 	}
-	if err := d.Persist(); err != nil {
+	if err := d.Persist(l); err != nil {
 		return fmt.Errorf("bringup: the record written ahead of %s could not be persisted, so nothing is done: %w", what, err)
 	}
 	return nil
+}
+
+// staged runs edit on a COPY of l, persists the copy, and only then publishes it into l.
+//
+// This is what makes a failed barrier leave nothing behind. The edit and the barrier are one
+// step: if the write fails, the caller's ledger is byte-identical to before, so a retry sees the
+// world it actually left. Editing in place first was a real defect — a failed resume barrier left
+// the `resumed` marker in memory, and a retry then read PlanExited and refused to start a
+// container that had never been started.
+func staged(d Deps, l *ledger.Ledger, what string, edit func(*ledger.Ledger) error) error {
+	if d.Persist == nil {
+		return fmt.Errorf("bringup: refusing to %s with no way to persist the record written ahead of it —\n"+
+			"  the record would exist only in memory, and a crash would leave an object nothing can\n"+
+			"  account for", what)
+	}
+	cp := l.Clone()
+	if err := edit(cp); err != nil {
+		return err
+	}
+	if err := d.Persist(cp); err != nil {
+		return fmt.Errorf("bringup: the record written ahead of %s could not be persisted, so nothing is done: %w", what, err)
+	}
+	return l.Adopt(cp)
 }
 
 // Desired is the desired state a bring-up records, plus `preserve`.
@@ -306,16 +335,15 @@ func Create(ctx context.Context, l *ledger.Ledger, d Deps, launch Launcher, cont
 	if err != nil {
 		return "", err
 	}
-	if err := intent.Open(l, prov.ClassContainer, container, nonce, d.Now(),
-		ledger.Field{Key: "desired", Value: string(want)},
-		ledger.Field{Key: "check", Value: string(state.CheckAlias)},
-		ledger.Field{Key: "check_param", Value: netID},
-	); err != nil {
-		return "", err
-	}
-	// THE INTENT IS DURABLE BEFORE THE CONTAINER EXISTS. This is the write-ahead barrier: a crash
-	// after the daemon accepts the create must find a record saying what was being built.
-	if err := barrier(d, "create a container"); err != nil {
+	// THE INTENT IS DURABLE BEFORE THE CONTAINER EXISTS — and the open and the write are ONE step,
+	// so a failed write leaves no intent for an object that was never created.
+	if err := staged(d, l, "create a container", func(c *ledger.Ledger) error {
+		return intent.Open(c, prov.ClassContainer, container, nonce, d.Now(),
+			ledger.Field{Key: "desired", Value: string(want)},
+			ledger.Field{Key: "check", Value: string(state.CheckAlias)},
+			ledger.Field{Key: "check_param", Value: netID},
+		)
+	}); err != nil {
 		return "", err
 	}
 	if _, err := launch.Launch(ctx, container, nonce); err != nil {
@@ -377,12 +405,12 @@ func Run(ctx context.Context, l *ledger.Ledger, d Deps, launch Launcher, contain
 	if want == state.Stopped {
 		// A STOPPED BRING-UP KEEPS THE OUTSTANDING ENTRY rather than clearing or performing it:
 		// a stopped container has no address for its alias to answer with.
-		return barrier(d, "finish a stopped bring-up")
+		return barrier(d, l, "finish a stopped bring-up")
 	}
 	// The confirmation, the desired state and the owed check are made DURABLE before the start —
 	// a crash between them would otherwise leave a running container whose ledger still says it
 	// was mid-creation.
-	if err := barrier(d, "start a container"); err != nil {
+	if err := barrier(d, l, "start a container"); err != nil {
 		return err
 	}
 	if serr := d.Mut.ContainerStart(ctx, container); serr != nil {
@@ -521,13 +549,14 @@ func Reconcile(ctx context.Context, l *ledger.Ledger, d Deps, container, netID, 
 	case state.PlanStartVerify:
 		// THE ATTEMPT IS RECORDED BEFORE IT IS MADE. A crash between starting and recording would
 		// leave the next run believing it had never tried, which is the restart loop.
-		if rerr := state.ResumeRecord(l, container); rerr != nil {
-			return rerr
-		}
-		// AND IT IS DURABLE BEFORE THE START. A crash between recording the attempt and making it
-		// would leave the next run believing it had never tried — which is the restart loop the
-		// record exists to stop, reinstated by the very crash it was meant to survive.
-		if err := barrier(d, "resume a container"); err != nil {
+		// THE ATTEMPT IS DURABLE BEFORE THE START, and recording it is ONE step with the write. A
+		// crash between recording and starting would leave the next run believing it had never
+		// tried — the restart loop the record exists to stop, reinstated by the very crash it was
+		// meant to survive. And a FAILED write must not leave the marker in memory either, or a
+		// retry reads PlanExited and refuses to start a container that was never started.
+		if err := staged(d, l, "resume a container", func(c *ledger.Ledger) error {
+			return state.ResumeRecord(c, container)
+		}); err != nil {
 			return err
 		}
 		if serr := d.Mut.ContainerStart(ctx, container); serr != nil {

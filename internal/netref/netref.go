@@ -78,8 +78,13 @@ type Deps struct {
 	NewNonce func() (string, error)
 	// Now reads the clock — the creation time an intent carries.
 	Now func() time.Time
-	// Persist commits the in-memory ledger to disk. REQUIRED, and it is the whole of the
+	// Persist commits THE LEDGER IT IS GIVEN to disk. REQUIRED, and it is the whole of the
 	// write-ahead guarantee.
+	//
+	// IT TAKES THE LEDGER rather than closing over one: a closure captured at construction stays
+	// bound to the ledger that existed then, so a caller that reloads and reuses its Deps gets a
+	// Persist that writes the OLD copy, reports success, and lets the runtime mutation proceed
+	// with the new copy's marker never written.
 	//
 	// Nothing in this package reaches disk: it mutates a *ledger.Ledger the caller owns. So an
 	// intent "opened before the network is created", and a migration phase "recorded before the
@@ -91,22 +96,27 @@ type Deps struct {
 	//
 	// It lives here rather than being a ledger.Write call because writing requires the family-lock
 	// token, which the caller holds.
-	Persist func() error
+	Persist func(*ledger.Ledger) error
 }
 
-// barrier persists the ledger before a runtime mutation, and REFUSES when it cannot. A nil
-// Persist is refused rather than skipped — silently proceeding would restore the defect this seam
+// staged runs edit on a COPY of l, persists the copy, and only then publishes it into l — so a
+// failed write leaves the caller's ledger byte-identical and a retry sees the world it left. A nil
+// Persist is refused rather than skipped: silently proceeding would restore the defect this seam
 // closes, invisibly.
-func barrier(d Deps, what string) error {
+func staged(d Deps, l *ledger.Ledger, what string, edit func(*ledger.Ledger) error) error {
 	if d.Persist == nil {
 		return fmt.Errorf("netref: refusing to %s with no way to persist the record written ahead of it —\n"+
 			"  the record would exist only in memory, and a crash would leave the fleet in a state\n"+
 			"  nothing can resume from", what)
 	}
-	if err := d.Persist(); err != nil {
+	cp := l.Clone()
+	if err := edit(cp); err != nil {
+		return err
+	}
+	if err := d.Persist(cp); err != nil {
 		return fmt.Errorf("netref: the record written ahead of %s could not be persisted, so nothing is done: %w", what, err)
 	}
-	return nil
+	return l.Adopt(cp)
 }
 
 var (
@@ -191,7 +201,15 @@ func (e engineObjects) ContainerNets(ctx context.Context, container string) ([]N
 // Recreating it silently would strand every attached container on a network the ledger no longer
 // names, with every product reporting healthy — so every answer other than "the recorded id is
 // answered by itself" refuses.
-func adoptOwned(ctx context.Context, objs Objects, rec []ledger.Field) (string, error) {
+func adoptOwned(ctx context.Context, objs Objects, rec []ledger.Field, name string) (string, error) {
+	// THE RECORD MUST DESCRIBE THE NETWORK IT WAS FOUND UNDER before its `id` is consumed. A
+	// record keyed for this name while describing something else supplies THAT object's id, and
+	// this function's answer is the network the whole family is then attached to — so the fleet
+	// would join a network the ledger never named. (The reference reads `id` without asking; the
+	// same latent blind spot as its sibling in the migration alias path, closed here.)
+	if derr := prov.Describes(rec, prov.ClassNetwork, name); derr != nil {
+		return "", derr
+	}
 	id, ok := ledger.FieldOf(rec, "id")
 	if !ok {
 		return "", errors.New("netref: the recorded family network carries no id. A network is recorded BY its id (§6a\n" +
@@ -236,7 +254,7 @@ func OwnedEnsure(ctx context.Context, l *ledger.Ledger, objs Objects, m Mutator,
 	rec, ferr := prov.Find(l, prov.ClassNetwork, name)
 	switch {
 	case ferr == nil:
-		return adoptOwned(ctx, objs, rec)
+		return adoptOwned(ctx, objs, rec, name)
 	case errors.Is(ferr, ledger.ErrAbsentRecord):
 	default:
 		return "", fmt.Errorf("netref: whether this installation already has a family network could not be read from\n"+
@@ -256,7 +274,7 @@ func OwnedEnsure(ctx context.Context, l *ledger.Ledger, objs Objects, m Mutator,
 			return "", fmt.Errorf("netref: the network intent reconciled, but no provenance record can be read for it.\n"+
 				"  Nothing is created over it. Run 'mythical-ctl state repair': %w", ferr)
 		}
-		return adoptOwned(ctx, objs, rec)
+		return adoptOwned(ctx, objs, rec, name)
 	default:
 		return "", fmt.Errorf("netref: whether a network create was already under way could not be read from the\n"+
 			"  ledger. A network is never reissued (D38), and starting a second create here is\n"+
@@ -267,17 +285,18 @@ func OwnedEnsure(ctx context.Context, l *ledger.Ledger, objs Objects, m Mutator,
 	if err != nil {
 		return "", err
 	}
-	if err := intent.Open(l, prov.ClassNetwork, name, nonce, d.Now()); err != nil {
-		return "", err
-	}
 	p, err := engine.NewProvenance(ident, nonce)
 	if err != nil {
 		return "", err
 	}
-	// THE INTENT IS DURABLE BEFORE THE NETWORK EXISTS. A network is never reissued (D38), so an
-	// unaccounted one created by a crashed run is not something a later run can create its way out
-	// of — it has to be found by the record this barrier makes durable.
-	if err := barrier(d, "create the family network"); err != nil {
+	// THE INTENT IS DURABLE BEFORE THE NETWORK EXISTS, and the open and the write are ONE step. A
+	// network is never reissued (D38), so an unaccounted one created by a crashed run is not
+	// something a later run can create its way out of — it has to be found by this record. And a
+	// FAILED write must leave no intent behind either, or the retry finds one and refuses under
+	// D38 rather than creating the network that was never created.
+	if err := staged(d, l, "create the family network", func(c *ledger.Ledger) error {
+		return intent.Open(c, prov.ClassNetwork, name, nonce, d.Now())
+	}); err != nil {
 		return "", err
 	}
 	id, cerr := m.NetworkCreate(ctx, name, p)

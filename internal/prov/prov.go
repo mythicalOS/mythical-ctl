@@ -446,7 +446,14 @@ func TombstoneFind(l *ledger.Ledger, class Class, name string) ([]ledger.Field, 
 	return l.Find(kindTomb, "key", key(class, name))
 }
 
-// normalizeLabel folds the runtime's spellings of ABSENT into one.
+// NormalizeLabel folds the runtime's spellings of ABSENT into one.
+//
+// EXPORTED because it is the reference's SHARED reader rule: its `_mi_intent_label` normalizes,
+// and every caller — deletion authority, reconciliation's ownership question, and the unaccounted
+// classifier — reads labels through it. A copy per package is a rule that drifts, and a package
+// that skips it reads a label MEANING absent as a real value: an object at one of our own derived
+// names labelled `installation=<no value>` would classify as another installation's rather than as
+// the unlabelled collision that blocks creation.
 //
 // The reference read labels through a Go TEMPLATE, whose `index` on a label map with no such key
 // prints `<no value>` rather than the empty string — so absence arrived spelled two ways depending
@@ -454,7 +461,7 @@ func TombstoneFind(l *ledger.Ledger, class Class, name string) ([]ledger.Field, 
 // template: an absent key is an absent map key, one spelling. The literal is still folded here
 // because a REAL label whose value is that string says nothing about ownership either, and it
 // cannot collide with a genuine identity (a minted one is `i` + 10 hex digits).
-func normalizeLabel(s string) string {
+func NormalizeLabel(s string) string {
 	if strings.TrimSpace(s) == "<no value>" {
 		return ""
 	}

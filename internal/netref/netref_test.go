@@ -144,9 +144,18 @@ type fakeMut struct {
 	discSilent  map[string]bool
 	// onDisconnect fires before each detach, so a test can observe what DISK held at that moment.
 	onDisconnect func()
+	// atCreateEntry fires as the FIRST thing NetworkCreate does — the instant the daemon would be
+	// asked to create. Inspecting disk after the call returns cannot tell "written before" from
+	// "written after", which is the ordering under test.
+	atCreateEntry func()
+	createCalls   int
 }
 
 func (m *fakeMut) NetworkCreate(_ context.Context, name string, _ engine.Provenance) (string, error) {
+	if m.atCreateEntry != nil {
+		m.atCreateEntry()
+	}
+	m.createCalls++
 	id := "netid-" + name
 	m.objs.network(name, id)
 	return id, nil
@@ -243,7 +252,9 @@ func (p *fakeProbe) Resolve(_ context.Context, _ *trust.Index, n, alias string) 
 
 type fakeAttach struct{ err map[string]error }
 
-func (f fakeAttach) VerifyAttach(_ context.Context, c, _, _ string) error { return f.err[c] }
+func (f fakeAttach) VerifyAttach(_ context.Context, _ *ledger.Ledger, c, _, _ string) error {
+	return f.err[c]
+}
 
 type fakeLive struct {
 	err map[string]error
@@ -252,7 +263,7 @@ type fakeLive struct {
 	pr   *fakeProbe
 }
 
-func (f fakeLive) VerifyLive(_ context.Context, _ *trust.Index, c, netID, alias string) error {
+func (f fakeLive) VerifyLive(_ context.Context, _ *ledger.Ledger, _ *trust.Index, c, netID, alias string) error {
 	if err := f.err[c]; err != nil {
 		return err
 	}
@@ -306,9 +317,18 @@ type rig struct {
 func newRig(t *testing.T) *rig {
 	t.Helper()
 	l := &ledger.Ledger{}
+	// A FIXED identity, seeded rather than minted: the container names in this file are constants
+	// of the form mythical-<identity>-<product>, and the alias derivation reads the product back
+	// out of that shape. With a randomly minted identity the two disagree, and every alias lookup
+	// refuses — which is exactly what a fixture that quietly supplied a `product` field used to
+	// hide.
+	l.ReplaceLines([]string{"identity\tid=i0123456789"})
 	id, err := l.IdentEnsure()
 	if err != nil {
 		t.Fatal(err)
+	}
+	if id != "i0123456789" {
+		t.Fatalf("the seeded identity was not adopted: %q", id)
 	}
 	objs := newObjs()
 	mut := &fakeMut{objs: objs, discSilent: map[string]bool{}}
@@ -333,7 +353,7 @@ func newRig(t *testing.T) *rig {
 	// A WORKING PERSISTENCE SEAM BY DEFAULT. The write-ahead barrier refuses without one, so the
 	// cases that assert THAT install their own; r.dk is what the durability cases read back.
 	r.dk = &disk{}
-	r.d.Persist = r.dk.persistFrom(l)
+	r.d.Persist = r.dk.persist()
 	return r
 }
 
@@ -347,8 +367,8 @@ type disk struct {
 	err    error
 }
 
-func (dk *disk) persistFrom(l *ledger.Ledger) func() error {
-	return func() error {
+func (dk *disk) persist() func(*ledger.Ledger) error {
+	return func(l *ledger.Ledger) error {
 		if dk.err != nil {
 			return dk.err
 		}
@@ -375,7 +395,10 @@ func (r *rig) fleet(t *testing.T, containers ...string) {
 		if c == c2 {
 			product = "saga"
 		}
-		if err := prov.Record(r.l, prov.ClassContainer, c, "n-"+c, ledger.Field{Key: "product", Value: product}); err != nil {
+		// NO `product` FIELD. Nothing writes one for a container — the confirmation records only
+		// `id=` — so a fixture that supplied one would hide the very break this file must exercise:
+		// the alias is derived from the NAME.
+		if err := prov.Record(r.l, prov.ClassContainer, c, "n-"+c); err != nil {
 			t.Fatal(err)
 		}
 		r.objs.nets[c] = []NetAttach{{NetworkID: src, Address: addrFor(c, src)}}
@@ -615,7 +638,7 @@ func TestRebindWithNoContainers(t *testing.T) {
 	// NOTHING TO MIGRATE: the new id is recorded directly, and no phase runs.
 	r := newRig(t)
 	r.objs.network("opnet", tgt)
-	if err := Rebind(ctx, r.l, r.d, tgt); err != nil {
+	if _, err := Rebind(ctx, r.l, r.d, tgt); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := MigGet(r.l); !errors.Is(err, ErrNoMigration) {
@@ -1035,7 +1058,7 @@ func TestResumeContinuesForward(t *testing.T) {
 	r.fleet(t, c1)
 	r.objs.network("opnet", tgt)
 	r.runTo(t, 2) // crash after phase 2
-	if err := MigResume(ctx, r.l, r.d); err != nil {
+	if _, err := MigResume(ctx, r.l, r.d); err != nil {
 		t.Fatal(err)
 	}
 	// It converged: the reference is committed, the intent is gone, and nothing was re-connected
@@ -1064,7 +1087,7 @@ func TestResumeContinuesForward(t *testing.T) {
 	if before == 0 {
 		t.Fatal("phase 3 never probed source egress, so this instrument measures nothing")
 	}
-	if err := MigResume(context.Background(), r2.l, r2.d); err != nil {
+	if _, err := MigResume(context.Background(), r2.l, r2.d); err != nil {
 		t.Fatal(err)
 	}
 	if got := r2.pr.egressCalls[src]; got != before {
@@ -1084,7 +1107,7 @@ func TestResumeRefusesIncompleteIntents(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	err := MigResume(ctx, r.l, r.d)
+	_, err := MigResume(ctx, r.l, r.d)
 	if err == nil || !strings.Contains(err.Error(), "names no source network") {
 		t.Fatalf("target-only intent: %v", err)
 	}
@@ -1101,7 +1124,7 @@ func TestResumeRefusesIncompleteIntents(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	err = MigResume(ctx, r2.l, r2.d)
+	_, err = MigResume(ctx, r2.l, r2.d)
 	if err == nil || !strings.Contains(err.Error(), "not a number") {
 		t.Fatalf("non-numeric phase: %v", err)
 	}
@@ -1114,7 +1137,7 @@ func TestResumeRefusesIncompleteIntents(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := MigResume(ctx, r3.l, r3.d); err == nil {
+	if _, err := MigResume(ctx, r3.l, r3.d); err == nil {
 		t.Fatal("an intent with no target resumed")
 	}
 }
@@ -1131,8 +1154,15 @@ func TestForwardOnlyMigration(t *testing.T) {
 	// The source disappears mid-migration, and the container is already only on the target.
 	delete(r.objs.live, src)
 	r.objs.nets[c1] = []NetAttach{{NetworkID: tgt, Address: addrFor(c1, tgt)}}
-	if err := MigResume(ctx, r.l, r.d); err != nil {
+	advisory, err := MigResume(ctx, r.l, r.d)
+	if err != nil {
 		t.Fatalf("a forward-only migration wedged: %v", err)
+	}
+	// AND IT IS NAMED AS SUCH. This is the SUCCESS path, so the statement travels as a return
+	// value — it says plainly that there is nothing to roll back to, rather than hiding behind a
+	// rollback promise that could not be kept.
+	if !strings.Contains(advisory, "forward-only") {
+		t.Fatalf("a forward-only migration was not named as one: %q", advisory)
 	}
 	if _, err := MigGet(r.l); !errors.Is(err, ErrNoMigration) {
 		t.Fatal("a forward-only migration did not converge")
@@ -1163,7 +1193,7 @@ func TestRebindOffOwnedNetwork(t *testing.T) {
 	}
 	r.fleet(t, c1)
 	r.objs.network("opnet", tgt)
-	if err := Rebind(ctx, r.l, r.d, tgt); err != nil {
+	if _, err := Rebind(ctx, r.l, r.d, tgt); err != nil {
 		t.Fatal(err)
 	}
 	id, err := RefGet(r.l)
@@ -1182,7 +1212,7 @@ func TestRebindOffOwnedNetwork(t *testing.T) {
 	r2 := newRig(t)
 	r2.fleet(t, c1)
 	r2.runTo(t, 2)
-	err = Rebind(ctx, r2.l, r2.d, nOther)
+	_, err = Rebind(ctx, r2.l, r2.d, nOther)
 	if err == nil || !strings.Contains(err.Error(), "already recorded") {
 		t.Fatalf("second migration: %v", err)
 	}
@@ -1206,7 +1236,7 @@ func TestRecordedPhaseMustBeOneOfTheSix(t *testing.T) {
 		if _, err := MigGet(r.l); err == nil {
 			t.Errorf("phase %q was read as a phase", bad)
 		}
-		err := MigResume(context.Background(), r.l, r.d)
+		_, err := MigResume(context.Background(), r.l, r.d)
 		if err == nil {
 			t.Errorf("phase %q resumed successfully without doing anything", bad)
 			continue
@@ -1236,21 +1266,22 @@ func TestOwnedNetworkIntentIsDurableBeforeTheCreate(t *testing.T) {
 	// The daemon accepts the create and the process dies. A NETWORK IS NEVER REISSUED (D38), so an
 	// unaccounted one is not something a later run can create its way out of — it has to be found
 	// by the record this barrier makes durable.
+	// Snapshot disk AT THE CREATE CALL, not after it returns.
+	var atCreate []string
+	r.mut.atCreateEntry = func() { atCreate = append([]string(nil), r.dk.lines...) }
 	if _, err := OwnedEnsure(ctx, r.l, r.objs, r.mut, r.d.Deps); err != nil {
 		t.Fatal(err)
 	}
-	if r.dk.writes == 0 {
-		t.Fatal("nothing was ever persisted, so this proves nothing")
+	if r.mut.createCalls != 1 {
+		t.Fatalf("NetworkCreate ran %d times, so this proves nothing about the order", r.mut.createCalls)
 	}
-	// Read back ONLY what was on disk when the create was issued: the first persist is the barrier.
-	firstWrite := &ledger.Ledger{}
-	firstWrite.ReplaceLines(r.dk.lines)
-	if _, err := intent.Find(firstWrite, prov.ClassNetwork, name); err != nil {
-		// The final persist is the confirmation, so an absent intent here is only correct if the
-		// PROVENANCE is there instead — either way the network is accounted for.
-		if _, perr := prov.Find(firstWrite, prov.ClassNetwork, name); perr != nil {
-			t.Fatalf("the network was created with neither a durable intent nor durable provenance: %v / %v", err, perr)
-		}
+	// The INTENT must already be on disk at that instant. A network is never reissued (D38), so an
+	// unaccounted one is not something a later run can create its way out of — only this record
+	// can find it.
+	atCreateLedger := &ledger.Ledger{}
+	atCreateLedger.ReplaceLines(atCreate)
+	if _, err := intent.Find(atCreateLedger, prov.ClassNetwork, name); err != nil {
+		t.Fatalf("the network was created with no durable intent — nothing could account for it: %v", err)
 	}
 
 	// A PERSIST THAT FAILS STOPS THE CREATE.
@@ -1259,12 +1290,24 @@ func TestOwnedNetworkIntentIsDurableBeforeTheCreate(t *testing.T) {
 	if _, err := OwnedEnsure(ctx, r2.l, r2.objs, r2.mut, r2.d.Deps); err == nil {
 		t.Fatal("a network was created with an unpersistable intent")
 	}
+	// THE RUNTIME WAS LEFT UNTOUCHED, and the caller's ledger too: a staged intent left behind an
+	// error saying nothing was done would wedge the retry behind D38's never-reissue rule.
+	if r2.mut.createCalls != 0 {
+		t.Fatal("a network was created despite the intent not being durable")
+	}
+	name2, _ := manifest.NetworkName(r2.id)
+	if _, ferr := intent.Find(r2.l, prov.ClassNetwork, name2); !errors.Is(ferr, ledger.ErrAbsentRecord) {
+		t.Fatalf("a failed persist left an intent in the caller's ledger: %v", ferr)
+	}
 	// A MISSING seam is refused, not skipped.
 	r3 := newRig(t)
 	r3.d.Persist = nil
 	_, err := OwnedEnsure(ctx, r3.l, r3.objs, r3.mut, r3.d.Deps)
 	if err == nil || !strings.Contains(err.Error(), "no way to persist") {
 		t.Fatalf("a create with no persistence seam: %v", err)
+	}
+	if r3.mut.createCalls != 0 {
+		t.Fatal("a network was created with no persistence seam")
 	}
 }
 
@@ -1307,21 +1350,70 @@ func TestPhaseMarkerIsDurableBeforeTheDetach(t *testing.T) {
 	r2.fleet(t, c1)
 	r2.runTo(t, 3)
 	r2.dk.err = errors.New("disk full")
+	before2 := strings.Join(r2.l.Lines(), "\n")
 	if err := MigRun(ctx, r2.l, r2.d, src, tgt, 4); err == nil {
 		t.Fatal("phase 4 detached with an unpersistable marker")
 	}
 	if len(r2.mut.disconnects) != 0 {
 		t.Fatal("phase 4 detached despite the marker not being durable")
 	}
+	if got := strings.Join(r2.l.Lines(), "\n"); got != before2 {
+		t.Fatal("a failed persist advanced the phase marker in the caller's ledger")
+	}
 	// And phase 2 is barriered the same way, before it connects anything.
 	r3 := newRig(t)
 	r3.fleet(t, c1)
 	r3.runTo(t, 1)
 	r3.dk.err = errors.New("disk full")
+	before3 := strings.Join(r3.l.Lines(), "\n")
 	if err := MigRun(ctx, r3.l, r3.d, src, tgt, 2); err == nil {
 		t.Fatal("phase 2 connected with an unpersistable marker")
 	}
 	if len(r3.mut.connects) != 0 {
 		t.Fatal("phase 2 connected despite the marker not being durable")
+	}
+	if got := strings.Join(r3.l.Lines(), "\n"); got != before3 {
+		t.Fatal("a failed persist advanced the phase marker in the caller's ledger")
+	}
+}
+
+func TestMigrationConsumesOnlyDescribingRecords(t *testing.T) {
+	ctx := context.Background()
+	// A RECORD KEYED FOR ONE OBJECT WHILE DESCRIBING ANOTHER is conflicting evidence, and both
+	// places that consume a provenance field here would otherwise act on the OTHER object's data:
+	// the alias path would derive an alias for it (which phase 2 attaches and phase 3 then
+	// "verifies" against itself), and owned-network adoption would return its id — the network the
+	// whole family is then attached to.
+	//
+	// The reference reads both fields without asking the question; this closes it in Go, as Wave 3
+	// closed the same class for the root-overlap and protected-set blind spots.
+	r := newRig(t)
+	r.fleet(t, c1)
+	// Replace the container's record with one keyed for it but describing something else.
+	lines := []string{}
+	for _, line := range r.l.Lines() {
+		if strings.Contains(line, "key=container:"+c1) {
+			line = "object\tkey=container:" + c1 + "\tclass=volume\tname=elsewhere\tnonce=x\tgen=1"
+		}
+		lines = append(lines, line)
+	}
+	r.l.ReplaceLines(lines)
+	err := MigRun(ctx, r.l, r.d, src, tgt, 2)
+	if err == nil || !strings.Contains(err.Error(), "does not describe it") {
+		t.Fatalf("the migration consumed a record about another object: %v", err)
+	}
+	if len(r.mut.connects) != 0 {
+		t.Fatal("the fleet was connected on the strength of a record about something else")
+	}
+
+	// The same question, on the owned-network side.
+	r2 := newRig(t)
+	name, _ := manifest.NetworkName(r2.id)
+	r2.l.ReplaceLines(append(r2.l.Lines(),
+		"object\tkey=network:"+name+"\tclass=network\tname=someone-elses\tnonce=x\tgen=1\tid="+src))
+	r2.objs.live[src] = true
+	_, err = OwnedEnsure(ctx, r2.l, r2.objs, r2.mut, r2.d.Deps)
+	if err == nil || !strings.Contains(err.Error(), "does not describe it") {
+		t.Fatalf("owned-network adoption consumed a record about another object: %v", err)
 	}
 }

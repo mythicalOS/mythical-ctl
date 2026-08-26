@@ -769,8 +769,16 @@ func TestAbandonClearsTheIntent(t *testing.T) {
 	l, _ := identLedger(t)
 	mustOpen(t, l, prov.ClassNetwork, "net", "n1")
 	f := newFake()
-	if err := Abandon(ctx, l, f, prov.ClassNetwork, "net", fixedNow.Add(time.Hour), DefaultGrace); err != nil {
+	advisory, err := Abandon(ctx, l, f, prov.ClassNetwork, "net", fixedNow.Add(time.Hour), DefaultGrace)
+	if err != nil {
 		t.Fatal(err)
+	}
+	// AND IT SAYS SO. Abandonment does NOT guarantee convergence, and the operator is told: the
+	// installer cannot distinguish "never created" from "not yet visible". This is a SUCCESS-path
+	// statement, so it travels as a return value — an error has no channel for one, and a warning
+	// written into the void could not be asserted at all.
+	if !strings.Contains(advisory, "may still appear") {
+		t.Fatalf("a successful abandonment said nothing about convergence: %q", advisory)
 	}
 	if _, err := Find(l, prov.ClassNetwork, "net"); !errors.Is(err, ledger.ErrAbsentRecord) {
 		t.Fatalf("the intent survived abandonment: %v", err)
@@ -783,8 +791,12 @@ func TestAbandonClearsTheIntent(t *testing.T) {
 	// And a refused abandonment consumes nothing.
 	l2, _ := identLedger(t)
 	mustOpen(t, l2, prov.ClassNetwork, "net", "n1")
-	if err := Abandon(ctx, l2, f, prov.ClassNetwork, "net", fixedNow, DefaultGrace); err == nil {
+	advisory, err = Abandon(ctx, l2, f, prov.ClassNetwork, "net", fixedNow, DefaultGrace)
+	if err == nil {
 		t.Fatal("abandoned inside the grace period")
+	}
+	if advisory != "" {
+		t.Fatalf("a refused abandonment still advised the operator: %q", advisory)
 	}
 	if _, err := Find(l2, prov.ClassNetwork, "net"); err != nil {
 		t.Fatal("a refused abandonment dropped the intent")
@@ -1111,4 +1123,38 @@ func (f *fakeObjs) answersNonceErr(key string) {
 		f.nonceErr = map[string]bool{}
 	}
 	f.nonceErr[key] = true
+}
+
+func TestGateNormalizesAbsentLabels(t *testing.T) {
+	ctx := context.Background()
+	// A LABEL MEANING ABSENT MUST READ AS ABSENT. The reference routes every label read through one
+	// normalizing reader, so `<no value>` — the spelling its template produced for a missing key —
+	// is absence everywhere. Skipping it here classifies an object at one of OUR OWN derived names
+	// as another installation's (unattributed, which the gate lets past) instead of the unlabelled
+	// COLLISION that must block creation.
+	l, id, f := gateFixture(t)
+	name := manifest.NamePrefix + "-" + id + "-brokkr-state"
+	f.put(prov.ClassVolume, name, map[string]string{prov.LabelInstall: "<no value>"})
+	err := UnaccountedGate(ctx, l, f)
+	if err == nil {
+		t.Fatal("an object at one of our own names with an absent-meaning label did not stop the gate")
+	}
+	if !strings.Contains(err.Error(), "holds a name this installer would create") {
+		t.Fatalf("classified as something other than a collision: %v", err)
+	}
+}
+
+func TestReconcileNormalizesAbsentLabels(t *testing.T) {
+	ctx := context.Background()
+	// The same rule on the ownership question: `<no value>` is NOT another installation's identity,
+	// it is no identity at all — so the refusal must be "carries no label", not "belongs to
+	// installation <no value>".
+	l, _ := identLedger(t)
+	mustOpen(t, l, prov.ClassVolume, "v1", "n1")
+	f := newFake()
+	f.put(prov.ClassVolume, "v1", map[string]string{prov.LabelInstall: "<no value>", prov.LabelNonce: "n1"})
+	err := Reconcile(ctx, l, f, nil, prov.ClassVolume, "v1")
+	if err == nil || !strings.Contains(err.Error(), "NO installation label") {
+		t.Fatalf("an absent-meaning label read as a real identity: %v", err)
+	}
 }

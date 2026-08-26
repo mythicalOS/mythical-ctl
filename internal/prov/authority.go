@@ -102,7 +102,7 @@ func Authority(ctx context.Context, l *ledger.Ledger, objs Objects, class Class,
 	if err != nil {
 		return fmt.Errorf("prov: the container runtime could not be asked who owns %q — authorizing nothing: %w", name, err)
 	}
-	label = normalizeLabel(label)
+	label = NormalizeLabel(label)
 	if label == "" {
 		return fmt.Errorf("prov: %q carries no installation label — nothing about the object itself says this\n"+
 			"  installer created it. An unlabelled object standing at a name this installer would\n"+
@@ -129,10 +129,10 @@ func Authority(ctx context.Context, l *ledger.Ledger, objs Objects, class Class,
 	if err != nil {
 		return fmt.Errorf("prov: the container runtime could not be asked which object %q is — authorizing nothing: %w", name, err)
 	}
-	if normalizeLabel(actual) != recorded {
+	if NormalizeLabel(actual) != recorded {
 		return fmt.Errorf("prov: %q carries nonce %q but the ledger recorded %q — it does not match.\n"+
 			"  A name can be reassigned to an object this installer never created, so this is\n"+
-			"  PRESERVED and reported rather than removed.", name, normalizeLabel(actual), recorded)
+			"  PRESERVED and reported rather than removed.", name, NormalizeLabel(actual), recorded)
 	}
 	return nil
 }

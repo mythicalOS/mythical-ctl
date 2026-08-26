@@ -59,6 +59,13 @@ func classify(ctx context.Context, l *ledger.Ledger, objs Objects, class prov.Cl
 	if err != nil {
 		return FindingUnasked
 	}
+	// THE SHARED LABEL RULE, not a local comparison: a label MEANING absent must read as absent
+	// here exactly as it does in deletion authority. Without it, an object standing at one of this
+	// installation's own derived names but labelled `installation=<no value>` classifies as
+	// ANOTHER installation's — which the gate lets past — instead of the unlabelled collision that
+	// blocks creation. The reference routes every label read through one normalizing reader for
+	// precisely this reason.
+	lident = prov.NormalizeLabel(lident)
 	if lident == "" {
 		// UNLABELLED. Only a name this installer would create matters: anything else on the daemon
 		// is simply not ours to have an opinion about.
@@ -77,6 +84,7 @@ func classify(ctx context.Context, l *ledger.Ledger, objs Objects, class prov.Cl
 	if err != nil {
 		return FindingUnasked
 	}
+	lnonce = prov.NormalizeLabel(lnonce)
 	// A provenance record accounts for it, or an OPEN INTENT does — an object mid-creation is
 	// accounted for by the record that says it was about to be created.
 	rec, ferr := prov.Find(l, class, name)

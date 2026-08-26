@@ -116,14 +116,26 @@ func Abandonable(ctx context.Context, l *ledger.Ledger, objs Objects, class prov
 	return nil
 }
 
-// Abandon drops an intent that Abandonable has cleared.
+// AbandonAdvisory is what a successful abandonment obliges the caller to tell the operator.
 //
-// It does NOT guarantee convergence, and says so: the installer cannot distinguish "never created"
-// from "not yet visible", so the object may still appear later. If it does, it is caught as an
-// unrecorded same-identity object and the next operation stops and reports it.
-func Abandon(ctx context.Context, l *ledger.Ledger, objs Objects, class prov.Class, name string, now time.Time, grace time.Duration) error {
+// IT IS RETURNED AS DATA rather than written somewhere, because it is a SUCCESS-path statement and
+// a Go error has no channel for one. The reference prints it from the same function that succeeds;
+// here the verb layer owns operator output, so the sentence travels to it as a value — a caller
+// that drops it is visibly dropping something, which a warning written into the void would not be.
+const AbandonAdvisory = "intent: abandoning the recorded intent. The object may still appear later.\n" +
+	"  This does NOT guarantee convergence: the installer cannot distinguish 'never created'\n" +
+	"  from 'not yet visible', so the object may still appear later. If it does, it is caught as\n" +
+	"  an unrecorded same-identity object and the next operation will stop and report it."
+
+// Abandon drops an intent that Abandonable has cleared, and returns the advisory the caller must
+// surface (see AbandonAdvisory). On refusal the advisory is empty — there is nothing to say about
+// an abandonment that did not happen.
+func Abandon(ctx context.Context, l *ledger.Ledger, objs Objects, class prov.Class, name string, now time.Time, grace time.Duration) (string, error) {
 	if err := Abandonable(ctx, l, objs, class, name, now, grace); err != nil {
-		return err
+		return "", err
 	}
-	return Drop(l, class, name)
+	if err := Drop(l, class, name); err != nil {
+		return "", err
+	}
+	return AbandonAdvisory, nil
 }

@@ -52,15 +52,20 @@ type Prober interface {
 // consumes this package's migration records (its own attach check permits {source,target} during a
 // migration), so an import in this direction would be a cycle. The seam is the one function this
 // package needs of it.
+//
+// IT TAKES THE LEDGER. bring-up's check reads the migration record to decide the permitted set, so
+// it must read the SAME ledger this phase is advancing — a verifier holding its own would answer
+// from stale migration bounds while the phase writes to a fresh one, which is precisely the
+// mismatch the adapter claims to prevent. Passing it through leaves no way to hold the wrong one.
 type AttachVerifier interface {
-	VerifyAttach(ctx context.Context, container, netID, alias string) error
+	VerifyAttach(ctx context.Context, l *ledger.Ledger, container, netID, alias string) error
 }
 
 // LiveVerifier is bring-up's live check, injected for the same reason. ErrProbeUnavailable
 // distinguishes "the probe did not run" from "the check failed" — the former stops the migration
 // without detaching, because nothing was established either way.
 type LiveVerifier interface {
-	VerifyLive(ctx context.Context, ix *trust.Index, container, netID, alias string) error
+	VerifyLive(ctx context.Context, l *ledger.Ledger, ix *trust.Index, container, netID, alias string) error
 }
 
 // ErrProbeUnavailable is what a LiveVerifier returns when the probe itself could not run.
@@ -186,9 +191,25 @@ func fleetFor(ctx context.Context, l *ledger.Ledger, objs Objects) ([]string, er
 	}
 }
 
-// aliasFor derives a container's family alias from its PROVENANCE RECORD. A container carrying
-// this installation's label that the ledger has no record of stops the migration: migrating a
-// fleet we cannot enumerate is migrating one we cannot verify.
+// aliasFor derives a container's family alias.
+//
+// THE RECORD IS THE PERMISSION, THE NAME IS THE DERIVATION — and the two are separate questions.
+//
+// A container carrying this installation's label that the ledger has no record of stops the
+// migration: migrating a fleet we cannot enumerate is migrating one we cannot verify. That is
+// what the provenance lookup is for, and the record must also DESCRIBE this container — a record
+// keyed for it while describing something else is conflicting evidence, and consuming it here
+// would derive an alias for the OTHER object, which phase 2 would then attach and phase 3 would
+// "verify" against itself. (The reference reads the record's `product` field without asking that
+// question; the same latent blind spot as its root-overlap one, closed here rather than carried.)
+//
+// The alias itself is derived from the NAME, not from a `product` field — because nothing writes
+// that field for a container. Both this port and the reference record a container's provenance as
+// key/class/name/nonce/gen/id (the confirmation passes only `id=`), so a `product` lookup refuses
+// EVERY container the bring-up path creates: in the reference, network migration of a real fleet
+// could never derive a single alias. The name is authoritative and always present — it is
+// `mythical-<identity>-<product>`, the same decomposition internal/state uses for its
+// storage-migration question.
 func aliasFor(l *ledger.Ledger, container string) (string, error) {
 	rec, err := prov.Find(l, prov.ClassContainer, container)
 	if errors.Is(err, ledger.ErrAbsentRecord) {
@@ -199,13 +220,17 @@ func aliasFor(l *ledger.Ledger, container string) (string, error) {
 		return "", fmt.Errorf("netref: whether %q is recorded could not be read from the ledger, so the fleet cannot be\n"+
 			"  enumerated. Stopping: %w", container, err)
 	}
-	product, ok := ledger.FieldOf(rec, "product")
-	if !ok {
-		return "", fmt.Errorf("netref: the record for %q names no product, so its alias cannot be derived. Stopping.", container)
+	if derr := prov.Describes(rec, prov.ClassContainer, container); derr != nil {
+		return "", derr
 	}
-	if product == "" {
-		return "", fmt.Errorf("netref: the record for %q names an EMPTY product, so its alias cannot be derived.\n"+
-			"  Stopping. Run 'mythical-ctl state repair'.", container)
+	ident, ierr := l.IdentGet()
+	if ierr != nil {
+		return "", ierr
+	}
+	product, ok := strings.CutPrefix(container, manifest.NamePrefix+"-"+ident+"-")
+	if !ok || product == "" {
+		return "", fmt.Errorf("netref: %q is not shaped like one of this installation's containers, so the product\n"+
+			"  its alias is derived from cannot be read out of it. Stopping rather than guessing.", container)
 	}
 	return manifest.Alias(product)
 }
@@ -347,15 +372,13 @@ func MigRun(ctx context.Context, l *ledger.Ledger, d MigDeps, src, tgt string, p
 		// CONNECT EVERY CONTAINER BEFORE ANY LEAVES THE OLD NETWORK. The target goes on at a
 		// LOWER gateway priority (-1) than the source, so attaching it does not move the default
 		// route out from under a running fleet mid-migration.
-		if err := migRecord(l, 2, src, tgt, cs); err != nil {
-			return err
-		}
-		// THE PHASE MARKER IS DURABLE BEFORE THE PHASE ACTS. A crash part-way through the connects
-		// with disk still saying phase 1 would re-run phase 2, which is harmless; a crash with
-		// disk saying nothing at all would leave containers attached to the target with no record
-		// that a migration is under way — and bring-up's exact-set check would then refuse every
-		// one of them.
-		if err := barrier(d.Deps, "connect the fleet to the target network"); err != nil {
+		// THE PHASE MARKER IS DURABLE BEFORE THE PHASE ACTS, and recording it is ONE step with the
+		// write. A crash with disk saying nothing at all would leave containers attached to the
+		// target with no record that a migration is under way — and bring-up's exact-set check
+		// would then refuse every one of them.
+		if err := staged(d.Deps, l, "connect the fleet to the target network", func(c *ledger.Ledger) error {
+			return migRecord(c, 2, src, tgt, cs)
+		}); err != nil {
 			return err
 		}
 		for _, c := range cs {
@@ -390,15 +413,14 @@ func MigRun(ctx context.Context, l *ledger.Ledger, d MigDeps, src, tgt string, p
 		if err := admits(l, 4, src, tgt, 3, 4); err != nil {
 			return err
 		}
-		if err := migRecord(l, 4, src, tgt, cs); err != nil {
-			return err
-		}
 		// THE MARKER IS DURABLE BEFORE THE FIRST DETACH — this is the destructive phase, and the
 		// one where a stale marker wedges the migration. If disk still said phase 3 while some
 		// containers were already detached, a resume would re-run phase 3, whose exact-set check
 		// requires {source,target}, and REFUSE exactly the containers this phase had already
 		// finished. The fleet would be half-migrated with no phase to move forward from.
-		if err := barrier(d.Deps, "detach the fleet from the source network"); err != nil {
+		if err := staged(d.Deps, l, "detach the fleet from the source network", func(c *ledger.Ledger) error {
+			return migRecord(c, 4, src, tgt, cs)
+		}); err != nil {
 			return err
 		}
 		for _, c := range cs {
@@ -503,7 +525,7 @@ func migPhase3(ctx context.Context, l *ledger.Ledger, d MigDeps, src, tgt string
 			// A STOPPED container has no address to answer with, so its check is DEFERRED — but
 			// only once it is confirmed attached to the target.
 			if srcPresent {
-				if verr := d.Attach.VerifyAttach(ctx, c, tgt, alias); verr != nil {
+				if verr := d.Attach.VerifyAttach(ctx, l, c, tgt, alias); verr != nil {
 					return fmt.Errorf("netref: phase 3: %q is stopped and is NOT confirmed attached to the target\n"+
 						"  network — a connect returned success but the attachment is not there. Stopping\n"+
 						"  without detaching: %w", c, verr)
@@ -526,7 +548,7 @@ func migPhase3(ctx context.Context, l *ledger.Ledger, d MigDeps, src, tgt string
 			continue
 		}
 		if srcPresent {
-			verr := d.Live.VerifyLive(ctx, d.Index, c, tgt, alias)
+			verr := d.Live.VerifyLive(ctx, l, d.Index, c, tgt, alias)
 			if errors.Is(verr, ErrProbeUnavailable) {
 				return fmt.Errorf("netref: phase 3 could not verify %q — the probe itself did not run, so nothing was\n"+
 					"  established either way. Stopping without detaching: %w", c, verr)
@@ -557,43 +579,59 @@ func migPhase3(ctx context.Context, l *ledger.Ledger, d MigDeps, src, tgt string
 	return migRecord(l, 3, src, tgt, cs)
 }
 
+// ForwardOnlyAdvisory is what a resume must tell the operator when the SOURCE network is gone.
+//
+// Returned as data for the same reason as intent.AbandonAdvisory: it is a success-path statement,
+// and it is load-bearing — it says plainly that there is nothing to roll back to, rather than
+// hiding behind a rollback promise that could not be kept.
+const ForwardOnlyAdvisory = "netref: the previous network no longer exists, so this migration is forward-only:\n" +
+	"  there is nothing to detach and nothing to return to. Phases 3 and 5 verify each container\n" +
+	"  against exactly {target} rather than {source,target}, so the migration completes FORWARD\n" +
+	"  rather than wedging on a source that is gone."
+
 // MigResume reads the recorded phase and CONTINUES FORWARD — never unwinds. Once containers are on
-// both networks there is nothing to unwind to.
-func MigResume(ctx context.Context, l *ledger.Ledger, d MigDeps) error {
+// both networks there is nothing to unwind to. It returns the advisory the caller must surface
+// (empty unless the migration turned out to be forward-only).
+func MigResume(ctx context.Context, l *ledger.Ledger, d MigDeps) (string, error) {
 	mig, err := MigGet(l)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if mig.Source == "" {
-		return errors.New("netref: the recorded migration intent names no source network.\n" +
+		return "", errors.New("netref: the recorded migration intent names no source network.\n" +
 			"  Phase 4 cannot know what to detach, and after a crash there is no other way to learn it:\n" +
 			"  the containers may by then be on two networks with nothing to say which was the old one.\n" +
 			"  An intent naming only the target cannot complete its own migration. Manual recovery:\n" +
 			"  inspect each container's attachments and detach the one that is not the target.")
 	}
 	if mig.Target == "" {
-		return errors.New("netref: the recorded migration intent names no target network, so there is nothing to\n" +
+		return "", errors.New("netref: the recorded migration intent names no target network, so there is nothing to\n" +
 			"  migrate onto. It is PRESERVED and reported. Run 'mythical-ctl state repair'.")
 	}
 	// A source that is GONE makes this FORWARD-ONLY, which is stated rather than hidden behind a
 	// rollback promise that could not be kept. A source that could not be ASKED about stops.
-	if _, perr := sourcePresence(ctx, d.Objs, mig.Source); perr != nil {
-		return fmt.Errorf("netref: whether the previous network (%s) still exists could not be established, so\n"+
+	present, perr := sourcePresence(ctx, d.Objs, mig.Source)
+	if perr != nil {
+		return "", fmt.Errorf("netref: whether the previous network (%s) still exists could not be established, so\n"+
 			"  nothing is resumed. A detach planned against a network we could not ask about is a\n"+
 			"  detach planned in the dark: %w", mig.Source, perr)
 	}
+	advisory := ""
+	if !present {
+		advisory = ForwardOnlyAdvisory
+	}
 	for p := mig.Phase; p <= phaseLast; p++ {
 		if err := MigRun(ctx, l, d, mig.Source, mig.Target, p); err != nil {
-			return err
+			return "", err
 		}
 	}
-	return nil
+	return advisory, nil
 }
 
 // Rebind starts a migration onto `target` and runs it to completion.
-func Rebind(ctx context.Context, l *ledger.Ledger, d MigDeps, target string) error {
+func Rebind(ctx context.Context, l *ledger.Ledger, d MigDeps, target string) (string, error) {
 	if target == "" {
-		return errors.New("netref: a rebind needs a resolved target network id, not an empty one.")
+		return "", errors.New("netref: a rebind needs a resolved target network id, not an empty one.")
 	}
 	// A SECOND MIGRATION OVER A FIRST would write over the only record of where the fleet came
 	// from.
@@ -601,24 +639,25 @@ func Rebind(ctx context.Context, l *ledger.Ledger, d MigDeps, target string) err
 	switch {
 	case errors.Is(merr, ErrNoMigration):
 	case merr == nil:
-		return errors.New("netref: a network migration is already recorded. Refusing to start a second one over\n" +
+		return "", errors.New("netref: a network migration is already recorded. Refusing to start a second one over\n" +
 			"  it — its intent is the only record of where the fleet came from. Resume it with\n" +
 			"  'mythical-ctl net rebind'.")
 	default:
-		return fmt.Errorf("netref: whether a migration is already under way could not be read from the ledger.\n"+
+		return "", fmt.Errorf("netref: whether a migration is already under way could not be read from the ledger.\n"+
 			"  Starting one now would write over an intent nobody could read. Nothing is started: %w", merr)
 	}
 	ident, ierr := l.IdentGet()
 	if ierr != nil {
-		return ierr
+		return "", ierr
 	}
 	cs, cerr := d.Objs.ContainersByInstall(ctx, ident)
 	if cerr != nil {
-		return cerr
+		return "", cerr
 	}
 	if len(cs) == 0 {
-		// NOTHING TO MIGRATE: record the new reference directly.
-		return RefCommit(ctx, l, d.Objs, target, d.Configured)
+		// NOTHING TO MIGRATE: record the new reference directly, and there is no advisory — no
+		// fleet moved, so nothing about rollback needs saying.
+		return "", RefCommit(ctx, l, d.Objs, target, d.Configured)
 	}
 	src, serr := RefGet(l)
 	switch {
@@ -626,29 +665,29 @@ func Rebind(ctx context.Context, l *ledger.Ledger, d MigDeps, target string) err
 	case errors.Is(serr, ErrNoReference):
 		oname, nerr := manifest.NetworkName(ident)
 		if nerr != nil {
-			return nerr
+			return "", nerr
 		}
 		rec, perr := prov.Find(l, prov.ClassNetwork, oname)
 		switch {
 		case perr == nil:
-			src, serr = adoptOwned(ctx, d.Objs, rec)
+			src, serr = adoptOwned(ctx, d.Objs, rec, oname)
 			if serr != nil {
-				return serr
+				return "", serr
 			}
 		case errors.Is(perr, ledger.ErrAbsentRecord):
-			return errors.New("netref: there is no reference to migrate FROM and no installer-owned network is\n" +
+			return "", errors.New("netref: there is no reference to migrate FROM and no installer-owned network is\n" +
 				"  recorded, yet containers exist — where the fleet is cannot be established, so\n" +
 				"  phase 4 would not know what to detach. Run 'mythical-ctl state repair'.")
 		default:
-			return fmt.Errorf("netref: whether this installation has its own network could not be read, so the\n"+
+			return "", fmt.Errorf("netref: whether this installation has its own network could not be read, so the\n"+
 				"  migration source is unknown. Nothing is started: %w", perr)
 		}
 	default:
-		return fmt.Errorf("netref: the recorded network reference could not be read, so phase 4 would not know what\n"+
+		return "", fmt.Errorf("netref: the recorded network reference could not be read, so phase 4 would not know what\n"+
 			"  to detach. Nothing is started: %w", serr)
 	}
 	if err := MigRun(ctx, l, d, src, target, 1); err != nil {
-		return err
+		return "", err
 	}
 	return MigResume(ctx, l, d)
 }

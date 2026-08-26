@@ -529,3 +529,29 @@ func (l *Ledger) Append(kind string, fields []Field) error {
 	l.lines = append(l.lines, serialize(kind, fields))
 	return nil
 }
+
+// --- staging a candidate edit (Task 21 / Wave 4 gate) --------------------------------------------
+// The write-ahead callers (internal/bringup, internal/netref) must make an edit, PERSIST it, and
+// only then publish it into the ledger the caller holds — so that a failed write leaves the
+// caller's ledger byte-identical and a retry sees the world it actually left.
+//
+// That needs a copy and a publish. Both are offered as TYPED operations rather than through
+// Lines/ReplaceLines, because the raw-lines pair is pinned to internal/trust (check.sh's
+// boundary rule) and for good reason: it is the one door that can put arbitrary rows into a
+// ledger. These two cannot — a Clone carries exactly what it was copied from, and Adopt takes
+// another Ledger this package minted, never a caller's string slice.
+
+// Clone returns an independent copy of the ledger's body.
+func (l *Ledger) Clone() *Ledger {
+	return &Ledger{lines: append([]string(nil), l.lines...)}
+}
+
+// Adopt replaces this ledger's body with src's — the publish half of a staged edit. A nil src is
+// refused rather than silently emptying the ledger it was asked to update.
+func (l *Ledger) Adopt(src *Ledger) error {
+	if src == nil {
+		return errors.New("ledger: refusing to adopt a nil ledger — it would empty the one being updated")
+	}
+	l.lines = append([]string(nil), src.lines...)
+	return nil
+}
