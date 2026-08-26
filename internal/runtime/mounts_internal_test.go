@@ -18,7 +18,12 @@ func TestProtectedIdentitiesCoverDirectories(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	for _, fpath := range []string{"mythical.conf", "bin/mythical-ctl"} {
+	for _, d := range []string{"brokkr/nested", ".state"} {
+		if err := os.MkdirAll(filepath.Join(home, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, fpath := range []string{"mythical.conf", "bin/mythical-ctl", "brokkr/cli.toml", "brokkr/nested/artifact", ".state/ledger", "logs/x.log", "transcripts/t.txt"} {
 		if err := os.WriteFile(filepath.Join(home, fpath), []byte("#x\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -31,7 +36,10 @@ func TestProtectedIdentitiesCoverDirectories(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, p := range []string{homeCanon, homeCanon + "/bin", homeCanon + "/brokkr", homeCanon + "/mythical.conf", homeCanon + "/bin/mythical-ctl"} {
+	// The directories, their CONTENTS at any depth (the user-owned host-tool slot
+	// `<product>/cli.toml` above all — gate round-18 P1), and the two named files.
+	for _, p := range []string{homeCanon, homeCanon + "/bin", homeCanon + "/brokkr", homeCanon + "/mythical.conf", homeCanon + "/bin/mythical-ctl",
+		homeCanon + "/brokkr/cli.toml", homeCanon + "/brokkr/nested", homeCanon + "/brokkr/nested/artifact", homeCanon + "/.state", homeCanon + "/.state/ledger"} {
 		ino, ierr := identity(p)
 		if ierr != nil {
 			t.Fatal(ierr)
@@ -40,7 +48,9 @@ func TestProtectedIdentitiesCoverDirectories(t *testing.T) {
 			t.Errorf("%s missing from the protected set", p)
 		}
 	}
-	for _, p := range []string{homeCanon + "/logs", homeCanon + "/transcripts"} {
+	// The two core-fixed SOURCES and their contents are NOT protected — they are what the
+	// product is meant to write.
+	for _, p := range []string{homeCanon + "/logs", homeCanon + "/transcripts", homeCanon + "/logs/x.log", homeCanon + "/transcripts/t.txt"} {
 		ino, ierr := identity(p)
 		if ierr != nil {
 			t.Fatal(ierr)

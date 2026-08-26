@@ -205,11 +205,27 @@ func protectedIdentities(homeCanon string) (map[string]bool, error) {
 		if !st.IsDir() {
 			continue
 		}
-		ino, ierr := identity(kp)
-		if ierr != nil {
-			return nil, fmt.Errorf("runtime: %q is an installer-zone directory and its identity cannot be read — refusing rather than leaving it out of the protected set", kp)
+		// The directory AND EVERYTHING BENEATH IT: a directory's own inode protects nothing
+		// inside it — an OS-level FILE bind of `<product>/cli.toml` (the user-owned host-tool
+		// slot, holding host-only credentials) over `<product>.conf` is a regular file with a
+		// link count of 1 whose identity is cli.toml's, and only cli.toml's own inode in this
+		// set refuses it. Walked without following symlinks (Lstat identities); an entry that
+		// cannot be examined is a refusal, not one fewer member. The reference's set
+		// (mythical.conf + bin/*) has this gap too — closed here, recorded in the plan.
+		werr := filepath.WalkDir(kp, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return fmt.Errorf("runtime: %q is under an installer-zone directory and cannot be examined — refusing rather than leaving it out of the protected set: %v", path, err)
+			}
+			ino, ierr := identity(path)
+			if ierr != nil {
+				return fmt.Errorf("runtime: %q is under an installer-zone directory and its identity cannot be read — refusing rather than leaving it out of the protected set", path)
+			}
+			out[ino] = true
+			return nil
+		})
+		if werr != nil {
+			return nil, werr
 		}
-		out[ino] = true
 	}
 	confPath := homeCanon + "/mythical.conf"
 	if _, err := os.Lstat(confPath); err == nil {
