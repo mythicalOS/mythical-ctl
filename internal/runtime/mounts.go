@@ -167,87 +167,97 @@ func nlinkOf(p string) (uint64, error) {
 	return uint64(sys.Nlink), nil
 }
 
-// protectedIdentities is the set NOTHING mounted into a container may share: mythical.conf,
-// everything under bin/ — and the DIRECTORIES themselves: the family home, bin/, and every
-// other direct-child directory of the home (the product directories holding the user-owned
-// host-tool slot included; logs/ and transcripts/ are excluded because they ARE core-fixed
-// sources). An OS-level bind mount aliases a directory with no symlink and no hardlink in
-// sight (directories cannot be hardlinked), so `logs` bind-mounted over `bin/` keeps the
-// expected path and type while being the CLI's own directory — the reference's set
-// (mythical.conf + bin/*) misses the directories, the same latent class as its root-overlap
-// blind spot; closed here. A path that EXISTS and whose identity cannot be read is a
-// refusal, not one fewer member. An ABSENT mythical.conf is not that case: a family home that
-// has never been configured has no such file, and refusing would refuse every first install.
-func protectedIdentities(homeCanon string) (map[string]bool, error) {
+// protectedIdentities is the set NOTHING mounted into a container may share. It is closed
+// over the whole family home EXCEPT what the product is meant to write: the home itself;
+// every direct child of the home other than the two core-fixed directory sources (logs/,
+// transcripts/) and this product's OWN <product>.conf (a core-fixed source, which must not
+// refuse itself) — FILES and directories alike, so a sibling <other>.conf and mythical.conf
+// are members (an OS-level file bind of saga.conf over brokkr.conf is a regular file, link
+// count 1, whose identity only saga.conf's own inode refuses); SYMLINKED children are followed
+// to their targets, which join too (a symlinked bin/ or .state/ — MkdirAll accepts one —
+// would otherwise contribute nothing, and its target bound over logs/ would pass); and
+// everything BENEATH every directory member at any depth, symlinks inside followed once
+// (a directory's own inode protects nothing inside it — the user-owned host-tool slot
+// <product>/cli.toml is the case that matters). An OS-level bind mount aliases without any
+// symlink or hardlink in sight, which is why identities, not paths, are what is compared.
+// A path that EXISTS and whose identity cannot be read is a refusal, not one fewer member.
+// An ABSENT mythical.conf is not that case: a never-configured home has no such file. The
+// reference's set (mythical.conf + bin/*) misses all of the above classes; closed here,
+// recorded in the plan.
+func protectedIdentities(homeCanon, product string) (map[string]bool, error) {
 	out := map[string]bool{}
 	homeIno, err := identity(homeCanon)
 	if err != nil {
 		return nil, fmt.Errorf("runtime: the family home's identity cannot be read: %v", err)
 	}
 	out[homeIno] = true
+	visited := map[string]bool{homeCanon: true}
 	kids, err := os.ReadDir(homeCanon)
 	if err != nil {
 		return nil, fmt.Errorf("runtime: cannot list the family home: %v", err)
 	}
 	for _, k := range kids {
-		if k.Name() == "logs" || k.Name() == "transcripts" {
+		if k.Name() == "logs" || k.Name() == "transcripts" || k.Name() == product+".conf" {
 			continue
 		}
-		kp := homeCanon + "/" + k.Name()
-		// Lstat, NOT DirEntry.IsDir(): the entry type comes from readdir's d_type, and a
-		// filesystem answering DT_UNKNOWN makes IsDir() false for a REAL directory — bin/
-		// would silently drop out of the protected set on exactly such filesystems. An entry
-		// that cannot be Lstat'd is a refusal, not one fewer member.
-		st, serr := os.Lstat(kp)
-		if serr != nil {
-			return nil, fmt.Errorf("runtime: %q is in the family home and cannot be examined — refusing rather than leaving it out of the protected set", kp)
+		if err := protectEntry(homeCanon+"/"+k.Name(), out, visited); err != nil {
+			return nil, err
 		}
-		if !st.IsDir() {
-			continue
-		}
-		// The directory AND EVERYTHING BENEATH IT: a directory's own inode protects nothing
-		// inside it — an OS-level FILE bind of `<product>/cli.toml` (the user-owned host-tool
-		// slot, holding host-only credentials) over `<product>.conf` is a regular file with a
-		// link count of 1 whose identity is cli.toml's, and only cli.toml's own inode in this
-		// set refuses it. Walked without following symlinks (Lstat identities); an entry that
-		// cannot be examined is a refusal, not one fewer member. The reference's set
-		// (mythical.conf + bin/*) has this gap too — closed here, recorded in the plan.
-		werr := filepath.WalkDir(kp, func(path string, d fs.DirEntry, err error) error {
-			if err != nil {
-				return fmt.Errorf("runtime: %q is under an installer-zone directory and cannot be examined — refusing rather than leaving it out of the protected set: %v", path, err)
-			}
-			ino, ierr := identity(path)
-			if ierr != nil {
-				return fmt.Errorf("runtime: %q is under an installer-zone directory and its identity cannot be read — refusing rather than leaving it out of the protected set", path)
-			}
-			out[ino] = true
-			return nil
-		})
-		if werr != nil {
-			return nil, werr
-		}
-	}
-	confPath := homeCanon + "/mythical.conf"
-	if _, err := os.Lstat(confPath); err == nil {
-		ino, ierr := identity(confPath)
-		if ierr != nil {
-			return nil, errors.New("runtime: the family configuration file exists but its identity cannot be read — nothing can then be shown NOT to be it, so this refuses rather than assuming")
-		}
-		out[ino] = true
-	}
-	entries, err := os.ReadDir(homeCanon + "/bin")
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return nil, fmt.Errorf("runtime: cannot list %s/bin: %v", homeCanon, err)
-	}
-	for _, e := range entries {
-		p := homeCanon + "/bin/" + e.Name()
-		ino, ierr := identity(p)
-		if ierr != nil {
-			return nil, fmt.Errorf("runtime: %q is under the installer-managed bin/ directory and its identity cannot be read — refusing rather than leaving it out of the protected set", p)
-		}
-		out[ino] = true
 	}
 	return out, nil
+}
+
+// protectEntry adds one entry's identity and, for a directory (or a symlink resolving to
+// one), everything beneath it. Lstat, NOT DirEntry.IsDir(): the entry type from readdir's
+// d_type can be DT_UNKNOWN, which would make a REAL directory look like a file. A symlink
+// contributes its own inode AND its target's; the target is walked once (visited by
+// canonical path) so a link cycle terminates.
+func protectEntry(p string, out, visited map[string]bool) error {
+	st, err := os.Lstat(p)
+	if err != nil {
+		return fmt.Errorf("runtime: %q is in the family home and cannot be examined — refusing rather than leaving it out of the protected set", p)
+	}
+	ino, err := identity(p)
+	if err != nil {
+		return fmt.Errorf("runtime: %q is in the family home and its identity cannot be read — refusing rather than leaving it out of the protected set", p)
+	}
+	out[ino] = true
+	dir := p
+	if st.Mode()&fs.ModeSymlink != 0 {
+		target, rerr := filepath.EvalSymlinks(p)
+		if rerr != nil {
+			return fmt.Errorf("runtime: the link %q in the family home cannot be resolved — refusing rather than leaving its target out of the protected set: %v", p, rerr)
+		}
+		tst, terr := os.Lstat(target)
+		if terr != nil {
+			return fmt.Errorf("runtime: the target of the link %q cannot be examined — refusing rather than leaving it out of the protected set", p)
+		}
+		tino, ierr := identity(target)
+		if ierr != nil {
+			return fmt.Errorf("runtime: the target of the link %q has no readable identity — refusing rather than leaving it out of the protected set", p)
+		}
+		out[tino] = true
+		if !tst.IsDir() {
+			return nil
+		}
+		dir = target
+	} else if !st.IsDir() {
+		return nil
+	}
+	if visited[dir] {
+		return nil
+	}
+	visited[dir] = true
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("runtime: %q is an installer-zone directory that cannot be listed — refusing rather than leaving its contents out of the protected set: %v", dir, err)
+	}
+	for _, e := range entries {
+		if err := protectEntry(dir+"/"+e.Name(), out, visited); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // CheckFixed checks every core-fixed mount for a product against the launch-site rules:
@@ -275,7 +285,7 @@ func CheckFixed(home, product string) error {
 	if err != nil {
 		return err
 	}
-	protected, err := protectedIdentities(homeCanon)
+	protected, err := protectedIdentities(homeCanon, product)
 	if err != nil {
 		return err
 	}
