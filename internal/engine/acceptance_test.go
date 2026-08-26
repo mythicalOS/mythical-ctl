@@ -396,11 +396,14 @@ func TestAcceptanceFidelity(t *testing.T) {
 		}
 		name := r.pfx + "-c6"
 		spec := launchSpec(t, name, acceptImage, netID, "a6", engine.SpecOpts{Mounts: []engine.Mount{vm, av}})
+		// Registered BEFORE the container exists (and before its cleanup), so on an early
+		// failure the LIFO order removes the container FIRST and this best-effort sweep can
+		// actually take the then-unreferenced volume with it.
+		r.cleanupVolume(t, autoName)
 		if _, err := r.m.ContainerCreate(ctx, spec); err != nil {
 			t.Fatal(err)
 		}
 		r.cleanupContainer(t, name)
-		r.cleanupVolume(t, autoName)
 		autoInfo, err := r.c.VolumeInspect(ctx, autoName)
 		if err != nil {
 			t.Fatalf("the daemon auto-creates a missing named volume (measured): %v", err)
@@ -416,6 +419,11 @@ func TestAcceptanceFidelity(t *testing.T) {
 		}
 		if err := r.m.VolumeRemove(ctx, volName); err != nil {
 			t.Fatalf("after the container is gone the volume goes: %v", err)
+		}
+		// The auto-created one is ASSERTED removable too — an undeletable auto-created volume
+		// would otherwise vanish into a discarded best-effort cleanup and never fail the lane.
+		if err := r.m.VolumeRemove(ctx, autoName); err != nil {
+			t.Fatalf("the auto-created volume goes the same way: %v", err)
 		}
 	})
 

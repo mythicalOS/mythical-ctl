@@ -301,7 +301,7 @@ func CheckOverlap(home, product, src string) error {
 	}
 	if pathOverlaps(canon, homeCanon) {
 		note := ""
-		if canon != homeCanon && strings.HasPrefix(homeCanon, canon+"/") {
+		if canon != homeCanon && strings.HasPrefix(homeCanon, withSep(canon)) {
 			note = " (the source CONTAINS the family home — containment is checked in both directions)"
 		}
 		return fmt.Errorf("runtime: bind source %q resolves to %q, which is, is inside, or contains the family home %q%s — that would hand the container write access to the CLI it will later be launched by, or to the generated artifacts that inform that launch", src, canon, homeCanon, note)
