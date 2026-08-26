@@ -55,7 +55,12 @@ func acceptClient(t *testing.T) *acceptRig {
 	if err != nil {
 		t.Fatalf("acceptance needs a local daemon: %v", err)
 	}
-	c := engine.Dial(socket)
+	// The production door: endpoint + registry-auth wiring in one step (the auth-registry
+	// case below relies on Connect having configured credential resolution already).
+	c, err := engine.Connect(os.Environ(), home)
+	if err != nil {
+		t.Fatalf("acceptance needs a local daemon: %v", err)
+	}
 	ctx := context.Background()
 	if err := c.Ping(ctx); err != nil {
 		t.Fatalf("acceptance needs a RUNNING local daemon at %s: %v", socket, err)
@@ -118,6 +123,16 @@ func (r *acceptRig) rawCreate(t *testing.T, name string, body map[string]any) {
 			return d.DialContext(ctx, "unix", r.socket)
 		},
 	}}
+	// The raw create carries provenance labels so its cleanup can prove OWNERSHIP: a name —
+	// even under the per-process prefix — is reusable and reserved to no one, so removal keys
+	// on the labels, exactly as HelperRun's ambiguous-create sweep does.
+	if _, has := body["Labels"]; has {
+		t.Fatal("rawCreate owns the Labels key")
+	}
+	body["Labels"] = map[string]string{
+		engine.LabelNS + "installation": "acceptance",
+		engine.LabelNS + "nonce":        name,
+	}
 	payload, err := json.Marshal(body)
 	if err != nil {
 		t.Fatal(err)
@@ -127,11 +142,21 @@ func (r *acceptRig) rawCreate(t *testing.T, name string, body map[string]any) {
 		t.Fatal(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	// Cleanup is registered BEFORE the request goes out: a transport error can arrive after
-	// the daemon created the container (the ambiguous window HelperRun sweeps for), and a
-	// name under this suite's per-process prefix is this suite's to remove by definition —
-	// so the early registration cannot delete anything that is not ours.
-	r.cleanupContainer(t, name)
+	// Registered BEFORE the request goes out — a transport error can arrive after the daemon
+	// created the container — and it removes ONLY a container it can prove is this call's, by
+	// the labels above: a 409's pre-existing conflicting container carries other labels (or
+	// none) and is left exactly where it is.
+	t.Cleanup(func() {
+		bg := context.Background()
+		info, ierr := r.c.ContainerInspect(bg, name)
+		if ierr != nil {
+			return
+		}
+		if info.Labels[engine.LabelNS+"installation"] != "acceptance" || info.Labels[engine.LabelNS+"nonce"] != name {
+			return
+		}
+		_ = r.m.ContainerRemove(bg, info.ID)
+	})
 	resp, err := hc.Do(req)
 	if err != nil {
 		t.Fatalf("raw create: %v", err)
@@ -359,12 +384,30 @@ func TestAcceptanceFidelity(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		// And a named volume that does NOT exist yet: the daemon AUTO-CREATES it, carrying
+		// none of our labels — the unlabelled orphan the fake models (MEASURED here).
+		autoName := r.pfx + "-vol6auto"
+		if _, ierr := r.c.VolumeInspect(ctx, autoName); !errors.Is(ierr, engine.ErrAbsent) {
+			t.Fatalf("the auto-create volume must not pre-exist: %v", ierr)
+		}
+		av, err := engine.NewVolumeMount(autoName, "/autodata")
+		if err != nil {
+			t.Fatal(err)
+		}
 		name := r.pfx + "-c6"
-		spec := launchSpec(t, name, acceptImage, netID, "a6", engine.SpecOpts{Mounts: []engine.Mount{vm}})
+		spec := launchSpec(t, name, acceptImage, netID, "a6", engine.SpecOpts{Mounts: []engine.Mount{vm, av}})
 		if _, err := r.m.ContainerCreate(ctx, spec); err != nil {
 			t.Fatal(err)
 		}
 		r.cleanupContainer(t, name)
+		r.cleanupVolume(t, autoName)
+		autoInfo, err := r.c.VolumeInspect(ctx, autoName)
+		if err != nil {
+			t.Fatalf("the daemon auto-creates a missing named volume (measured): %v", err)
+		}
+		if autoInfo.Labels[engine.LabelNS+"installation"] != "" {
+			t.Fatalf("an auto-created volume carries NO provenance labels: %v", autoInfo.Labels)
+		}
 		if err := r.m.VolumeRemove(ctx, volName); err == nil || !strings.Contains(err.Error(), "volume is in use") {
 			t.Fatalf("a mounted volume must refuse removal in the daemon's words: %v", err)
 		}
@@ -446,8 +489,8 @@ func TestAcceptanceFidelity(t *testing.T) {
 		if ref == "" {
 			t.Skip("SKIPPED LOUDLY: no authenticated registry configured — set MYTHICAL_ACCEPTANCE_AUTH_REF to a ref whose registry needs the docker login this machine holds, and re-run")
 		}
-		home, _ := os.UserHomeDir()
-		r.c.SetDockerConfig(os.Environ(), home)
+		// No setter here: acceptClient constructed the client via engine.Connect, which
+		// configured credential resolution already — that absence IS the case's point.
 		if err := r.m.ImagePull(ctx, ref); err != nil {
 			t.Fatalf("authenticated pull of %s: %v", ref, err)
 		}

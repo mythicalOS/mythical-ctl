@@ -1280,3 +1280,30 @@ func TestPullAuthHeader(t *testing.T) {
 		t.Fatalf("anonymous pull must carry no header: %v", f.LastPullAuth)
 	}
 }
+
+// Connect wires registry auth WITHOUT a separate setter: the one production door resolves the
+// endpoint and configures credential resolution in the same step — a caller cannot forget the
+// half the reference's `docker pull` did implicitly.
+func TestConnectWiresAuth(t *testing.T) {
+	f, _ := newFake(t)
+	ctx := context.Background()
+	home := t.TempDir()
+	if err := os.MkdirAll(home+"/.docker", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := `{"auths":{"reg.example":{"username":"oneuser","password":"onepass"}}}`
+	if err := os.WriteFile(home+"/.docker/config.json", []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := engine.Connect([]string{"DOCKER_HOST=unix://" + f.Socket()}, home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, _ := newMutator(t, c)
+	if err := m.ImagePull(ctx, "reg.example/img:v1"); err != nil {
+		t.Fatal(err)
+	}
+	if f.LastPullAuth["username"] != "oneuser" {
+		t.Fatalf("Connect must have configured auth resolution, got %v", f.LastPullAuth)
+	}
+}

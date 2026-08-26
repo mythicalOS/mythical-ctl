@@ -296,6 +296,11 @@ func TestCheckOverlap(t *testing.T) {
 		filepath.Join(home, "brokkr", "cli.toml"),       // the host-tool slot itself
 		filepath.Join(home, "transcripts", "somewhere"), // inside a core-fixed mount
 		filepath.Dir(homeCanon),                         // an ANCESTOR containing the home — symmetric containment
+		// The ROOT: the ancestor of EVERYTHING. `<p>/` as the strictly-inside prefix is "//"
+		// for "/", a prefix no path has — without the root-aware join, a configured `/` bind
+		// passed every protected check and mounted the host filesystem read-write (gate
+		// round-4 P1; the frozen bash's _mi_path_overlaps has the same latent blind spot).
+		"/",
 	}
 	for _, src := range refuse {
 		if err := runtime.CheckOverlap(home, "brokkr", src); err == nil {
@@ -317,6 +322,20 @@ func TestCheckOverlap(t *testing.T) {
 	}
 	if err := runtime.CheckOverlap(home, "brokkr", ok); err != nil {
 		t.Fatalf("an outside bind must pass: %v", err)
+	}
+}
+
+// The root bind must ALSO fall to the pairwise rule: "/" overlaps every other bind, so with
+// either side writable the combination is refused. (Two read-only overlapping binds are
+// permitted by the rule — the root's unconditional refusal is CheckOverlap's job, which the
+// "/" case in TestCheckOverlap asserts.)
+func TestPairwiseRootOverlapsEverything(t *testing.T) {
+	err := runtime.CheckPairwise([]runtime.Bind{
+		{Source: "/", ReadOnly: false},
+		{Source: "/somewhere/else", ReadOnly: true},
+	})
+	if err == nil {
+		t.Fatal("a writable root bind overlaps every other bind and must be refused pairwise")
 	}
 }
 

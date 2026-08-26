@@ -83,7 +83,21 @@ func Canon(path string) (string, error) {
 // CONTAINMENT IS SYMMETRIC: checking one direction only lets an ancestor through, and an
 // ancestor contains everything below it.
 func pathOverlaps(a, b string) bool {
-	return a == b || strings.HasPrefix(a, b+"/") || strings.HasPrefix(b, a+"/")
+	return a == b || strings.HasPrefix(a, withSep(b)) || strings.HasPrefix(b, withSep(a))
+}
+
+// withSep is the prefix that means "strictly inside p": `<p>/` — except for the ROOT, whose
+// descendants all begin with exactly "/". Appending another separator there would produce
+// "//", a prefix NO canonical path has, silently declaring the one path that contains
+// EVERYTHING disjoint from everything — a configured `/` bind would then pass every protected
+// check and mount the host filesystem read-write. (The reference's `_mi_path_overlaps` has the
+// same blind spot — `case ... in "$2"/*` builds `//*` for root; latent there, recorded rather
+// than fixed because the bash is frozen.)
+func withSep(p string) string {
+	if p == "/" {
+		return "/"
+	}
+	return p + "/"
 }
 
 // nameOK: a product or role name before it is joined into a path or a configuration key. Both

@@ -112,6 +112,22 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 	return nil
 }
 
+// Connect is THE production door to a client: resolve the local endpoint (fail-closed),
+// dial it, and configure registry-auth resolution from the SAME environment — one step, so a
+// caller cannot end up holding a client that pulls anonymously from a registry the operator's
+// docker config has credentials for (the reference shelled out to the docker CLI, which never
+// could). Dial stays the raw door for tests, which dial a per-test fake socket and must not
+// read the host's docker config.
+func Connect(env []string, home string) (*Client, error) {
+	socket, err := ResolveEndpoint(env, home)
+	if err != nil {
+		return nil, err
+	}
+	c := Dial(socket)
+	c.SetDockerConfig(env, home)
+	return c, nil
+}
+
 // Ping asks whether the daemon answers at all, depending on no object existing.
 func (c *Client) Ping(ctx context.Context) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://docker/_ping", nil)
