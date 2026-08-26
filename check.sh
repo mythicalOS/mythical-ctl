@@ -6,10 +6,13 @@
 #   bash check.sh packages   # only the "does this lane actually cover anything" guard
 #   bash check.sh go         # packages + gofmt + build + vet + boundary + test
 #   bash check.sh boundary   # only the reference-boundary gates
-#   bash check.sh acceptance # the REAL-DAEMON lane: re-measures every behavior the hermetic
-#                            # fake asserts against a live local daemon (needs Docker running,
-#                            # and one busybox pull). Opt-in - NOT in CI's default path; run
-#                            # before every wave gate, divergences fixed in fake+client.
+#   bash check.sh acceptance # the REAL-DAEMON lane: re-measures the daemon behaviors the
+#                            # hermetic fake asserts, against a live local daemon (needs Docker
+#                            # running, and two small pulls). The behaviors it CANNOT reach are
+#                            # named in the lane's own comments (the private-mode connect
+#                            # refusal, the helper success path pending the pinned probe
+#                            # image). Opt-in - NOT in CI's default path; run before every
+#                            # wave gate, divergences fixed in fake+client.
 #
 # WHY THIS FILE EXISTS. CI and any future release gate must run identical checks; spelling the
 # commands out twice guarantees they drift, and the direction they drift is always the same —

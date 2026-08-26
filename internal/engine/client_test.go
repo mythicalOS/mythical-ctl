@@ -1133,6 +1133,61 @@ func TestHelperFailKnob(t *testing.T) {
 	}
 }
 
+// The ambiguous-create window: the daemon creates the container and the RESPONSE is lost, so
+// the caller never learns the id. HelperRun must still leave nothing behind — it sweeps by name
+// and removes the container because its provenance labels are this run's.
+func TestHelperAmbiguousCreateIsSwept(t *testing.T) {
+	f, c := newFake(t)
+	ctx := context.Background()
+	m, _ := newMutator(t, c)
+	f.PullImage("probe:pinned")
+	f.CreateResponseLost = true
+	hs, err := engine.NewHelperSpec("probe:pinned", "h1", engine.HelperEgress, mustProv(t), engine.HelperOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.HelperRun(ctx, hs); err == nil {
+		t.Fatal("a create whose response was lost must be reported as a failure")
+	}
+	if n := f.ContainerCount(); n != 0 {
+		t.Fatalf("%d container(s) survived an ambiguous create — the sweep by name did not run or did not remove", n)
+	}
+}
+
+// The sweep removes ONLY what is provably ours: a same-named container carrying other labels is
+// a name conflict (the create's own 409), never a removal — the sweep must not become a way to
+// delete someone else's container by choosing its name.
+func TestHelperNameConflictIsNotSwept(t *testing.T) {
+	f, c := newFake(t)
+	ctx := context.Background()
+	m, _ := newMutator(t, c)
+	f.PullImage("probe:pinned")
+	netID, err := m.NetworkCreate(ctx, "family", mustProv(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Someone else's object under the name the helper wants.
+	spec := launchSpec(t, "h1", "probe:pinned", netID, "a1", engine.SpecOpts{})
+	if _, err := m.ContainerCreate(ctx, spec); err != nil {
+		t.Fatal(err)
+	}
+	other, _ := engine.NewProvenance("other-installation", "zz")
+	hs, err := engine.NewHelperSpec("probe:pinned", "h1", engine.HelperEgress, other, engine.HelperOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = m.HelperRun(ctx, hs)
+	if err == nil || !strings.Contains(err.Error(), "already in use") {
+		t.Fatalf("the conflict must surface in the daemon's words: %v", err)
+	}
+	if n := f.ContainerCount(); n != 1 {
+		t.Fatalf("the conflicting container must be left alone, %d container(s) remain", n)
+	}
+	if _, err := c.ContainerInspect(ctx, "h1"); err != nil {
+		t.Fatalf("the other installation's container must still exist: %v", err)
+	}
+}
+
 // Stdout is the ANSWER and stderr is diagnostics — the reference captured `$(…)` (stdout) and
 // let stderr through to the operator. A protocol field printed on stderr must not reach the
 // reader through Stdout.

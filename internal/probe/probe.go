@@ -23,6 +23,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"strings"
 
 	"mythicalos.ai/ctl/internal/docfmt"
@@ -72,6 +74,11 @@ type Prober struct {
 	acct     Accounting
 	ident    string
 	newNonce func() (string, error)
+	// diag receives every helper's STDERR, verbatim, on EVERY run — success, failure, or a run
+	// that errored after its logs were read. The reference's `$(mi_rt_run_helper …)` captured
+	// stdout and let stderr pass straight through to the operator's terminal; this is that
+	// pass-through. Defaults to os.Stderr; SetDiagnostics redirects it.
+	diag io.Writer
 }
 
 // New wires a Prober. The installation identity is REQUIRED and validated here: every
@@ -86,7 +93,18 @@ func New(rt *runtime.Runtime, acct Accounting, ident string, newNonce func() (st
 	if !docfmt.TypeOK("ident", ident) {
 		return nil, fmt.Errorf("probe: %q is not a usable installation identity — no probe container can be shown to be this installation's, so nothing is removed and nothing is forgotten", ident)
 	}
-	return &Prober{rt: rt, acct: acct, ident: ident, newNonce: newNonce}, nil
+	return &Prober{rt: rt, acct: acct, ident: ident, newNonce: newNonce, diag: os.Stderr}, nil
+}
+
+// SetDiagnostics redirects the helpers' stderr pass-through (see Prober.diag). A nil writer
+// is refused rather than silently discarding — losing the diagnostics is the failure this
+// seam exists to prevent.
+func (p *Prober) SetDiagnostics(w io.Writer) error {
+	if w == nil {
+		return errors.New("probe: a nil diagnostics writer would discard the helpers' stderr")
+	}
+	p.diag = w
+	return nil
 }
 
 // Image is the probe image, from the VERIFIED family index and nowhere else: the Index type
@@ -199,6 +217,11 @@ func (p *Prober) run(ctx context.Context, ix *trust.Index, netID, netalias strin
 		return nil, err
 	}
 	res, runErr := p.rt.HelperRun(ctx, spec)
+	// The helper's stderr reaches the operator on EVERY path — before any verdict is formed, so
+	// no branch below can drop it (a run that errored after its logs were read carries it too).
+	if len(res.Stderr) > 0 {
+		_, _ = p.diag.Write(res.Stderr)
+	}
 	// The ANSWER is stdout alone — the reference captured `$(mi_rt_run_helper …)`, which is
 	// stdout, and let stderr through to the operator. Stderr rides the verdict text below as
 	// diagnostics and is never read for a field.

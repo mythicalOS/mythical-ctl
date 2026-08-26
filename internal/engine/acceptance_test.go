@@ -13,9 +13,14 @@ package engine_test
 // already guarantees that structurally).
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"os"
 	"strings"
 	"testing"
@@ -34,9 +39,10 @@ import (
 const acceptImage = "registry.k8s.io/pause:3.9"
 
 type acceptRig struct {
-	c   *engine.Client
-	m   *engine.Mutator
-	pfx string
+	c      *engine.Client
+	m      *engine.Mutator
+	pfx    string
+	socket string
 }
 
 func acceptClient(t *testing.T) *acceptRig {
@@ -69,7 +75,7 @@ func acceptClient(t *testing.T) *acceptRig {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := &acceptRig{c: c, m: m, pfx: fmt.Sprintf("mctlacc%d", os.Getpid())}
+	r := &acceptRig{c: c, m: m, pfx: fmt.Sprintf("mctlacc%d", os.Getpid()), socket: socket}
 	if _, ierr := c.ImageInspect(ctx, acceptImage); errors.Is(ierr, engine.ErrAbsent) {
 		if perr := m.ImagePull(ctx, acceptImage); perr != nil {
 			t.Fatalf("acceptance needs %s (one pull): %v", acceptImage, perr)
@@ -99,6 +105,38 @@ func (r *acceptRig) network(t *testing.T, ctx context.Context, name string) stri
 	}
 	r.cleanupNetwork(t, name)
 	return id
+}
+
+// rawCreate issues a create the typed client deliberately cannot express (an EndpointsConfig
+// keyed by the network ID) straight at the REAL daemon, so the fake's model of that shape is
+// re-measured here rather than asserted from memory.
+func (r *acceptRig) rawCreate(t *testing.T, name string, body map[string]any) {
+	t.Helper()
+	hc := &http.Client{Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "unix", r.socket)
+		},
+	}}
+	payload, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodPost, "http://docker/"+engine.APIVersion+"/containers/create?name="+name, bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := hc.Do(req)
+	if err != nil {
+		t.Fatalf("raw create: %v", err)
+	}
+	defer resp.Body.Close()
+	out, _ := io.ReadAll(resp.Body)
+	r.cleanupContainer(t, name)
+	if resp.StatusCode >= 300 {
+		t.Fatalf("raw create: %d %s", resp.StatusCode, out)
+	}
 }
 
 func (r *acceptRig) container(t *testing.T, ctx context.Context, name, netID, alias string) string {
@@ -179,6 +217,40 @@ func TestAcceptanceFidelity(t *testing.T) {
 		}
 		if stopped.NetworkID == "" {
 			t.Fatalf("the endpoint id PERSISTS across stop: %+v", stopped)
+		}
+	})
+
+	t.Run("a never-started endpoint is keyed by the SUBMITTED key (the fake's model, re-measured)", func(t *testing.T) {
+		// MEASURED 2026-08-25 through the client path and asserted DIRECTLY here since the fake
+		// models it: the daemon reports a create-time endpoint under whatever string keyed
+		// EndpointsConfig — the ID, when the ID was submitted — until first start, then under
+		// the name. This is why the typed client resolves to the name before creating.
+		netName := r.pfx + "-netk"
+		netID := r.network(t, ctx, netName)
+		name := r.pfx + "-ck"
+		r.rawCreate(t, name, map[string]any{
+			"Image":            acceptImage,
+			"NetworkingConfig": map[string]any{"EndpointsConfig": map[string]any{netID: map[string]any{}}},
+		})
+		info, err := r.c.ContainerInspect(ctx, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, byName := info.Networks[netName]; byName {
+			t.Fatalf("an ID-keyed create must NOT be reported under the name before start: %+v", info.Networks)
+		}
+		if _, byID := info.Networks[netID]; !byID {
+			t.Fatalf("a never-started create is reported under the SUBMITTED key: %+v", info.Networks)
+		}
+		if err := r.m.ContainerStart(ctx, name); err != nil {
+			t.Fatal(err)
+		}
+		info, err = r.c.ContainerInspect(ctx, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, byName := info.Networks[netName]; !byName {
+			t.Fatalf("after start the daemon normalizes the key to the network NAME: %+v", info.Networks)
 		}
 	})
 

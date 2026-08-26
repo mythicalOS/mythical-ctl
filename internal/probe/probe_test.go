@@ -1,6 +1,7 @@
 package probe_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -104,6 +105,7 @@ type rig struct {
 	netID string
 	dir   string
 	n     int
+	diag  *bytes.Buffer // the helpers' stderr pass-through, captured
 }
 
 func newRig(t *testing.T) *rig {
@@ -131,6 +133,10 @@ func newRig(t *testing.T) *rig {
 		return fmt.Sprintf("n%d", r.n), nil
 	})
 	if err != nil {
+		t.Fatal(err)
+	}
+	r.diag = &bytes.Buffer{}
+	if err := r.p.SetDiagnostics(r.diag); err != nil {
 		t.Fatal(err)
 	}
 	// An anchored, ACCEPTED index — the only way to a *trust.Index.
@@ -303,6 +309,37 @@ func TestStderrIsNotEvidence(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "OWN per-run alias") {
 		t.Fatalf("an empty stdout is a broken PROBE, not a DNS verdict: %v", err)
+	}
+}
+
+// Stderr reaches the operator on EVERY run — a passing check's warnings included — exactly as
+// the reference's inherited stderr did. It is diagnostics, not evidence (the test above), but
+// it is never dropped either.
+func TestStderrReachesTheOperatorOnEveryRun(t *testing.T) {
+	r := newRig(t)
+	ctx := context.Background()
+	r.fake.PullImage(probeRef)
+	r.fake.HelperEntry = conformingHelper
+	r.fake.HelperStderr = []byte("warning: the resolver took two tries\n")
+	if err := r.p.SelfCheck(ctx, r.ix, r.netID); err != nil {
+		t.Fatalf("a conforming probe: %v", err)
+	}
+	if !strings.Contains(r.diag.String(), "warning: the resolver took two tries") {
+		t.Fatalf("a PASSING run's stderr must reach the operator, got %q", r.diag.String())
+	}
+	r.diag.Reset()
+	r.fake.HelperEntry = func(cmd string, args []string, view enginetest.HelperNetView, stdin []byte) (int, []byte) {
+		return 1, []byte("alias=" + args[0] + "\naddress=\n")
+	}
+	r.fake.HelperStderr = []byte("resolver: NXDOMAIN\n")
+	if err := r.p.SelfCheck(ctx, r.ix, r.netID); err == nil {
+		t.Fatal("a failing probe must fail")
+	}
+	if !strings.Contains(r.diag.String(), "resolver: NXDOMAIN") {
+		t.Fatalf("a FAILING run's stderr must reach the operator too, got %q", r.diag.String())
+	}
+	if err := r.p.SetDiagnostics(nil); err == nil {
+		t.Fatal("a nil diagnostics writer must be refused — discarding stderr is the failure this seam prevents")
 	}
 }
 

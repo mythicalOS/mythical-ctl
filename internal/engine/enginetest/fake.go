@@ -173,6 +173,10 @@ type Fake struct {
 	// fixture answers stdout only. It exists so a test can prove stderr is never read as the
 	// protocol answer.
 	HelperStderr []byte
+	// CreateResponseLost fabricates the ambiguous-create window: the container IS created and
+	// recorded, and then the connection is aborted before the response carries its id — the
+	// caller cannot tell a refused create from one that succeeded silently.
+	CreateResponseLost bool
 
 	// Requests logs "METHOD /path" for every request, INCLUDING ones the Down knobs then
 	// refuse — the post-release Mutator test's "the fake recorded NO request" reads this.
@@ -645,6 +649,11 @@ func (f *Fake) createContainer(w http.ResponseWriter, r *http.Request) {
 	}
 	c.id = f.longID()
 	f.containers[name] = c
+	if f.CreateResponseLost {
+		// The record is written; the answer never arrives. The dispatcher's deferred unlock
+		// runs during the unwind, so the fake stays answerable for the sweep that follows.
+		panic(http.ErrAbortHandler)
+	}
 	ok(w, map[string]string{"Id": c.id})
 }
 

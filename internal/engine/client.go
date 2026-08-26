@@ -826,7 +826,11 @@ func (m *Mutator) HelperRun(ctx context.Context, h HelperSpec) (HelperResult, er
 	}
 	q := url.Values{"name": {h.name}}
 	if err := m.c.do(ctx, http.MethodPost, "/containers/create", q, body, &created); err != nil {
-		return none, err
+		// AMBIGUOUS FAILURE: the daemon may have created the container and only the RESPONSE
+		// failed (a connection that broke, a body truncated after the 201) — in which case the
+		// id-keyed remover below would never be installed and a survivor would exist. So sweep
+		// by NAME, removing only what is provably ours; see sweepOwnHelper.
+		return none, errors.Join(err, m.sweepOwnHelper(ctx, h))
 	}
 	// From here on the container EXISTS: every return path below must have tried to remove
 	// it. A removal error is reported on otherwise-successful paths and never masks the
@@ -870,6 +874,35 @@ func (m *Mutator) HelperRun(ctx context.Context, h HelperSpec) (HelperResult, er
 
 // helperRemoveTimeout bounds the detached force-remove in HelperRun.
 const helperRemoveTimeout = 30 * time.Second
+
+// sweepOwnHelper covers the ambiguous-create window: after a create whose OUTCOME is unknown,
+// ask by name whether a container exists, and remove it ONLY if its provenance labels are this
+// run's installation AND nonce — the nonce is per-run unique, so a match is proof the object
+// is ours (§6a: the labels are the only evidence). Absence is the common case and not an
+// error. A same-named container carrying OTHER labels is a name conflict — someone else's
+// object, reported by the create's own 409 — and is left exactly where it is. Detached from
+// the caller's context for the same reason the remover is.
+func (m *Mutator) sweepOwnHelper(ctx context.Context, h HelperSpec) error {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), helperRemoveTimeout)
+	defer cancel()
+	info, err := m.c.ContainerInspect(rctx, h.name)
+	if errors.Is(err, ErrAbsent) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("engine: after an ambiguous helper create, the sweep could not ask whether %q exists: %w", h.name, err)
+	}
+	want := h.prov.labels()
+	for k, v := range want {
+		if info.Labels[k] != v {
+			return nil // not ours — a conflict, never a removal
+		}
+	}
+	if err := m.c.do(rctx, http.MethodDelete, "/containers/"+url.PathEscape(info.ID), url.Values{"force": {"1"}}, nil, nil); err != nil {
+		return fmt.Errorf("engine: after an ambiguous helper create, the sweep could not remove %q: %w", h.name, err)
+	}
+	return nil
+}
 
 // attachStdin hands bytes to a created container's stdin over a hijacked attach connection,
 // then half-closes so the process sees EOF. This is the API's one stdin vehicle; the

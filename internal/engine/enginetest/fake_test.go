@@ -264,7 +264,8 @@ func TestEmptyHostIPReportsAllInterfaces(t *testing.T) {
 // reference to the NAME before creating; this fixture is what makes that resolution
 // load-bearing in the hermetic suite — a client that stopped resolving would fail the
 // never-started name-keyed assertions instead of being quietly forgiven by a fake that
-// normalized for it.
+// normalized for it. The acceptance lane re-measures this exact shape against the real daemon
+// (its "SUBMITTED key" case) so the model here cannot drift unnoticed.
 func TestCreateKeyPreservedUntilStart(t *testing.T) {
 	f, c, m := setup(t)
 	ctx := context.Background()
