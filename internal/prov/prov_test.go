@@ -1,0 +1,934 @@
+package prov
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"mythicalos.ai/ctl/internal/engine"
+	"mythicalos.ai/ctl/internal/ledger"
+)
+
+// Inventory — tests/unit/prov.bats. Task 8 (internal/ledger) owns the generalized-editor,
+// identity and membership rows; this task owns the PROVENANCE-SEMANTICS remainder, and the two
+// sets together cover the file exactly once.
+//
+// PORTED: tests/unit/prov.bats: "provenance records an object by name AND nonce, and finds it by both" -> TestRecordAndFind
+// PORTED: tests/unit/prov.bats: "a re-record SUPERSEDES the prior generation rather than appending beside it" -> TestRecordSupersedes
+// PORTED: tests/unit/prov.bats: "CLASS AND NAME together key a record — a container and a volume can derive the same name" -> TestClassAndNameKeyTheRecord
+// PORTED: tests/unit/prov.bats: "removal writes a tombstone and drops the object record" -> TestTombstoneReplacesRecord
+// PORTED: tests/unit/prov.bats: "deletion authority requires the RECORDED nonce to match what is actually there" -> TestAuthorityNonceMustMatch
+// PORTED: tests/unit/prov.bats: "a REUSED volume name fails the nonce check and is NOT authorized for deletion" -> TestAuthorityNonceMustMatch
+// PORTED: tests/unit/prov.bats: "an object with NO record is never authorized — it is preserved and reported" -> TestAuthorityNoRecord
+// PORTED: tests/unit/prov.bats: "an object that is GONE reports 3, distinctly from a mismatch" -> TestAuthorityGoneIsDistinct
+// PORTED: tests/unit/prov.bats: "images are recorded by DIGEST and mi_prov_authority refuses them outright (D37)" -> TestImageRecordAndRefusal
+// PORTED: tests/unit/prov.bats: "first use is ledger-absent AND every other trace absent" -> TestFirstUseClean
+// PORTED: tests/unit/prov.bats: "no ledger BESIDE a product conf is INCONSISTENT, not first use" -> TestFirstUseTraces
+// PORTED: tests/unit/prov.bats: "no ledger BESIDE a product directory is inconsistent" -> TestFirstUseTraces
+// PORTED: tests/unit/prov.bats: "no ledger BESIDE a labelled runtime object is inconsistent" -> TestFirstUseRuntimeObjects
+// PORTED: tests/unit/prov.bats: "a product directory holding NOTHING BUT the host-tool slot is not a trace" -> TestHostToolSlotExemption
+// PORTED: tests/unit/prov.bats: "the host-tool slot BESIDE a generated artifact is still a trace" -> TestHostToolSlotExemption
+// PORTED: tests/unit/prov.bats: "a HIDDEN entry beside the host-tool slot is still a trace — a bare * would not see it" -> TestHostToolSlotExemption
+// PORTED: tests/unit/prov.bats: "an EMPTY product directory is STILL a trace — the slot must be present, not merely unopposed" -> TestHostToolSlotExemption
+// PORTED: tests/unit/prov.bats: "a DIRECTORY at the slot's name is a trace, not the slot" -> TestHostToolSlotShape
+// PORTED: tests/unit/prov.bats: "a SYMLINK at the slot's name is a trace — the contract requires a regular file" -> TestHostToolSlotShape
+// PORTED: tests/unit/prov.bats: "a SYMLINK standing where the product directory should be is a trace, whatever it holds" -> TestHostToolSlotShape
+// PORTED: tests/unit/prov.bats: "an UNREADABLE product directory is a trace — 'I could not look' is not 'nothing is there'" -> TestHostToolSlotUnreadable
+// N/A: tests/unit/prov.bats: "GLOBIGNORE cannot hide a generated artifact from the exemption's own sweep" -- no glob: the sweep is a directory READ, which no ambient variable can filter. The behavior it protected (a hidden artifact is still a trace) is asserted by TestHostToolSlotExemption's hidden-entry case.
+// N/A: tests/unit/prov.bats: "the exemption helper clears GLOBIGNORE for ITSELF, not only via its caller" -- same reason: there is no GLOBIGNORE and no glob in either sweep.
+// N/A: tests/unit/prov.bats: "GLOBIGNORE cannot hide the product DIRECTORY from the outer sweep either" -- same reason; the outer sweep is os.ReadDir, which returns every entry including dotfiles and dangling links.
+// PORTED: tests/unit/prov.bats: "a directory whose NAME is not a legal product is a trace, slot or no slot" -> TestHostToolSlotNameGrammar
+// PORTED: tests/unit/prov.bats: "a name that is illegal only PAST its first character is a trace too" -> TestHostToolSlotNameGrammar
+// PORTED: tests/unit/prov.bats: "the RESERVED name 'mythical' is a trace even holding nothing but a slot" -> TestHostToolSlotNameGrammar
+// PORTED: tests/unit/prov.bats: "the exemption is per-directory: an exempt product does not excuse a second product's trace" -> TestHostToolSlotNameGrammar
+// PORTED: tests/unit/prov.bats: "a ledger that EXISTS is not first use" -> TestFirstUseLedgerPresent
+// PORTED: tests/unit/prov.bats: "a runtime that CANNOT BE ASKED is not evidence of a fresh machine" -> TestFirstUseRuntimeUnasked
+// PORTED: tests/unit/prov.bats: "an unlistable object kind is a listing FAILURE, not an empty listing" -> TestUnlistableKind
+// PORTED: tests/unit/prov.bats: "a tombstone cannot forge a record through the object NAME it serializes" -> TestTombstoneCannotForge
+// PORTED: tests/unit/prov.bats: "a ledger path that is a DIRECTORY is inconsistent, not a fresh machine" -> TestFirstUseLedgerNotRegular
+// PORTED: tests/unit/prov.bats: "a DANGLING SYMLINK at the ledger path is inconsistent, not a fresh machine" -> TestFirstUseLedgerNotRegular
+// PORTED: tests/unit/prov.bats: "a STAGING ledger that is not a regular file still blocks first use" -> TestFirstUseStaging
+// PORTED: tests/unit/prov.bats: "a DANGLING SYMLINK product conf is a trace too — presence is the test, not readability" -> TestFirstUseTraces
+// PORTED: tests/unit/prov.bats: "a product DIRECTORY entry is a trace whether it is real, a link, or a dangling link" -> TestFirstUseTraces
+// PORTED: tests/unit/prov.bats: "a GENERATION out of the ledger is DIGITS before arithmetic — it is never EVALUATED" -> TestGenerationMustBeDigits
+// PORTED: tests/unit/prov.bats: "a generation this module refuses to READ is never carried into a tombstone either" -> TestGenerationMustBeDigits
+// PORTED: tests/unit/prov.bats: "authority checks that the record it found DESCRIBES the object it was asked about" -> TestAuthorityRecordMustDescribe
+// PORTED: tests/unit/prov.bats: "a record ill-formed in a field OTHER than the selector is never authority, and is preserved" -> TestAuthorityRecordMustDescribe
+// PORTED: tests/unit/prov.bats: "a tombstone consumes only a record that DESCRIBES the object it is tombstoning" -> TestTombstoneRecordMustDescribe
+// PORTED: tests/unit/prov.bats: "a REPEATED tombstone keeps the identity the tombstone exists to preserve" -> TestRepeatedTombstoneKeepsIdentity
+// PORTED: tests/unit/prov.bats: "a contradiction among TOMBSTONES is preserved too, even when the object record reads fine" -> TestTombstoneAmbiguityPreserved
+// PORTED: tests/unit/prov.bats: "deletion authority requires the object to carry THIS installation's label" -> TestAuthorityInstallationLabel
+// PORTED: tests/unit/prov.bats: "authority refuses when this installation's OWN identity cannot be read" -> TestAuthorityOwnIdentityUnreadable
+// PORTED: tests/unit/prov.bats: "an ABSENT installation label is refused as absent however the runtime spells it" -> TestAuthorityInstallationLabel
+// PORTED: tests/unit/prov.bats: "a record ALREADY carrying a duplicate selector matches nothing — not even its own key" -> TestDuplicateSelectorMatchesNothing
+// PORTED: tests/unit/prov.bats: "a record with an EMPTY field is ill-formed — the walk sees what IFS splitting collapsed" -> TestEmptyFieldIsIllFormed
+// PORTED: tests/unit/prov.bats: "a field VALUE that is a glob is compared LITERALLY — the cwd cannot manufacture a nonce" -> TestGlobValueComparedLiterally
+
+// --- the runtime fake ---------------------------------------------------------------------------
+// Labels a real daemon would carry, and the two failure shapes that must never be folded together:
+// engine.ErrAbsent (the object is GONE — an answer) and a transport error (the question could not
+// be asked — never an answer).
+
+type fakeObjs struct {
+	obj      map[string]map[string]string // "class:name" -> label -> value
+	list     map[Class][]string
+	listFail map[Class]bool
+	askErr   error
+}
+
+func newFakeObjs() *fakeObjs {
+	return &fakeObjs{obj: map[string]map[string]string{}, list: map[Class][]string{}, listFail: map[Class]bool{}}
+}
+
+func (f *fakeObjs) put(class Class, name string, labels map[string]string) {
+	f.obj[string(class)+":"+name] = labels
+}
+
+func (f *fakeObjs) Label(_ context.Context, class Class, name, label string) (string, error) {
+	if f.askErr != nil {
+		return "", f.askErr
+	}
+	m, ok := f.obj[string(class)+":"+name]
+	if !ok {
+		return "", engine.ErrAbsent
+	}
+	return m[label], nil
+}
+
+func (f *fakeObjs) Names(_ context.Context, class Class) ([]string, error) {
+	if f.listFail[class] {
+		return nil, errors.New("the container runtime did not answer")
+	}
+	if !ClassOK(class) || class == ClassProbe {
+		return nil, errors.New("prov: not a listable object kind")
+	}
+	return f.list[class], nil
+}
+
+func identLedger(t *testing.T) (*ledger.Ledger, string) {
+	t.Helper()
+	l := &ledger.Ledger{}
+	id, err := l.IdentEnsure()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return l, id
+}
+
+// --- records ------------------------------------------------------------------------------------
+
+func TestRecordAndFind(t *testing.T) {
+	l := &ledger.Ledger{}
+	if err := Record(l, ClassVolume, "v1", "n1", ledger.Field{Key: "role", Value: "state"}); err != nil {
+		t.Fatal(err)
+	}
+	fields, err := Find(l, ClassVolume, "v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []struct{ k, v string }{
+		{"key", "volume:v1"}, {"class", "volume"}, {"name", "v1"}, {"nonce", "n1"},
+		{"gen", "1"}, {"role", "state"},
+	} {
+		if got, ok := ledger.FieldOf(fields, want.k); !ok || got != want.v {
+			t.Errorf("%s = %q (present=%v), want %q", want.k, got, ok, want.v)
+		}
+	}
+	// Absence is an ANSWER, never a refusal.
+	if _, err := Find(l, ClassVolume, "nope"); !errors.Is(err, ledger.ErrAbsentRecord) {
+		t.Fatalf("absent record: %v", err)
+	}
+}
+
+func TestRecordSupersedes(t *testing.T) {
+	l := &ledger.Ledger{}
+	for i, nonce := range []string{"n1", "n2", "n3"} {
+		if err := Record(l, ClassVolume, "v1", nonce); err != nil {
+			t.Fatal(err)
+		}
+		g, err := Gen(l, ClassVolume, "v1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if g != uint64(i+1) {
+			t.Fatalf("generation %d, want %d", g, i+1)
+		}
+	}
+	// ONE record, not three claims about one object.
+	rows, err := l.All("object")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("a re-record appended beside instead of superseding: %d rows", len(rows))
+	}
+	fields, _ := Find(l, ClassVolume, "v1")
+	if n, _ := ledger.FieldOf(fields, "nonce"); n != "n3" {
+		t.Fatalf("newest record did not win: nonce=%q", n)
+	}
+}
+
+func TestClassAndNameKeyTheRecord(t *testing.T) {
+	// The reachable collision: a container and a volume deriving the SAME name. Recording either
+	// must not delete the other's record.
+	const shared = "mythical-i0123456789-p1-state"
+	l := &ledger.Ledger{}
+	if err := Record(l, ClassContainer, shared, "cn"); err != nil {
+		t.Fatal(err)
+	}
+	if err := Record(l, ClassVolume, shared, "vn"); err != nil {
+		t.Fatal(err)
+	}
+	cf, err := Find(l, ClassContainer, shared)
+	if err != nil {
+		t.Fatalf("the container record was destroyed by the volume's: %v", err)
+	}
+	vf, err := Find(l, ClassVolume, shared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cn, _ := ledger.FieldOf(cf, "nonce"); cn != "cn" {
+		t.Fatalf("container nonce = %q", cn)
+	}
+	if vn, _ := ledger.FieldOf(vf, "nonce"); vn != "vn" {
+		t.Fatalf("volume nonce = %q", vn)
+	}
+	// And tombstoning one leaves the other's provenance intact.
+	if err := Tombstone(l, ClassVolume, shared); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Find(l, ClassContainer, shared); err != nil {
+		t.Fatalf("tombstoning the volume erased the container's record: %v", err)
+	}
+}
+
+func TestGenerationMustBeDigits(t *testing.T) {
+	// A `gen=` that is not a number is REFUSED, never reset to 0 — a silent reset is how a
+	// tampered record erases the history that would show it had been tampered with. The reference
+	// warned about arithmetic EVALUATION; Go has no evaluator to reach, so what is asserted here
+	// is the surviving half of the rule: refusal, in both readers.
+	for _, bad := range []string{"a[$(touch pwned)]", "1e3", "", "-1", "0x10", "1234567890123456789"} {
+		l := &ledger.Ledger{}
+		if err := l.Put("object", "key", "volume:v1", []ledger.Field{
+			{Key: "key", Value: "volume:v1"}, {Key: "class", Value: "volume"},
+			{Key: "name", Value: "v1"}, {Key: "nonce", Value: "n"}, {Key: "gen", Value: bad},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Gen(l, ClassVolume, "v1"); err == nil {
+			t.Errorf("gen %q was read as a number", bad)
+		}
+		// Recording over it refuses too — it must compute from a generation it can read.
+		if err := Record(l, ClassVolume, "v1", "n2"); err == nil {
+			t.Errorf("gen %q was superseded on the strength of an unreadable generation", bad)
+		}
+		// AND IT IS NEVER CARRIED INTO A TOMBSTONE: a module that will not read a value must not
+		// write it back either, or the next reader gets it preserved instead of reported.
+		if err := Tombstone(l, ClassVolume, "v1"); err == nil {
+			t.Errorf("gen %q was carried into a tombstone", bad)
+		}
+		// The evidence is still there, untouched.
+		if _, err := Find(l, ClassVolume, "v1"); err != nil {
+			t.Errorf("evidence destroyed for gen %q: %v", bad, err)
+		}
+	}
+}
+
+// --- tombstones ---------------------------------------------------------------------------------
+
+func TestTombstoneReplacesRecord(t *testing.T) {
+	l := &ledger.Ledger{}
+	if err := Record(l, ClassVolume, "v1", "n1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := Tombstone(l, ClassVolume, "v1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Find(l, ClassVolume, "v1"); !errors.Is(err, ledger.ErrAbsentRecord) {
+		t.Fatalf("the object record survived the tombstone: %v", err)
+	}
+	tomb, err := TombstoneFind(l, ClassVolume, "v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// §6b: provenance SURVIVES what it describes — the identity is what a later --purge needs.
+	if n, _ := ledger.FieldOf(tomb, "nonce"); n != "n1" {
+		t.Fatalf("tombstone nonce = %q, want n1", n)
+	}
+	if g, _ := ledger.FieldOf(tomb, "gen"); g != "1" {
+		t.Fatalf("tombstone gen = %q, want 1", g)
+	}
+}
+
+func TestRepeatedTombstoneKeepsIdentity(t *testing.T) {
+	l := &ledger.Ledger{}
+	if err := Record(l, ClassVolume, "v1", "n1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := Tombstone(l, ClassVolume, "v1"); err != nil {
+		t.Fatal(err)
+	}
+	// The object record is gone, so the SECOND removal must read the tombstone it wrote a moment
+	// ago and copy it forward — reading only the object record left the retry with nothing, and it
+	// replaced a good tombstone with an empty one.
+	if err := Tombstone(l, ClassVolume, "v1"); err != nil {
+		t.Fatal(err)
+	}
+	tomb, err := TombstoneFind(l, ClassVolume, "v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := ledger.FieldOf(tomb, "nonce"); n != "n1" {
+		t.Fatalf("a repeat removal erased the identity it exists to preserve: nonce=%q", n)
+	}
+	if g, _ := ledger.FieldOf(tomb, "gen"); g != "1" {
+		t.Fatalf("a repeat removal erased the generation: gen=%q", g)
+	}
+	// And it SUPERSEDES rather than appending beside: a reinstall/uninstall cycle must not
+	// accumulate one tombstone per generation.
+	rows, err := l.All("tombstone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("%d tombstones for one object", len(rows))
+	}
+}
+
+func TestTombstoneRecordMustDescribe(t *testing.T) {
+	// A record keyed `volume:v1` that describes something else is CONFLICTING EVIDENCE: consuming
+	// it would copy another object's identity into this object's tombstone and drop the record.
+	l := &ledger.Ledger{}
+	if err := l.Put("object", "key", "volume:v1", []ledger.Field{
+		{Key: "key", Value: "volume:v1"}, {Key: "class", Value: "container"},
+		{Key: "name", Value: "other"}, {Key: "nonce", Value: "n1"}, {Key: "gen", Value: "1"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	err := Tombstone(l, ClassVolume, "v1")
+	if err == nil || !strings.Contains(err.Error(), "does not describe it") {
+		t.Fatalf("a record about something else was consumed: %v", err)
+	}
+	if _, ferr := Find(l, ClassVolume, "v1"); ferr != nil {
+		t.Fatalf("the conflicting record was destroyed rather than preserved: %v", ferr)
+	}
+	// A record with NO nonce loses the same way: an empty tombstone is indistinguishable
+	// afterwards from the honest one written for an object that never had provenance.
+	l2 := &ledger.Ledger{}
+	if err := l2.Put("object", "key", "volume:v2", []ledger.Field{
+		{Key: "key", Value: "volume:v2"}, {Key: "class", Value: "volume"},
+		{Key: "name", Value: "v2"}, {Key: "gen", Value: "1"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Tombstone(l2, ClassVolume, "v2"); err == nil || !strings.Contains(err.Error(), "carries no nonce") {
+		t.Fatalf("a record with no nonce was consumed: %v", err)
+	}
+	if _, ferr := Find(l2, ClassVolume, "v2"); ferr != nil {
+		t.Fatalf("evidence destroyed: %v", ferr)
+	}
+}
+
+func TestTombstoneAmbiguityPreserved(t *testing.T) {
+	// BOTH cardinality questions are asked BEFORE anything is read or dropped. When the object
+	// record is present and fine, the tombstone lookup is never reached by a naive port — and the
+	// rewrite would still have replaced every tombstone row for this key.
+	l := &ledger.Ledger{}
+	l.ReplaceLines([]string{
+		"object\tkey=volume:v1\tclass=volume\tname=v1\tnonce=n1\tgen=1",
+		"tombstone\tkey=volume:v1\tclass=volume\tname=v1\tnonce=old-a\tgen=1",
+		"tombstone\tkey=volume:v1\tclass=volume\tname=v1\tnonce=old-b\tgen=1",
+	})
+	err := Tombstone(l, ClassVolume, "v1")
+	if err == nil || !errors.Is(err, ledger.ErrAmbiguous) {
+		t.Fatalf("contradictory tombstones were collapsed: %v", err)
+	}
+	if got := l.Lines(); len(got) != 3 {
+		t.Fatalf("evidence destroyed: %v", got)
+	}
+}
+
+func TestTombstoneCannotForge(t *testing.T) {
+	// A newline or TAB in the object NAME would forge a whole record. The reference needed its own
+	// copy of the field rule to stop that, because its tombstone serialized the record itself;
+	// this one hands a field list to the same typed editor as every other write, so what is
+	// asserted here is the END-TO-END property — a forged name is refused and NOTHING is written.
+	//
+	// MUTATION-ANCHORING NOTE: no single mutation reddens this, and that is a fact about the
+	// ledger rather than a weakness here — the selector gate (argsOK) and the field-list gate
+	// (fieldsOK) each refuse it independently, so disabling either leaves the other standing.
+	// Measured: with BOTH disabled the case fails on its own two messages and the ledger is left
+	// holding the forged record, which is what makes this an integration assertion over those two
+	// gates rather than the sole proof of either.
+	l := &ledger.Ledger{}
+	for _, bad := range []string{"v1\nobject\tkey=volume:forged", "v1\tnonce=forged"} {
+		if err := Tombstone(l, ClassVolume, bad); err == nil {
+			t.Errorf("a name containing a separator was serialized: %q", bad)
+		}
+	}
+	if got := l.Lines(); len(got) != 0 {
+		t.Fatalf("a refused tombstone still wrote: %v", got)
+	}
+}
+
+// --- deletion authority -------------------------------------------------------------------------
+
+func authorityFixture(t *testing.T) (*ledger.Ledger, *fakeObjs, string) {
+	t.Helper()
+	l, id := identLedger(t)
+	if err := Record(l, ClassVolume, "v1", "n1"); err != nil {
+		t.Fatal(err)
+	}
+	f := newFakeObjs()
+	f.put(ClassVolume, "v1", map[string]string{LabelInstall: id, LabelNonce: "n1"})
+	return l, f, id
+}
+
+func TestAuthorityNonceMustMatch(t *testing.T) {
+	ctx := context.Background()
+	l, f, _ := authorityFixture(t)
+	if err := Authority(ctx, l, f, ClassVolume, "v1"); err != nil {
+		t.Fatalf("a matching record and object was refused: %v", err)
+	}
+	// A REUSED name: same name, same installation, DIFFERENT object. `docker volume create`
+	// against an existing name succeeds, so this is reachable by accident.
+	f.obj["volume:v1"][LabelNonce] = "someone-elses"
+	err := Authority(ctx, l, f, ClassVolume, "v1")
+	if err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("a reused name was authorized for deletion: %v", err)
+	}
+	if errors.Is(err, ErrGone) {
+		t.Fatal("a mismatch was reported as already-gone")
+	}
+}
+
+func TestAuthorityNoRecord(t *testing.T) {
+	ctx := context.Background()
+	l, _ := identLedger(t)
+	f := newFakeObjs()
+	// PRESENT but unattributed: preserved and reported, never assumed ours on no evidence.
+	f.put(ClassVolume, "v1", map[string]string{})
+	err := Authority(ctx, l, f, ClassVolume, "v1")
+	if err == nil || !strings.Contains(err.Error(), "no provenance record") {
+		t.Fatalf("an unattributed object was authorized: %v", err)
+	}
+	if errors.Is(err, ErrGone) {
+		t.Fatal("an unattributed present object was reported as already-gone")
+	}
+	// COULD NOT BE ASKED: fail closed — authorizing "already gone" on a question that could not be
+	// asked is the refusal-into-answer fold this module exists to prevent.
+	f.askErr = errors.New("daemon down")
+	err = Authority(ctx, l, f, ClassVolume, "v1")
+	if err == nil || errors.Is(err, ErrGone) || !strings.Contains(err.Error(), "could not be") {
+		t.Fatalf("a down daemon was folded into an answer: %v", err)
+	}
+}
+
+func TestAuthorityGoneIsDistinct(t *testing.T) {
+	ctx := context.Background()
+	// GONE with no record: this installer's own prior removal already tombstoned it. Nothing to
+	// authorize and nothing to fear — an ANSWER, distinct from "cannot prove ownership".
+	l, _ := identLedger(t)
+	f := newFakeObjs()
+	if err := Authority(ctx, l, f, ClassVolume, "v1"); !errors.Is(err, ErrGone) {
+		t.Fatalf("gone-with-no-record: %v", err)
+	}
+	// GONE with a record: same answer, reached through the label lookups.
+	l2, f2, _ := authorityFixture(t)
+	delete(f2.obj, "volume:v1")
+	if err := Authority(ctx, l2, f2, ClassVolume, "v1"); !errors.Is(err, ErrGone) {
+		t.Fatalf("gone-with-record: %v", err)
+	}
+}
+
+func TestAuthorityInstallationLabel(t *testing.T) {
+	ctx := context.Background()
+	// WHOSE IS IT — the half the nonce does not answer. A foreign installation's object with a
+	// MATCHING nonce (a restored or foreign ledger supplies both) must still be refused.
+	l, f, _ := authorityFixture(t)
+	f.obj["volume:v1"][LabelInstall] = "i9999999999"
+	err := Authority(ctx, l, f, ClassVolume, "v1")
+	if err == nil || !strings.Contains(err.Error(), "another installation") {
+		t.Fatalf("another installation's object was authorized: %v", err)
+	}
+	// UNLABELLED: neither adopted nor removed. And absence is refused as absence however the
+	// runtime spells it — an absent key and the template-era `<no value>` fold to one answer.
+	for _, spelling := range []string{"", "<no value>"} {
+		l2, f2, _ := authorityFixture(t)
+		f2.obj["volume:v1"][LabelInstall] = spelling
+		err := Authority(ctx, l2, f2, ClassVolume, "v1")
+		if err == nil || !strings.Contains(err.Error(), "no installation label") {
+			t.Fatalf("unlabelled (%q) was authorized: %v", spelling, err)
+		}
+	}
+}
+
+func TestAuthorityOwnIdentityUnreadable(t *testing.T) {
+	ctx := context.Background()
+	// Two identity records: the ledger cannot answer for its own identity, so nothing can be shown
+	// to belong to it and no removal is authorized.
+	l := &ledger.Ledger{}
+	l.ReplaceLines([]string{
+		"identity\tid=i0000000001",
+		"identity\tid=i0000000002",
+		"object\tkey=volume:v1\tclass=volume\tname=v1\tnonce=n1\tgen=1",
+	})
+	f := newFakeObjs()
+	f.put(ClassVolume, "v1", map[string]string{LabelInstall: "i0000000001", LabelNonce: "n1"})
+	err := Authority(ctx, l, f, ClassVolume, "v1")
+	if err == nil || !strings.Contains(err.Error(), "own identity cannot be read") {
+		t.Fatalf("authority proceeded without an identity: %v", err)
+	}
+}
+
+func TestAuthorityRecordMustDescribe(t *testing.T) {
+	ctx := context.Background()
+	l, id := identLedger(t)
+	// Keyed `volume:v1`, describing something else: it answers the lookup and then hands authority
+	// the OTHER object's nonce, compared against THIS object's label.
+	if err := l.Put("object", "key", "volume:v1", []ledger.Field{
+		{Key: "key", Value: "volume:v1"}, {Key: "class", Value: "container"},
+		{Key: "name", Value: "other"}, {Key: "nonce", Value: "n1"}, {Key: "gen", Value: "1"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f := newFakeObjs()
+	f.put(ClassVolume, "v1", map[string]string{LabelInstall: id, LabelNonce: "n1"})
+	err := Authority(ctx, l, f, ClassVolume, "v1")
+	if err == nil || !strings.Contains(err.Error(), "does not describe it") {
+		t.Fatalf("a record about another object granted authority: %v", err)
+	}
+	if _, ferr := Find(l, ClassVolume, "v1"); ferr != nil {
+		t.Fatalf("the conflicting record was not preserved: %v", ferr)
+	}
+	// Ill-formed in a field OTHER than the selector: it matches nothing, so it is never authority,
+	// and an ordinary operation must not destroy it.
+	l2, _ := identLedger(t)
+	l2.ReplaceLines(append(l2.Lines(),
+		"object\tkey=volume:v2\tclass=volume\tname=v2\tnonce=n1\tgen=1\tnot-a-field"))
+	f2 := newFakeObjs()
+	f2.put(ClassVolume, "v2", map[string]string{LabelInstall: "i0000000001", LabelNonce: "n1"})
+	if err := Authority(ctx, l2, f2, ClassVolume, "v2"); err == nil {
+		t.Fatal("an ill-formed record granted authority")
+	}
+	if !strings.Contains(strings.Join(l2.Lines(), "\n"), "not-a-field") {
+		t.Fatal("the ill-formed record was destroyed")
+	}
+}
+
+func TestImageRecordAndRefusal(t *testing.T) {
+	ctx := context.Background()
+	l := &ledger.Ledger{}
+	const ref = "ghcr.io/x/brokkr@sha256:" + "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	if err := ImageRecord(l, ref, "brokkr"); err != nil {
+		t.Fatal(err)
+	}
+	fields, err := l.Find("image", "ref", ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := ledger.FieldOf(fields, "product"); p != "brokkr" {
+		t.Fatalf("product = %q", p)
+	}
+	// D37: images are NEVER removed automatically — the ledger proves acquisition, not ownership.
+	err = Authority(ctx, l, newFakeObjs(), "image", ref)
+	if err == nil || !strings.Contains(err.Error(), "never removed automatically") {
+		t.Fatalf("image authority: %v", err)
+	}
+	if errors.Is(err, ErrGone) {
+		t.Fatal("an image refusal was reported as already-gone")
+	}
+}
+
+func TestUnlistableKind(t *testing.T) {
+	// A listing FAILURE, not an empty listing: the reference's missing default arm let an unknown
+	// kind fall through to "answered, nothing there" — the same fail-open, from a typo.
+	if _, err := Engine(nil).Names(context.Background(), Class("nonsense")); err == nil {
+		t.Fatal("an unknown kind was listed as empty")
+	}
+	if _, err := Engine(nil).Names(context.Background(), ClassProbe); err == nil {
+		t.Fatal("probe was listed as its own kind, double-counting the container listing")
+	}
+}
+
+// --- first use ----------------------------------------------------------------------------------
+
+func homeWith(t *testing.T, build func(home string)) string {
+	t.Helper()
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, ".state"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if build != nil {
+		build(home)
+	}
+	return home
+}
+
+func TestFirstUseClean(t *testing.T) {
+	// Genuinely first use: no ledger, no trace, and the runtime ANSWERED that it holds none of
+	// ours. The installer's own scaffolding is exempt, or no machine would ever read as fresh.
+	home := homeWith(t, func(h string) {
+		mustMkdir(t, filepath.Join(h, "bin"))
+		mustMkdir(t, filepath.Join(h, "logs"))
+		mustMkdir(t, filepath.Join(h, "transcripts"))
+		mustWrite(t, filepath.Join(h, "mythical.conf"), "")
+	})
+	f := newFakeObjs()
+	f.list[ClassContainer] = []string{"unrelated"}
+	if err := FirstUse(context.Background(), home, f); err != nil {
+		t.Fatalf("a genuinely fresh machine was refused: %v", err)
+	}
+}
+
+func TestFirstUseLedgerPresent(t *testing.T) {
+	home := homeWith(t, func(h string) {
+		mustWrite(t, filepath.Join(h, ".state", "ledger"), "#mythical-ctl-ledger schema=1\n")
+	})
+	if err := FirstUse(context.Background(), home, newFakeObjs()); !errors.Is(err, ErrNotFirstUse) {
+		t.Fatalf("a ledger that exists is not first use: %v", err)
+	}
+}
+
+func TestFirstUseLedgerNotRegular(t *testing.T) {
+	// A failed or partial restore leaves the ledger path as a DIRECTORY or a dangling symlink;
+	// a regular-file test is false for both, and a fresh machine is one this installer
+	// initialises over.
+	dir := homeWith(t, func(h string) { mustMkdir(t, filepath.Join(h, ".state", "ledger")) })
+	err := FirstUse(context.Background(), dir, newFakeObjs())
+	if err == nil || errors.Is(err, ErrNotFirstUse) || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("a directory at the ledger path: %v", err)
+	}
+	dangling := homeWith(t, func(h string) {
+		if serr := os.Symlink(filepath.Join(h, "gone"), filepath.Join(h, ".state", "ledger")); serr != nil {
+			t.Fatal(serr)
+		}
+	})
+	err = FirstUse(context.Background(), dangling, newFakeObjs())
+	if err == nil || errors.Is(err, ErrNotFirstUse) || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("a dangling symlink at the ledger path: %v", err)
+	}
+}
+
+func TestFirstUseStaging(t *testing.T) {
+	// An in-progress restore is its own third state: not first use, not inconsistent-with-traces.
+	// Any PRESENCE at the path is the marker — a restore that failed while creating it is exactly
+	// the case this catches.
+	for _, mk := range []func(t *testing.T, h string){
+		func(t *testing.T, h string) { mustWrite(t, filepath.Join(h, ".state", "ledger.staging"), "x") },
+		func(t *testing.T, h string) { mustMkdir(t, filepath.Join(h, ".state", "ledger.staging")) },
+		func(t *testing.T, h string) {
+			if err := os.Symlink(filepath.Join(h, "gone"), filepath.Join(h, ".state", "ledger.staging")); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		home := homeWith(t, func(h string) { mk(t, h) })
+		err := FirstUse(context.Background(), home, newFakeObjs())
+		if err == nil || !strings.Contains(err.Error(), "restore is in progress") {
+			t.Fatalf("staging marker: %v", err)
+		}
+	}
+}
+
+func TestFirstUseTraces(t *testing.T) {
+	cases := []struct {
+		name  string
+		build func(t *testing.T, h string)
+		want  string
+	}{
+		{"product conf", func(t *testing.T, h string) { mustWrite(t, filepath.Join(h, "brokkr.conf"), "") }, "brokkr.conf"},
+		{"dangling conf", func(t *testing.T, h string) {
+			// PRESENCE is the test, not readability.
+			if err := os.Symlink(filepath.Join(h, "gone"), filepath.Join(h, "brokkr.conf")); err != nil {
+				t.Fatal(err)
+			}
+		}, "brokkr.conf"},
+		{"product dir", func(t *testing.T, h string) {
+			mustMkdir(t, filepath.Join(h, "brokkr"))
+			mustWrite(t, filepath.Join(h, "brokkr", "compose.yaml"), "")
+		}, "brokkr/"},
+		{"link to a live dir", func(t *testing.T, h string) {
+			mustMkdir(t, filepath.Join(h, "elsewhere"))
+			if err := os.Symlink(filepath.Join(h, "elsewhere"), filepath.Join(h, "brokkr")); err != nil {
+				t.Fatal(err)
+			}
+		}, "brokkr/"},
+		{"dangling product dir", func(t *testing.T, h string) {
+			if err := os.Symlink(filepath.Join(h, "gone"), filepath.Join(h, "brokkr")); err != nil {
+				t.Fatal(err)
+			}
+		}, "brokkr"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			home := homeWith(t, func(h string) { tc.build(t, h) })
+			err := FirstUse(context.Background(), home, newFakeObjs())
+			if err == nil || !strings.Contains(err.Error(), "already holds") || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("trace not reported (want %q): %v", tc.want, err)
+			}
+		})
+	}
+}
+
+func TestFirstUseRuntimeObjects(t *testing.T) {
+	// Labelled objects survive removing the home entirely, so a clean home is not enough.
+	home := homeWith(t, nil)
+	f := newFakeObjs()
+	f.list[ClassVolume] = []string{"unrelated", "mythical-i0123456789-brokkr-state"}
+	err := FirstUse(context.Background(), home, f)
+	if err == nil || !strings.Contains(err.Error(), "mythical-i0123456789-brokkr-state") {
+		t.Fatalf("a family-named object was not reported: %v", err)
+	}
+}
+
+func TestFirstUseRuntimeUnasked(t *testing.T) {
+	// AN EMPTY ANSWER IS NOT THE SAME FACT AS NO ANSWER. Three swallowed failures produced three
+	// empty listings and "genuinely first use" off a question never asked.
+	home := homeWith(t, nil)
+	f := newFakeObjs()
+	f.listFail[ClassNetwork] = true
+	err := FirstUse(context.Background(), home, f)
+	if err == nil || !strings.Contains(err.Error(), "could not be asked") || !strings.Contains(err.Error(), "network") {
+		t.Fatalf("a down runtime read as a fresh machine: %v", err)
+	}
+}
+
+// --- the host-tool slot exemption ---------------------------------------------------------------
+
+func TestHostToolSlotExemption(t *testing.T) {
+	// A REAL product directory holding nothing but the slot is not evidence of a previous
+	// INSTALLATION: an operator can install and configure a product's host-side tool before this
+	// installer has ever run here.
+	home := homeWith(t, func(h string) {
+		mustMkdir(t, filepath.Join(h, "brokkr"))
+		mustWrite(t, filepath.Join(h, "brokkr", "cli.toml"), "")
+	})
+	if err := FirstUse(context.Background(), home, newFakeObjs()); err != nil {
+		t.Fatalf("the host-tool slot alone was counted as a trace: %v", err)
+	}
+	// BESIDE a generated artifact it is still a trace — the exemption is "nothing that is not one".
+	home2 := homeWith(t, func(h string) {
+		mustMkdir(t, filepath.Join(h, "brokkr"))
+		mustWrite(t, filepath.Join(h, "brokkr", "cli.toml"), "")
+		mustWrite(t, filepath.Join(h, "brokkr", "compose.yaml"), "")
+	})
+	if err := FirstUse(context.Background(), home2, newFakeObjs()); err == nil {
+		t.Fatal("a generated artifact beside the slot was excused")
+	}
+	// A HIDDEN entry beside it is still a trace — a sweep that cannot see dotfiles is a sweep with
+	// a blind spot exactly where a hidden artifact would sit.
+	home3 := homeWith(t, func(h string) {
+		mustMkdir(t, filepath.Join(h, "brokkr"))
+		mustWrite(t, filepath.Join(h, "brokkr", "cli.toml"), "")
+		mustWrite(t, filepath.Join(h, "brokkr", ".generated"), "")
+	})
+	if err := FirstUse(context.Background(), home3, newFakeObjs()); err == nil {
+		t.Fatal("a hidden artifact beside the slot was excused")
+	}
+	// An EMPTY product directory is STILL a trace: the slot must be PRESENT, not merely unopposed.
+	home4 := homeWith(t, func(h string) { mustMkdir(t, filepath.Join(h, "brokkr")) })
+	if err := FirstUse(context.Background(), home4, newFakeObjs()); err == nil {
+		t.Fatal("an empty product directory was excused")
+	}
+}
+
+func TestHostToolSlotShape(t *testing.T) {
+	// The slot must be a plain regular file: exempting a DIRECTORY called cli.toml would hide a
+	// whole generated subtree behind a reserved name.
+	home := homeWith(t, func(h string) {
+		mustMkdir(t, filepath.Join(h, "brokkr", "cli.toml"))
+	})
+	if err := FirstUse(context.Background(), home, newFakeObjs()); err == nil {
+		t.Fatal("a directory at the slot's name was excused")
+	}
+	// A SYMLINK at the slot's name is not the slot either.
+	home2 := homeWith(t, func(h string) {
+		mustMkdir(t, filepath.Join(h, "brokkr"))
+		mustWrite(t, filepath.Join(h, "real.toml"), "")
+		if err := os.Symlink(filepath.Join(h, "real.toml"), filepath.Join(h, "brokkr", "cli.toml")); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if err := FirstUse(context.Background(), home2, newFakeObjs()); err == nil {
+		t.Fatal("a symlink at the slot's name was excused")
+	}
+	// A SYMLINK standing where the product DIRECTORY should be is a trace whatever it holds: the
+	// exemption is about a directory this layout owns, and the classifier classifies home-relative
+	// paths, not link targets somewhere else on the disk.
+	home3 := homeWith(t, func(h string) {
+		mustMkdir(t, filepath.Join(h, "elsewhere"))
+		mustWrite(t, filepath.Join(h, "elsewhere", "cli.toml"), "")
+		if err := os.Symlink(filepath.Join(h, "elsewhere"), filepath.Join(h, "brokkr")); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if err := FirstUse(context.Background(), home3, newFakeObjs()); err == nil {
+		t.Fatal("a symlinked product directory was excused")
+	}
+}
+
+func TestHostToolSlotUnreadable(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores the permission bits this case turns on")
+	}
+	// "I could not look" is not "there is nothing there".
+	home := homeWith(t, func(h string) {
+		d := filepath.Join(h, "brokkr")
+		mustMkdir(t, d)
+		mustWrite(t, filepath.Join(d, "cli.toml"), "")
+		if err := os.Chmod(d, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(d, 0o755) })
+	})
+	if err := FirstUse(context.Background(), home, newFakeObjs()); err == nil {
+		t.Fatal("an unreadable product directory was excused")
+	}
+}
+
+func TestHostToolSlotNameGrammar(t *testing.T) {
+	// THE NAME IS VALIDATED IN THE ZONE CLASSIFIER, ONCE. A directory whose name is not a legal
+	// product carries no slot, so it is a trace however it is spelled — including a name that is
+	// illegal only PAST its first character, which an early-exit classifier would have accepted.
+	for _, bad := range []string{"Brokkr", "fooBAR", "9lives", "mythical"} {
+		home := homeWith(t, func(h string) {
+			mustMkdir(t, filepath.Join(h, bad))
+			mustWrite(t, filepath.Join(h, bad, "cli.toml"), "")
+		})
+		err := FirstUse(context.Background(), home, newFakeObjs())
+		if err == nil || !strings.Contains(err.Error(), bad) {
+			t.Errorf("%q was excused by the slot exemption: %v", bad, err)
+		}
+	}
+	// THE EXEMPTION IS PER-DIRECTORY: an exempt product does not excuse a second product's trace.
+	home := homeWith(t, func(h string) {
+		mustMkdir(t, filepath.Join(h, "brokkr"))
+		mustWrite(t, filepath.Join(h, "brokkr", "cli.toml"), "")
+		mustMkdir(t, filepath.Join(h, "saga"))
+		mustWrite(t, filepath.Join(h, "saga", "compose.yaml"), "")
+	})
+	err := FirstUse(context.Background(), home, newFakeObjs())
+	if err == nil || !strings.Contains(err.Error(), "saga/") {
+		t.Fatalf("an exempt product excused another product's trace: %v", err)
+	}
+	if strings.Contains(errString(err), "brokkr") {
+		t.Fatalf("the exempt product was itself reported: %v", err)
+	}
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+func mustMkdir(t *testing.T, p string) {
+	t.Helper()
+	if err := os.MkdirAll(p, 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func mustWrite(t *testing.T, p, s string) {
+	t.Helper()
+	if err := os.WriteFile(p, []byte(s), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// --- records this module refuses to READ ---------------------------------------------------------
+
+func TestDuplicateSelectorMatchesNothing(t *testing.T) {
+	// The writer refuses to WRITE this record, so it arrives the way a RESTORE puts it there:
+	// through the ledger writer, checksum and all. A checksum proves the bytes were not altered
+	// after they were written; it does not prove this installation wrote them. So the reader has
+	// to refuse the record independently of the writer, or the writer's rule is only a rule for
+	// well-behaved ledgers.
+	l := &ledger.Ledger{}
+	l.ReplaceLines([]string{
+		"object\tkey=volume:mine\tclass=volume\tname=mine\tnonce=n1\tgen=1\tkey=volume:target",
+	})
+	// It answers for NEITHER key — not even its own first one.
+	for _, name := range []string{"target", "mine"} {
+		if _, err := Find(l, ClassVolume, name); !errors.Is(err, ledger.ErrAbsentRecord) {
+			t.Errorf("the record answered for %q: %v", name, err)
+		}
+	}
+	// Inert, not deleted — any mismatch preserves. And the REPORTING half is the listing's: a
+	// keyed lookup answers absent, a listing refuses rather than omitting what it cannot read.
+	if _, err := l.All("object"); err == nil {
+		t.Fatal("a listing silently omitted the record it could not read")
+	}
+	if got := l.Lines(); len(got) != 1 || !strings.Contains(got[0], "key=volume:target") {
+		t.Fatalf("the ambiguous record was not preserved: %v", got)
+	}
+}
+
+func TestEmptyFieldIsIllFormed(t *testing.T) {
+	// THE EMPTY FIELD THE REFERENCE'S SPLITTER COULD NOT SEE. `IFS=$'\t'; set -- $record` is IFS
+	// word-splitting, and TAB is IFS *whitespace*, so ADJACENT SEPARATORS COLLAPSE: a record with
+	// an empty field passed the well-formedness gate as though the empty field were not there, and
+	// a checksum-valid ledger carrying one matched, read back, and AUTHORISED DELETION of a live
+	// volume. No writer can emit that record — so the read rule accepted what the write rule
+	// cannot produce, which is exactly the drift between the two directions the gate exists to
+	// make impossible. Here the empty token is one token like any other, and it is not a field.
+	ctx := context.Background()
+	l, id := identLedger(t)
+	l.ReplaceLines(append(l.Lines(),
+		"object\tkey=volume:v1\t\tclass=volume\tname=v1\tnonce=actual\tgen=1"))
+	f := newFakeObjs()
+	f.put(ClassVolume, "v1", map[string]string{LabelInstall: id, LabelNonce: "actual"})
+	err := Authority(ctx, l, f, ClassVolume, "v1")
+	if err == nil {
+		t.Fatal("a record with an empty field authorised deletion of a live volume")
+	}
+	if !strings.Contains(err.Error(), "no provenance record") {
+		t.Fatalf("refused for the wrong reason: %v", err)
+	}
+	if !strings.Contains(strings.Join(l.Lines(), "\n"), "\t\tclass=volume") {
+		t.Fatal("the ill-formed record was destroyed rather than preserved")
+	}
+}
+
+func TestGlobValueComparedLiterally(t *testing.T) {
+	// THE WORKING DIRECTORY COULD MANUFACTURE THE NONCE THAT AUTHORISES A DELETION. The
+	// reference's unquoted expansion made every field a PATHNAME PATTERN: `*` contains neither a
+	// TAB nor a newline, so `nonce=*` is a LEGAL field its own editor writes verbatim and a
+	// restored ledger can carry. It then expanded against whatever directory the CLI happened to
+	// be invoked from — measured, with a file named `nonce=live-nonce` there, the field BECAME
+	// `nonce=live-nonce` and deletion of a volume labelled `live-nonce` was authorised while the
+	// ledger literally recorded `*`.
+	//
+	// Go performs no expansion anywhere, so this asserts the property rather than a defence: the
+	// comparison is literal, and the cwd is set up exactly as the reference's was to prove the
+	// vector is inert.
+	ctx := context.Background()
+	t.Chdir(t.TempDir())
+	if err := os.WriteFile("nonce=live-nonce", []byte(""), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	l, id := identLedger(t)
+	if err := Record(l, ClassVolume, "v1", "*"); err != nil {
+		t.Fatal(err)
+	}
+	f := newFakeObjs()
+	f.put(ClassVolume, "v1", map[string]string{LabelInstall: id, LabelNonce: "live-nonce"})
+	err := Authority(ctx, l, f, ClassVolume, "v1")
+	if err == nil {
+		t.Fatal("the working directory manufactured a nonce that authorised deletion")
+	}
+	if !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("refused for the wrong reason: %v", err)
+	}
+	// And the literal value still matches ITSELF — the comparison is literal in both directions,
+	// not merely broken for globs.
+	f.obj["volume:v1"][LabelNonce] = "*"
+	if err := Authority(ctx, l, f, ClassVolume, "v1"); err != nil {
+		t.Fatalf("a literal '*' did not match itself: %v", err)
+	}
+}
