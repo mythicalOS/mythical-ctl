@@ -189,8 +189,9 @@ func TestLookupOrderExactBeatsLegacy(t *testing.T) {
 	if _, err := resolveRegistryAuth(nil, home, "reg.example/img"); err == nil || !strings.Contains(err.Error(), "refusing to guess") {
 		t.Fatalf("ambiguous legacy spellings must refuse: %v", err)
 	}
-	// The same order for credHelpers: the exact hostname key beats a legacy one; two legacy
-	// keys naming different helpers refuse.
+	// credHelpers are EXACT-ONLY, as the CLI's plain map lookup is: the hostname key is used;
+	// a URL-spelled key is not a match at all — it neither runs nor refuses, the lookup falls
+	// through to credsStore / inline exactly as the CLI would.
 	hExact := writeHelper(t, "hexact", `echo '{"Username":"from-exact","Secret":"x"}'`)
 	hLegacy := writeHelper(t, "hlegacy", `echo '{"Username":"from-legacy","Secret":"y"}'`)
 	env := []string{"PATH=" + hExact + string(os.PathListSeparator) + hLegacy}
@@ -202,11 +203,16 @@ func TestLookupOrderExactBeatsLegacy(t *testing.T) {
 	if ac := decodeHeader(t, hdr); ac["username"] != "from-exact" {
 		t.Fatalf("credHelpers: exact key must win: %v", ac)
 	}
-	writeConfig(t, root, `{"credHelpers":{"https://reg.example":"hlegacy","http://reg.example":"hexact"}}`)
-	if _, err := resolveRegistryAuth(env, home, "reg.example/img"); err == nil || !strings.Contains(err.Error(), "refusing to guess") {
-		t.Fatalf("credHelpers: ambiguous legacy keys must refuse: %v", err)
+	writeConfig(t, root, `{"credHelpers":{"https://reg.example":"hlegacy"},"auths":{"reg.example":{"auth":"`+exact+`"}}}`)
+	hdr, err = resolveRegistryAuth(env, home, "reg.example/img")
+	if err != nil {
+		t.Fatal(err)
 	}
-	// Hub: the legacy URL IS the exact key (what every `docker login` wrote).
+	if ac := decodeHeader(t, hdr); ac["username"] != "exact" {
+		t.Fatalf("a URL-spelled helper key is not a helper match; the inline entry applies: %v", ac)
+	}
+	// Hub: the legacy URL IS the exact key (what every `docker login` wrote); the bare
+	// hostnames are legacy spellings — two of them with no exact key refuse.
 	writeConfig(t, root, `{"auths":{"docker.io":{"auth":"`+legacy+`"},"https://index.docker.io/v1/":{"auth":"`+exact+`"}}}`)
 	hdr, err = resolveRegistryAuth(nil, home, "busybox")
 	if err != nil {
@@ -214,6 +220,10 @@ func TestLookupOrderExactBeatsLegacy(t *testing.T) {
 	}
 	if ac := decodeHeader(t, hdr); ac["username"] != "exact" {
 		t.Fatalf("Hub: the legacy URL is the exact key: %v", ac)
+	}
+	writeConfig(t, root, `{"auths":{"docker.io":{"auth":"`+legacy+`"},"index.docker.io":{"auth":"`+other+`"}}}`)
+	if _, err := resolveRegistryAuth(nil, home, "busybox"); err == nil || !strings.Contains(err.Error(), "refusing to guess") {
+		t.Fatalf("Hub: two legacy hostnames and no exact key must refuse: %v", err)
 	}
 }
 

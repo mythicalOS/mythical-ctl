@@ -566,6 +566,17 @@ func TestConstructorRefusals(t *testing.T) {
 	if _, err := engine.NewHelperSpec("img", "h1", engine.HelperResolve, good, engine.HelperOpts{RunAs: "10x0"}); err == nil {
 		t.Error("a non-numeric uid")
 	}
+	// The uid range is the manifest's runtime_uid type — the full 32-bit space, not a digit
+	// count: the first port refused every 10-digit uid (gate round-10 P2).
+	if _, err := engine.NewHelperSpec("img", "h1", engine.HelperResolve, good, engine.HelperOpts{RunAs: "4294967295"}); err != nil {
+		t.Errorf("uid 4294967295 is valid: %v", err)
+	}
+	if _, err := engine.NewHelperSpec("img", "h1", engine.HelperResolve, good, engine.HelperOpts{RunAs: "4294967296"}); err == nil {
+		t.Error("uid 2^32 is out of range")
+	}
+	if _, err := engine.NewHelperSpec("img", "h1", engine.HelperResolve, good, engine.HelperOpts{RunAs: "+1"}); err == nil {
+		t.Error("a signed uid is not digits-only")
+	}
 }
 
 func TestHelperMountVocabulary(t *testing.T) {

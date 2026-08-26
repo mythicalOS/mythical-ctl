@@ -25,6 +25,7 @@ package engine
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -463,13 +464,16 @@ func NewHelperSpec(image, name string, cmd HelperCommand, prov Provenance, opts 
 		}
 	}
 	if opts.RunAs != "" {
-		if len(opts.RunAs) > 9 {
-			return HelperSpec{}, errors.New("engine: helper uid out of range")
-		}
+		// The reference's rule is digits-only (`*[!0-9]*` refused) with no length cap; the
+		// ceiling is the manifest's own `runtime_uid` type, int:0:4294967295 — the only source
+		// of a RunAs value — so a 32-bit uid is accepted in full and 2^32 is refused.
 		for i := 0; i < len(opts.RunAs); i++ {
 			if opts.RunAs[i] < '0' || opts.RunAs[i] > '9' {
 				return HelperSpec{}, errors.New("engine: helper uid must be numeric")
 			}
+		}
+		if _, perr := strconv.ParseUint(opts.RunAs, 10, 32); perr != nil {
+			return HelperSpec{}, errors.New("engine: helper uid out of range (0..4294967295)")
 		}
 	}
 	for _, a := range opts.Args {

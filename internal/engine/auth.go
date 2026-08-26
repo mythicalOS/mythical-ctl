@@ -147,7 +147,7 @@ func runCredHelper(env []string, helper, serverAddress string) (*authConfig, err
 // hostname the way the CLI does, and decodes the base64 `auth` pair when that is the spelling
 // present.
 func inlineAuthFor(auths map[string]configAuthEntry, host string) (*authConfig, error) {
-	key, err := lookupKey(keysOf(auths), host, "inline auths")
+	key, err := lookupKey(keysOf(auths), host, "inline auths", true)
 	if err != nil {
 		return nil, err
 	}
@@ -188,20 +188,24 @@ func keysOf[V any](m map[string]V) []string {
 	return out
 }
 
-// lookupKey ports the docker CLI's lookup order and closes its one open door. The CLI tries
-// the EXACT config key first (`AuthConfigs[serverAddress]`, `CredentialHelpers[hostname]`)
-// and only then falls back to matching keys by normalized hostname — where it iterates a Go
-// map, so a config carrying both a canonical and a legacy spelling of one registry answers
-// NONDETERMINISTICALLY. Here: the exact key wins; a normalized fallback is taken only when it
-// is UNIQUE; two legacy spellings that disagree are a REFUSAL, never a coin toss.
-func lookupKey(keys []string, host, what string) (string, error) {
+// lookupKey ports the docker CLI's lookup order and closes its one open door. The CLI's
+// EXACT key is the server address — `AuthConfigs[serverAddress]` for inline auths (the Hub
+// legacy URL for Hub, the bare host otherwise) and `CredentialHelpers[hostname]` for helpers
+// — and the two tables differ AFTER that: inline auths fall back to matching keys by
+// normalized hostname (file_store's legacy path), where the CLI iterates a Go map and a
+// config carrying both a canonical and a legacy spelling answers NONDETERMINISTICALLY;
+// credHelpers get NO fallback at all (getConfiguredCredentialStore is a plain map lookup).
+// Here: the exact key wins; with legacyFallback, a normalized match is taken only when it is
+// UNIQUE and two legacy spellings that disagree are a REFUSAL, never a coin toss; without
+// it, a URL-spelled helper key is simply not a match — exactly as the CLI would not run it.
+func lookupKey(keys []string, host, what string, legacyFallback bool) (string, error) {
 	exact := serverAddressFor(host)
 	var candidates []string
 	for _, k := range keys {
-		if k == exact || k == host {
+		if k == exact {
 			return k, nil
 		}
-		if normalizeRegistryHost(k) == host {
+		if legacyFallback && normalizeRegistryHost(k) == host {
 			candidates = append(candidates, k)
 		}
 	}
@@ -225,7 +229,7 @@ func resolveRegistryAuth(env []string, home string, ref string) (string, error) 
 	}
 
 	var ac *authConfig
-	helperKey, err := lookupKey(keysOf(cfg.CredHelpers), host, "credHelpers")
+	helperKey, err := lookupKey(keysOf(cfg.CredHelpers), host, "credHelpers", false)
 	if err != nil {
 		return "", err
 	}
