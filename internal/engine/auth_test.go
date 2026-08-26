@@ -222,9 +222,36 @@ func TestLookupOrderExactBeatsLegacy(t *testing.T) {
 	if ac := decodeHeader(t, hdr); ac["username"] != "exact" {
 		t.Fatalf("Hub: the legacy URL is the exact key: %v", ac)
 	}
+	// Hub has NO fallback in the CLI (its server address is the legacy URL, which
+	// ConvertToHostname(key) never equals): bare hostname keys are IGNORED, one or many —
+	// the pull proceeds anonymously, exactly as `docker pull` does with such a config.
 	writeConfig(t, root, `{"auths":{"docker.io":{"auth":"`+legacy+`"},"index.docker.io":{"auth":"`+other+`"}}}`)
-	if _, err := resolveRegistryAuth(nil, home, "busybox"); err == nil || !strings.Contains(err.Error(), "refusing to guess") {
-		t.Fatalf("Hub: two legacy hostnames and no exact key must refuse: %v", err)
+	hdr, err = resolveRegistryAuth(nil, home, "busybox")
+	if err != nil || hdr != "" {
+		t.Fatalf("Hub: bare hostname keys are ignored as the CLI ignores them (anonymous): %q %v", hdr, err)
+	}
+	writeConfig(t, root, `{"auths":{"index.docker.io":{"auth":"`+other+`"}}}`)
+	hdr, err = resolveRegistryAuth(nil, home, "busybox")
+	if err != nil || hdr != "" {
+		t.Fatalf("Hub: a lone bare hostname key is ignored too: %q %v", hdr, err)
+	}
+	// Non-Hub fallback spellings the CLI DOES match: a scheme+port URL keeps its port; a
+	// path-bearing key is cut at its first slash.
+	writeConfig(t, root, `{"auths":{"https://reg.example:5000":{"auth":"`+legacy+`"}}}`)
+	hdr, err = resolveRegistryAuth(nil, home, "reg.example:5000/img")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ac := decodeHeader(t, hdr); ac["username"] != "legacy" {
+		t.Fatalf("a scheme+port key matches its host:port: %v", ac)
+	}
+	writeConfig(t, root, `{"auths":{"reg.example/v2/":{"auth":"`+legacy+`"}}}`)
+	hdr, err = resolveRegistryAuth(nil, home, "reg.example/img")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ac := decodeHeader(t, hdr); ac["username"] != "legacy" {
+		t.Fatalf("a path-bearing key is cut at its first slash: %v", ac)
 	}
 }
 

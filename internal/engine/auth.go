@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -81,6 +83,22 @@ func normalizeRegistryHost(key string) string {
 		return "index.docker.io"
 	}
 	return h
+}
+
+// convertToHostname is docker/cli v28.4.0's credentials.ConvertToHostname, field for field:
+// a key carrying a scheme is url-parsed to its host (port kept); anything else is cut at its
+// first `/`. No Hub special-casing — the CLI has none here.
+func convertToHostname(maybeURL string) string {
+	if strings.Contains(maybeURL, "://") {
+		if u, err := url.Parse(maybeURL); err == nil && u.Hostname() != "" {
+			if u.Port() == "" {
+				return u.Hostname()
+			}
+			return net.JoinHostPort(u.Hostname(), u.Port())
+		}
+	}
+	hostName, _, _ := strings.Cut(maybeURL, "/")
+	return hostName
 }
 
 // serverAddressFor is the ServerAddress the daemon (and a credential helper) is handed: the
@@ -288,7 +306,12 @@ func lookupKey(keys []string, host, what string, legacyFallback bool) (string, e
 		if k == exact {
 			return k, nil
 		}
-		if legacyFallback && normalizeRegistryHost(k) == host {
+		// The CLI's legacy comparison, VERBATIM: `serverAddress == ConvertToHostname(key)`.
+		// For Docker Hub the server address is the legacy URL, which no hostname ever equals
+		// — so Hub has NO fallback in the CLI, and a bare `docker.io` / `index.docker.io` key
+		// is ignored there (a pull proceeds anonymously); matching it here would inject
+		// credentials `docker pull` would not send, or refuse where it proceeds.
+		if legacyFallback && convertToHostname(k) == exact {
 			candidates = append(candidates, k)
 		}
 	}
