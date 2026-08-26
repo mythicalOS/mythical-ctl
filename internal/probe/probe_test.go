@@ -285,6 +285,27 @@ func TestSelfCheck(t *testing.T) {
 	}
 }
 
+// Stderr is diagnostics, never evidence: a helper that prints a complete conforming answer on
+// STDERR and nothing on stdout has not passed — the reference read `$(…)`, stdout alone, and a
+// reader that merged the streams would let a debug echo satisfy the check.
+func TestStderrIsNotEvidence(t *testing.T) {
+	r := newRig(t)
+	ctx := context.Background()
+	r.fake.PullImage(probeRef)
+	r.fake.HelperEntry = func(cmd string, args []string, view enginetest.HelperNetView, stdin []byte) (int, []byte) {
+		// The knob is read after the entry returns, so the per-run alias can be echoed.
+		r.fake.HelperStderr = []byte("alias=" + args[0] + "\naddress=10.88.0.9\nselfcheck=ok\n")
+		return 0, nil // exit 0, said NOTHING on stdout
+	}
+	err := r.p.SelfCheck(ctx, r.ix, r.netID)
+	if err == nil {
+		t.Fatal("a conforming answer on STDERR alone must not pass the self-check")
+	}
+	if strings.Contains(err.Error(), "OWN per-run alias") {
+		t.Fatalf("an empty stdout is a broken PROBE, not a DNS verdict: %v", err)
+	}
+}
+
 func TestSelfCheckPerRunAlias(t *testing.T) {
 	r := newRig(t)
 	ctx := context.Background()

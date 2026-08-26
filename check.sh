@@ -36,7 +36,8 @@ MIN_TESTED_PACKAGES="${MIN_TESTED_PACKAGES:-18}"
 # added by the task that creates the boundary and NEVER removed — these survive the bash
 # cutover; a once-run audit protects nothing afterwards. The gate resolves REFERENCES via the
 # AST (selector and identifier use, not call syntax), so a function VALUE of a guarded symbol
-# is caught too — see tools/boundary-gate.
+# is caught too, and the DEFINING package is not exempt (an in-package bare reference trips
+# the rule unless that package is allowlisted explicitly) — see tools/boundary-gate.
 BOUNDARY_RULES=(
   # staging-boundary (Task 8): the restore staging store is constructed ONLY by the backup
   # module — a lifecycle path that could open staging would treat a not-yet-verified restore

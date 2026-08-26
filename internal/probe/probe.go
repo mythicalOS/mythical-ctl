@@ -198,7 +198,11 @@ func (p *Prober) run(ctx context.Context, ix *trust.Index, netID, netalias strin
 	if err := p.acct.OpenProbe(name, nonce); err != nil {
 		return nil, err
 	}
-	code, out, runErr := p.rt.HelperRun(ctx, spec)
+	res, runErr := p.rt.HelperRun(ctx, spec)
+	// The ANSWER is stdout alone — the reference captured `$(mi_rt_run_helper …)`, which is
+	// stdout, and let stderr through to the operator. Stderr rides the verdict text below as
+	// diagnostics and is never read for a field.
+	code, out := res.Code, res.Stdout
 
 	// The helper's contract is 0 (ran and passed) · 1 (ran and FAILED) · 2 (the command word
 	// is not implemented). ANYTHING ELSE IS OUT OF CONTRACT and is a FAILED CHECK — loudly,
@@ -209,9 +213,9 @@ func (p *Prober) run(ctx context.Context, ix *trust.Index, netID, netalias strin
 		checkErr = runErr
 	case code == 0:
 	case code == 1 || code == 2:
-		checkErr = fmt.Errorf("probe: the %s probe reported failure (exit %d)", cmd, code)
+		checkErr = fmt.Errorf("probe: the %s probe reported failure (exit %d)%s", cmd, code, diagnostics(res.Stderr))
 	default:
-		checkErr = fmt.Errorf("probe: the probe exited %d, which is not a status the helper contract defines (0 the check passed · 1 the check FAILED · 2 the command is not implemented) — treated as a FAILED CHECK, never as this installer's own accounting failure", code)
+		checkErr = fmt.Errorf("probe: the probe exited %d, which is not a status the helper contract defines (0 the check passed · 1 the check FAILED · 2 the command is not implemented) — treated as a FAILED CHECK, never as this installer's own accounting failure%s", code, diagnostics(res.Stderr))
 	}
 
 	// The intent goes only once the runtime has SAID the object is gone (or it was removed
@@ -228,6 +232,20 @@ func (p *Prober) run(ctx context.Context, ix *trust.Index, netID, netalias strin
 		return nil, checkErr
 	}
 	return out, nil
+}
+
+// diagnostics renders the helper's stderr for a verdict message — the operator-facing words
+// the reference let pass straight through. Bounded, trimmed, and NEVER parsed as an answer.
+func diagnostics(stderr []byte) string {
+	const limit = 2048
+	s := strings.TrimSpace(string(stderr))
+	if s == "" {
+		return ""
+	}
+	if len(s) > limit {
+		s = s[:limit] + "…"
+	}
+	return " — the helper said: " + s
 }
 
 // field reads one field out of the helper's answer. THE DUPLICATE RULE IS THE READER'S, NOT

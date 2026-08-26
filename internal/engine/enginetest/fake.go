@@ -75,6 +75,13 @@ type HelperEntryFunc func(cmd string, args []string, view HelperNetView, stdin [
 type fakeEndpoint struct {
 	netID   string
 	netName string
+	// key is the string the endpoint is REPORTED under while the container has never started.
+	// MEASURED 2026-08-25 (Engine 28.4.0 / API 1.51): the daemon stores a create-time endpoint
+	// under WHATEVER string keyed EndpointsConfig — id or name, as submitted — and normalizes
+	// to the network name only at first start. Preserved here so a client that stopped
+	// resolving its attach reference to the NAME before creating fails the never-started
+	// inspect exactly as it would against the real daemon, instead of being quietly forgiven.
+	key     string
 	aliases []string // explicit first, then the container's own name
 	gw      int
 }
@@ -95,7 +102,8 @@ type fakeContainer struct {
 	stdin     []byte
 	ran       bool
 	exitCode  int64
-	output    []byte
+	output    []byte // the helper's stdout (stream 1)
+	stderr    []byte // the helper's stderr (stream 2), from the HelperStderr knob
 }
 
 type mountRec struct {
@@ -161,6 +169,10 @@ type Fake struct {
 	DisconnectSilent      bool
 	HelperFail            string
 	HelperEntry           HelperEntryFunc
+	// HelperStderr is emitted on the helper's STDERR stream (frame id 2) at start; the entry
+	// fixture answers stdout only. It exists so a test can prove stderr is never read as the
+	// protocol answer.
+	HelperStderr []byte
 
 	// Requests logs "METHOD /path" for every request, INCLUDING ones the Down knobs then
 	// refuse — the post-release Mutator test's "the fake recorded NO request" reads this.
@@ -578,6 +590,7 @@ func (f *Fake) createContainer(w http.ResponseWriter, r *http.Request) {
 			c.endpoints = append(c.endpoints, &fakeEndpoint{
 				netID:   n.id,
 				netName: n.name,
+				key:     ref, // as submitted — see fakeEndpoint.key
 				aliases: append(append([]string(nil), ep.Aliases...), name),
 				gw:      ep.GwPriority,
 			})
@@ -659,7 +672,13 @@ func (f *Fake) inspectContainer(w http.ResponseWriter, seg string) {
 		if c.state == "running" {
 			addr = addrFor(c.name, ep.netID)
 		}
-		networks[ep.netName] = map[string]any{
+		// The map KEY is the network name once the container has started; before that it is
+		// the submitted EndpointsConfig key, verbatim (measured — see fakeEndpoint.key).
+		key := ep.netName
+		if c.state == "created" {
+			key = ep.key
+		}
+		networks[key] = map[string]any{
 			"NetworkID": id, "IPAddress": addr, "Aliases": ep.aliases, "GwPriority": ep.gw,
 		}
 	}
@@ -708,6 +727,7 @@ func (f *Fake) startContainer(w http.ResponseWriter, seg string) {
 		code, out := f.HelperEntry(c.cmd[0], c.cmd[1:], view, c.stdin)
 		c.exitCode = int64(code)
 		c.output = out
+		c.stderr = append([]byte(nil), f.HelperStderr...)
 		c.ran = true
 		c.state = "exited"
 		ok(w, nil)
@@ -784,14 +804,21 @@ func (f *Fake) logsContainer(w http.ResponseWriter, seg string) {
 		return
 	}
 	w.WriteHeader(http.StatusOK)
-	if len(c.output) == 0 {
-		return
+	// The daemon's non-TTY framing: one 8-byte header per record, stream id in byte 0 —
+	// 1 stdout, 2 stderr. Both streams are emitted so the client's demultiplexer is exercised
+	// on the split, not just on the framing.
+	frame := func(stream byte, payload []byte) {
+		if len(payload) == 0 {
+			return
+		}
+		var hdr [8]byte
+		hdr[0] = stream
+		binary.BigEndian.PutUint32(hdr[4:], uint32(len(payload)))
+		_, _ = w.Write(hdr[:])
+		_, _ = w.Write(payload)
 	}
-	var hdr [8]byte
-	hdr[0] = 1 // stdout
-	binary.BigEndian.PutUint32(hdr[4:], uint32(len(c.output)))
-	_, _ = w.Write(hdr[:])
-	_, _ = w.Write(c.output)
+	frame(1, c.output)
+	frame(2, c.stderr)
 }
 
 func (f *Fake) attachContainer(w http.ResponseWriter, r *http.Request, seg string) {
@@ -1136,9 +1163,13 @@ func (f *Fake) connectNetwork(w http.ResponseWriter, r *http.Request, seg string
 			fail(w, 403, "endpoint with name %s already exists in network %s", c.name, ref)
 			return
 		}
+		// Connect-time endpoints are stored under the network NAME (the daemon resolves the
+		// reference at connect; measured on a running container by the acceptance gw-priority
+		// case — the never-started connect key is unmeasured and modelled the same way).
 		c.endpoints[i] = &fakeEndpoint{
 			netID:   n.id,
 			netName: n.name,
+			key:     n.name,
 			aliases: append(append([]string(nil), body.EndpointConfig.Aliases...), c.name),
 			gw:      body.EndpointConfig.GwPriority,
 		}
@@ -1148,6 +1179,7 @@ func (f *Fake) connectNetwork(w http.ResponseWriter, r *http.Request, seg string
 	c.endpoints = append(c.endpoints, &fakeEndpoint{
 		netID:   n.id,
 		netName: n.name,
+		key:     n.name,
 		aliases: append(append([]string(nil), body.EndpointConfig.Aliases...), c.name),
 		gw:      body.EndpointConfig.GwPriority,
 	})

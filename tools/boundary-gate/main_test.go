@@ -125,6 +125,41 @@ var n = NewMutator() // unattributable through a dot-import; the import itself i
 	}
 }
 
+// The defining package is NOT exempt: a bare in-package reference (no import selector) is the
+// one shape the selector walk cannot see, and it is exactly how a production file added inside
+// the guarded package would build the guarded thing unseen. The declaration alone is fine; an
+// EXPLICIT allow entry for the package is the way to say it may.
+func TestDefiningPackageIsNotExempt(t *testing.T) {
+	root := writeTree(t, map[string]string{
+		"go.mod":                    fixtureGoMod,
+		"internal/engine/engine.go": guardedPkg,
+		"internal/engine/self.go": `package engine
+
+var f = NewMutator   // bare in-package function value
+var n = NewMutator() // bare in-package call
+`,
+	})
+	v, err := run(root, []string{"example.test/mod/internal/engine:NewMutator=example.test/mod/internal/runtime"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(v) != 2 {
+		t.Fatalf("want both in-package references flagged (and not the declaration), got %v", v)
+	}
+	for _, s := range v {
+		if !strings.Contains(s, "self.go") || !strings.Contains(s, "inside its defining package") {
+			t.Fatalf("unexpected violation shape: %v", v)
+		}
+	}
+	v, err = run(root, []string{"example.test/mod/internal/engine:NewMutator=example.test/mod/internal/engine"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(v) != 0 {
+		t.Fatalf("an explicit allow entry for the defining package must pass, got %v", v)
+	}
+}
+
 func TestMalformedRuleIsAnError(t *testing.T) {
 	root := writeTree(t, map[string]string{"go.mod": fixtureGoMod})
 	if _, err := run(root, []string{"no-separators"}); err == nil {
@@ -290,6 +325,14 @@ func TestProductionRulesCatchViolations(t *testing.T) {
 		{"mythicalos.ai/ctl/internal/engine:NewContainerSpec=mythicalos.ai/ctl/internal/runtime",
 			map[string]string{"internal/engine/e.go": "package engine\n\nfunc NewContainerSpec() {}\n",
 				"internal/rogue/r.go": "package rogue\n\nimport \"mythicalos.ai/ctl/internal/engine\"\n\nvar _ = engine.NewContainerSpec\n"}},
+		// The defining package's OWN production file: not exempt — a second Mutator or spec
+		// door added inside internal/engine must trip the same rules.
+		{"mythicalos.ai/ctl/internal/engine:NewMutator=mythicalos.ai/ctl/internal/runtime",
+			map[string]string{"internal/engine/e.go": "package engine\n\nfunc NewMutator() {}\n",
+				"internal/engine/self.go": "package engine\n\nvar _ = NewMutator\n"}},
+		{"mythicalos.ai/ctl/internal/engine:NewContainerSpec=mythicalos.ai/ctl/internal/runtime",
+			map[string]string{"internal/engine/e.go": "package engine\n\nfunc NewContainerSpec() {}\n",
+				"internal/engine/self.go": "package engine\n\nvar _ = NewContainerSpec()\n"}},
 		// The file-level sole-launch pin: a second create call site anywhere — even inside
 		// internal/runtime, in a file that is not launch.go — must trip it.
 		{"method:ContainerCreate=internal/runtime/launch.go",

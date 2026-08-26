@@ -259,6 +259,46 @@ func TestEmptyHostIPReportsAllInterfaces(t *testing.T) {
 	}
 }
 
+// MEASURED 2026-08-25 (Engine 28.4.0 / API 1.51): a create keyed by the network ID is reported
+// under the ID until the first start, then under the name. The typed client resolves its attach
+// reference to the NAME before creating; this fixture is what makes that resolution
+// load-bearing in the hermetic suite — a client that stopped resolving would fail the
+// never-started name-keyed assertions instead of being quietly forgiven by a fake that
+// normalized for it.
+func TestCreateKeyPreservedUntilStart(t *testing.T) {
+	f, c, m := setup(t)
+	ctx := context.Background()
+	f.PullImage("img:v1")
+	netID, err := m.NetworkCreate(ctx, "family", prov(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawCreate(t, f, "bykey", map[string]any{
+		"Image":            "img:v1",
+		"NetworkingConfig": map[string]any{"EndpointsConfig": map[string]any{netID: map[string]any{}}},
+	})
+	info, err := c.ContainerInspect(ctx, "bykey")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, byName := info.Networks["family"]; byName {
+		t.Fatal("a never-started ID-keyed create must NOT be reported under the network name (measured)")
+	}
+	if _, byID := info.Networks[netID]; !byID {
+		t.Fatalf("a never-started create is reported under the SUBMITTED key: %v", info.Networks)
+	}
+	if code, out := raw(t, f, http.MethodPost, "/containers/bykey/start", nil); code >= 300 {
+		t.Fatalf("start: %d %s", code, out)
+	}
+	info, err = c.ContainerInspect(ctx, "bykey")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, byName := info.Networks["family"]; !byName {
+		t.Fatalf("after start the endpoint is reported under the network NAME: %v", info.Networks)
+	}
+}
+
 func TestHelperCrashWindowLeavesContainer(t *testing.T) {
 	f, c, m := setup(t)
 	ctx := context.Background()
@@ -352,7 +392,7 @@ func TestHelperNetViewSurfaces(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := m.HelperRun(ctx, hs); err != nil {
+	if _, err := m.HelperRun(ctx, hs); err != nil {
 		t.Fatal(err)
 	}
 	// The RUNNING sibling resolves by name and alias; the created-never-started one does not.

@@ -104,6 +104,17 @@ type Mount struct {
 	source   string // host path (bind) or volume name (volume)
 	target   string
 	readOnly bool
+	// ok is set ONLY by the constructors below. A zero-value Mount is constructible anywhere
+	// (`var m engine.Mount`), and without this bit NewContainerSpec/NewHelperSpec could not
+	// tell it from a validated one — the serializer would then emit an empty mount, which is a
+	// wire value that never passed a constructor. Every sealed request type carries the same
+	// bit for the same reason.
+	ok bool
+	// helper marks the five-word helper vocabulary. A helper spec accepts ONLY helper mounts
+	// (the general NewBindMount would otherwise put an arbitrary writable host tree in a
+	// helper, exactly what the closed vocabulary exists to forbid); a product spec accepts
+	// only NON-helper mounts (the read-only volume variants are helper-only by design).
+	helper bool
 }
 
 // NewBindMount validates a host-path bind. The doc-of-record reason binds are expressed as
@@ -117,7 +128,7 @@ func NewBindMount(source, target string, readOnly bool) (Mount, error) {
 	if err := pathOK(target, "mount target"); err != nil {
 		return Mount{}, err
 	}
-	return Mount{typ: "bind", source: source, target: target, readOnly: readOnly}, nil
+	return Mount{typ: "bind", source: source, target: target, readOnly: readOnly, ok: true}, nil
 }
 
 // NewVolumeMount validates a named-volume mount. Product volume mounts are read-write; the
@@ -130,7 +141,7 @@ func NewVolumeMount(volumeName, target string) (Mount, error) {
 	if err := pathOK(target, "mount target"); err != nil {
 		return Mount{}, err
 	}
-	return Mount{typ: "volume", source: volumeName, target: target, readOnly: false}, nil
+	return Mount{typ: "volume", source: volumeName, target: target, readOnly: false, ok: true}, nil
 }
 
 // The closed helper-mount vocabulary (D49/D54/D59). The reference adapter's helper arm takes
@@ -146,7 +157,7 @@ func NewHelperSrcVolume(volumeName string) (Mount, error) {
 	if err := volumeNameOK(volumeName); err != nil {
 		return Mount{}, err
 	}
-	return Mount{typ: "volume", source: volumeName, target: "/src", readOnly: true}, nil
+	return Mount{typ: "volume", source: volumeName, target: "/src", readOnly: true, ok: true, helper: true}, nil
 }
 
 // NewHelperStaging — the staging tree being filled, the only writable host mount, at /dst.
@@ -154,7 +165,7 @@ func NewHelperStaging(hostPath string) (Mount, error) {
 	if err := pathOK(hostPath, "helper staging source"); err != nil {
 		return Mount{}, err
 	}
-	return Mount{typ: "bind", source: hostPath, target: "/dst", readOnly: false}, nil
+	return Mount{typ: "bind", source: hostPath, target: "/dst", readOnly: false, ok: true, helper: true}, nil
 }
 
 // NewHelperDstRO — a host tree the helper only verifies, read-only at /dst.
@@ -162,7 +173,7 @@ func NewHelperDstRO(hostPath string) (Mount, error) {
 	if err := pathOK(hostPath, "helper read-only source"); err != nil {
 		return Mount{}, err
 	}
-	return Mount{typ: "bind", source: hostPath, target: "/dst", readOnly: true}, nil
+	return Mount{typ: "bind", source: hostPath, target: "/dst", readOnly: true, ok: true, helper: true}, nil
 }
 
 // NewHelperSrcBind — a backup's untrusted host tree being restored FROM, read-only at /src.
@@ -170,7 +181,7 @@ func NewHelperSrcBind(hostPath string) (Mount, error) {
 	if err := pathOK(hostPath, "helper read-only bind source"); err != nil {
 		return Mount{}, err
 	}
-	return Mount{typ: "bind", source: hostPath, target: "/src", readOnly: true}, nil
+	return Mount{typ: "bind", source: hostPath, target: "/src", readOnly: true, ok: true, helper: true}, nil
 }
 
 // NewHelperDstVolume — the fresh volume being filled, writable at /dst.
@@ -178,7 +189,7 @@ func NewHelperDstVolume(volumeName string) (Mount, error) {
 	if err := volumeNameOK(volumeName); err != nil {
 		return Mount{}, err
 	}
-	return Mount{typ: "volume", source: volumeName, target: "/dst", readOnly: false}, nil
+	return Mount{typ: "volume", source: volumeName, target: "/dst", readOnly: false, ok: true, helper: true}, nil
 }
 
 // PortPublish is one published port. THE loopback wall (D26/§4b.1): there is NO HostIP
@@ -187,6 +198,7 @@ func NewHelperDstVolume(volumeName string) (Mount, error) {
 type PortPublish struct {
 	containerPort uint16
 	hostPort      uint16
+	ok            bool // constructor-set; see Mount.ok
 }
 
 // NewPortPublish refuses only the port the uint16 type cannot: zero. The reference's
@@ -195,7 +207,7 @@ func NewPortPublish(containerPort, hostPort uint16) (PortPublish, error) {
 	if containerPort == 0 || hostPort == 0 {
 		return PortPublish{}, errors.New("engine: port 0 is not a publishable port")
 	}
-	return PortPublish{containerPort: containerPort, hostPort: hostPort}, nil
+	return PortPublish{containerPort: containerPort, hostPort: hostPort, ok: true}, nil
 }
 
 // NetworkAttach names the ONE network a container is created attached to, and the aliases it
@@ -206,6 +218,7 @@ func NewPortPublish(containerPort, hostPort uint16) (PortPublish, error) {
 type NetworkAttach struct {
 	network string
 	aliases []string
+	ok      bool // constructor-set; see Mount.ok
 }
 
 // netmodeOK ports the reference's refusal of the three modes no product container may ever
@@ -237,7 +250,7 @@ func NewNetworkAttach(network string, aliases ...string) (NetworkAttach, error) 
 			return NetworkAttach{}, errors.New("engine: invalid network alias")
 		}
 	}
-	return NetworkAttach{network: network, aliases: append([]string(nil), aliases...)}, nil
+	return NetworkAttach{network: network, aliases: append([]string(nil), aliases...), ok: true}, nil
 }
 
 // Provenance is the closed label pair every resource this installer creates carries: WHOSE
@@ -248,6 +261,7 @@ func NewNetworkAttach(network string, aliases ...string) (NetworkAttach, error) 
 type Provenance struct {
 	installation string
 	nonce        string
+	ok           bool // constructor-set; see Mount.ok
 }
 
 // NewProvenance validates both halves.
@@ -258,7 +272,7 @@ func NewProvenance(installation, nonce string) (Provenance, error) {
 	if !argOK(nonce) {
 		return Provenance{}, errors.New("engine: invalid nonce")
 	}
-	return Provenance{installation: installation, nonce: nonce}, nil
+	return Provenance{installation: installation, nonce: nonce, ok: true}, nil
 }
 
 func (p Provenance) labels() map[string]string {
@@ -312,8 +326,8 @@ func NewContainerSpec(name, imageRef string, opts SpecOpts) (ContainerSpec, erro
 	if !argOK(imageRef) {
 		return ContainerSpec{}, errors.New("engine: invalid image reference")
 	}
-	if opts.Network.network == "" {
-		return ContainerSpec{}, errors.New("engine: a container spec must name its network attachment (a bare create would join the default bridge)")
+	if !opts.Network.ok {
+		return ContainerSpec{}, errors.New("engine: a container spec must name its network attachment via NewNetworkAttach (a bare create would join the default bridge)")
 	}
 	labels := map[string]string{}
 	for k, v := range opts.Labels {
@@ -329,6 +343,22 @@ func NewContainerSpec(name, imageRef string, opts SpecOpts) (ContainerSpec, erro
 		key, _, found := strings.Cut(e, "=")
 		if !found || key == "" || !argOK(e) {
 			return ContainerSpec{}, errors.New("engine: env entries must be KEY=value with no control bytes")
+		}
+	}
+	// Nested values are re-checked for their constructor bit: a zero-value Mount or
+	// PortPublish is constructible anywhere, and copying it through would let a wire value
+	// reach the daemon that no constructor validated.
+	for _, mt := range opts.Mounts {
+		if !mt.ok {
+			return ContainerSpec{}, errors.New("engine: a zero-value Mount — use NewBindMount or NewVolumeMount")
+		}
+		if mt.helper {
+			return ContainerSpec{}, errors.New("engine: a helper-vocabulary mount is not a product mount (product volume mounts are read-write and target where the manifest says)")
+		}
+	}
+	for _, p := range opts.Ports {
+		if !p.ok {
+			return ContainerSpec{}, errors.New("engine: a zero-value PortPublish — use NewPortPublish")
 		}
 	}
 	return ContainerSpec{
@@ -384,7 +414,11 @@ type HelperOpts struct {
 	Args []string
 	// Stdin, when non-empty, is handed to the helper on its stdin — restore's per-entry
 	// manifest verify reads the manifest there rather than from a THIRD host mount.
-	Stdin  []byte
+	Stdin []byte
+	// Mounts must ALL come from the five-word helper vocabulary (NewHelperSrcVolume,
+	// NewHelperStaging, NewHelperDstRO, NewHelperSrcBind, NewHelperDstVolume) — NewHelperSpec
+	// refuses a general NewBindMount/NewVolumeMount here, because the vocabulary's whole point
+	// is that a helper cannot be handed an arbitrary writable host tree.
 	Mounts []Mount
 }
 
@@ -412,8 +446,8 @@ func NewHelperSpec(image, name string, cmd HelperCommand, prov Provenance, opts 
 	if !helperCommands[cmd] {
 		return HelperSpec{}, fmt.Errorf("engine: %q is not a helper command", cmd)
 	}
-	if prov.installation == "" {
-		return HelperSpec{}, errors.New("engine: a helper needs provenance (installation + nonce)")
+	if !prov.ok {
+		return HelperSpec{}, errors.New("engine: a helper needs provenance (installation + nonce) from NewProvenance")
 	}
 	if opts.Network != "" {
 		if err := netmodeOK(opts.Network); err != nil {
@@ -441,6 +475,15 @@ func NewHelperSpec(image, name string, cmd HelperCommand, prov Provenance, opts 
 	for _, a := range opts.Args {
 		if !argOK(a) {
 			return HelperSpec{}, errors.New("engine: invalid helper argument")
+		}
+	}
+	// THE CLOSED VOCABULARY IS ENFORCED HERE, not merely offered: a mount that did not come
+	// from one of the five helper constructors — a general bind, a general volume, or a
+	// zero value — is refused, so no helper can be handed a mount whose target or writability
+	// the vocabulary did not pin.
+	for _, mt := range opts.Mounts {
+		if !mt.ok || !mt.helper {
+			return HelperSpec{}, errors.New("engine: helper mounts come only from the closed vocabulary (NewHelperSrcVolume, NewHelperStaging, NewHelperDstRO, NewHelperSrcBind, NewHelperDstVolume)")
 		}
 	}
 	o := opts

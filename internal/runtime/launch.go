@@ -85,7 +85,7 @@ func (r *Runtime) ImagePull(ctx context.Context, refWithDigest string) error {
 // HelperRun is the facade's helper door — probes and volume copies launch their pinned
 // helpers through here, which is why probe runs require the lock, exactly as the reference's
 // probe arm does under its verbs.
-func (r *Runtime) HelperRun(ctx context.Context, h engine.HelperSpec) (int64, []byte, error) {
+func (r *Runtime) HelperRun(ctx context.Context, h engine.HelperSpec) (engine.HelperResult, error) {
 	return r.m.HelperRun(ctx, h)
 }
 

@@ -249,46 +249,58 @@ func (c *Client) ContainerWait(ctx context.Context, id string) (int64, error) {
 	return w.StatusCode, nil
 }
 
-// ContainerLogs reads a stopped container's combined output. The daemon multiplexes non-TTY
-// output in 8-byte-framed records; both streams are concatenated in arrival order, which is
-// the same view `docker run`'s inherited stderr gave the reference.
-func (c *Client) ContainerLogs(ctx context.Context, id string) ([]byte, error) {
+// ContainerLogs reads a stopped container's output, stdout and stderr SEPARATELY. The daemon
+// multiplexes non-TTY output in 8-byte-framed records that carry the stream id; the two are
+// kept apart because the reference captured `$(mi_rt_run_helper …)` — STDOUT ONLY — as the
+// helper's answer, with stderr passing through to the operator. A merged view would let a
+// diagnostic line on stderr satisfy a protocol field on stdout.
+func (c *Client) ContainerLogs(ctx context.Context, id string) (stdout, stderr []byte, err error) {
 	q := url.Values{"stdout": {"1"}, "stderr": {"1"}}
 	u := "http://docker/" + APIVersion + "/containers/" + url.PathEscape(id) + "/logs?" + q.Encode()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("engine: %w: %v", ErrDaemonDown, err)
+		return nil, nil, fmt.Errorf("engine: %w: %v", ErrDaemonDown, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, fmt.Errorf("engine: %w", ErrAbsent)
+		return nil, nil, fmt.Errorf("engine: %w", ErrAbsent)
 	}
 	if resp.StatusCode >= 300 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 65536))
-		return nil, fmt.Errorf("engine: the daemon refused logs (%d): %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+		return nil, nil, fmt.Errorf("engine: the daemon refused logs (%d): %s", resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
 	return demuxLogs(resp.Body)
 }
 
-// demuxLogs strips the daemon's stream framing: [stream:1][0 0 0][len:4 BE][payload].
-func demuxLogs(r io.Reader) ([]byte, error) {
+// demuxLogs splits the daemon's framed stream: [stream:1][0 0 0][len:4 BE][payload], where
+// stream 1 is stdout and 2 is stderr (0, stdin, is written back on stdout by the daemon and is
+// treated as stdout). Any other stream id is a malformed stream, refused rather than guessed.
+func demuxLogs(r io.Reader) (stdout, stderr []byte, err error) {
 	br := bufio.NewReader(r)
-	var out bytes.Buffer
+	var out, errOut bytes.Buffer
 	var hdr [8]byte
 	for {
-		if _, err := io.ReadFull(br, hdr[:]); err != nil {
-			if errors.Is(err, io.EOF) {
-				return out.Bytes(), nil
+		if _, rerr := io.ReadFull(br, hdr[:]); rerr != nil {
+			if errors.Is(rerr, io.EOF) {
+				return out.Bytes(), errOut.Bytes(), nil
 			}
-			return nil, fmt.Errorf("engine: malformed log stream: %v", err)
+			return nil, nil, fmt.Errorf("engine: malformed log stream: %v", rerr)
+		}
+		dst := &out
+		switch hdr[0] {
+		case 0, 1:
+		case 2:
+			dst = &errOut
+		default:
+			return nil, nil, fmt.Errorf("engine: malformed log stream: unknown stream id %d", hdr[0])
 		}
 		n := binary.BigEndian.Uint32(hdr[4:])
-		if _, err := io.CopyN(&out, br, int64(n)); err != nil {
-			return nil, fmt.Errorf("engine: truncated log frame: %v", err)
+		if _, cerr := io.CopyN(dst, br, int64(n)); cerr != nil {
+			return nil, nil, fmt.Errorf("engine: truncated log frame: %v", cerr)
 		}
 	}
 }
@@ -746,6 +758,16 @@ func (m *Mutator) ImagePull(ctx context.Context, refWithDigest string) error {
 	}
 }
 
+// HelperResult is what a helper run reports. Stdout is the helper's ANSWER — the `key=value`
+// protocol lines the reference read from `$(…)`; Stderr is its diagnostics, which the
+// reference let pass through to the operator's terminal and never parsed. Callers that read
+// protocol fields read Stdout and nothing else.
+type HelperResult struct {
+	Code   int64
+	Stdout []byte
+	Stderr []byte
+}
+
 // HelperRun runs one pinned helper container (D49/D54): closed command word, validated spec,
 // provenance labels — and NO HELPER OUTLIVES ITS OWN INVOCATION. The reference expressed that
 // with `--rm`; this client enforces the same guarantee itself — create, start, wait, read the
@@ -753,12 +775,13 @@ func (m *Mutator) ImagePull(ctx context.Context, refWithDigest string) error {
 // AutoRemove'd container races its own log read on the API. A removal that fails leaves the
 // error in the result, never a silent survivor; the probe layer's accounting (write-ahead
 // intent) covers the crash window exactly as it does in the reference.
-func (m *Mutator) HelperRun(ctx context.Context, h HelperSpec) (int64, []byte, error) {
+func (m *Mutator) HelperRun(ctx context.Context, h HelperSpec) (HelperResult, error) {
+	var none HelperResult
 	if err := m.assert(); err != nil {
-		return 0, nil, err
+		return none, err
 	}
 	if h.name == "" {
-		return 0, nil, errors.New("engine: an empty HelperSpec — use NewHelperSpec")
+		return none, errors.New("engine: an empty HelperSpec — use NewHelperSpec")
 	}
 	mounts := make([]map[string]any, 0, len(h.opts.Mounts))
 	for _, mt := range h.opts.Mounts {
@@ -786,7 +809,7 @@ func (m *Mutator) HelperRun(ctx context.Context, h HelperSpec) (int64, []byte, e
 		// Same name resolution as ContainerCreate, for the same measured reason.
 		ni, nerr := m.c.NetworkInspect(ctx, h.opts.Network)
 		if nerr != nil {
-			return 0, nil, nerr
+			return none, nerr
 		}
 		ep := map[string]any{}
 		if h.opts.Alias != "" {
@@ -803,39 +826,50 @@ func (m *Mutator) HelperRun(ctx context.Context, h HelperSpec) (int64, []byte, e
 	}
 	q := url.Values{"name": {h.name}}
 	if err := m.c.do(ctx, http.MethodPost, "/containers/create", q, body, &created); err != nil {
-		return 0, nil, err
+		return none, err
 	}
 	// From here on the container EXISTS: every return path below must have tried to remove
 	// it. A removal error is reported on otherwise-successful paths and never masks the
 	// primary error on failing ones.
 	remove := func() error {
-		return m.c.do(ctx, http.MethodDelete, "/containers/"+url.PathEscape(created.ID), url.Values{"force": {"1"}}, nil, nil)
+		// DETACHED from the caller's context on purpose: a cancelled or expired ctx is exactly
+		// the moment a container is most likely to be left behind, and a removal that inherited
+		// the cancellation would fail before it reached the daemon — a survivor created by the
+		// very mechanism meant to prevent one. Bounded by its own deadline so a dead daemon
+		// cannot hang the caller either.
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), helperRemoveTimeout)
+		defer cancel()
+		return m.c.do(rctx, http.MethodDelete, "/containers/"+url.PathEscape(created.ID), url.Values{"force": {"1"}}, nil, nil)
 	}
 	if len(h.opts.Stdin) > 0 {
 		if err := m.c.attachStdin(created.ID, h.opts.Stdin); err != nil {
 			rmErr := remove()
-			return 0, nil, errors.Join(err, rmErr)
+			return none, errors.Join(err, rmErr)
 		}
 	}
 	if err := m.c.do(ctx, http.MethodPost, "/containers/"+url.PathEscape(created.ID)+"/start", nil, nil, nil); err != nil {
 		rmErr := remove()
-		return 0, nil, errors.Join(err, rmErr)
+		return none, errors.Join(err, rmErr)
 	}
 	code, err := m.c.ContainerWait(ctx, created.ID)
 	if err != nil {
 		rmErr := remove()
-		return 0, nil, errors.Join(err, rmErr)
+		return none, errors.Join(err, rmErr)
 	}
-	out, err := m.c.ContainerLogs(ctx, created.ID)
+	stdout, stderr, err := m.c.ContainerLogs(ctx, created.ID)
 	if err != nil {
 		rmErr := remove()
-		return 0, nil, errors.Join(err, rmErr)
+		return none, errors.Join(err, rmErr)
 	}
+	res := HelperResult{Code: code, Stdout: stdout, Stderr: stderr}
 	if err := remove(); err != nil {
-		return code, out, fmt.Errorf("engine: the helper ran but its container could not be removed: %w", err)
+		return res, fmt.Errorf("engine: the helper ran but its container could not be removed: %w", err)
 	}
-	return code, out, nil
+	return res, nil
 }
+
+// helperRemoveTimeout bounds the detached force-remove in HelperRun.
+const helperRemoveTimeout = 30 * time.Second
 
 // attachStdin hands bytes to a created container's stdin over a hijacked attach connection,
 // then half-closes so the process sees EOF. This is the API's one stdin vehicle; the

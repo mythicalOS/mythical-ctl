@@ -36,17 +36,25 @@ const MinEngine = 28
 // new-enough is the same error as treating an unmeasured thing as measured-clean.
 //
 // A COMPLETE grammar, not a prefix check (the reference closed this class after three
-// rounds of next-malformed-string): `<digits>(.<digits>)*` with an OPTIONAL non-empty
-// pre-release/build suffix introduced by the first `-` or `+`, its first byte alphanumeric.
-// So `28`, `28.1.4`, `2025.1`, `28.0.0-beta.1`, `28.0.0+build.7` pass; `28.`, `28..`,
-// `28.0..`, `28.0__`, `28.0-`, `28.0.0--`, `.28`, `-28.0`, `dev` and “ are refused. The
-// suffix is deliberately NOT parsed beyond that: its contents are Docker's business, and
-// inventing a grammar for them risks REFUSING a legitimate future version — a false refusal
-// strands every install on a supported daemon, the more expensive error when only the major
-// decides the gate.
+// rounds of next-malformed-string): every byte of the string in the class `[0-9.a-zA-Z+_-]`
+// (the reference's first gate — a `/`, a space or a newline anywhere is a refusal, even
+// inside the otherwise-uninterpreted suffix); then `<digits>(.<digits>)*` with an OPTIONAL
+// non-empty pre-release/build suffix introduced by the first `-` or `+`, its first byte
+// alphanumeric. So `28`, `28.1.4`, `2025.1`, `28.0.0-beta.1`, `28.0.0+build.7` pass; `28.`,
+// `28..`, `28.0..`, `28.0__`, `28.0-`, `28.0.0--`, `28.0.0-a/b`, `.28`, `-28.0`, `dev` and “
+// are refused. The suffix is deliberately NOT parsed beyond that: its contents are Docker's
+// business, and inventing a grammar for them risks REFUSING a legitimate future version — a
+// false refusal strands every install on a supported daemon, the more expensive error when
+// only the major decides the gate.
 func engineMajorOK(v string) bool {
 	if v == "" {
 		return false
+	}
+	for i := 0; i < len(v); i++ {
+		b := v[i]
+		if !(b >= '0' && b <= '9' || b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b == '.' || b == '+' || b == '_' || b == '-') {
+			return false
+		}
 	}
 	core := v
 	if i := strings.IndexAny(v, "-+"); i >= 0 {

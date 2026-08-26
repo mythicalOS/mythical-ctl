@@ -104,7 +104,10 @@ func TestEngineVersionGate(t *testing.T) {
 func TestEngineVersionGrammar(t *testing.T) {
 	// The full malforming matrix — every shape a reviewer produced, closed as a class.
 	refuse := []string{"", "dev", "28.", "28..", "28.0..", "28.0__", "28.0-", "28.0.0--",
-		".28", "-28.0", "27.9.9", "0.28", "28.1234567890", "2 8", "28.x"}
+		".28", "-28.0", "27.9.9", "0.28", "28.1234567890", "2 8", "28.x",
+		// The reference's byte class `[0-9.a-zA-Z+_-]` applies to the WHOLE string — a `/`,
+		// a space, a newline or a non-ASCII byte inside the uninterpreted suffix still refuses.
+		"28.0.0-a/b", "28.0.0-rc 1", "28.0.0\n", "28.0.0-β", "28.0.0+build/7"}
 	for _, v := range refuse {
 		if engineMajorOK(v) {
 			t.Errorf("%q accepted", v)

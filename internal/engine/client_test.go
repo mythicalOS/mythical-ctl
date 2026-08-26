@@ -317,7 +317,7 @@ func TestMutatorDeadAfterRelease(t *testing.T) {
 		{"NetworkConnect", func() error { return m.NetworkConnect(ctx, "net1", "c1", "a", 0) }},
 		{"NetworkDisconnect", func() error { return m.NetworkDisconnect(ctx, "net1", "c1") }},
 		{"ImagePull", func() error { return m.ImagePull(ctx, "img:v2") }},
-		{"HelperRun", func() error { _, _, err := m.HelperRun(ctx, hs); return err }},
+		{"HelperRun", func() error { _, err := m.HelperRun(ctx, hs); return err }},
 	}
 	for _, tc := range calls {
 		if err := tc.call(); err == nil {
@@ -354,7 +354,14 @@ func TestCreateStoppedAttachedAliased(t *testing.T) {
 	if len(info.Networks) != 1 {
 		t.Fatalf("exactly one network: %+v", info.Networks)
 	}
-	ep := info.Networks["family"]
+	// The NAME key must be PRESENT — asserted, not assumed: a missing key yields a zero
+	// NetEndpoint whose empty NetworkID would satisfy the next check for the wrong reason. The
+	// fake reports a never-started endpoint under the SUBMITTED key (measured), so this is what
+	// makes the client's resolve-to-name before create load-bearing in the hermetic suite.
+	ep, present := info.Networks["family"]
+	if !present {
+		t.Fatalf("the never-started endpoint must be keyed by the network NAME; got keys %v", keysOf(info.Networks))
+	}
 	// NEVER-STARTED fidelity: NetworkID empty while the name key is present.
 	if ep.NetworkID != "" {
 		t.Fatalf("a never-started container must report an empty NetworkID, got %q", ep.NetworkID)
@@ -370,7 +377,11 @@ func TestAddressLifecycle(t *testing.T) {
 	ctx := context.Background()
 	fakeSetup(t, f, m, ctx)
 	info, _ := c.ContainerInspect(ctx, "c1")
-	if info.Networks["family"].IPAddress != "" {
+	created, present := info.Networks["family"]
+	if !present {
+		t.Fatalf("the never-started endpoint must be keyed by the network NAME; got keys %v", keysOf(info.Networks))
+	}
+	if created.IPAddress != "" {
 		t.Fatal("a created container must have no address")
 	}
 	if err := m.ContainerStart(ctx, "c1"); err != nil {
@@ -393,6 +404,15 @@ func TestAddressLifecycle(t *testing.T) {
 	if stopped.NetworkID == "" {
 		t.Fatal("the endpoint id persists across stop")
 	}
+}
+
+// keysOf lists a Networks map's keys for a failure message.
+func keysOf(m map[string]engine.NetEndpoint) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }
 
 // fakeSetup pulls img:v1, creates network "family" and container c1 on it.
@@ -505,6 +525,31 @@ func TestConstructorRefusals(t *testing.T) {
 	}); err == nil {
 		t.Error("env without =")
 	}
+	// NESTED zero values: constructible anywhere (`var m engine.Mount`), so the spec
+	// constructors must re-check the constructor bit or an unvalidated wire value gets through.
+	if _, err := engine.NewContainerSpec("c1", "img", engine.SpecOpts{
+		Network: na, Mounts: []engine.Mount{{}},
+	}); err == nil {
+		t.Error("a zero-value Mount in a product spec")
+	}
+	if _, err := engine.NewContainerSpec("c1", "img", engine.SpecOpts{
+		Network: na, Ports: []engine.PortPublish{{}},
+	}); err == nil {
+		t.Error("a zero-value PortPublish in a product spec")
+	}
+	if _, err := engine.NewContainerSpec("c1", "img", engine.SpecOpts{
+		Network: engine.NetworkAttach{},
+	}); err == nil {
+		t.Error("a zero-value NetworkAttach")
+	}
+	// A helper-vocabulary mount is not a product mount: the read-only volume variants exist
+	// only for helpers, and a product spec must not be able to smuggle one in.
+	srcRO, _ := engine.NewHelperSrcVolume("v1")
+	if _, err := engine.NewContainerSpec("c1", "img", engine.SpecOpts{
+		Network: na, Mounts: []engine.Mount{srcRO},
+	}); err == nil {
+		t.Error("a helper-vocabulary mount in a product spec")
+	}
 	prov := engine.Provenance{}
 	if _, err := engine.NewHelperSpec("img", "h1", engine.HelperResolve, prov, engine.HelperOpts{}); err == nil {
 		t.Error("a helper without provenance")
@@ -547,6 +592,27 @@ func TestHelperMountVocabulary(t *testing.T) {
 	}
 	if _, err := engine.NewHelperDstVolume("/abs"); err == nil {
 		t.Error("dstvol with a path")
+	}
+	// THE VOCABULARY IS ENFORCED AT THE SPEC, not merely offered: a general bind — an
+	// arbitrary writable host tree — is refused by NewHelperSpec, as are a general volume
+	// mount and a zero value. Each of the five words is accepted.
+	prov := mustProv(t)
+	bind, _ := engine.NewBindMount("/etc", "/dst", false)
+	if _, err := engine.NewHelperSpec("img", "h1", engine.HelperCopy, prov, engine.HelperOpts{Mounts: []engine.Mount{bind}}); err == nil {
+		t.Error("a general bind mount in a helper spec — an arbitrary writable host tree")
+	}
+	vol, _ := engine.NewVolumeMount("v1", "/data")
+	if _, err := engine.NewHelperSpec("img", "h1", engine.HelperCopy, prov, engine.HelperOpts{Mounts: []engine.Mount{vol}}); err == nil {
+		t.Error("a general volume mount in a helper spec")
+	}
+	if _, err := engine.NewHelperSpec("img", "h1", engine.HelperCopy, prov, engine.HelperOpts{Mounts: []engine.Mount{{}}}); err == nil {
+		t.Error("a zero-value mount in a helper spec")
+	}
+	for _, tc := range cases {
+		mt, _ := tc.make()
+		if _, err := engine.NewHelperSpec("img", "h1", engine.HelperCopy, prov, engine.HelperOpts{Mounts: []engine.Mount{mt}}); err != nil {
+			t.Errorf("%s refused by NewHelperSpec: %v", tc.name, err)
+		}
 	}
 }
 
@@ -969,12 +1035,12 @@ func TestHelperRunLeavesNothing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	code, out, err := m.HelperRun(ctx, hs)
-	if err != nil || code != 0 {
-		t.Fatalf("helper: %d %v", code, err)
+	res, err := m.HelperRun(ctx, hs)
+	if err != nil || res.Code != 0 {
+		t.Fatalf("helper: %d %v", res.Code, err)
 	}
-	if !strings.Contains(string(out), "selfcheck=ok") {
-		t.Fatalf("output: %q", out)
+	if !strings.Contains(string(res.Stdout), "selfcheck=ok") {
+		t.Fatalf("output: %q", res.Stdout)
 	}
 	// NO HELPER OUTLIVES ITS OWN INVOCATION — and a FAILING helper is removed too.
 	if n := f.ContainerCount(); n != 0 {
@@ -983,9 +1049,9 @@ func TestHelperRunLeavesNothing(t *testing.T) {
 	f.HelperEntry = func(cmd string, args []string, view enginetest.HelperNetView, stdin []byte) (int, []byte) {
 		return 1, []byte("selfcheck=fail\n")
 	}
-	code, _, err = m.HelperRun(ctx, hs)
-	if err != nil || code != 1 {
-		t.Fatalf("failing helper reports its code: %d %v", code, err)
+	res, err = m.HelperRun(ctx, hs)
+	if err != nil || res.Code != 1 {
+		t.Fatalf("failing helper reports its code: %d %v", res.Code, err)
 	}
 	if n := f.ContainerCount(); n != 0 {
 		t.Fatalf("%d container(s) survived a FAILED helper run", n)
@@ -1009,7 +1075,7 @@ func TestHelperArgvBoundaries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := m.HelperRun(ctx, hs); err != nil {
+	if _, err := m.HelperRun(ctx, hs); err != nil {
 		t.Fatal(err)
 	}
 	if gotCmd != "verify" {
@@ -1039,7 +1105,7 @@ func TestHelperStdin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := m.HelperRun(ctx, hs); err != nil {
+	if _, err := m.HelperRun(ctx, hs); err != nil {
 		t.Fatal(err)
 	}
 	if string(gotStdin) != string(manifest) {
@@ -1057,13 +1123,66 @@ func TestHelperFailKnob(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _, err = m.HelperRun(ctx, hs)
+	_, err = m.HelperRun(ctx, hs)
 	if err == nil || !strings.Contains(err.Error(), "fabricated launch failure") {
 		t.Fatalf("launch failure surfaces the daemon's words: %v", err)
 	}
 	// Even a helper that never RAN is removed — the create succeeded, so an object existed.
 	if n := f.ContainerCount(); n != 0 {
 		t.Fatalf("%d container(s) survived a failed helper launch", n)
+	}
+}
+
+// Stdout is the ANSWER and stderr is diagnostics — the reference captured `$(…)` (stdout) and
+// let stderr through to the operator. A protocol field printed on stderr must not reach the
+// reader through Stdout.
+func TestHelperStderrIsNotTheAnswer(t *testing.T) {
+	f, c := newFake(t)
+	ctx := context.Background()
+	m, _ := newMutator(t, c)
+	f.PullImage("probe:pinned")
+	f.HelperEntry = func(cmd string, args []string, view enginetest.HelperNetView, stdin []byte) (int, []byte) {
+		return 1, []byte("egress=fail\n")
+	}
+	f.HelperStderr = []byte("egress=ok\nwarning: a diagnostic line\n")
+	hs, err := engine.NewHelperSpec("probe:pinned", "h1", engine.HelperEgress, mustProv(t), engine.HelperOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := m.HelperRun(ctx, hs)
+	if err != nil || res.Code != 1 {
+		t.Fatalf("run: %d %v", res.Code, err)
+	}
+	if string(res.Stdout) != "egress=fail\n" {
+		t.Fatalf("Stdout must carry ONLY the helper's answer, got %q", res.Stdout)
+	}
+	if !strings.Contains(string(res.Stderr), "warning: a diagnostic line") {
+		t.Fatalf("Stderr must carry the diagnostics, got %q", res.Stderr)
+	}
+}
+
+// The force-remove must not inherit the caller's cancellation: a context that dies mid-run is
+// exactly when a survivor is most likely, and a removal that failed before reaching the daemon
+// would be a survivor created by the mechanism meant to prevent one.
+func TestHelperRunCleanupSurvivesCancellation(t *testing.T) {
+	f, c := newFake(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m, _ := newMutator(t, c)
+	f.PullImage("probe:pinned")
+	f.HelperEntry = func(cmd string, args []string, view enginetest.HelperNetView, stdin []byte) (int, []byte) {
+		cancel() // the caller's context dies WHILE the helper runs
+		return 0, []byte("egress=ok\n")
+	}
+	hs, err := engine.NewHelperSpec("probe:pinned", "h1", engine.HelperEgress, mustProv(t), engine.HelperOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.HelperRun(ctx, hs); err == nil {
+		t.Fatal("a run whose context was cancelled mid-flight must report it")
+	}
+	if n := f.ContainerCount(); n != 0 {
+		t.Fatalf("%d container(s) survived a cancelled helper run — the removal inherited the cancellation", n)
 	}
 }
 

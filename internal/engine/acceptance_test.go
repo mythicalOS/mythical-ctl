@@ -208,11 +208,23 @@ func TestAcceptanceFidelity(t *testing.T) {
 	})
 
 	t.Run("referenced resources cannot be removed; force-remove clears a running container", func(t *testing.T) {
+		// MEASURED 2026-08-25, and ASSERTED here so the divergence cannot regress unnoticed: a
+		// created-but-never-started attachment does NOT block network removal (no active
+		// endpoint exists yet) — the fake models exactly that, and the assertion below is what
+		// keeps the model honest.
+		netB := r.network(t, ctx, r.pfx+"-net4b")
+		nameB := r.pfx + "-c4b"
+		r.container(t, ctx, nameB, netB, "a4b")
+		if err := r.m.NetworkRemove(ctx, netB); err != nil {
+			t.Fatalf("a network whose only attachment is a NEVER-STARTED container is removable (measured 2026-08-25): %v", err)
+		}
+		if err := r.m.ContainerRemove(ctx, nameB); err != nil {
+			t.Fatal(err)
+		}
+		// A RUNNING attachment does block it.
 		netID := r.network(t, ctx, r.pfx+"-net4")
 		name := r.pfx + "-c4"
 		r.container(t, ctx, name, netID, "a4")
-		// MEASURED 2026-08-25: a created-but-never-started attachment does NOT block network
-		// removal (no active endpoint exists yet); a running one does.
 		if err := r.m.ContainerStart(ctx, name); err != nil {
 			t.Fatal(err)
 		}
@@ -305,7 +317,7 @@ func TestAcceptanceFidelity(t *testing.T) {
 			t.Fatal(err)
 		}
 		r.cleanupContainer(t, r.pfx+"-h1")
-		_, _, herr := r.m.HelperRun(ctx, hs)
+		_, herr := r.m.HelperRun(ctx, hs)
 		if herr == nil || !strings.Contains(herr.Error(), "resolve") {
 			t.Fatalf("the daemon's own words must ride the launch failure: %v", herr)
 		}

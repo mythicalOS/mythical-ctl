@@ -21,8 +21,11 @@
 //
 // An `<allowed>` entry is an import path — or, when it ends in `.go`, a single FILE
 // (module-relative path), so a rule can pin a symbol to one file within a package.
-// The guarded package itself is always allowed (package-level form); *_test.go files are
-// exempt (tests exercise boundaries deliberately).
+// THE GUARDED PACKAGE ITSELF IS NOT EXEMPT: a bare in-package reference to the guarded
+// identifier (`NewMutator(...)`, or a function value) is a violation unless that package is
+// allowlisted explicitly — only the declaration itself is not a reference. Otherwise a
+// production file added inside the guarded package could build the guarded thing with no
+// gate ever seeing it. *_test.go files are exempt (tests exercise boundaries deliberately).
 //
 // Stdlib only — this tool guards the dependency-minimal tree and must not itself add to it.
 package main
@@ -66,9 +69,8 @@ func parseRule(s string) (rule, error) {
 		r.pkgPath = ""
 	} else if r.pkgPath == "" {
 		return rule{}, fmt.Errorf("malformed rule %q (empty package; use the method: form for receiver-independent rules)", s)
-	} else {
-		r.allowed[r.pkgPath] = true // the defining package always may
 	}
+	// No implicit allowance for the defining package — see the package doc.
 	for _, a := range strings.Split(s[eq+1:], ",") {
 		if a = strings.TrimSpace(a); a != "" {
 			r.allowed[a] = true
@@ -172,7 +174,52 @@ func check(fset *token.FileSet, f *ast.File, filePkgPath, fileRel string, declar
 		}
 		return true
 	})
+	// The DEFINING package: an in-package reference is a bare identifier, never a selector
+	// through an import, so the walk above cannot see it. Every use of the guarded name in a
+	// non-allowlisted file of the guarded package is a violation — except the declaration.
+	for _, r := range rules {
+		if r.isMethod() || filePkgPath != r.pkgPath || r.allows(filePkgPath, fileRel) {
+			continue
+		}
+		decls := declaredNames(f)
+		ast.Inspect(f, func(n ast.Node) bool {
+			id, ok := n.(*ast.Ident)
+			if ok && id.Name == r.ident && !decls[id] {
+				out = append(out, fmt.Sprintf("%s: %s referenced inside its defining package %s, which is not allowlisted (allowed: %s)",
+					fset.Position(id.Pos()), r.ident, r.pkgPath, strings.Join(allowedList(r), ", ")))
+			}
+			return true
+		})
+	}
 	return out
+}
+
+// declaredNames collects the identifiers a file DECLARES at package level — function, type
+// and value names — so the in-package check can tell a declaration from a reference.
+// Methods are excluded on purpose: a method named like a guarded package-level symbol is a
+// different identifier in Go, but for a gate the overmatch is the safe side.
+func declaredNames(f *ast.File) map[*ast.Ident]bool {
+	names := map[*ast.Ident]bool{}
+	for _, d := range f.Decls {
+		switch d := d.(type) {
+		case *ast.FuncDecl:
+			if d.Recv == nil {
+				names[d.Name] = true
+			}
+		case *ast.GenDecl:
+			for _, s := range d.Specs {
+				switch s := s.(type) {
+				case *ast.TypeSpec:
+					names[s.Name] = true
+				case *ast.ValueSpec:
+					for _, n := range s.Names {
+						names[n] = true
+					}
+				}
+			}
+		}
+	}
+	return names
 }
 
 func allowedList(r rule) []string {
