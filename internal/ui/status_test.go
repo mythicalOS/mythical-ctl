@@ -192,13 +192,26 @@ func TestAnIndentedFirstLineIsNotDropped(t *testing.T) {
 
 // TestEveryIngestedLineReachesTheView is the end-to-end form of the completeness property: every
 // line fed in is readable on screen, either verbatim or — for the lines this view lays out as a
-// table — as its parsed cells.
+// table — with every field the LINE carried.
+//
+// IT CHECKS THE LINE'S OWN CAPTURES, NOT THE STRUCT'S FIELDS. Checking the fields the row type
+// happens to keep is circular: a capture dropped on the way into the struct is then dropped from
+// the assertion too, and the test passes while the fact is gone from the screen. That is exactly
+// how the volume's `product=` was lost — including the `product=?` the report prints precisely so
+// that an unattributable volume cannot hide.
 func TestEveryIngestedLineReachesTheView(t *testing.T) {
 	m := NewStatusModel(nil)
 	for _, l := range sampleReport {
 		m = say(m, l)
 	}
 	m = say(m, "  installed with --force-install (the manifest said not launched)")
+	// EVERY FIELD A DISTINCT TOKEN. With the realistic lines alone, a dropped capture goes
+	// unnoticed because its value occurs somewhere else on screen anyway — a volume's
+	// `product=brokkr` is satisfied by the product table's own "brokkr" row, and a plan of "none"
+	// by an outstanding of "none". Three separate dropped-field mutations survived on exactly
+	// that coincidence before these two lines were added.
+	m = say(m, "zzprod: desired=zzdesired observed=zzobserved outstanding=zzoutstanding next=zznext plan")
+	m = say(m, "volume zzvolname: role=zzrole data=zzdata class product=zzproduct — recorded but GONE from the runtime")
 	m = warn(m, "ledger: something went wrong")
 	m = say(m, "a line no classifier knows")
 	m, _ = sstep(m, statusDoneMsg{})
@@ -206,17 +219,17 @@ func TestEveryIngestedLineReachesTheView(t *testing.T) {
 	for _, e := range m.entries {
 		switch {
 		case e.hasProduct:
-			p := e.product
-			for _, cell := range []string{p.Product, p.Desired, p.Observed, p.Outstanding, p.Next} {
-				if !strings.Contains(v, cell) {
-					t.Errorf("product cell %q is not on screen", cell)
+			for i, capture := range productLineRe.FindStringSubmatch(e.head)[1:] {
+				if !strings.Contains(v, capture) {
+					t.Errorf("field %d of %q — %q — is not on screen", i+1, e.head, capture)
 				}
 			}
 		case e.hasVolume:
-			vol := e.volume
-			for _, cell := range []string{vol.Name, vol.Role, vol.Data, vol.State} {
-				if !strings.Contains(v, cell) {
-					t.Errorf("volume cell %q is not on screen", cell)
+			for i, capture := range volumeLineRe.FindStringSubmatch(e.head)[1:] {
+				// The state phrase is shown as a short token with the phrase itself in the
+				// legend beneath the table, so it is checked there rather than in the row.
+				if !strings.Contains(v, capture) {
+					t.Errorf("field %d of %q — %q — is not on screen", i+1, e.head, capture)
 				}
 			}
 		default:
@@ -335,7 +348,7 @@ func TestAReportWithNoLinesIsNotShownAsAnEmptyInstallation(t *testing.T) {
 // exactly where an empty-looking column invites one. The field set is asserted EXACTLY, so a
 // field added for any reason has to come through this test.
 func TestVolumeRowCarriesNoSizeField(t *testing.T) {
-	want := []string{"Name", "Role", "Data", "State"}
+	want := []string{"Name", "Role", "Data", "Product", "State"}
 	rt := reflect.TypeOf(volumeRow{})
 	var got []string
 	for i := 0; i < rt.NumField(); i++ {
@@ -352,6 +365,47 @@ func TestVolumeRowCarriesNoSizeField(t *testing.T) {
 // sizeish matches anything that would read as a volume size in a report an operator consults
 // before deciding whether to purge.
 var sizeish = regexp.MustCompile(`(?i)\bsize\b|\bbytes\b|\b[0-9.]+\s?(B|KB|KiB|MB|MiB|GB|GiB|TB|TiB)\b`)
+
+// headerOf returns the fields of the table header line containing the given column name.
+func headerOf(t *testing.T, view, col string) []string {
+	t.Helper()
+	for _, line := range strings.Split(view, "\n") {
+		f := strings.Fields(line)
+		if len(f) > 0 && f[0] == col {
+			return f
+		}
+	}
+	t.Fatalf("no table header starting with %q in:\n%s", col, view)
+	return nil
+}
+
+// TestEachTableNamesExactlyTheFactsTheReportGives. The column set is the contract: every field
+// the report's line carries has a heading, nothing else does, and a value therefore never appears
+// under a neighbouring column's name. A heading dropped from the header does not shorten the
+// table — it shifts every value after it one column left, silently.
+func TestEachTableNamesExactlyTheFactsTheReportGives(t *testing.T) {
+	m := sized(NewStatusModel(nil), 200, 60)
+	m = say(m, "brokkr: desired=running observed=running outstanding=none next=none")
+	m = say(m, "volume v1: role=data data=UNREGENERABLE product=brokkr — present, created by this installation")
+	v := plain(m)
+	if got, want := headerOf(t, v, "PRODUCT"), []string{"PRODUCT", "DESIRED", "OBSERVED", "OUTSTANDING", "NEXT"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("product table columns %v, want %v", got, want)
+	}
+	if got, want := headerOf(t, v, "VOLUME"), []string{"VOLUME", "ROLE", "DATA", "PRODUCT", "STATE"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("volume table columns %v, want %v.\n"+
+			"  A volume has no SIZE among these facts, and every fact it does have must have a\n"+
+			"  heading of its own or its value is drawn under the next column's name.", got, want)
+	}
+}
+
+// TestATableWhoseHeaderDoesNotNameEveryCellIsNotDrawn — the fail-safe behind the assertion above:
+// a mismatch degrades to the report's own lines rather than to values under wrong headings.
+func TestATableWhoseHeaderDoesNotNameEveryCellIsNotDrawn(t *testing.T) {
+	tb := table{head: []string{"A", "B"}, rows: []tableRow{{cells: []string{"1", "2", "3"}}}}
+	if lines, laidOut := tb.render(80); laidOut {
+		t.Fatalf("a table with 2 headings drew a 3-cell row:\n%s", strings.Join(lines, "\n"))
+	}
+}
 
 // TestTheVolumeTableShowsNoSize — the rendered table, header and rows, carries nothing that
 // reads as a size.
@@ -513,10 +567,16 @@ func TestColumnsStartAtTheSameCellInEveryRow(t *testing.T) {
 	}
 }
 
-// TestControlCharactersNeverReachTheScreen. A ledger record's fields end up in this table; an
+// TestControlCharactersNeverReachTheDrawnFrame. A ledger record's fields end up in this table; an
 // escape sequence or a bidi override in one of them can make a refusing line render as a
-// reassuring one.
-func TestControlCharactersNeverReachTheScreen(t *testing.T) {
+// reassuring one INSIDE THE PANE, or corrupt the whole rendering.
+//
+// THE FRAME, NOT "THE SCREEN" — the name matters. runStatus replays the report to the real
+// streams byte-for-byte when the dashboard closes, exactly as --plain and a pipe and the frozen
+// shell original deliver it, so control bytes in the report's own text do reach the terminal
+// there. This test does not and cannot cover that path; the reasoning for leaving it byte-exact
+// is at the Flush call in status.go.
+func TestControlCharactersNeverReachTheDrawnFrame(t *testing.T) {
 	m := sized(NewStatusModel(nil), 200, 60)
 	// One in a table cell and one in prose, because they are laid out by different code and a
 	// sanitiser applied to only one of them would leave the other open.

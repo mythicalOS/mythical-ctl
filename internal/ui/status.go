@@ -86,10 +86,16 @@ type productRow struct{ Product, Desired, Observed, Outstanding, Next string }
 
 // volumeRow is one volume's line.
 //
-// THE FIELD SET IS THE WHOLE CONTRACT AND IT IS ASSERTED. There is no size, and there is no
-// field that could become one: see TestVolumeRowCarriesNoSizeField, which fails on any field
-// this list does not name.
-type volumeRow struct{ Name, Role, Data, State string }
+// THE FIELD SET IS THE WHOLE CONTRACT AND IT IS ASSERTED, in both directions. There is no size
+// and no field that could become one; and every field the report's line CARRIES is here, because
+// a parsed line is drawn as a row and never verbatim, so a capture left out of this struct is a
+// fact erased from the screen. Product was left out once: the report deliberately shows an
+// unattributable volume as `product=?` — "silently dropping it from a filtered view is how an
+// unattributable volume becomes invisible", says the verb — and a table without the column made
+// that volume look like any other. See TestVolumeRowCarriesNoSizeField and
+// TestEveryIngestedLineReachesTheView, which now checks the LINE's captures rather than the
+// fields this struct happens to keep.
+type volumeRow struct{ Name, Role, Data, Product, State string }
 
 // statusEntry is one line of the report, plus the indented lines that continue it.
 //
@@ -173,11 +179,10 @@ func classify(line string, stderr bool) statusEntry {
 		e.kind = kindVolume
 		if short, ok := volumeStates[m[5]]; ok {
 			e.hasVolume = true
-			e.volume = volumeRow{Name: m[1], Role: m[2], Data: m[3], State: short}
+			e.volume = volumeRow{Name: m[1], Role: m[2], Data: m[3], Product: m[4], State: short}
 		}
-		// The product this volume belongs to is already the row's scope in the products table
-		// and is repeated in the verbatim line; it is not a column here. When the phrase is
-		// unknown, hasVolume stays false and the whole line is rendered as it came.
+		// When the phrase is unknown, hasVolume stays false and the whole line is rendered as it
+		// came.
 		return e
 	}
 	switch {
@@ -687,7 +692,7 @@ func renderProducts(entries []statusEntry, avail int) []string {
 // token and the legend under it reproduces the report's own phrase, so the token never has to
 // be interpreted and a phrase this view does not know is never squeezed into it.
 func renderVolumes(entries []statusEntry, avail int) []string {
-	t := table{head: []string{"VOLUME", "ROLE", "DATA", "STATE"}}
+	t := table{head: []string{"VOLUME", "ROLE", "DATA", "PRODUCT", "STATE"}}
 	var rest []statusEntry
 	seen := map[string]bool{}
 	for _, e := range entries {
@@ -697,7 +702,7 @@ func renderVolumes(entries []statusEntry, avail int) []string {
 		}
 		v := e.volume
 		seen[v.State] = true
-		t.rows = append(t.rows, tableRow{cells: []string{v.Name, v.Role, v.Data, v.State}, notes: e.cont})
+		t.rows = append(t.rows, tableRow{cells: []string{v.Name, v.Role, v.Data, v.Product, v.State}, notes: e.cont})
 	}
 	out, laidOut := t.render(avail)
 	if !laidOut {
@@ -754,6 +759,15 @@ func (t table) render(avail int) ([]string, bool) {
 		return nil, true
 	}
 	cols := len(t.head)
+	// A HEADER THAT DOES NOT NAME EVERY CELL DRAWS NO TABLE. padRow lays a row out against the
+	// header's widths, so a row with more cells than headings loses its last cell and shows every
+	// cell after the missing heading under its NEIGHBOUR's — a value under the wrong name, which
+	// is worse than no table at all. The caller falls back to the report's own lines.
+	for _, r := range t.rows {
+		if len(r.cells) != cols {
+			return nil, false
+		}
+	}
 	const gap = 2
 	const indent = 2
 	// A TERMINAL TOO NARROW FOR THE TABLE GETS NO TABLE. Below this the columns cannot all reach
@@ -1080,6 +1094,21 @@ func runStatus(ctx context.Context, base verbs.Deps, fn VerbFunc, mk func(Status
 	// The LAST COMPLETED run's record, replayed to the real streams. That is what leaves the
 	// operator with the report itself in their terminal rather than an erased frame, and it is
 	// what makes this view's classification a viewing aid rather than a filter.
+	//
+	// THE REPLAY IS BYTE-EXACT AND THEREFORE UNSANITISED, and that is worth stating plainly
+	// because this file sanitises everything it DRAWS. The two are different jobs: sanitising the
+	// frame stops one stray escape from corrupting a whole rendering, or a bidi override from
+	// making a refusing line read as an accepting one INSIDE the pane. The replay reproduces what
+	// the report wrote, byte for byte, exactly as `--plain`, a pipe and the frozen shell original
+	// all deliver it — so a control byte in a ledger value reaches a terminal here no more and no
+	// less than it always has.
+	//
+	// It is NOT fixed here on purpose. The escape belongs to the report's own bytes, so the one
+	// place a fix covers every path is where those bytes are produced or replayed for everyone —
+	// the verb, or Bridge.Flush, which this runner shares with the lifecycle runner and does not
+	// own. A second, sanitising flush HERE would protect one of five paths while reading as
+	// though it protected all of them, and would put this runner's replay out of step with its
+	// sibling's for every report that contains no control byte at all, which is all of them.
 	res.b.Flush(base.Stdout, base.Stderr)
 	return res.code, runErr
 }
