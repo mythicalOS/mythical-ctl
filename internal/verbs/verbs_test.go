@@ -580,19 +580,61 @@ func TestRecreateRefusesAnUnsetSecretWithTheContainerIntact(t *testing.T) {
 }
 
 // TestTheLaunchIsAssembledOnce is not a bats port — the shell gets this structurally, because it
-// builds its launch arguments into an array once and hands that array to the bring-up. Here the
-// two halves are a dry run and a real create, so the config that feeds both has to be READ once
-// and carried: re-reading mythical.conf on the far side of the teardown would let the launch that
-// was judged possible and the launch that actually happens disagree about what to publish.
+// builds its launch arguments into an array ONCE and hands that array to the bring-up. Here the
+// two halves are a dry run and a real create with a container removal between them, so the config
+// that feeds both has to be read on the near side and CARRIED. Two things have to hold, and each
+// is asserted against the way the other implementation would behave, not merely against a good
+// outcome — an unchanged config makes read-once and read-twice produce identical results.
 func TestTheLaunchIsAssembledOnce(t *testing.T) {
 	r := newRig(t)
 	r.writeProduct("p1")
 	r.mintIdentity()
-	// The operator's configured host port, in force for the whole verb.
-	r.writeFile("mythical.conf", "MYTHICAL_TELEMETRY_KEY=tk\nMYTHICAL_P1_PORT=17480\n")
 	r.mustInstall("p1")
 
-	info, err := r.c.ContainerInspect(context.Background(), r.container("p1"))
+	// (a) CARRIED, NOT RE-DERIVED. The launcher is handed a host-port map that mythical.conf does
+	// NOT say — the file names no port for this product, so anything re-deriving from it would
+	// publish the manifest's 7480. The runtime object must follow what was carried.
+	s, serr := openSession(r.d)
+	if serr != nil {
+		t.Fatal(serr)
+	}
+	pc, cerr := s.productCtx("p1", s.manifestPath("p1"))
+	if cerr != nil {
+		s.close()
+		t.Fatal(cerr)
+	}
+	netID, nerr := s.netTarget(context.Background())
+	if nerr != nil {
+		s.close()
+		t.Fatal(nerr)
+	}
+	if err := s.ensureImage(context.Background(), pc.Image, "p1"); err != nil {
+		s.close()
+		t.Fatal(err)
+	}
+	carried, lerr := s.launchConfig(pc, pc.Image, netID)
+	if lerr != nil {
+		s.close()
+		t.Fatal(lerr)
+	}
+	if carried.HostPorts != nil {
+		s.close()
+		t.Fatalf("the fixture names a host port after all (%v) — the case cannot tell the two apart", carried.HostPorts)
+	}
+	carried.HostPorts = map[uint16]uint16{7480: 19999}
+	// The installed container is in the way of the name; take it out as a replacement would.
+	if err := s.replaceContainer(context.Background(), pc.Container, "test"); err != nil {
+		s.close()
+		t.Fatal(err)
+	}
+	launcher := &productLauncher{rt: s.rt, m: pc.Manifest, p: pc.Policy, cfg: carried}
+	if _, err := launcher.Launch(context.Background(), pc.Container, "nlaunchtest"); err != nil {
+		s.close()
+		t.Fatal(err)
+	}
+	s.close()
+
+	info, err := r.c.ContainerInspect(context.Background(), pc.Container)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -600,21 +642,39 @@ func TestTheLaunchIsAssembledOnce(t *testing.T) {
 		t.Fatal("nothing was published")
 	}
 	for _, p := range info.Ports {
-		if p.HostPort != "17480" {
-			t.Fatalf("published on host port %q, want the configured 17480", p.HostPort)
+		if p.HostPort != "19999" {
+			t.Fatalf("published on host port %q — the launcher re-derived the config instead of using the one it was carrying", p.HostPort)
 		}
 	}
-	// And the nonce the container really carries is the INTENT's, never the dry run's placeholder.
-	rec, ferr := prov.Find(r.ledgerNow(), prov.ClassContainer, r.container("p1"))
-	if ferr != nil {
-		t.Fatal(ferr)
+
+	// (b) THE NONCE IS THE ONE THING SUBSTITUTED AT THE CREATE. The dry run stamps a placeholder on
+	// its own copy because the spec validates every label; that placeholder must never reach a real
+	// container, whose nonce is the intent's — the only thing that can later prove the object is
+	// the one this installer recorded.
+	if got := info.Labels["mythicalos.nonce"]; got != "nlaunchtest" {
+		t.Fatalf("the container carries nonce %q, want the one the create was given", got)
 	}
-	recorded, _ := ledger.FieldOf(rec, "nonce")
-	if got := info.Labels["mythicalos.nonce"]; got != recorded || got == "" {
-		t.Fatalf("the container carries nonce %q, the ledger records %q", got, recorded)
+}
+
+// TestRecreateRefusesAnUnreadableHostPortWithTheContainerIntact is not a bats port. It is the
+// other half of assembling once: the config has to be read on the NEAR side of the teardown, so a
+// value that cannot be used refuses while the working container is still there. Reading it inside
+// the create instead would answer the same question after the container was already gone.
+func TestRecreateRefusesAnUnreadableHostPortWithTheContainerIntact(t *testing.T) {
+	r := newRig(t)
+	r.writeProduct("p1")
+	r.mintIdentity()
+	r.mustInstall("p1")
+	c := r.container("p1")
+
+	// A configured host port that is not a port number at all.
+	r.writeFile("mythical.conf", "MYTHICAL_TELEMETRY_KEY=tk\nMYTHICAL_P1_PORT=notaport\n")
+
+	if rc := r.recreate("p1"); rc != cliio.ExitFail {
+		t.Fatalf("rc = %d, want 1\n%s", rc, r.said())
 	}
-	if strings.Contains(info.Labels["mythicalos.nonce"], "prelaunch") {
-		t.Fatal("the dry run's placeholder nonce reached the real container")
+	if got := r.observed(c); got != state.ObsRunning {
+		t.Fatalf("observed %q — the recreate tore down a container before it read the config it needed", got)
 	}
 }
 
