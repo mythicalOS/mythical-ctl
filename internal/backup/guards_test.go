@@ -717,3 +717,23 @@ func TestBackupIntoTheInstallerHomeDoesNotCopyItself(t *testing.T) {
 		t.Fatalf("the backup copied itself into its own tree %d time(s)", nested)
 	}
 }
+
+// TestStagingAWriteDoesNotFollowASymlink: a failed or partial restore can leave the staging
+// path as a DANGLING SYMLINK — a state this codebase already recognises elsewhere — and an
+// open-and-truncate on that name follows it, writing the incoming ledger to wherever it points.
+// The staged ledger is installed by rename, which follows nothing.
+func TestStagingAWriteDoesNotFollowASymlink(t *testing.T) {
+	r := newRig(t)
+	r.backupOK()
+	r.dropLedger()
+	elsewhere := filepath.Join(canon(t, t.TempDir()), "elsewhere")
+	if err := os.Symlink(elsewhere, stagingPath(r.home)); err != nil {
+		t.Fatal(err)
+	}
+	if err := Restore(context.Background(), r.deps(), r.bk); err != nil {
+		t.Fatalf("Restore: %v\n%s", err, r.stderr())
+	}
+	if exists(elsewhere) {
+		t.Fatal("the staged ledger was written through the symlink, to a path outside .state")
+	}
+}

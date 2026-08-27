@@ -188,7 +188,20 @@ func Restore(ctx context.Context, d Deps, rawDir string) error {
 			return fmt.Errorf("restore: %q carries no ledger", dir)
 		}
 		// Phase 1: the staging ledger IS the incoming ledger, with the intent written inside it.
-		if cerr := copyFilePreserving(ledgercanon, sf); cerr != nil {
+		//
+		// INSTALLED THE WAY EVERY OTHER LEDGER IS — a temp file in .state/ and one rename —
+		// never a plain copy onto the well-known name. Two reasons, and both are states this
+		// codebase has already met: a failed or partial restore can leave the staging path as
+		// a DANGLING SYMLINK, and an open-and-truncate on that name follows it, writing the
+		// incoming ledger to wherever it points; and a copy interrupted midway leaves a torn
+		// file at the name a later run classifies from. A rename is atomic and follows
+		// nothing.
+		incoming, rerr := os.ReadFile(ledgercanon)
+		if rerr != nil {
+			d.warn("restore: cannot read the backup's ledger: %v", rerr)
+			return fmt.Errorf("restore: cannot read the backup's ledger: %w", rerr)
+		}
+		if cerr := writeFileAtomic(sf, incoming); cerr != nil {
 			d.warn("restore: cannot stage the incoming ledger: %v", cerr)
 			return fmt.Errorf("restore: cannot stage the incoming ledger: %w", cerr)
 		}
