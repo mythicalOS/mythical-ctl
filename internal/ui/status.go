@@ -427,14 +427,9 @@ func (m StatusModel) handleKey(msg tea.KeyMsg) (StatusModel, tea.Cmd) {
 		m.offset = 0
 		return m.clamp(), nil
 	case "end", "G":
-		content := m.render()
-		body := m.body()
-		if body == 0 {
-			return m, nil
-		}
-		// The END of the report can itself be blank — an error whose text ends in a newline
-		// splits into a last, empty line — so the correction looks BACKWARDS from there.
-		m.offset = visibleFrom(content, clampOffset(len(content)-body, len(content), body), body, -1)
+		// ONE definition of where the end is, shared with maxOffset — which is what the scrolling
+		// loop tests against and what decides whether there is anything further down.
+		m.offset = m.maxOffset()
 		return m, nil
 	}
 	return m, nil
@@ -528,15 +523,19 @@ func (m StatusModel) body() int {
 	return b
 }
 
+// maxOffset is the LAST POSITION THE VIEWPORT SETTLES AT, which is not the same as the last index
+// it could be given. A report can end in blank lines — an error whose text ends in a newline
+// splits into a last, empty one — and an offset whose whole window is blank is corrected away
+// from. Reporting the raw last index as the maximum made the two disagree: End landed on the last
+// line with something on it, and the position past it still counted as "further down", so one
+// more press of Down went nowhere.
 func (m StatusModel) maxOffset() int {
+	content := m.render()
 	body := m.body()
 	if body == 0 {
 		return 0
 	}
-	if n := len(m.render()) - body; n > 0 {
-		return n
-	}
-	return 0
+	return visibleFrom(content, clampOffset(len(content)-body, len(content), body), body, -1)
 }
 
 // --- rendering --------------------------------------------------------------------------------

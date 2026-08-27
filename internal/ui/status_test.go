@@ -645,9 +645,32 @@ func TestTheStoredOffsetAlwaysShowsSomething(t *testing.T) {
 // RENDERING and thrown away, so the stored offset lagged behind the drawn one and the first press
 // or two only caught it up while the screen sat still.
 func TestNoScrollKeystrokeIsInert(t *testing.T) {
-	for _, h := range []int{1, 2, 3, 5, 9} {
-		m := narrowReport(100)
-		m = sized(m, 100, h)
+	fixtures := map[string]func(int) StatusModel{
+		"a report of every shape": func(h int) StatusModel { return sized(narrowReport(100), 100, h) },
+		// A report ending in blank lines is the awkward one: the last index is not the last
+		// position the viewport settles at, and a maximum that ignored that left one dead press
+		// at the bottom.
+		"a report with a blank tail": func(h int) StatusModel {
+			m := sized(NewStatusModel(nil), 100, h)
+			m = say(m, "installation: zzident")
+			m = say(m, "unattributed container: zzthing")
+			m = say(m, "  a continuation of it")
+			m = say(m, "")
+			m = say(m, "")
+			m, _ = sstep(m, statusDoneMsg{})
+			return m
+		},
+	}
+	for name, build := range fixtures {
+		for _, h := range []int{1, 2, 3, 5, 9} {
+			runInertScrollCase(t, name, h, build(h))
+		}
+	}
+}
+
+func runInertScrollCase(t *testing.T, name string, h int, m StatusModel) {
+	t.Helper()
+	{
 		m, _ = sstep(m, tea.KeyMsg{Type: tea.KeyHome})
 		seen := plain(m)
 		for press := 0; press < 200; press++ {
@@ -657,12 +680,13 @@ func TestNoScrollKeystrokeIsInert(t *testing.T) {
 			}
 			next, _ := sstep(m, tea.KeyMsg{Type: tea.KeyDown})
 			if v := plain(next); v == seen {
-				t.Fatalf("height %d, press %d at offset %d: the screen did not move", h, press+1, at)
+				t.Fatalf("%s, height %d, press %d at offset %d (max %d): the screen did not move",
+					name, h, press+1, at, m.maxOffset())
 			} else {
 				seen = v
 			}
 			if next.Offset() <= at {
-				t.Fatalf("height %d, press %d: the offset went from %d to %d", h, press+1, at, next.Offset())
+				t.Fatalf("%s, height %d, press %d: the offset went from %d to %d", name, h, press+1, at, next.Offset())
 			}
 			m = next
 		}
@@ -674,13 +698,20 @@ func TestNoScrollKeystrokeIsInert(t *testing.T) {
 			}
 			next, _ := sstep(m, tea.KeyMsg{Type: tea.KeyUp})
 			if next.Offset() >= at {
-				t.Fatalf("height %d: scrolling up from offset %d went to %d — a blank run it cannot\n"+
-					"  get past", h, at, next.Offset())
+				t.Fatalf("%s, height %d: scrolling up from offset %d went to %d — a blank run it\n"+
+					"  cannot get past", name, h, at, next.Offset())
 			}
 			m = next
 		}
 		if m.Offset() != 0 {
-			t.Fatalf("height %d: scrolling up stopped at offset %d", h, m.Offset())
+			t.Fatalf("%s, height %d: scrolling up stopped at offset %d", name, h, m.Offset())
+		}
+		// End lands exactly where "there is nothing further down" is decided, so one more press
+		// down from there is legitimately inert and everything before it was not.
+		m, _ = sstep(m, tea.KeyMsg{Type: tea.KeyEnd})
+		if m.Offset() != m.maxOffset() {
+			t.Fatalf("%s, height %d: End went to %d, the last reachable position is %d",
+				name, h, m.Offset(), m.maxOffset())
 		}
 	}
 }
