@@ -254,12 +254,19 @@ func TestRestoreRefusesAManifestTheVolumeDoesNotMatch(t *testing.T) {
 	}
 }
 
-// TestRestoreBindsVerificationToTheManifestItCarries proves the manifest actually TRAVELS to the
-// copy container: the helper answers with the number of `manifest=` records it read on its stdin,
-// and the restore requires that number to equal the count of the manifest file it holds. A seam
-// that never opened the container's stdin would produce `checked=0` against a five-entry
-// manifest, which is what this asserts by making the helper honest and the manifest bigger.
-func TestRestoreBindsVerificationToTheManifestItCarries(t *testing.T) {
+// TestRestoreBindsVerificationToTheManifestsOwnEntryCount pins the COUNT BINDING and nothing else:
+// a verifier that claims completion having checked a different number of entries than the manifest
+// names has not verified THAT manifest, and the restore must refuse rather than trust a partial or
+// padded check.
+//
+// IT DOES NOT MEASURE THE STDIN TRANSPORT, deliberately, and it used to claim it did. The knob it
+// sets answers with a CONSTANT count, so a seam that never opened the container's stdin produces
+// exactly the same refusal — the test would have passed for the wrong reason and stayed green with
+// the transport broken. That property is measured where the answer actually depends on the bytes:
+// internal/copyfill's TestVerifyAgainstManifestCarriesTheManifestOnStdin, and the default round
+// trip above, where the helper reports the number of `manifest=` records it read and a dropped
+// payload turns five into zero. (Codex gate round 10.)
+func TestRestoreBindsVerificationToTheManifestsOwnEntryCount(t *testing.T) {
 	r, img := bkRig(t)
 	r.writeProduct("p1")
 	if rc := r.run(append([]string{"install", "p1"}, r.docArgs()...)...); rc != cliio.ExitOK {
@@ -276,8 +283,8 @@ func TestRestoreBindsVerificationToTheManifestItCarries(t *testing.T) {
 	if err := os.Remove(filepath.Join(r.home, ".state", "ledger")); err != nil {
 		t.Fatal(err)
 	}
-	// An HONEST verifier that reports a count it did not derive from the manifest — the shape a
-	// helper regression takes. The count binding is the only thing between it and a pass.
+	// A verifier that claims completion having checked FEWER entries than the manifest names — the
+	// shape a helper regression takes. The count binding is the only thing between it and a pass.
 	img.RestoreVerify = "understate"
 	if rc := r.run(append([]string{"restore", bk}, r.docArgs()...)...); rc != cliio.ExitFail {
 		t.Fatalf("restore rc = %d, want 1 — a count that does not match the manifest cannot bind\n%s", rc, r.said())
