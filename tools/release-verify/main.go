@@ -414,11 +414,21 @@ func checkBuildInfo(path string, t Target, toolchain string) error {
 	// -trimpath is recorded ONLY when it was on: a build without it carries no -trimpath
 	// setting at all (measured), so "absent" and "false" are the same failure and both are
 	// caught by requiring the value below.
-	keys := make([]string, 0, len(want))
+	// GOOS and GOARCH FIRST, then the rest in a stable order. The file name CLAIMS a platform
+	// and these two settings are the fact behind the claim, so a mismatch has to be diagnosed
+	// as the wrong platform rather than as whatever else falls over once the platform is wrong.
+	// The microarchitecture pin is GOARCH-derived, so without this order an arch mismatch
+	// surfaces as "GOAMD64 is absent" -- true, unhelpful, and it sends a reader looking in the
+	// wrong place. It also leaves the GOARCH pin itself with no input that can reach it.
+	keys := []string{"GOOS", "GOARCH"}
+	rest := make([]string, 0, len(want))
 	for k := range want {
-		keys = append(keys, k)
+		if k != "GOOS" && k != "GOARCH" {
+			rest = append(rest, k)
+		}
 	}
-	sort.Strings(keys)
+	sort.Strings(rest)
+	keys = append(keys, rest...)
 	for _, k := range keys {
 		got, ok := settings[k]
 		if !ok {

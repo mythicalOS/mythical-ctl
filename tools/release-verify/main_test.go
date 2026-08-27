@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -269,20 +270,33 @@ func TestCheckBuildInfoAcceptsAReleaseBuild(t *testing.T) {
 // The GOOS/GOARCH suffix in the file name is a claim; the build info is the fact. A file that
 // is a copy of another platform's build must not pass under this name.
 func TestCheckArtifactRefusesTheWrongPlatform(t *testing.T) {
-	// EVERY other target, not just the first one. The matrix contains neighbours that differ
-	// from the host in GOOS alone and in GOARCH alone; checking one of them would leave the
-	// other field's assertion unexercised, which is how a half-checked platform claim survives.
-	checked := 0
-	for _, tg := range targets {
-		if tg == hostTarget {
-			continue
-		}
-		checked++
-		_, err := checkArtifact(hostArtifact, tg, testVersion, testToolchain, forbidNothingReal())
-		mustFail(t, err, "build setting")
+	// One case per FIELD, each asserting the exact diagnosis for that field. Grading against
+	// "some other target" is not enough: the microarchitecture pin is GOARCH-derived, so a
+	// target that differs in both fields trips the arch-level check and the GOOS and GOARCH pins
+	// are never reached -- they could both be deleted and this test would still pass.
+	otherOS := map[string]string{"darwin": "linux", "linux": "darwin"}[hostTarget.GOOS]
+	otherArch := map[string]string{"amd64": "arm64", "arm64": "amd64"}[hostTarget.GOARCH]
+	if otherOS == "" || otherArch == "" {
+		t.Fatalf("host %s has no counterpart in the matrix's two axes", hostTarget)
 	}
-	if checked == 0 {
-		t.Fatal("no non-host target to check against")
+	cases := []struct {
+		name   string
+		claim  Target
+		expect string
+	}{
+		{"wrong GOOS", Target{GOOS: otherOS, GOARCH: hostTarget.GOARCH},
+			fmt.Sprintf("build setting GOOS is %q, want %q", hostTarget.GOOS, otherOS)},
+		{"wrong GOARCH", Target{GOOS: hostTarget.GOOS, GOARCH: otherArch},
+			fmt.Sprintf("build setting GOARCH is %q, want %q", hostTarget.GOARCH, otherArch)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if !slices.Contains(targets, tc.claim) {
+				t.Fatalf("%s is not in the shipped matrix; this case would grade a platform nobody publishes", tc.claim)
+			}
+			_, err := checkArtifact(hostArtifact, tc.claim, testVersion, testToolchain, forbidNothingReal())
+			mustFail(t, err, tc.expect)
+		})
 	}
 }
 
@@ -598,7 +612,9 @@ func TestCheckBuildInfoRefusesACgoBuild(t *testing.T) {
 	if b, err := cmd.CombinedOutput(); err != nil {
 		t.Skipf("a CGO_ENABLED=1 build is not available here: %v: %s", err, b)
 	}
-	mustFail(t, checkBuildInfo(out, hostTarget, testToolchain), "CGO_ENABLED")
+	// The SPECIFIC diagnosis: dropping the CGO_ENABLED pin would still produce a message
+	// naming it, via the unexpected-setting catch-all.
+	mustFail(t, checkBuildInfo(out, hostTarget, testToolchain), `build setting CGO_ENABLED is "1", want "0"`)
 }
 
 // --- the stamp round-trip, both spellings -------------------------------------------------
