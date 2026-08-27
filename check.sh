@@ -38,8 +38,8 @@ cd "$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 # Floors, not exact counts: the tree grows a package per port task, and each task raises these
 # two literals in its commit. Overridable ONLY so a test harness can prove the guard refuses.
-MIN_PACKAGES="${MIN_PACKAGES:-28}"
-MIN_TESTED_PACKAGES="${MIN_TESTED_PACKAGES:-28}"
+MIN_PACKAGES="${MIN_PACKAGES:-29}"
+MIN_TESTED_PACKAGES="${MIN_TESTED_PACKAGES:-29}"
 
 # The reference-boundary rules, one per line: `<guarded-import-path>:<Identifier>=<allowed
 # import path>[,<more allowed>]`. Each rule is
@@ -94,6 +94,18 @@ check_packages() {
   listed="$(go list ./...)"
   count="$(printf '%s\n' "$listed" | awk 'NF {n++} END {print n + 0}')"
   printf '%s\n' "$listed"
+  # A FLOOR THAT SITS BELOW REALITY STILL PASSES, AND THAT IS HOW IT DIES. Measured three times
+  # on the Wave 5-8 integration: parallel branches each add a package and each raise this literal
+  # by one, and git merges N identical one-line raises into ONE — the last time with no conflict at
+  # all, because both sides agreed on a number that was already stale. The floor then sits below
+  # the tree, reports OK, and is silently unable to notice the next package that stops being
+  # tested. So drift is now REPORTED rather than tolerated: it is not fatal (a floor is meant to be
+  # a floor, and a branch legitimately adds packages before it bumps this), but it can no longer
+  # happen quietly.
+  if [ "$count" -gt "$MIN_PACKAGES" ]; then
+    printf 'check.sh: NOTE: %s packages present, floor is %s — raise MIN_PACKAGES to %s.\n' \
+      "$count" "$MIN_PACKAGES" "$count" >&2
+  fi
   if [ "$count" -lt "$MIN_PACKAGES" ]; then
     die "go list ./... matched $count package(s), expected at least $MIN_PACKAGES.
    Either this lane is pointed at the wrong directory — in which case every 'go test' below is
