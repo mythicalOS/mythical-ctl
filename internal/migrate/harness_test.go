@@ -374,6 +374,7 @@ type fx struct {
 	bld  *fakeBuild
 	mt   *fakeMounts
 	log  bytes.Buffer
+	warn bytes.Buffer
 
 	confirmed bool
 	prompts   []string
@@ -452,6 +453,7 @@ func newFx(t *testing.T) *fx {
 		Persist: func(l *ledger.Ledger) error { return ledger.Write(lock, st, l) },
 		Entries: &EntryCount{},
 		Log:     &f.log,
+		Warn:    &f.warn,
 		NewNonce: func() (string, error) {
 			nonces++
 			return fmt.Sprintf("nz%d", nonces), nil

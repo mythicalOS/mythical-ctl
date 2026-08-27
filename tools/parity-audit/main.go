@@ -260,20 +260,44 @@ type claim struct {
 }
 
 // The inventory grammar. Leading whitespace is tolerated (one claim in the tree sits indented
-// beside the test it describes) but the comment marker must open the line: a `// PORTED:` inside a
-// Go string literal is not a claim, and anchoring here is what keeps it from being read as one.
+// beside the test it describes) but the comment marker must OPEN the line — that anchoring is what
+// makes a claim a claim, and it is why the stray rules below exist: anything that looks like a claim
+// and is not in that position is text no gate reads, so it is REPORTED rather than trusted. That
+// includes inventory syntax inside a string literal. This program cannot tell a documentation
+// example from a claim somebody meant, so it refuses both when they name a REAL corpus row and
+// ignores both when they do not — which is why its own fixtures name files the corpus does not hold.
 var (
 	invAny = regexp.MustCompile(`^[ \t]*//[ \t]*(PORTED|N/A):`)
 	// A claim written where the parser does not look. Found once for real: a PORTED: line wrapped
 	// into the middle of a paragraph, naming rows that another file had meanwhile marked N/A — two
-	// statements about the same row, one of them invisible to every gate. Deliberately narrow: it
-	// fires only when the mention names a bats file the CORPUS actually holds, so this program's
-	// own documentation and fixtures (which name tests/unit/<file>.bats and tests/unit/a.bats) are
-	// not swept up, and neither is prose about the convention.
-	invStray  = regexp.MustCompile(`(PORTED|N/A):[ \t]+(tests/[A-Za-z0-9_./-]+\.bats)`)
-	invPorted = regexp.MustCompile(`^[ \t]*// PORTED:[ \t]+(\S+):[ \t]+"(.+)"[ \t]+->[ \t]+(.*\S)[ \t]*$`)
-	invNA     = regexp.MustCompile(`^[ \t]*// N/A:[ \t]+(\S+):[ \t]+"(.+)"[ \t]+--[ \t]+(.*\S)[ \t]*$`)
-	goTestID  = regexp.MustCompile(`\bTest[A-Za-z0-9_]*`)
+	// statements about the same row, one of them invisible to every gate.
+	//
+	// TWO SIGNALS, NOT ONE, because a claim can be SPLIT ACROSS LINES: `PORTED:` on one line and the
+	// row on the next parses as neither, and requiring both on one line left that split as a hiding
+	// place. So a line is suspicious if it mentions a corpus bats file AND EITHER carries claim syntax
+	// anywhere on it, OR quotes a string that is a real @test name in that same file. The second
+	// signal catches the continuation line, which is the one carrying the row's identity.
+	//
+	// Narrow by CORPUS MEMBERSHIP, checked later where the corpus is known: a mention of a bats file
+	// the corpus does not hold is this program's own documentation or one of its fixtures, and is
+	// ignored whatever syntax surrounds it.
+	invStrayClaim = regexp.MustCompile(`(PORTED|N/A):`)
+	invStrayPath  = regexp.MustCompile(`tests/[A-Za-z0-9_./-]+\.bats`)
+	// EVERY quoted string, at any length. A length floor here was a silent hole: it only ever costs
+	// a map lookup to consider one more candidate, and the signal fires only on an EXACT match with
+	// a real @test name, so a short quoted word can never be a false positive.
+	invQuoted = regexp.MustCompile(`"([^"]*)"`)
+	// The quoted-row-name signal fires on COMMENT lines only. A claim — split across lines or not —
+	// is written in a comment; CODE that quotes a row name is a different thing entirely, and the
+	// tree has 144 lines of it: internal/verbs/owners.go's partition map is keyed by (file, name)
+	// pairs by design, is guarded by its own test, and is not an inventory claim. Sweeping it up
+	// would make this check fire on 144 legitimate lines, which is how a check gets switched off.
+	// The claim-syntax signal below has no such restriction: PORTED:/N/A: beside a REAL corpus path
+	// is never innocent, wherever it sits.
+	invCommentLine = regexp.MustCompile(`^[ \t]*(//|/\*|\*)`)
+	invPorted      = regexp.MustCompile(`^[ \t]*// PORTED:[ \t]+(\S+):[ \t]+"(.+)"[ \t]+->[ \t]+(.*\S)[ \t]*$`)
+	invNA          = regexp.MustCompile(`^[ \t]*// N/A:[ \t]+(\S+):[ \t]+"(.+)"[ \t]+--[ \t]+(.*\S)[ \t]*$`)
+	goTestID       = regexp.MustCompile(`\bTest[A-Za-z0-9_]*`)
 )
 
 // minNAReason is a substance floor, not a style rule. "N/A -- n/a" satisfies a syntax check and
@@ -287,8 +311,16 @@ const minNAReason = 16
 // is not wired in this build" and "re-claim once that verb lands". Every one of those premises had
 // expired — the verbs landed a wave earlier — and nothing noticed, because the audit was checking
 // that each row was CLAIMED, never that its claim still held. A deferral is a promise with no
-// expiry date attached; refusing the phrasing forces the promise to be an argument that is true
-// now, or an unclaimed row that fails loudly the moment the reason stops being true.
+// expiry date attached, and this list catches the phrasings that ACTUALLY OCCURRED here.
+//
+// STATED RESIDUAL, because the honest version of this comment matters more than the guard: THIS IS A
+// TRIPWIRE, NOT A PROOF. It is a finite list of substrings, so a deferral spelled some other way
+// ("this case will be ported after the Windows backend ships") passes it. No lexical rule can decide
+// whether a sentence is an argument, and pretending otherwise is worse than the gap — a reader who
+// believes this cannot be evaded stops reading N/A rationales, which is the only thing that actually
+// catches them. It exists because the four expired premises found on this tree were all spelled in
+// one of these ways, so it makes the cheapest recurrence loud; judging the rest is a reviewer's job
+// and is written down as such in the task's report.
 //
 // Deliberately phrase-level, not word-level: "later" appears innocently inside real arguments
 // ("every later step consumes that byte slice"), and a check that fires on prose nobody can rewrite
@@ -310,6 +342,10 @@ var naDeferrals = []string{
 	"in a later wave",
 	"a future wave",
 	"a future task",
+	"will be ported",
+	"once ported",
+	"when it ships",
+	"after the",
 	"todo",
 	"tbd",
 }
@@ -331,12 +367,17 @@ type malformed struct {
 	Text   string
 }
 
-// stray is a claim-shaped mention the parser cannot read because of where it sits.
+// stray is a claim-shaped mention the parser cannot read because of where it sits. Whether it is a
+// PROBLEM depends on the corpus, which parseInventory does not have — so everything needed to decide
+// travels with it and auditCoverage judges.
 type stray struct {
-	GoFile   string
-	GoLine   int
-	BatsFile string
-	Text     string
+	GoFile     string
+	GoLine     int
+	BatsFile   string
+	Text       string
+	ClaimWords bool     // the line carries PORTED:/N/A: somewhere
+	InComment  bool     // the line opens as a comment (the only place a claim can be written)
+	Quoted     []string // every quoted string on the line; any may be a row name
 }
 
 // parseInventory reads one Go file's claims. Anything that opens like an inventory line but does
@@ -364,8 +405,23 @@ func parseInventory(rel string, content []byte) ([]claim, []malformed, []stray, 
 			// corpus-file scoping below is what keeps this narrow: a mention naming a bats file the
 			// corpus does not hold (this program's own `tests/unit/<file>.bats` documentation, its
 			// fixtures' `tests/unit/a.bats`) is not swept up, whatever syntax surrounds it.
-			if m := invStray.FindStringSubmatch(text); m != nil {
-				strays = append(strays, stray{rel, line, m[2], text})
+			// EVERY path on the line, not the first: a mention of a file the corpus does not hold,
+			// earlier on the same line, would otherwise shadow a real one after it.
+			paths := invStrayPath.FindAllString(text, -1)
+			if len(paths) == 0 {
+				continue
+			}
+			claimWords := invStrayClaim.MatchString(text)
+			var quoted []string
+			for _, q := range invQuoted.FindAllStringSubmatch(text, -1) {
+				quoted = append(quoted, q[1])
+			}
+			if !claimWords && len(quoted) == 0 {
+				continue
+			}
+			inComment := invCommentLine.MatchString(text)
+			for _, path := range paths {
+				strays = append(strays, stray{rel, line, path, text, claimWords, inComment, quoted})
 			}
 			continue
 		}
@@ -557,12 +613,45 @@ func auditCoverage(r *report, pairs []batsPair, claims []claim, bad []malformed,
 	// A claim about a real corpus file, written somewhere the parser does not read. It states
 	// something about a row that some OTHER line is meanwhile claiming, and the two can disagree
 	// forever because only one of them is checked.
+	// A mention is reported when the corpus holds the file AND either the line carries claim words or
+	// it quotes one of that file's actual @test names. The second signal is what closes the
+	// split-across-lines hiding place: the continuation line carries the row identity even when the
+	// claim words sat on the line above.
+	namesOf := map[string]map[string]bool{}
+	for _, p := range pairs {
+		if namesOf[p.File] == nil {
+			namesOf[p.File] = map[string]bool{}
+		}
+		namesOf[p.File][p.Name] = true
+	}
+	type where struct {
+		file string
+		line int
+	}
+	reported := map[where]bool{}
 	for _, s := range strays {
 		if len(perFile[s.BatsFile]) == 0 {
 			continue
 		}
-		r.fail("%s:%d: a PORTED:/N/A: claim about %s is written mid-line, where the inventory parser does not read it — put it at the start of its own comment line, or say it in prose that does not use the claim syntax: %s",
-			s.GoFile, s.GoLine, s.BatsFile, strings.TrimSpace(s.Text))
+		why := ""
+		if s.ClaimWords {
+			why = "it carries PORTED:/N/A: claim syntax"
+		}
+		for _, q := range s.Quoted {
+			if s.InComment && namesOf[s.BatsFile][q] {
+				why = fmt.Sprintf("it quotes %q, which is a real @test in that file", q)
+				break
+			}
+		}
+		if why == "" {
+			continue
+		}
+		if reported[where{s.GoFile, s.GoLine}] {
+			continue
+		}
+		reported[where{s.GoFile, s.GoLine}] = true
+		r.fail("%s:%d: this names %s where the inventory parser does not read it (%s) — a claim here is invisible to every gate, so it can contradict the real one forever. Put it at the start of its own comment line, or reword it so it neither uses the claim syntax nor quotes a row name: %s",
+			s.GoFile, s.GoLine, s.BatsFile, why, strings.TrimSpace(s.Text))
 	}
 
 	byPair := map[batsPair][]claim{}

@@ -2,6 +2,7 @@ package conf
 
 import (
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -40,7 +41,7 @@ import (
 // PORTED: tests/unit/config_family.bats: "a forged lock token does not authorize a write" -> TestWritesRequireTheLock (a nil/foreign Held fails famlock.Assert — the sealed-type port of the token forgery test)
 // N/A: tests/unit/config_family.bats: "mi_lock_assert_held refuses a no-argument call in its own words" -- Go arity is compile-time
 // N/A: tests/unit/config_family.bats: "the ledger's lock refusal is unchanged by the extraction" -- bash source-extraction regression; Go has no extraction seam
-// PORTED: tests/unit/config_family.bats: "a foreign-owned mythical.conf is refused" -> TestForeignOwnedRefused (identityOK's uid branch; STATED RESIDUAL — creating a foreign-owned file needs root, so the test skips on an unprivileged run and only a root run exercises it)
+// PORTED: tests/unit/config_family.bats: "a foreign-owned mythical.conf is refused" -> TestForeignOwnedRefused (drives FamilyAdd, the public door the row calls, and asserts the file is unchanged. STATED RESIDUAL — the reference could shim `ls`; this gate asks the kernel, so a foreign-owned fixture needs root and the test SKIPS otherwise. That the gate is APPLIED on that door at all is proved unprivileged by TestFamilySymlinkRefused)
 // PORTED: tests/unit/config_family.bats: "a non-regular mythical.conf is refused" -> TestNonRegularRefused
 //
 // Inventory — tests/unit/config_product.bats:
@@ -54,7 +55,7 @@ import (
 // PORTED: tests/unit/config_product.bats: "an oversized product conf is refused, and leaves no snapshot behind" -> TestProductOversizedRefused (Go's snapshot is in-memory; "no snapshot file behind" has no on-disk artifact to leak)
 // PORTED: tests/unit/config_product.bats: "a retry after rc 5 repairs the mode and the group" -> TestProductOwnershipFailure
 // PORTED: tests/unit/config_product.bats: "a no-op merge does not rewrite the file" -> TestProductNoOpKeepsBytesAndInode
-// PORTED: tests/unit/config_product.bats: "a chmod failure after the bytes have landed reports rc 5, not rc 1" -> TestProductOwnershipFailure (the rc-5 semantics the row exists for: the bytes ARE committed and the file is left at the 0600 fallback, reported as OwnershipError rather than a plain failure. STATED RESIDUAL — the TRIGGER differs: an unprivileged process cannot make chmod fail on a file it owns after a successful chgrp (the bash shimmed it), so the Go induces the same state through StateGroupFailed)
+// N/A: tests/unit/config_product.bats: "a chmod failure after the bytes have landed reports rc 5, not rc 1" -- the row induces its two states with a PATH shim over /bin/chmod, and this port calls the syscall: there is nothing to shim, and an unprivileged process cannot make chmod fail on a file it owns. So StateModeFailed and StateBothFailed are UNREACHABLE from a test here, and claiming this row as PORTED would overstate what runs. A round-1 pass did claim it, against TestProductOwnershipFailure, which induces only the THIRD state (StateGroupFailed) — a weaker assertion wearing the row's name. What IS guarded without the shim is the part that can still regress silently: TestOwnershipErrorNamesEachState pins all three states' diagnostics and the rc-5 mapping directly, and TestProductOwnershipFailure pins the one state that can be induced end to end (bytes committed, 0600 fallback, repair on retry)
 // PORTED: tests/unit/config_product.bats: "a rewrite keeps the same inode — a bind mount must not be detached" -> TestProductRewriteKeepsInode
 // PORTED: tests/unit/config_product.bats: "a value containing a newline is refused and nothing is written" -> TestProductAddRefusals
 // PORTED: tests/unit/config_product.bats: "a key outside the product spec is refused on write, leaving no partial file" -> TestProductAddRefusals
@@ -71,7 +72,7 @@ import (
 // PORTED: tests/unit/config_product.bats: "a symlinked product conf is refused on both read and write" -> TestProductSymlinkRefused
 // PORTED: tests/unit/config_product.bats: "a product conf hardlinked to mythical.conf is refused" -> TestProductHardlinkRefused
 // PORTED: tests/unit/config_product.bats: "a product conf hardlinked to a file under bin/ is refused" -> TestProductHardlinkRefused
-// PORTED: tests/unit/config_product.bats: "a product conf owned by another uid is refused on both read and write" -> TestForeignOwnedRefused (identityOK's uid branch, the same code path every identity test exercises; same STATED RESIDUAL — it skips off-root)
+// PORTED: tests/unit/config_product.bats: "a product conf owned by another uid is refused on both read and write" -> TestForeignOwnedRefused (drives LoadProduct AND ProductAdd — both directions the row names. Same STATED RESIDUAL: root-only; the gate's application on both doors is proved unprivileged by TestProductSymlinkRefused)
 // N/A: tests/unit/config_product.bats: "an unreadable owner is refused rather than assumed to be ours" -- the bash parsed `ls` output which could be garbled; os.Lstat's Stat_t either exists or the assertion fails closed (that fail-closed branch is in identityOK and cannot be induced portably)
 // PORTED: tests/unit/config_product.bats: "a matching marker reads silently" -> TestProductLoadRoundTrip
 // PORTED: tests/unit/config_product.bats: "a stale marker over a parseable body is torn, not accepted" -> TestProductTornAndMalformed
@@ -292,19 +293,61 @@ func TestNonRegularRefused(t *testing.T) {
 }
 
 func TestForeignOwnedRefused(t *testing.T) {
+	// STATED RESIDUAL, and it is why this test is written the way it is. The reference could shim
+	// `ls` to report a foreign uid, because its gate read `ls -ldn` output; this one asks the kernel
+	// through Lstat, so there is no seam to shim and a foreign-owned fixture genuinely needs root.
+	// The test therefore SKIPS on an ordinary run — which is exactly why it must not stop at the
+	// private helper. That the gate is APPLIED on every public path is proved unprivileged and
+	// separately, by TestFamilySymlinkRefused (FamilyAdd) and TestProductSymlinkRefused (both the
+	// product read and the product write): identityOK refuses a symlink with no privilege at all.
+	// What is left needing root is the uid COMPARISON, and under root it is exercised here through
+	// the public doors rather than through identityOK alone — a claim satisfied by the private
+	// helper would stay green if any public path stopped calling it.
 	if os.Getuid() != 0 {
-		t.Skip("needs root to create a foreign-owned file; the uid comparison itself is identityOK's, exercised on every identity test")
+		t.Skip("needs root to create a foreign-owned file; the gate's APPLICATION on every public path is proved unprivileged by TestFamilySymlinkRefused and TestProductSymlinkRefused")
 	}
 	home := t.TempDir()
 	f := FamilyPath(home)
 	if err := os.WriteFile(f, []byte("MYTHICAL_NET=n\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	before, rerr := os.ReadFile(f)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
 	if err := os.Chown(f, 12345, -1); err != nil {
 		t.Fatal(err)
 	}
 	if err := identityOK(f); err == nil {
 		t.Fatal("foreign-owned file accepted")
+	}
+	// THE PUBLIC WRITE DOOR, which is what the frozen row actually calls.
+	h := lockFor(t, home)
+	if err := FamilyAdd(h, "MYTHICAL_TELEMETRY_KEY", "tok"); err == nil {
+		t.Fatal("FamilyAdd wrote into a foreign-owned mythical.conf")
+	} else if !strings.Contains(err.Error(), "owned by uid") {
+		t.Fatalf("FamilyAdd refused for the wrong reason: %v", err)
+	}
+	if after, aerr := os.ReadFile(f); aerr != nil || string(after) != string(before) {
+		t.Fatalf("the refused write changed the file: %v / %q", aerr, after)
+	}
+
+	// ...and the product file, on BOTH read and write, which is the other frozen row.
+	pf, perr := ProductPath(home, "brokkr")
+	if perr != nil {
+		t.Fatal(perr)
+	}
+	if err := os.WriteFile(pf, []byte("MYTHICAL_BROKKR_PORT=7480\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(pf, 12345, -1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadProduct(home, "brokkr", testSpec); err == nil {
+		t.Fatal("LoadProduct read a foreign-owned product conf")
+	}
+	if err := ProductAdd(h, "brokkr", gidStr(), testSpec, []KV{{"MYTHICAL_BROKKR_PORT", "7480"}}); err == nil {
+		t.Fatal("ProductAdd wrote into a foreign-owned product conf")
 	}
 }
 
@@ -315,7 +358,7 @@ func TestWritesRequireTheLock(t *testing.T) {
 	if err := ProductAdd(nil, "brokkr", "20", Spec{}, nil); err == nil {
 		t.Fatal("nil token authorized a product write")
 	}
-	if err := FamilyCAS(nil, "MYTHICAL_BROKKR_DATA_BIND", "/x", "", AttemptNone, nil, nil); err == nil {
+	if err := FamilyCAS(nil, "MYTHICAL_BROKKR_DATA_BIND", "/x", "", AttemptNone, nil, CASReport{}); err == nil {
 		t.Fatal("nil token authorized a CAS")
 	}
 }
@@ -797,7 +840,7 @@ func TestFamilyCASAttemptTable(t *testing.T) {
 
 	// none + absent + prior "" => write.
 	h, home := setup("")
-	if err := FamilyCAS(h, key, "/new", "", AttemptNone, nil, nil); err != nil {
+	if err := FamilyCAS(h, key, "/new", "", AttemptNone, nil, CASReport{}); err != nil {
 		t.Fatal(err)
 	}
 	if b, _ := os.ReadFile(FamilyPath(home)); string(b) != key+"=/new\n" {
@@ -806,7 +849,7 @@ func TestFamilyCASAttemptTable(t *testing.T) {
 
 	// none + holds prior => write, preserving other lines.
 	h, home = setup("# note\n" + key + "=/old\nMYTHICAL_NET=n\n")
-	if err := FamilyCAS(h, key, "/new", "/old", AttemptNone, nil, nil); err != nil {
+	if err := FamilyCAS(h, key, "/new", "/old", AttemptNone, nil, CASReport{}); err != nil {
 		t.Fatal(err)
 	}
 	if b, _ := os.ReadFile(FamilyPath(home)); string(b) != "# note\n"+key+"=/new\nMYTHICAL_NET=n\n" {
@@ -815,7 +858,7 @@ func TestFamilyCASAttemptTable(t *testing.T) {
 
 	// none + holds something else => refuse untouched.
 	h, home = setup(key + "=/theirs\n")
-	if err := FamilyCAS(h, key, "/new", "/old", AttemptNone, nil, nil); err == nil {
+	if err := FamilyCAS(h, key, "/new", "/old", AttemptNone, nil, CASReport{}); err == nil {
 		t.Fatal("mismatched prior accepted")
 	}
 	if b, _ := os.ReadFile(FamilyPath(home)); string(b) != key+"=/theirs\n" {
@@ -825,7 +868,7 @@ func TestFamilyCASAttemptTable(t *testing.T) {
 	// started + holds our value => advance without rewriting.
 	h, home = setup(key + "=/new\n")
 	st1, _ := os.Stat(FamilyPath(home))
-	if err := FamilyCAS(h, key, "/new", "/old", AttemptStarted, nil, nil); err != nil {
+	if err := FamilyCAS(h, key, "/new", "/old", AttemptStarted, nil, CASReport{}); err != nil {
 		t.Fatal(err)
 	}
 	st2, _ := os.Stat(FamilyPath(home))
@@ -835,10 +878,10 @@ func TestFamilyCASAttemptTable(t *testing.T) {
 
 	// started + absent => refuse without confirmation; write only WITH it.
 	h, home = setup("MYTHICAL_NET=n\n")
-	if err := FamilyCAS(h, key, "/new", "/old", AttemptStarted, func(string) bool { return false }, nil); err == nil {
+	if err := FamilyCAS(h, key, "/new", "/old", AttemptStarted, func(string) bool { return false }, CASReport{}); err == nil {
 		t.Fatal("started+absent wrote without consent")
 	}
-	if err := FamilyCAS(h, key, "/new", "/old", AttemptStarted, func(string) bool { return true }, nil); err != nil {
+	if err := FamilyCAS(h, key, "/new", "/old", AttemptStarted, func(string) bool { return true }, CASReport{}); err != nil {
 		t.Fatal(err)
 	}
 	if b, _ := os.ReadFile(FamilyPath(home)); string(b) != "MYTHICAL_NET=n\n"+key+"=/new\n" {
@@ -847,7 +890,7 @@ func TestFamilyCASAttemptTable(t *testing.T) {
 
 	// The door is bind-shaped only: a core key is refused outright.
 	h, _ = setup("")
-	if err := FamilyCAS(h, "MYTHICAL_NET", "n2", "n1", AttemptNone, nil, nil); err == nil {
+	if err := FamilyCAS(h, "MYTHICAL_NET", "n2", "n1", AttemptNone, nil, CASReport{}); err == nil {
 		t.Fatal("CAS accepted a core key")
 	}
 }
@@ -878,13 +921,14 @@ func TestFamilyCASNarratesWhatItDid(t *testing.T) {
 		}
 		return h, home
 	}
-	var notes []string
+	var notes, warns []string
 	note := func(s string) { notes = append(notes, s) }
+	warnNote := func(s string) { warns = append(warns, s) }
 
 	// A write REPORTS the value it wrote, and names the file it wrote it in.
 	h, home := setup("")
 	notes = nil
-	if err := FamilyCAS(h, key, "/new", "", AttemptNone, nil, note); err != nil {
+	if err := FamilyCAS(h, key, "/new", "", AttemptNone, nil, CASReport{Say: note, Warn: warnNote}); err != nil {
 		t.Fatal(err)
 	}
 	joined := strings.Join(notes, "\n")
@@ -897,7 +941,7 @@ func TestFamilyCASNarratesWhatItDid(t *testing.T) {
 	// A REFUSED write says nothing: a report of a value that was not written is worse than silence.
 	h, _ = setup(key + "=/theirs\n")
 	notes = nil
-	if err := FamilyCAS(h, key, "/new", "/old", AttemptNone, nil, note); err == nil {
+	if err := FamilyCAS(h, key, "/new", "/old", AttemptNone, nil, CASReport{Say: note, Warn: warnNote}); err == nil {
 		t.Fatal("mismatched prior accepted")
 	}
 	if len(notes) != 0 {
@@ -907,40 +951,52 @@ func TestFamilyCASNarratesWhatItDid(t *testing.T) {
 	// The no-op advance says so, rather than looking like a write that did not happen.
 	h, _ = setup(key + "=/new\n")
 	notes = nil
-	if err := FamilyCAS(h, key, "/new", "/old", AttemptStarted, nil, note); err != nil {
+	if err := FamilyCAS(h, key, "/new", "/old", AttemptStarted, nil, CASReport{Say: note, Warn: warnNote}); err != nil {
 		t.Fatal(err)
 	}
 	if j := strings.Join(notes, "\n"); !strings.Contains(j, "already holds the migrated destination") {
 		t.Fatalf("the advance said %q", j)
 	}
 
-	// The PROMPT the operator answers carries the whole explanation — including the value actually
-	// found, which is the thing they are being asked to discard.
+	// THE EXPLANATION IS EMITTED BEFORE THE QUESTION, ON THE DIAGNOSTIC STREAM — not inside the
+	// prompt. cliio.Confirm SHORT-CIRCUITS on MI_CONFIRM=yes/no and never renders a prompt, so an
+	// explanation carried only there reaches nobody who set that variable: under =yes the file is
+	// rewritten with nothing said about what was discarded, and under =no the reference's own bats
+	// row ("attempt in progress, key ABSENT") asserts the words "equally" and "deleted", which
+	// would be absent. This asserts the placement, not just the words.
 	h, _ = setup(key + "=/somebody-elses-edit\n")
 	var asked string
-	if err := FamilyCAS(h, key, "/new", "/old", AttemptStarted, func(p string) bool { asked = p; return false }, note); err == nil {
+	warns = nil
+	if err := FamilyCAS(h, key, "/new", "/old", AttemptStarted, func(p string) bool { asked = p; return false }, CASReport{Say: note, Warn: warnNote}); err == nil {
 		t.Fatal("started+different wrote without consent")
 	}
+	explained := strings.Join(warns, "\n")
 	for _, want := range []string{
 		"recorded as IN PROGRESS",
 		"/somebody-elses-edit",
+		"equally",
 		"deleted or changed the line by hand",
 		"additive-only rule promises to keep",
-		"write " + key + "=/new, discarding what is there?",
 	} {
-		if !strings.Contains(asked, want) {
-			t.Fatalf("the confirmation prompt does not carry %q — the operator consents uninformed:\n%s", want, asked)
+		if !strings.Contains(explained, want) {
+			t.Fatalf("the explanation does not carry %q — an operator with MI_CONFIRM set never sees the prompt, so this is their only telling:\n%s", want, explained)
 		}
 	}
+	if !strings.Contains(asked, "write "+key+"=/new, discarding what is there?") {
+		t.Fatalf("the prompt is not the reference's one-line question: %q", asked)
+	}
+	if strings.Contains(asked, "equally") {
+		t.Fatalf("the explanation is back inside the prompt, where MI_CONFIRM=yes/no never renders it: %q", asked)
+	}
 
-	// ...and when the key is ABSENT the prompt says so in words, rather than showing an empty line.
+	// ...and when the key is ABSENT the explanation says so in words, rather than an empty line.
 	h, _ = setup("MYTHICAL_NET=n\n")
-	asked = ""
-	if err := FamilyCAS(h, key, "/new", "/old", AttemptStarted, func(p string) bool { asked = p; return false }, note); err == nil {
+	warns = nil
+	if err := FamilyCAS(h, key, "/new", "/old", AttemptStarted, func(p string) bool { return false }, CASReport{Say: note, Warn: warnNote}); err == nil {
 		t.Fatal("started+absent wrote without consent")
 	}
-	if !strings.Contains(asked, "<nothing>") {
-		t.Fatalf("an absent key rendered as blank in the prompt:\n%s", asked)
+	if !strings.Contains(strings.Join(warns, "\n"), "<nothing>") {
+		t.Fatalf("an absent key rendered as blank:\n%s", strings.Join(warns, "\n"))
 	}
 
 	// A WRITE THAT FAILED AT THE LAST STEP MUST NOT REPORT SUCCESS. This is the report's worst
@@ -958,7 +1014,7 @@ func TestFamilyCASNarratesWhatItDid(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
 		notes = nil
-		if err := FamilyCAS(h, key, "/new", "", AttemptNone, nil, note); err == nil {
+		if err := FamilyCAS(h, key, "/new", "", AttemptNone, nil, CASReport{Say: note, Warn: warnNote}); err == nil {
 			t.Fatal("a write into an unwritable directory reported success")
 		}
 		if len(notes) != 0 {
@@ -966,9 +1022,28 @@ func TestFamilyCASNarratesWhatItDid(t *testing.T) {
 		}
 	}
 
-	// A nil note is a caller with nowhere to write, not a crash.
+	// THROUGH THE PRODUCTION CONFIRMATION, with MI_CONFIRM set — the input that makes the prompt
+	// disappear, and the exact shape the reference's bats row uses (it calls mi_conf_family_cas
+	// directly under MI_CONFIRM=no and asserts the words "equally" and "deleted"). A callback-based
+	// test cannot see this: cliio.Confirm returns before rendering anything.
+	for _, mi := range []string{"no", "yes"} {
+		h, _ = setup(key + "=/operators/own/choice\n")
+		warns = nil
+		confirm := func(prompt string) bool {
+			return cliio.Confirm([]string{"MI_CONFIRM=" + mi}, strings.NewReader(""), io.Discard, prompt)
+		}
+		_ = FamilyCAS(h, key, "/new", "/old", AttemptStarted, confirm, CASReport{Say: note, Warn: warnNote})
+		said := strings.Join(warns, "\n")
+		for _, want := range []string{"IN PROGRESS", "/operators/own/choice", "equally", "deleted"} {
+			if !strings.Contains(said, want) {
+				t.Fatalf("MI_CONFIRM=%s: the operator was never told %q — no prompt is rendered at all on this path:\n%s", mi, want, said)
+			}
+		}
+	}
+
+	// A nil report is a caller with nowhere to write, not a crash.
 	h, _ = setup("")
-	if err := FamilyCAS(h, key, "/new", "", AttemptNone, nil, nil); err != nil {
+	if err := FamilyCAS(h, key, "/new", "", AttemptNone, nil, CASReport{}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -1046,5 +1121,42 @@ func TestProductAddRefusesChownSentinelGid(t *testing.T) {
 	}
 	if _, err := os.Lstat(filepath.Join(home, "brokkr.conf")); !os.IsNotExist(err) {
 		t.Fatal("refused gid still created a file")
+	}
+}
+
+// TestOwnershipErrorNamesEachState pins the three ownership states' diagnostics and their exit-code
+// mapping DIRECTLY, because two of the three cannot be induced.
+//
+// WHY IT EXISTS. config_product.bats' chmod row drives all three by shimming /bin/chmod on PATH.
+// This port calls the syscall, so there is nothing to shim and an unprivileged process cannot make
+// chmod fail on a file it owns — StateModeFailed and StateBothFailed are unreachable end to end.
+// That is an honest N/A for the ROW, but it would leave the three states' selection and wording
+// with no guard at all: they could be reordered, or two of them made to say the same thing, and
+// every suite would stay green. So they are asserted where they CAN be: on the error value itself.
+func TestOwnershipErrorNamesEachState(t *testing.T) {
+	seen := map[string]bool{}
+	for _, tc := range []struct {
+		state OwnershipState
+		want  string
+	}{
+		{StateGroupFailed, "group"},
+		{StateModeFailed, "mode"},
+		{StateBothFailed, "OR mode"},
+	} {
+		e := &OwnershipError{State: tc.state, Path: "/tmp/x.conf", GID: 20}
+		msg := e.Error()
+		if !strings.Contains(msg, tc.want) {
+			t.Errorf("state %d says %q, which does not name %q", tc.state, msg, tc.want)
+		}
+		if !strings.Contains(msg, "/tmp/x.conf") {
+			t.Errorf("state %d does not name the file: %q", tc.state, msg)
+		}
+		// EACH STATE MUST BE DISTINGUISHABLE. Two states sharing a message is the regression this
+		// test exists for: an operator told "the group could not be set" when the group IS set and
+		// only the mode is wrong will look in the wrong place.
+		if seen[msg] {
+			t.Errorf("state %d repeats another state's message verbatim: %q", tc.state, msg)
+		}
+		seen[msg] = true
 	}
 }

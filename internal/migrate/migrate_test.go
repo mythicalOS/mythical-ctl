@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	"io"
+
 	"mythicalos.ai/ctl/internal/cliio"
 	"mythicalos.ai/ctl/internal/conf"
 	"mythicalos.ai/ctl/internal/engine"
@@ -1938,5 +1940,48 @@ func TestPhase9PreservesAStoppedContainersOutstandingCheck(t *testing.T) {
 	}
 	if _, perr := Phase(f.l, testProduct, testRole); !errors.Is(perr, ErrNoMigration) {
 		t.Fatalf("the intent survived a completed migration: %v", perr)
+	}
+}
+
+// TestTheAmbiguityIsExplainedEVENWhenTheConfirmationIsShortCircuited is the integration half of the
+// compare-and-set's explanation, and the test that would have caught the defect the round-2 gate
+// found.
+//
+// THE UNIT TEST INJECTS A CONFIRM CALLBACK, so it can only prove the explanation exists — not that
+// an operator ever receives it. Production confirmation is cliio.Confirm, which SHORT-CIRCUITS on
+// MI_CONFIRM=yes/no and never renders a prompt at all. An explanation carried inside the prompt
+// therefore reaches nobody who set that variable: under MI_CONFIRM=yes the file is rewritten and
+// nothing is ever said about what was discarded, and under MI_CONFIRM=no the reference's own bats
+// row asserts the words "equally" and "deleted", which would be missing. The reference emits these
+// lines with mi_warn BEFORE calling mi_confirm; this asserts that placement through the real
+// confirmation implementation, on the real diagnostic stream.
+func TestTheAmbiguityIsExplainedEvenWhenTheConfirmationIsShortCircuited(t *testing.T) {
+	// MI_CONFIRM=yes is the arm that matters and the one the unit test cannot reach: the resume's
+	// own gate passes, the compare-and-set's question is auto-answered, the file IS rewritten — and
+	// without this the operator is never told what was discarded. (MI_CONFIRM=no refuses at the
+	// resume's own gate before the compare-and-set is reached, which is why the =no half of the
+	// contract is asserted in internal/conf against FamilyCAS directly, exactly as the reference's
+	// bats row calls mi_conf_family_cas directly.)
+	for _, mi := range []string{"yes"} {
+		f := newFx(t)
+		canon := f.canonDest()
+		if err := conf.FamilyAdd(f.lock, f.confkey, "/operators/own/choice"); err != nil {
+			t.Fatal(err)
+		}
+		f.seed(record{Phase: 6, Dest: canon, Nonce: "nz", Staging: StagingPath(canon, "nz"),
+			Attempt: "started", Desired: "running"})
+		// The real thing, not a stand-in: MI_CONFIRM is exactly what an operator or a script sets,
+		// and it is the input that makes the prompt disappear.
+		f.d.Confirm = func(prompt string) bool {
+			return cliio.Confirm([]string{"MI_CONFIRM=" + mi}, strings.NewReader(""), io.Discard, prompt)
+		}
+		_ = Resume(ctx(), f.l, f.d)
+
+		said := f.warn.String()
+		for _, want := range []string{"IN PROGRESS", "/operators/own/choice", "equally", "deleted or changed the line by hand"} {
+			if !strings.Contains(said, want) {
+				t.Fatalf("MI_CONFIRM=%s: the operator was never told %q — the whole explanation:\n%s", mi, want, said)
+			}
+		}
 	}
 }

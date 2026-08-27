@@ -1883,3 +1883,70 @@ func TestStopCommitsTheIntentBeforeItActs(t *testing.T) {
 		t.Fatal("the container is not running")
 	}
 }
+
+// TestNoValueFromAProductConfReachesTheLaunch ports bringup.bats' "no value from <product>.conf
+// reaches any launch argument".
+//
+// PORTED: tests/unit/bringup.bats: "no value from <product>.conf reaches any launch argument" -> TestNoValueFromAProductConfReachesTheLaunch
+//
+// IT WAS N/A ON A STRUCTURAL ARGUMENT THAT DOES NOT HOLD. The claim was that the launch seam takes
+// only a container name and a nonce, so this package could not pass a config value into a launch
+// argument even by mistake. But an interface says nothing about what an implementation carries:
+// the real launcher carries the launch config, the manifest and the policy into LaunchProduct, so
+// the subject of this row exists here — it is simply not exercised today. "Nothing currently reads
+// it" is not a guard; it is the state a guard exists to preserve.
+//
+// WHAT THE ROW IS ABOUT. <product>.conf is written by the PRODUCT, inside its container: it is the
+// one file in this system an attacker who owns a product can choose the contents of. If any of it
+// reached the container spec, a value like `--privileged` would be a container escape authored by
+// the thing being contained. The reference plants exactly that and asserts the launch happened and
+// the value did not travel; so does this.
+func TestNoValueFromAProductConfReachesTheLaunch(t *testing.T) {
+	const hostile = "--privileged"
+	r := newRig(t)
+	r.writeProduct("p1")
+	r.mintIdentity()
+	// The product writes its own conf, and it writes something it should never be able to use. The
+	// bytes are planted BEFORE the install so every step of bring-up sees them.
+	r.writeFile("p1.conf", "PEER="+hostile+"\nMYTHICAL_BROKKR_PORT=7480\n")
+	r.mustInstall("p1")
+
+	c := r.container("p1")
+	info, err := r.c.ContainerInspect(context.Background(), c)
+	if err != nil {
+		t.Fatalf("the launch did not happen, so this test would pass for the wrong reason: %v", err)
+	}
+	// THE LAUNCH REALLY HAPPENED — without this the assertions below hold just as well for a
+	// bring-up that never ran, which is the shape the reference guards against with its alias check.
+	if !info.Running {
+		t.Fatalf("the container is not running; the assertions below would prove nothing")
+	}
+
+	// Nothing the product wrote may appear anywhere the daemon acts on: not the env, not the
+	// labels, not the image, not a mount, not a published port.
+	for _, e := range info.Env {
+		if strings.Contains(e, hostile) || strings.HasPrefix(e, "PEER=") {
+			t.Fatalf("a <product>.conf value reached the container environment: %q", e)
+		}
+	}
+	for k, v := range info.Labels {
+		if strings.Contains(k, hostile) || strings.Contains(v, hostile) {
+			t.Fatalf("a <product>.conf value reached a label: %s=%s", k, v)
+		}
+	}
+	if strings.Contains(info.Image, hostile) {
+		t.Fatalf("a <product>.conf value reached the image reference: %q", info.Image)
+	}
+	for _, m := range info.Mounts {
+		if strings.Contains(m.Source, hostile) || strings.Contains(m.Destination, hostile) {
+			t.Fatalf("a <product>.conf value reached a mount: %+v", m)
+		}
+	}
+	// And nothing carrying it reached the daemon AT ALL — the request log is every call this
+	// install made, so a value that never appears there never had a chance to be acted on.
+	for _, req := range r.fake.RequestLog() {
+		if strings.Contains(req, hostile) {
+			t.Fatalf("a <product>.conf value reached the daemon in %q", req)
+		}
+	}
+}

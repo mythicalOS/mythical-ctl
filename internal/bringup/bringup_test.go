@@ -62,7 +62,12 @@ import (
 // TestSecretsInjection owns them. They were marked N/A here on the argument that the port was
 // "elsewhere"; that argument was false. A relocated behaviour is PORTED, not N/A, and saying N/A
 // while another file quietly said PORTED left one row described two contradictory ways.)
-// N/A: tests/unit/bringup.bats: "no value from <product>.conf reaches any launch argument" -- structural in Go: the launch seam takes a container name and a nonce, so this package cannot pass a config value to a launch argument even by mistake.
+// (bringup.bats' "no value from <product>.conf reaches any launch argument" row is claimed in
+// internal/verbs by TestNoValueFromAProductConfReachesTheLaunch. It was N/A here on the argument
+// that the launch seam takes only a container name and a nonce — but an interface says nothing
+// about what an implementation CARRIES, and the real launcher carries the launch config, the
+// manifest and the policy into LaunchProduct. The subject of the row exists; "nothing currently
+// reads it" is the state a guard preserves, not a guard.)
 
 // --- fakes ---------------------------------------------------------------------------------------
 

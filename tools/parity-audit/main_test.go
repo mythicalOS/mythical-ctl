@@ -806,13 +806,20 @@ func TestAuditCoverageCatchesAClaimWrittenMidLine(t *testing.T) {
 		// looks like a line comment at all. The exactly-once guarantee is worth exactly as much as
 		// its least-visible hiding place.
 		`/* PORTED: tests/unit/b.bats: "one" -> TestThree */`,
+		// AND THE THIRD: a claim SPLIT ACROSS LINES parses as neither line, so requiring the claim
+		// words and the row on one line left the continuation as a place to hide. The continuation
+		// is what carries the identity, so that is what is recognised.
+		`// prose that says PORTED: and then continues`,
+		`// tests/unit/a.bats: "two" -> TestTwo, invisibly claiming it a second time`,
+		// A NON-CORPUS PATH EARLIER ON THE LINE must not shadow a real one after it.
+		`// see tests/unit/nowhere.bats and also PORTED: tests/unit/b.bats: "one"`,
 	)
-	if len(st) != 2 {
-		t.Fatalf("a mid-line claim went undetected: %+v", st)
+	if len(st) != 5 {
+		t.Fatalf("a mid-line claim went undetected (%d found): %+v", len(st), st)
 	}
 	r := &report{}
 	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
-	if !hasProblem(r, "is written mid-line") {
+	if !hasProblem(r, "where the inventory parser does not read it") {
 		t.Fatalf("the mid-line claim was not reported: %v", r.Problems)
 	}
 }
@@ -831,5 +838,64 @@ func TestAuditCoverageIgnoresAMidLineMentionOfANonCorpusFile(t *testing.T) {
 	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
 	if len(r.Problems) != 0 {
 		t.Fatalf("a mention of a non-corpus file was reported: %v", r.Problems)
+	}
+}
+
+// CODE THAT QUOTES A ROW NAME IS NOT A CLAIM, and the tree has 144 lines of it: the Wave 5 owner map
+// is keyed by (file, name) pairs by design. The quoted-row-name signal is therefore scoped to
+// COMMENT lines — a claim, split or not, is written in a comment. Without this the check fires on
+// 144 legitimate lines, which is how a check gets switched off.
+func TestStrayDetectionDoesNotFireOnCodeThatQuotesARowName(t *testing.T) {
+	c, b, st := claimsFrom(t,
+		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
+		`// PORTED: tests/unit/a.bats: "two" -> TestTwo`,
+		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
+		"\t{\"tests/unit/a.bats\", \"two\"}: 22,",
+	)
+	r := &report{}
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
+	if len(r.Problems) != 0 {
+		t.Fatalf("a map entry keyed by (file, name) was read as a hidden claim: %v", r.Problems)
+	}
+}
+
+// ...but claim SYNTAX beside a real corpus path is never innocent, wherever it sits — including in
+// code, where a documentation example naming a REAL row is indistinguishable from a claim somebody
+// meant. Fixtures name files the corpus does not hold, deliberately.
+func TestStrayDetectionFiresOnClaimSyntaxEvenOutsideAComment(t *testing.T) {
+	c, b, st := claimsFrom(t,
+		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
+		`// PORTED: tests/unit/a.bats: "two" -> TestTwo`,
+		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
+		"\texample := \"PORTED: tests/unit/b.bats: ...\"",
+	)
+	r := &report{}
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
+	if !hasProblem(r, "claim syntax") {
+		t.Fatalf("claim syntax naming a real corpus row went unreported: %v", r.Problems)
+	}
+}
+
+// TestAuditCoverageCatchesAClaimSplitAcrossLines isolates the second stray signal.
+//
+// The line carrying the claim WORDS and the line carrying the ROW can be different lines, and
+// neither parses as a claim. Requiring both on one line left that split as a hiding place, so the
+// continuation — the line that carries the row's identity — is recognised on its own. This fixture
+// deliberately contains NO claim-syntax stray, so only the quoted-row-name signal can report it.
+func TestAuditCoverageCatchesAClaimSplitAcrossLines(t *testing.T) {
+	c, b, st := claimsFrom(t,
+		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
+		`// PORTED: tests/unit/a.bats: "two" -> TestTwo`,
+		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
+		`// and the continuation line, carrying the row and nothing that looks like a claim:`,
+		`// tests/unit/a.bats: "two" -> TestTwo, claiming it a second time where nothing reads it`,
+	)
+	if len(st) != 1 {
+		t.Fatalf("the continuation line was not detected: %+v", st)
+	}
+	r := &report{}
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
+	if !hasProblem(r, "which is a real @test in that file") {
+		t.Fatalf("the split claim was not reported: %v", r.Problems)
 	}
 }

@@ -104,6 +104,7 @@ func (s *session) migrateStorage(ctx context.Context, product, role string, o mi
 		Persist:  s.persistFn(),
 		Entries:  &migrate.EntryCount{},
 		Log:      d.out(),
+		Warn:     d.errw(),
 		NewNonce: intent.NonceNew,
 	}
 	if err := migrate.MigrateStorage(ctx, s.l, md, product, role, o); err != nil {
