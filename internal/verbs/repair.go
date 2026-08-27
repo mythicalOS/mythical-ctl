@@ -529,6 +529,17 @@ func (s *session) rebuild(ctx context.Context, rd repairSeams, choice string) in
 		d.warnErr(err)
 		return cliio.ExitFail
 	}
+	// THE IDENTITY IS MADE DURABLE HERE, BEFORE THE LOOP, because every refusal below TELLS THE
+	// OPERATOR IT IS ALREADY THERE — "the ledger already carries the new identity; re-run
+	// 'mythical-ctl state repair <identity>'". Left in memory until the refusal path's own write, a
+	// failure of THAT write would leave the ledger the reset just emptied with no identity at all
+	// while the message beside it claimed otherwise, and the re-run it names would find nothing to
+	// re-run against. The reference wrote this record to the file the moment it made it; this is
+	// that ordering, and the promise is true from here on.
+	if err := s.persist(); err != nil {
+		d.warnErr(err)
+		return cliio.ExitFail
+	}
 
 	var inferred []string
 	// NETWORKS, THEN VOLUMES, THEN CONTAINERS — the reference's order, and the containers' own
@@ -1098,16 +1109,30 @@ func (s *session) repairNetref(ctx context.Context, rd repairSeams, ident string
 	// no source recorded to migrate them FROM. Repair's job is to reach a RESUMABLE state, not a
 	// finished one. Here the pair is two in-memory edits the session's single write persists, so a
 	// crash between them cannot happen — there is no between.
-	if err := s.putNetRef(common, name); err != nil {
+	//
+	// BOTH EDITS LAND ON A CLONE, adopted only once both have succeeded. "Two in-memory edits the
+	// session's single write persists" makes a CRASH between them impossible, which is not the same
+	// as making a REFUSAL between them impossible: the second edit can be refused on its own terms —
+	// a fleet whose comma-joined names exceed the ledger's field limit is the reachable case — and
+	// the first would then already be sitting in the session's ledger for the refusal path to
+	// persist. That leaves the reference naming the observed network with no migration intent beside
+	// it: the ledger would point at the network the fleet is on while nothing records that it is
+	// supposed to move, and the next 'net rebind' would open a fresh migration rather than resume
+	// this one. A refusal must leave the caller's ledger exactly as it found it.
+	cp := s.l.Clone()
+	if err := putNetRefOn(cp, common, name); err != nil {
 		return err
 	}
-	if err := s.l.Put(kindNetMig, "key", "family", []ledger.Field{
+	if err := cp.Put(kindNetMig, "key", "family", []ledger.Field{
 		{Key: "key", Value: "family"},
 		{Key: "phase", Value: "1"},
 		{Key: "source", Value: common},
 		{Key: "target", Value: resolved},
 		{Key: "containers", Value: strings.Join(fleet, ",")},
 	}); err != nil {
+		return err
+	}
+	if err := s.l.Adopt(cp); err != nil {
 		return err
 	}
 	d.warn("repair: recorded the observed network as the reference and a migration intent to move the")
@@ -1122,8 +1147,13 @@ func (s *session) repairNetref(ctx context.Context, rd repairSeams, ident string
 //
 // `owned=no` is not decoration: an operator-supplied network is ATTACH-ONLY, and repair confers no
 // deletion authority it did not have — the class has none to grant.
-func (s *session) putNetRef(id, name string) error {
-	return s.l.Put(kindNetRef, "key", "family", []ledger.Field{
+func (s *session) putNetRef(id, name string) error { return putNetRefOn(s.l, id, name) }
+
+// putNetRefOn is the same write against a NAMED ledger, so the migration path can stage it on a
+// clone beside the intent it must land with. One field shape, one writer — a second spelling of
+// these four fields is a second thing to keep in step with netref's own reader.
+func putNetRefOn(l *ledger.Ledger, id, name string) error {
+	return l.Put(kindNetRef, "key", "family", []ledger.Field{
 		{Key: "key", Value: "family"},
 		{Key: "id", Value: id},
 		{Key: "name", Value: name},

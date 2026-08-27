@@ -469,16 +469,19 @@ func TestRepairAnchorValidatorMatchesTrust(t *testing.T) {
 // --- the schema gate -------------------------------------------------------------------------
 
 func TestNewerLedgerSchemaIsRefusedByTheReader(t *testing.T) {
+	// THE LEDGER IS CHECKSUM-VALID, and that is the whole test. Bumping the header of an existing
+	// ledger in place leaves the checksum stale, and the reader gates INTEGRITY BEFORE SCHEMA — so
+	// such a file refuses as CORRUPT and would go on refusing with the schema gate deleted outright,
+	// which is exactly the ledger this gate exists for: one a newer build wrote, intact, that this
+	// build must not parse. Written whole here, with its checksum computed over its own bytes.
 	r := newRepairRig(t)
-	r.mintIdentity()
-	bumpSchema(t, r.ledgerPath(), "99")
+	writeLedgerAtSchema(t, r.ledgerPath(), "99", "identity\tid=insta")
 
-	// The reader refuses, so nothing downstream of it can read an identity out of a ledger this
-	// build does not understand. (Plan 1's gate; asserted here because repair is the verb an
-	// operator reaches for next.)
-	if _, err := ledger.Read(ledger.LiveRead(r.home)); err == nil {
-		t.Fatal("a schema-99 ledger was read as if this build understood it")
+	if _, err := ledger.Read(ledger.LiveRead(r.home)); !errors.Is(err, ledger.ErrNewerSchema) {
+		t.Fatalf("reading a checksum-valid schema-99 ledger: %v, want ErrNewerSchema", err)
 	}
+	// ...and nothing downstream can read an identity out of it — naming the version it needs rather
+	// than reporting a fresh machine.
 	var got error
 	r.withLock(func(_ famlock.Held, st ledger.Store) {
 		l, err := ledger.Read(st)
@@ -488,8 +491,26 @@ func TestNewerLedgerSchemaIsRefusedByTheReader(t *testing.T) {
 		}
 		_, got = l.IdentGet()
 	})
-	if got == nil {
-		t.Fatal("the installation identity was read out of a schema-99 ledger")
+	if !errors.Is(got, ledger.ErrNewerSchema) {
+		t.Fatalf("the installation identity was read out of a schema-99 ledger: %v", got)
+	}
+	if !strings.Contains(got.Error(), ledger.Schema) {
+		t.Fatalf("the refusal does not name the schema this build understands (%s): %v", ledger.Schema, got)
+	}
+}
+
+// writeLedgerAtSchema writes a COMPLETE, checksum-valid ledger at an arbitrary schema number — the
+// file a newer build of this tool would have left behind. Hand-built because the writer only ever
+// emits its own schema, which is the point: nothing in the product can produce this file.
+func writeLedgerAtSchema(t *testing.T, path, schema string, rows ...string) {
+	t.Helper()
+	body := "#mythical-ctl-ledger schema=" + schema + "\n"
+	for _, r := range rows {
+		body += r + "\n"
+	}
+	body += "#sha256=" + cliio.SHA256Hex([]byte(body)) + "\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -804,16 +825,67 @@ func TestDesiredStateIsInferredFromObservation(t *testing.T) {
 func TestTrustFloorsAreResetWithTheWindowStated(t *testing.T) {
 	r := newRepairRig(t)
 	r.labelledVolume("v1", "n1", "insta")
+	// A RECORDED FLOOR TO LOSE. Without one, "the floors are reset" is a claim about an empty set:
+	// an implementation that preserved every trust-floor row while printing the same warning would
+	// satisfy every other assertion here.
+	r.withLock(func(h famlock.Held, st ledger.Store) {
+		if err := trust.FloorSet(h, st, "manifest:p1", "7"); err != nil {
+			t.Fatal(err)
+		}
+	})
+	anchorBefore := r.anchorNow()
+	if anchorBefore == "" {
+		t.Fatal("no trust anchor to preserve — the fixture cannot tell the reset from a total wipe")
+	}
 
 	r.setEnv("MI_CONFIRM", "no")
 	if rc := r.repair("insta"); rc == cliio.ExitOK {
 		t.Fatalf("repair reset the trust floors without confirmation\n%s", r.said())
 	}
 	r.mustSay("rollback")
+	if got := r.floorNow("manifest:p1"); got != "7" {
+		t.Fatalf("floor manifest:p1 = %q after a REFUSED repair, want 7 — nothing may be reset without confirmation", got)
+	}
 
 	r.setEnv("MI_CONFIRM", "yes")
 	r.reset()
 	r.mustRepair("insta")
+
+	// THE FLOOR IS GONE — that is the rollback window the operator was told they were accepting.
+	if got := r.floorNow("manifest:p1"); got != "" {
+		t.Fatalf("floor manifest:p1 = %q after the repair, want it reset", got)
+	}
+	// AND THE ANCHOR IS NOT. Dropping it would force a fresh online bootstrap for no security
+	// benefit, and would make live verification impossible for the rest of the same repair run.
+	if got := r.anchorNow(); got != anchorBefore {
+		t.Fatalf("trust anchor = %q, want it preserved as %q", got, anchorBefore)
+	}
+}
+
+// floorNow reads one document's recorded version floor; "" means none is recorded.
+func (r *rig) floorNow(docid string) string {
+	r.t.Helper()
+	out := ""
+	r.withLock(func(_ famlock.Held, st ledger.Store) {
+		v, err := trust.FloorGet(st, docid)
+		if err == nil {
+			out = v
+		}
+	})
+	return out
+}
+
+// anchorNow reads the recorded family-index anchor digest; "" means none is recorded.
+func (r *rig) anchorNow() string {
+	r.t.Helper()
+	out := ""
+	r.withLock(func(_ famlock.Held, st ledger.Store) {
+		v, err := trust.AnchorGet(st)
+		if err == nil {
+			out = v
+		}
+	})
+	return out
 }
 
 func TestRepairStatesItCannotProveNothingIsInFlight(t *testing.T) {
@@ -1948,5 +2020,114 @@ func TestAnchorRowNamingTwoDigestsIsDropped(t *testing.T) {
 	r.withLock(func(_ famlock.Held, st ledger.Store) { _, got = trust.AnchorGet(st) })
 	if !errors.Is(got, ledger.ErrAbsentRecord) {
 		t.Fatalf("an anchor was preserved from a record naming two digests: %v", got)
+	}
+}
+
+// --- what the round-1 gate found ------------------------------------------------------------------
+
+// diskAtFailure wraps the provenance read seam and, at the moment it makes one named label read
+// unanswerable, SNAPSHOTS THE LEDGER AS IT IS ON DISK. That snapshot is the only way to ask what the
+// refusal path could actually promise the operator, as distinct from what it manages to write on its
+// way out.
+type diskAtFailure struct {
+	prov.Objects
+	class prov.Class
+	name  string
+	after int
+	seen  *int
+	snap  *string
+	read  func() string
+}
+
+func (f diskAtFailure) Label(ctx context.Context, class prov.Class, name, label string) (string, error) {
+	if class == f.class && name == f.name && label == prov.LabelInstall {
+		*f.seen++
+		if *f.seen > f.after {
+			*f.snap = f.read()
+			return "", errUnaskable
+		}
+	}
+	return f.Objects.Label(ctx, class, name, label)
+}
+
+func TestTheAdoptedIdentityIsDurableBeforeTheRebuildPromisesIt(t *testing.T) {
+	// Every refusal in the rebuild loop tells the operator "the ledger already carries the new
+	// identity; re-run 'mythical-ctl state repair <identity>'". That is a promise about DISK, and it
+	// is made before the refusal path gets its own chance to write — so if the identity is only in
+	// memory until then, a failing write leaves the ledger the reset just emptied carrying nothing at
+	// all while the message says otherwise, and the re-run it names has nothing to re-run against.
+	//
+	// Asserting the ledger AFTER the refusal cannot tell the two orderings apart: the refusal path
+	// writes on its way out either way. So the disk is read AT the moment of the failing read.
+	r := newRepairRig(t)
+	r.labelledVolume("v1", "n1", "insta")
+	seen, snap := 0, ""
+	stageReads(t, func(rd repairSeams) repairSeams {
+		rd.objs = diskAtFailure{
+			Objects: rd.objs, class: prov.ClassVolume, name: "v1",
+			after: 1, seen: &seen, snap: &snap,
+			read: func() string { return readFile(t, r.ledgerPath()) },
+		}
+		return rd
+	})
+
+	if rc := r.repair("insta"); rc == cliio.ExitOK {
+		t.Fatalf("the rebuild reported success over a read it could not make\n%s", r.said())
+	}
+	r.mustSay("already been reset")
+	if snap == "" {
+		t.Fatal("the staged read never fired — the fixture proved nothing")
+	}
+	if !strings.Contains(snap, "id=insta") {
+		t.Fatalf("the ledger on disk did not carry the adopted identity when the refusal promised it did:\n%s", snap)
+	}
+}
+
+func TestTheReferenceAndItsMigrationIntentLandTogetherOrNotAtAll(t *testing.T) {
+	// The second of the two edits can be REFUSED on its own terms — a fleet whose comma-joined names
+	// exceed the ledger's field limit is the reachable case — and "one write persists both" does not
+	// help there: the FIRST edit is already in the session's ledger for the refusal path to persist.
+	// That would leave the reference naming the observed network with no intent beside it: the
+	// ledger points at where the fleet is while nothing records that it is supposed to move, and the
+	// next rebind opens a fresh migration instead of resuming this one.
+	r := newRepairRig(t)
+	src := r.operatorNetwork("oldnet")
+	long := strings.Repeat("c", 400)
+	for _, suffix := range []string{"1", "2", "3"} {
+		r.productContainer(long+suffix, src, "p1", "insta", "nc"+suffix)
+	}
+	r.operatorNetwork("opnet")
+	r.familyConf("MYTHICAL_NET=opnet\n")
+
+	if rc := r.repair("insta"); rc == cliio.ExitOK {
+		t.Fatalf("a migration was recorded with a fleet the ledger cannot hold\n%s", r.said())
+	}
+	l := r.ledgerNow()
+	if _, err := netref.MigGet(l); !errors.Is(err, netref.ErrNoMigration) {
+		t.Fatalf("a migration intent was recorded: %v", err)
+	}
+	if _, err := netref.RefGet(l); !errors.Is(err, netref.ErrNoReference) {
+		t.Fatalf("the reference was recorded WITHOUT the intent it must land with: %v", err)
+	}
+}
+
+func TestACheckSumValidNewerLedgerIsRefusedByRepairUntouched(t *testing.T) {
+	// The realistic newer-schema ledger: intact, checksum-valid, written by a build that understands
+	// more than this one. It reaches repair's own peek — not the reader's gate, which repair
+	// deliberately does not go through — and must be refused with nothing touched and nothing moved
+	// aside. Repairing over it would replace a still-valid ledger with an empty one.
+	r := newRepairRig(t)
+	writeLedgerAtSchema(t, r.ledgerPath(), "2", "identity\tid=insta")
+	before := readFile(t, r.ledgerPath())
+
+	if rc := r.repair(reinitialize); rc == cliio.ExitOK {
+		t.Fatalf("repair ran over a checksum-valid newer-schema ledger\n%s", r.said())
+	}
+	r.mustSay("newer than this build")
+	if after := readFile(t, r.ledgerPath()); after != before {
+		t.Fatalf("the newer-schema ledger was rewritten:\nbefore: %s\nafter:  %s", before, after)
+	}
+	if sibs := r.corruptSiblings(); len(sibs) != 0 {
+		t.Fatalf("a .corrupt.* sibling was created for a valid, merely-newer ledger: %v", sibs)
 	}
 }
