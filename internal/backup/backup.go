@@ -27,8 +27,14 @@
 //
 // THIS IS THE ONLY PACKAGE THAT MAY CONSTRUCT THE STAGING STORE. check.sh's boundary gate
 // pins ledger.OpenStaging to this import path: a lifecycle path that could open staging would
-// treat a not-yet-verified restore as live state. Nothing here re-exports it, and nothing here
-// hands a caller a staging Store or the path of one.
+// treat a not-yet-verified restore as live state. Nothing here re-exports it, hands a caller a
+// staging Store, or hands one the path of one — INCLUDING the seams. A restore genuinely does
+// have to authenticate documents against the STAGED ledger (the anchor the backup carries is
+// the one it must measure against), but that acceptance happens HERE and only the resulting
+// authenticated *trust.Index crosses the seam: an index is an answer, not a capability, and it
+// carries no way to read or write any ledger. Handing the seam the Store and the lock instead
+// would have left the gate green while the boundary it names was open — a caller could have
+// written to staging without ever naming OpenStaging.
 package backup
 
 import (
@@ -83,31 +89,34 @@ type Transcript struct {
 // dependency in this direction would couple two ports that have no reason to move together.
 // The production implementation is wired by an adapter at the CLI.
 //
-// EVERY METHOD TAKES A Chain. That is how a restore's "run this against the STAGED ledger, not
-// the (absent) active one" is expressed: the copy image is authenticated against the family
-// index, the index against the recorded trust anchor, and the anchor lives IN A LEDGER. A
-// restore runs with NO active ledger by definition, so without the staged store every one of
-// these calls would fail "no family-index anchor has been recorded" on precisely the machine a
-// restore is rebuilding — even though the anchor the backup's OWN installation established is
-// sitting in the ledger this restore just staged.
+// EVERY METHOD TAKES AN ALREADY-AUTHENTICATED *trust.Index AND NOTHING ELSE FROM THE STATE
+// LAYER. That is deliberate and it is the whole shape of the seam. A restore's copy calls DO
+// have to be measured against the STAGED ledger rather than the (absent) active one — the
+// pinned copy image is named by the family index, the index is authenticated against the
+// recorded trust anchor, and the anchor lives IN A LEDGER, so a restore with no active ledger
+// would otherwise fail "no anchor has been recorded" on precisely the machine it is rebuilding.
+// That acceptance therefore happens INSIDE this module, against the store the operation runs
+// under, and only its RESULT crosses the seam. An index is an answer; a Store and a lock are
+// capabilities, and handing those out would have opened the staging boundary while its gate
+// stayed green.
 //
 // An error means the helper COULD NOT BE RUN — never an answer. A helper that ran and failed
 // reports itself in Transcript.Code.
 type Copier interface {
 	// Available makes the pinned copy image usable, or refuses (reported).
-	Available(ctx context.Context, ch Chain) error
+	Available(ctx context.Context, ix *trust.Index) error
 	// Enumerate runs the per-entry manifest enumeration over a volume.
-	Enumerate(ctx context.Context, ch Chain, volume string) (Transcript, error)
+	Enumerate(ctx context.Context, ix *trust.Index, volume string) (Transcript, error)
 	// Count runs the entry-count enumeration over a volume.
-	Count(ctx context.Context, ch Chain, volume string) (Transcript, error)
+	Count(ctx context.Context, ix *trust.Index, volume string) (Transcript, error)
 	// Verify checks a volume's contents against a per-entry manifest, which is handed to the
 	// helper on its STDIN rather than mounted as a third host path.
-	Verify(ctx context.Context, ch Chain, volume string, manifest []byte) (Transcript, error)
+	Verify(ctx context.Context, ix *trust.Index, volume string, manifest []byte) (Transcript, error)
 	// Run copies a VOLUME's contents out to a host directory (the backup direction).
-	Run(ctx context.Context, ch Chain, volume, dstHostDir, runtimeUID, operatorUID string) error
+	Run(ctx context.Context, ix *trust.Index, volume, dstHostDir, runtimeUID, operatorUID string) error
 	// Fill copies a host directory's contents INTO a volume (the restore direction — host
 	// data read-only, the volume writable; the reverse of Run).
-	Fill(ctx context.Context, ch Chain, srcHostDir, volume, runtimeUID, operatorUID string) error
+	Fill(ctx context.Context, ix *trust.Index, srcHostDir, volume, runtimeUID, operatorUID string) error
 }
 
 // SafeChain is the OWNERSHIP-SAFETY CHECK for an operator-named location: it refuses unless
@@ -142,6 +151,9 @@ type SafeChain func(canonicalPath, what string) error
 // is measured against. A backup runs its chain against the LIVE ledger; every step of a
 // restore runs against the STAGED one, which is where any floor advance belongs until
 // activation carries it forward.
+//
+// IT NEVER CROSSES A SEAM. Only this module holds one; what it hands the copy module is the
+// authenticated index a Chain produces (see acceptIndex), never the Chain itself.
 type Chain struct {
 	Lock  famlock.Held
 	Store ledger.Store
@@ -298,6 +310,24 @@ func withSep(p string) string {
 	return p + "/"
 }
 
+// acceptIndex authenticates the family index against the trust anchor recorded in THIS
+// operation's store, and hands back the result. It is where a restore's "measure this against
+// the ledger the backup carried, not the machine's own" actually happens, and it is the only
+// thing the copy seam ever receives from the state layer.
+//
+// It is called at each point the reference calls its own copy-availability check, rather than
+// once per verb: the reference re-authenticates per helper invocation, and any floor advance
+// that follows lands in the same store either way.
+func (d Deps) acceptIndex(ch Chain) (*trust.Index, error) {
+	ix, err := trust.AcceptIndex(ch.Lock, ch.Store, ch.Index)
+	if err != nil {
+		d.warn("backup: the family index cannot be authenticated — the pinned copy image it names")
+		d.warn("  cannot be trusted, so nothing is read or written through it: %v", err)
+		return nil, fmt.Errorf("backup: the family index cannot be authenticated: %w", err)
+	}
+	return ix, nil
+}
+
 // runtimeUID resolves EACH VOLUME'S REAL, DECLARED runtime_uid through the FULL authenticated
 // chain — index, policy and trust — never a fixed stand-in and never a bare parse. A product
 // declaring runtime_uid=900 owns its files as uid 900: treating every volume as if it belonged
@@ -356,6 +386,13 @@ func (d Deps) volumeRecords(l *ledger.Ledger, verb string) ([]volumeRec, error) 
 		return nil, fmt.Errorf("%s: the object records could not be listed in full: %w", verb, err)
 	}
 	var out []volumeRec
+	// ONE VOLUME, ONE ROW. The selector below settles cardinality by KEY, which leaves one
+	// shape open: a second row keyed for something else while NAMING a volume that does have
+	// its own row. Both walk to the same volume, so the loop would visit it twice — restore
+	// filling it, then meeting it again as "already filled" — on the authority of a row that
+	// is not its record at all. Two rows reaching one name is a contradiction the ledger
+	// cannot settle, so it refuses here rather than picking.
+	seen := map[string]bool{}
 	for _, fields := range records {
 		if class, _ := ledger.FieldOf(fields, "class"); class != "volume" {
 			continue
@@ -366,6 +403,32 @@ func (d Deps) volumeRecords(l *ledger.Ledger, verb string) ([]volumeRec, error) 
 			d.warn("  ledger-declared volume. Record: %s", renderRecord(fields))
 			return nil, fmt.Errorf("%s: a volume object record carries no name", verb)
 		}
+		// THE ROW IS RE-SELECTED THROUGH THE ONE PROVENANCE SELECTOR, and the fields used from
+		// here down are the ones IT returns. A walk of raw rows answers two questions this
+		// module must not answer for itself.
+		//
+		// DOES THE ROW DESCRIBE WHAT IT IS KEYED AS? `key`, `class` and `name` are three
+		// INDEPENDENT fields and nothing in the format makes them agree, so a row keyed
+		// `volume:X` while naming Y would have this restore create and fill Y on X's
+		// authority — and the restored installation could then never authorize Y, because the
+		// selector it authorizes through would refuse the very same row.
+		//
+		// AND IS IT THE ONLY ROW THAT ANSWERS? Two rows for one volume are a contradiction the
+		// ledger cannot settle. Acting on the first one fills the volume, meets the second,
+		// finds it non-empty and verifying, calls it "already done", and ACTIVATES a ledger in
+		// which that volume can never be authorized again — a machine wedged by its own
+		// consistency rules working correctly on inconsistent input, which is exactly what
+		// this module exists to prevent. The selector refuses ambiguity; this walk must not
+		// route around it.
+		selected, serr := prov.Find(l, prov.ClassVolume, name)
+		if serr != nil {
+			d.warn("%s: the ledger's record for volume %q cannot be read as the authority for it —", verb, name)
+			d.warn("  refusing rather than acting on a row that answers for one object while describing")
+			d.warn("  another, or on one of several rows that contradict each other: %v", serr)
+			d.warn("  Record: %s", renderRecord(fields))
+			return nil, fmt.Errorf("%s: the record for volume %q is not its authority: %w", verb, name, serr)
+		}
+		fields = selected
 		nonce, ok := ledger.FieldOf(fields, "nonce")
 		if !ok || nonce == "" {
 			d.warn("%s: the record for volume %q carries no nonce — refusing rather than silently omitting it.", verb, name)
@@ -377,6 +440,13 @@ func (d Deps) volumeRecords(l *ledger.Ledger, verb string) ([]volumeRec, error) 
 			d.warn("  manifest declares its runtime uid.")
 			return nil, fmt.Errorf("%s: the record for volume %q carries no product", verb, name)
 		}
+		if seen[name] {
+			d.warn("%s: more than one 'volume' object record reaches volume %q — refusing rather than", verb, name)
+			d.warn("  acting on one of several rows that contradict each other about the same object.")
+			d.warn("  Record: %s", renderRecord(fields))
+			return nil, fmt.Errorf("%s: more than one record reaches volume %q", verb, name)
+		}
+		seen[name] = true
 		out = append(out, volumeRec{name: name, nonce: nonce, product: product})
 	}
 	return out, nil
@@ -414,10 +484,14 @@ func ManifestWrite(ctx context.Context, d Deps, ch Chain, vol, out string) error
 	if err := d.check(); err != nil {
 		return err
 	}
-	if err := d.Copier.Available(ctx, ch); err != nil {
+	ix, err := d.acceptIndex(ch)
+	if err != nil {
 		return err
 	}
-	t, err := d.Copier.Enumerate(ctx, ch, vol)
+	if err := d.Copier.Available(ctx, ix); err != nil {
+		return err
+	}
+	t, err := d.Copier.Enumerate(ctx, ix, vol)
 	if err != nil || t.Code != 0 {
 		d.warn("backup: could not enumerate volume %q for its manifest — the backup is NOT written.", vol)
 		if err != nil {
@@ -553,7 +627,14 @@ func Run(ctx context.Context, d Deps, rawDir string) error {
 			d.warn("backup: cannot create the contents directory for volume %q: %v", v.name, err)
 			return fmt.Errorf("backup: cannot create the contents directory for volume %q: %w", v.name, err)
 		}
-		if err := d.Copier.Run(ctx, ch, v.name, base+".data", ruid, d.OperatorUID); err != nil {
+		ix, ierr := d.acceptIndex(ch)
+		if ierr != nil {
+			return ierr
+		}
+		if err := d.Copier.Available(ctx, ix); err != nil {
+			return err
+		}
+		if err := d.Copier.Run(ctx, ix, v.name, base+".data", ruid, d.OperatorUID); err != nil {
 			return err
 		}
 		d.log("backup: captured volume %s (contents, per-entry manifest, and its nonce).", v.name)

@@ -3,6 +3,7 @@ package backup
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -110,16 +111,21 @@ func manifestTranscript() string {
 // verification's own `checked=` must equal for the count to bind.
 const manifestEntryCount = 4
 
-func (c *fakeCopier) Available(ctx context.Context, ch Chain) error { return c.availableErr }
+func (c *fakeCopier) Available(ctx context.Context, ix *trust.Index) error {
+	if ix == nil {
+		return errors.New("copy: no authenticated family index — refusing")
+	}
+	return c.availableErr
+}
 
-func (c *fakeCopier) Enumerate(ctx context.Context, ch Chain, vol string) (Transcript, error) {
+func (c *fakeCopier) Enumerate(ctx context.Context, ix *trust.Index, vol string) (Transcript, error) {
 	if c.enumerate != nil {
 		return c.enumerate(vol)
 	}
 	return Transcript{Text: manifestTranscript() + "\n"}, nil
 }
 
-func (c *fakeCopier) Count(ctx context.Context, ch Chain, vol string) (Transcript, error) {
+func (c *fakeCopier) Count(ctx context.Context, ix *trust.Index, vol string) (Transcript, error) {
 	if c.count != nil {
 		return c.count(vol)
 	}
@@ -130,7 +136,7 @@ func (c *fakeCopier) Count(ctx context.Context, ch Chain, vol string) (Transcrip
 	return Transcript{Text: "checked=" + strconv.Itoa(n) + "\n"}, nil
 }
 
-func (c *fakeCopier) Verify(ctx context.Context, ch Chain, vol string, man []byte) (Transcript, error) {
+func (c *fakeCopier) Verify(ctx context.Context, ix *trust.Index, vol string, man []byte) (Transcript, error) {
 	c.verified[vol]++
 	if c.verify != nil {
 		return c.verify(vol, man)
@@ -141,12 +147,12 @@ func (c *fakeCopier) Verify(ctx context.Context, ch Chain, vol string, man []byt
 	return Transcript{Text: "checked=" + strconv.Itoa(manifestEntryCount) + "\ndone=ok\n"}, nil
 }
 
-func (c *fakeCopier) Run(ctx context.Context, ch Chain, vol, dst, ruid, ouid string) error {
+func (c *fakeCopier) Run(ctx context.Context, ix *trust.Index, vol, dst, ruid, ouid string) error {
 	c.runs = append(c.runs, copyCall{volume: vol, hostDir: dst, runtimeUID: ruid, operatorUID: ouid})
 	return c.runErr
 }
 
-func (c *fakeCopier) Fill(ctx context.Context, ch Chain, src, vol, ruid, ouid string) error {
+func (c *fakeCopier) Fill(ctx context.Context, ix *trust.Index, src, vol, ruid, ouid string) error {
 	c.fills = append(c.fills, copyCall{volume: vol, hostDir: src, runtimeUID: ruid, operatorUID: ouid})
 	if c.fillErr != nil {
 		return c.fillErr

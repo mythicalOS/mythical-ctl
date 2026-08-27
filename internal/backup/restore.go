@@ -187,29 +187,29 @@ func Restore(ctx context.Context, d Deps, rawDir string) error {
 			d.warn("  floors and no provenance.")
 			return fmt.Errorf("restore: %q carries no ledger", dir)
 		}
-		// Phase 1: the staging ledger IS the incoming ledger, with the intent written inside it.
+		// Phase 1: the staging ledger IS the incoming ledger, WITH the intent already inside
+		// it — parsed in memory, edited in memory, and installed in ONE atomic write.
 		//
-		// INSTALLED THE WAY EVERY OTHER LEDGER IS — a temp file in .state/ and one rename —
-		// never a plain copy onto the well-known name. Two reasons, and both are states this
-		// codebase has already met: a failed or partial restore can leave the staging path as
-		// a DANGLING SYMLINK, and an open-and-truncate on that name follows it, writing the
-		// incoming ledger to wherever it points; and a copy interrupted midway leaves a torn
-		// file at the name a later run classifies from. A rename is atomic and follows
-		// nothing.
+		// THE INTENT MUST NEVER BE A SECOND WRITE. Copying the incoming ledger onto the
+		// well-known staging name and adding the intent afterwards leaves a window in which
+		// that name holds a checksum-VALID, intent-FREE ledger — which is byte-for-byte the
+		// state a COMPLETED phase 5 leaves, and which recovery therefore reads as "ready to
+		// activate". A crash in that window, or merely a failure of the second write, would
+		// hand the next invocation a ledger it activates WITHOUT HAVING CREATED, FILLED OR
+		// VERIFIED A SINGLE VOLUME. The failure is not even hypothetical: a backup directory
+		// whose canonical path is long enough that `source=<path>` exceeds the record format's
+		// field bound makes the edit fail deterministically, every time, on an ordinary
+		// operator path. Building the whole thing first and writing once closes it: the file
+		// either does not exist or carries the intent.
 		incoming, rerr := os.ReadFile(ledgercanon)
 		if rerr != nil {
 			d.warn("restore: cannot read the backup's ledger: %v", rerr)
 			return fmt.Errorf("restore: cannot read the backup's ledger: %w", rerr)
 		}
-		if cerr := writeFileAtomic(sf, incoming); cerr != nil {
-			d.warn("restore: cannot stage the incoming ledger: %v", cerr)
-			return fmt.Errorf("restore: cannot stage the incoming ledger: %w", cerr)
-		}
-		l, rerr := ledger.Read(staging)
-		if rerr != nil {
-			d.warn("restore: the incoming ledger does not validate — refusing to stage it: %v", rerr)
-			_ = os.Remove(sf)
-			return fmt.Errorf("restore: the incoming ledger does not validate: %w", rerr)
+		l, verr := ledger.ReadBytes(incoming)
+		if verr != nil {
+			d.warn("restore: the incoming ledger does not validate — refusing to stage it: %v", verr)
+			return fmt.Errorf("restore: the incoming ledger does not validate: %w", verr)
 		}
 		if perr := l.Put(restoreKind, "key", "restore", []ledger.Field{
 			{Key: "key", Value: "restore"},
@@ -217,10 +217,12 @@ func Restore(ctx context.Context, d Deps, rawDir string) error {
 			{Key: "source", Value: dir},
 			{Key: "volumes", Value: ""},
 		}); perr != nil {
-			return perr
+			d.warn("restore: cannot record the restore intent — nothing has been staged: %v", perr)
+			return fmt.Errorf("restore: cannot record the restore intent: %w", perr)
 		}
 		if werr := ledger.Write(d.Lock, staging, l); werr != nil {
-			return werr
+			d.warn("restore: cannot stage the incoming ledger: %v", werr)
+			return fmt.Errorf("restore: cannot stage the incoming ledger: %w", werr)
 		}
 	}
 
@@ -367,7 +369,14 @@ func (d Deps) restoreVolume(ctx context.Context, ch Chain, dir, ident string, v 
 	if empty {
 		// Phase 3: fill, via the pinned copy container — HOST BACKUP DATA (read-only) into the
 		// VOLUME (writable). The reverse of the backup direction.
-		if ferr := d.Copier.Fill(ctx, ch, datacanon, v.name, ruid, d.OperatorUID); ferr != nil {
+		ix, ierr := d.acceptIndex(ch)
+		if ierr != nil {
+			return ierr
+		}
+		if aerr := d.Copier.Available(ctx, ix); aerr != nil {
+			return aerr
+		}
+		if ferr := d.Copier.Fill(ctx, ix, datacanon, v.name, ruid, d.OperatorUID); ferr != nil {
 			return ferr
 		}
 		// Phase 4: against THE MANIFEST'S contract, not bytes alone.
@@ -592,10 +601,14 @@ func (d Deps) reportBlocking(ctx context.Context) {
 // (D54). A count that cannot be obtained, or that is not a number, REFUSES rather than
 // assuming: "assume empty" fills over survivors and "assume non-empty" wedges a fresh restore.
 func (d Deps) volumeEmpty(ctx context.Context, ch Chain, vol string) (bool, error) {
-	if err := d.Copier.Available(ctx, ch); err != nil {
+	ix, ierr := d.acceptIndex(ch)
+	if ierr != nil {
+		return false, ierr
+	}
+	if err := d.Copier.Available(ctx, ix); err != nil {
 		return false, err
 	}
-	t, err := d.Copier.Count(ctx, ch, vol)
+	t, err := d.Copier.Count(ctx, ix, vol)
 	if err != nil || t.Code != 0 {
 		d.warn("restore: cannot determine whether volume %q is empty — refusing rather than assuming.", vol)
 		if err != nil {
@@ -637,7 +650,11 @@ func digitsOnly(s string) bool {
 // mismatch would name one entry and hide the rest, and an operator deciding whether to abandon
 // a restore needs the whole picture.
 func (d Deps) verify(ctx context.Context, ch Chain, vol, man string) error {
-	if err := d.Copier.Available(ctx, ch); err != nil {
+	ix, ierr := d.acceptIndex(ch)
+	if ierr != nil {
+		return ierr
+	}
+	if err := d.Copier.Available(ctx, ix); err != nil {
 		return err
 	}
 	fi, lerr := os.Lstat(man)
@@ -652,7 +669,7 @@ func (d Deps) verify(ctx context.Context, ch Chain, vol, man string) error {
 		return fmt.Errorf("restore: could not read the manifest for volume %q: %w", vol, rerr)
 	}
 
-	t, herr := d.Copier.Verify(ctx, ch, vol, manifestBytes)
+	t, herr := d.Copier.Verify(ctx, ix, vol, manifestBytes)
 	if herr != nil {
 		// The helper could not be RUN. That is not an answer, so it is folded into the same
 		// "did not complete" verdict below rather than being read as a pass.

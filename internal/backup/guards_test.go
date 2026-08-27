@@ -4,10 +4,12 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
 	"mythicalos.ai/ctl/internal/cliio"
+	"mythicalos.ai/ctl/internal/famlock"
 	"mythicalos.ai/ctl/internal/ledger"
 	"mythicalos.ai/ctl/internal/trust"
 )
@@ -720,8 +722,10 @@ func TestBackupIntoTheInstallerHomeDoesNotCopyItself(t *testing.T) {
 
 // TestStagingAWriteDoesNotFollowASymlink: a failed or partial restore can leave the staging
 // path as a DANGLING SYMLINK — a state this codebase already recognises elsewhere — and an
-// open-and-truncate on that name follows it, writing the incoming ledger to wherever it points.
-// The staged ledger is installed by rename, which follows nothing.
+// open-and-truncate on that name would follow it, writing the incoming ledger to wherever it
+// points. The staged ledger goes in through the ledger writer, which refuses a name that is
+// present but not a regular file and PRESERVES it: the link is evidence about what happened
+// here, and a restore that cannot use the staging name must say so rather than write past it.
 func TestStagingAWriteDoesNotFollowASymlink(t *testing.T) {
 	r := newRig(t)
 	r.backupOK()
@@ -730,10 +734,184 @@ func TestStagingAWriteDoesNotFollowASymlink(t *testing.T) {
 	if err := os.Symlink(elsewhere, stagingPath(r.home)); err != nil {
 		t.Fatal(err)
 	}
-	if err := Restore(context.Background(), r.deps(), r.bk); err != nil {
-		t.Fatalf("Restore: %v\n%s", err, r.stderr())
+	if err := Restore(context.Background(), r.deps(), r.bk); err == nil {
+		t.Fatal("a restore wrote to a staging name that is not a regular file")
 	}
 	if exists(elsewhere) {
 		t.Fatal("the staged ledger was written through the symlink, to a path outside .state")
+	}
+	fi, lerr := os.Lstat(stagingPath(r.home))
+	if lerr != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("the symlink was not preserved as evidence")
+	}
+	if len(r.cop.fills) != 0 {
+		t.Fatal("a volume was filled by a restore that never staged its ledger")
+	}
+}
+
+// TestPhase1LeavesNoIntentFreeStagingLedger is the whole point of building the staged ledger in
+// memory. If the intent were a SECOND write, a failure of that write would leave the staging
+// name holding a checksum-valid, intent-free ledger — byte-for-byte the state a COMPLETED phase
+// 5 leaves — and the next invocation would ACTIVATE it without creating, filling or verifying a
+// single volume.
+//
+// The trigger is not hypothetical and needs no crash: the record format refuses a field value
+// carrying a newline (it would forge a whole record), so a backup directory whose name contains
+// one makes the intent edit fail deterministically, every time, on a path an operator can
+// create with an ordinary mkdir.
+func TestPhase1LeavesNoIntentFreeStagingLedger(t *testing.T) {
+	r := newRig(t)
+	weird := filepath.Join(canon(t, t.TempDir()), "we\nird")
+	if err := os.MkdirAll(weird, 0o755); err != nil {
+		t.Skipf("this filesystem will not hold a newline in a directory name: %v", err)
+	}
+	bk := filepath.Join(weird, "backup")
+	if err := Run(context.Background(), r.deps(), bk); err != nil {
+		t.Fatalf("the backup itself must still succeed: %v\n%s", err, r.stderr())
+	}
+	r.dropLedger()
+	r.reset()
+
+	err := Restore(context.Background(), r.deps(), bk)
+	if err == nil {
+		t.Fatal("a source the record format cannot carry was recorded anyway")
+	}
+	mustContain(t, r.stderr(), "cannot record the restore intent", "the refusal")
+	// NOTHING was staged — not a valid ledger, not an invalid one, nothing.
+	if exists(stagingPath(r.home)) {
+		t.Fatalf("a staging ledger survives a phase 1 that could not record its own intent: %v", err)
+	}
+	// So the next invocation has nothing to activate, rather than a ledger that looks finished.
+	s, serr := CurrentState(r.deps())
+	if serr != nil || s != StateNone {
+		t.Fatalf("state after the failed phase 1: %q %v", s, serr)
+	}
+	if err := Restore(context.Background(), r.deps(), bk); err == nil {
+		t.Fatal("the second invocation activated something")
+	}
+	if regularFile(livePath(r.home)) {
+		t.Fatal("a ledger was activated over volumes that were never created")
+	}
+}
+
+// TestVolumeWalkRefusesTwoRecordsForOneVolume: two rows for one volume are a contradiction the
+// ledger cannot settle. Acting on the first fills the volume; the second is then met as
+// non-empty and verifying, called "already done", and the restore ACTIVATES a ledger in which
+// that volume can never be authorized again — the provenance selector refuses an ambiguous
+// lookup, so the restored installation is wedged by its own consistency rules working correctly
+// on inconsistent input.
+func TestVolumeWalkRefusesTwoRecordsForOneVolume(t *testing.T) {
+	r := newRig(t)
+	// The duplicate goes in the way a damaged or foreign ledger actually carries it: a second
+	// identical row in the file, with a recomputed checksum. The typed editor replaces by key,
+	// so it cannot produce this state itself.
+	row := volumeRowOf(t, r, r.vols[0].name)
+	appendLedgerRow(t, livePath(r.home), row)
+
+	if err := Run(context.Background(), r.deps(), r.bk); err == nil {
+		t.Fatal("a backup acted on a ledger that says two contradictory things about one volume")
+	}
+	mustContain(t, r.stderr(), "cannot be read as the authority for it", "the refusal")
+	if exists(filepath.Join(r.bk, "ledger")) {
+		t.Fatal("the backup was written anyway")
+	}
+}
+
+// TestVolumeWalkRefusesARecordKeyedForSomethingElse: `key`, `class` and `name` are three
+// INDEPENDENT fields and nothing in the format makes them agree. A row keyed `volume:X` while
+// naming Y would have a restore create and fill Y on X's authority — and the restored
+// installation could then never authorize Y, because the selector it authorizes through would
+// refuse that very row.
+func TestVolumeWalkRefusesARecordKeyedForSomethingElse(t *testing.T) {
+	r := newRig(t)
+	r.putObject(t, "volume:not-the-name",
+		ledger.Field{Key: "class", Value: "volume"},
+		ledger.Field{Key: "name", Value: "some-other-volume"},
+		ledger.Field{Key: "nonce", Value: "deadbeef"},
+		ledger.Field{Key: "product", Value: "p1"})
+	if err := Run(context.Background(), r.deps(), r.bk); err == nil {
+		t.Fatal("a row keyed for one object was acted on as the authority for another")
+	}
+	mustContain(t, r.stderr(), "cannot be read as the authority for it", "the refusal")
+	if exists(filepath.Join(r.bk, "ledger")) {
+		t.Fatal("the backup was written anyway")
+	}
+}
+
+// TestVolumeWalkRefusesASecondRowReachingOneVolume: the selector settles cardinality by KEY,
+// which leaves one shape open — a row keyed for something else that NAMES a volume which does
+// have its own row. Both walk to the same volume.
+func TestVolumeWalkRefusesASecondRowReachingOneVolume(t *testing.T) {
+	r := newRig(t)
+	victim := r.vols[0].name
+	r.putObject(t, "volume:phantom",
+		ledger.Field{Key: "class", Value: "volume"},
+		ledger.Field{Key: "name", Value: victim},
+		ledger.Field{Key: "nonce", Value: "deadbeef"},
+		ledger.Field{Key: "product", Value: "p1"})
+	if err := Run(context.Background(), r.deps(), r.bk); err == nil {
+		t.Fatal("two rows reaching one volume were both acted on")
+	}
+	mustContain(t, r.stderr(), "more than one 'volume' object record reaches volume", "the refusal")
+	if exists(filepath.Join(r.bk, "ledger")) {
+		t.Fatal("the backup was written anyway")
+	}
+}
+
+// volumeRowOf renders the ledger row currently held for a volume, verbatim.
+func volumeRowOf(t *testing.T, r *rig, name string) string {
+	t.Helper()
+	b, err := os.ReadFile(livePath(r.home))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if strings.HasPrefix(line, kindObject+"\t") && strings.Contains(line, "name="+name+"\t") {
+			return line
+		}
+	}
+	t.Fatalf("no object row for %s", name)
+	return ""
+}
+
+// TestCopierSeamCarriesNoStateCapability is a STRUCTURAL guard on the staging boundary, and it
+// is the half a call-graph gate cannot see.
+//
+// check.sh pins ledger.OpenStaging to this package, so nothing else can CONSTRUCT a staging
+// store. That is worth nothing if this package then hands one out: an injected Copier holding a
+// staging ledger.Store and the family lock could read, retain and WRITE the staging ledger
+// without ever naming OpenStaging, and the gate would stay green the whole time. So the seam
+// carries an authenticated *trust.Index — an answer — and never a capability.
+//
+// Reflection, not review: a signature that regains a Store, a lock or a raw ledger reddens here
+// rather than being noticed by whoever reads the diff.
+func TestCopierSeamCarriesNoStateCapability(t *testing.T) {
+	forbidden := map[reflect.Type]string{
+		reflect.TypeOf((*ledger.Store)(nil)).Elem(): "a ledger store",
+		reflect.TypeOf((*famlock.Held)(nil)).Elem(): "the family lock",
+		reflect.TypeOf((*ledger.Ledger)(nil)):       "a raw ledger",
+		reflect.TypeOf(Chain{}):                     "this module's own chain (store + lock)",
+		reflect.TypeOf((*Deps)(nil)).Elem():         "this module's dependencies",
+	}
+	iface := reflect.TypeOf((*Copier)(nil)).Elem()
+	if iface.NumMethod() == 0 {
+		t.Fatal("the Copier seam has no methods; this guard would pass vacuously")
+	}
+	for i := 0; i < iface.NumMethod(); i++ {
+		m := iface.Method(i)
+		ft := m.Type
+		for j := 0; j < ft.NumIn(); j++ {
+			if what, bad := forbidden[ft.In(j)]; bad {
+				t.Fatalf("Copier.%s takes %s (parameter %d). The seam must carry answers, not "+
+					"capabilities — an implementation holding one could write the staging ledger "+
+					"without ever naming ledger.OpenStaging, and the boundary gate would stay green.",
+					m.Name, what, j)
+			}
+		}
+		for j := 0; j < ft.NumOut(); j++ {
+			if what, bad := forbidden[ft.Out(j)]; bad {
+				t.Fatalf("Copier.%s returns %s (result %d)", m.Name, what, j)
+			}
+		}
 	}
 }

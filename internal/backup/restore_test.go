@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"mythicalos.ai/ctl/internal/cliio"
@@ -357,6 +358,20 @@ func TestPhase5LeavesTheLedgerIntentFree(t *testing.T) {
 	}
 }
 
+// inodeOf identifies a file rather than describing it: a rename preserves it, a copy does not.
+func inodeOf(t *testing.T, path string) uint64 {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Skip("this platform does not expose an inode; the rename property cannot be measured here")
+	}
+	return uint64(st.Ino)
+}
+
 func mustLive(t *testing.T, r *rig) ledger.Store {
 	t.Helper()
 	st, err := ledger.Live(r.lock)
@@ -386,6 +401,33 @@ func TestPhase6ActivatesByRename(t *testing.T) {
 	}
 	if got, _ := l.IdentGet(); got != r.ident {
 		t.Fatalf("the activated ledger's identity is %q, not the backup's %q", got, r.ident)
+	}
+
+	// ACTIVATION IS ONE RENAME, and "staging gone, live present" does not say that: a copy
+	// followed by a delete satisfies both, while exposing a PARTIALLY WRITTEN authoritative
+	// ledger for as long as the copy takes — the exact hazard phase 6 exists to prevent. The
+	// property that separates them is IDENTITY: a rename moves the same file, so the inode
+	// survives; a copy makes a new one.
+	//
+	// Asked of phase 6 in isolation, because phase 5 writes the staging ledger through its own
+	// temp-and-rename first, so a file identified before the whole restore is not the one
+	// phase 6 moves.
+	if err := copyFilePreserving(livePath(r.home), stagingPath(r.home)); err != nil {
+		t.Fatal(err)
+	}
+	r.dropLedger()
+	stagedIno := inodeOf(t, stagingPath(r.home))
+	r.reset()
+	if err := Activate(r.deps()); err != nil {
+		t.Fatalf("Activate: %v\n%s", err, r.stderr())
+	}
+	if got := inodeOf(t, livePath(r.home)); got != stagedIno {
+		t.Fatalf("the live ledger is a DIFFERENT file (inode %d) from the staged one (%d) — it was "+
+			"copied into place, not renamed, so a crash mid-write would leave a torn authoritative ledger",
+			got, stagedIno)
+	}
+	if exists(stagingPath(r.home)) {
+		t.Fatal("the staging ledger survived activation")
 	}
 }
 
