@@ -50,11 +50,6 @@ EXIT CODES
 Documentation: https://docs.mythicalos.ai   Source: https://github.com/mythicalOS/mythical-ctl
 `
 
-// lifecycleVerbs are the five that share one option matrix and one dispatch path.
-var lifecycleVerbs = map[string]bool{
-	"install": true, "start": true, "stop": true, "restart": true, "recreate": true,
-}
-
 // run holds the whole entrypoint so it can be exercised in-process: it takes the argument list
 // without argv[0] and reads and writes the streams it is handed instead of reaching for the
 // process globals. It reads the real process environment; runEnv is the same entrypoint with the
@@ -85,7 +80,10 @@ func runEnv(args, env []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprint(stdout, usage)
 		return cliio.ExitOK
 	}
-	if lifecycleVerbs[verb] {
+	// ONE list of the five, and it is the verb layer's own: a second copy here is a copy that
+	// drifts, and the direction it drifts is a verb this dispatcher accepts and the batch driver
+	// then refuses (or the reverse — a verb nothing dispatches at all).
+	if verbs.Batchable(verb) {
 		return lifecycle(verb, o, env, stdin, stdout, stderr)
 	}
 	fmt.Fprintf(stderr, "mythical-ctl: unknown command: %s\n\n", verb)

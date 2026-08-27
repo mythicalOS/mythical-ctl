@@ -13,8 +13,10 @@ var batchable = map[string]bool{
 	"install": true, "start": true, "stop": true, "restart": true, "recreate": true,
 }
 
-// Batchable reports whether a verb name may be handed to Batch. The dispatcher asks so it can
-// refuse before it takes a lock or touches a document.
+// Batchable reports whether a verb name is one of the five this package drives — which is the same
+// question as "may Batch be handed it". The dispatcher asks it too, so an unknown verb is refused
+// before anything takes a lock or reads a document, and so there is ONE list of the five rather
+// than a second copy at the entrypoint that drifts from this one.
 func Batchable(verb string) bool { return batchable[verb] }
 
 // ExitName is the exit-code contract's own vocabulary, used for the per-product batch report.
