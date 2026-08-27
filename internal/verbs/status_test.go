@@ -615,3 +615,53 @@ func TestStatusReportsAnUnreadableOutstandingSet(t *testing.T) {
 	r.mustSay("outstanding=UNREADABLE")
 	r.mustNotSay("outstanding=none")
 }
+
+func TestStatusReportsANetmigRecordWithNoSourceOrTarget(t *testing.T) {
+	// A record whose PHASE reads cleanly can still name neither endpoint. Printing a blank source
+	// and target reads as a usable migration, which is the shape an operator would act on: the
+	// phase makes it look like real progress, and the endpoints make it look like it goes nowhere.
+	r := newRig(t)
+	r.mintIdentity()
+	r.appendRows("netmig\tkey=family\tphase=1\tcontainers=")
+
+	if rc := r.status(); rc != cliio.ExitOK {
+		t.Fatalf("rc = %d, want 0\n%s", rc, r.said())
+	}
+	r.mustSay("MIGRATION record UNREADABLE")
+	r.mustNotSay("IN PROGRESS")
+}
+
+func TestStatusReportsAVolumeRecordWithNoName(t *testing.T) {
+	// The volume loop's sibling of the container loop's rule: a record with no readable name is
+	// corrupt, not absent, and skipping past it would let status show fewer volumes than the ledger
+	// claims — while the operator is deciding whether to purge.
+	r := newRig(t)
+	r.writeProduct("p1")
+	r.mintIdentity()
+	r.mustInstall("p1")
+	r.appendRows("object\tkey=volume:nameless\tclass=volume\tnonce=n\tgen=1")
+
+	if rc := r.status(); rc != cliio.ExitOK {
+		t.Fatalf("rc = %d, want 0\n%s", rc, r.said())
+	}
+	r.mustSay("volume:       UNREADABLE")
+	// The healthy volumes are still reported beside it.
+	r.mustSay("volume mythical-" + r.ident() + "-p1-state")
+}
+
+func TestStatusShowsAnUnattributableVolumeEvenUnderAFilter(t *testing.T) {
+	// A volume record with no readable product is shown UNFILTERED rather than hidden: it is
+	// exactly the record an operator needs to see, and silently dropping it from a filtered view is
+	// how an unattributable volume becomes invisible — including to the operator deciding whether
+	// `--purge` has covered everything.
+	r := newRig(t)
+	r.writeProduct("p1")
+	r.mintIdentity()
+	r.mustInstall("p1")
+	r.appendRows("object\tkey=volume:orphan\tclass=volume\tname=orphan\tnonce=n\tgen=1")
+
+	if rc := r.status("p1"); rc != cliio.ExitOK {
+		t.Fatalf("rc = %d, want 0\n%s", rc, r.said())
+	}
+	r.mustSay("volume orphan: role=? data=UNREGENERABLE (unclassified) product=?")
+}

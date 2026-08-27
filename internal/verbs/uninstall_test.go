@@ -842,3 +842,112 @@ func TestFamilyUninstallPreservesAVolumeItCannotProveIsOurs(t *testing.T) {
 		t.Fatalf("the ledger was reset over a preserved object: %v", err)
 	}
 }
+
+func TestUninstallDoesNotTombstoneAContainerItCouldNotRemove(t *testing.T) {
+	// TOMBSTONE ONLY ON A REMOVAL THAT ACTUALLY SUCCEEDED. Recording a removal that did not happen
+	// strips the container's authority record while it is still running — after which nothing can
+	// ever remove it, and the unaccounted gate wedges every later operation over it.
+	r := newRig(t)
+	r.writeProduct("p1")
+	r.mintIdentity()
+	r.mustInstall("p1")
+	c := r.container("p1")
+	r.fake.InterruptOn = "DELETE /containers/" + c
+
+	if rc := r.uninstall("p1", false); rc != cliio.ExitFail {
+		t.Fatalf("rc = %d, want 1 — a removal that did not happen is not a success\n%s", rc, r.said())
+	}
+	r.mustSay("could not remove the container")
+	if !r.containerExists(c) {
+		t.Fatal("the container is gone, so the fixture did not exercise a FAILED removal")
+	}
+	if _, err := prov.Find(r.ledgerNow(), prov.ClassContainer, c); err != nil {
+		t.Fatalf("the container's provenance record was dropped for a removal that did not happen: %v", err)
+	}
+	if r.tombstoned(prov.ClassContainer, c) {
+		t.Fatal("a tombstone was written for a removal that did not happen")
+	}
+}
+
+func TestProductPurgePreservesAVolumeItCannotProveIsOurs(t *testing.T) {
+	// The product-scoped sibling of the family rule, reached where nothing earlier pre-empts it:
+	// two records answer for one volume name, so authority cannot be established — and the volume
+	// is absent from the runtime, so the unaccounted sweep never sees it and the gate does not stop
+	// the verb first.
+	r := newRig(t)
+	r.writeProduct("p1")
+	r.mintIdentity()
+	r.mustInstall("p1")
+	vol := "mythical-" + r.ident() + "-p1-state"
+	if rc := r.uninstall("p1", false); rc != cliio.ExitOK {
+		t.Fatalf("preparing: uninstall rc = %d\n%s", rc, r.said())
+	}
+	r.removeObjects(vol)
+	r.appendRows("object\tkey=volume:" + vol + "\tclass=volume\tname=" + vol +
+		"\tnonce=ncontested\tgen=1\tproduct=p1\trole=state")
+	r.reset()
+	r.confirm("yes")
+
+	if rc := r.uninstall("p1", true); rc == cliio.ExitOK {
+		t.Fatalf("the purge reported success over a volume it could not prove is ours\n%s", r.said())
+	}
+	r.mustSay("PRESERVED volume " + vol)
+}
+
+func TestFamilyUninstallRefusesAContainerRecordWithNoName(t *testing.T) {
+	// The container half of the fail-closed name rule. A record that passes the listing's format
+	// check but carries no `name=` cannot be acted on; skipping it silently would leave `preserved`
+	// clear and let the reset wipe its provenance while the object it describes still stands.
+	r := newRig(t)
+	r.writeProduct("p1")
+	r.mintIdentity()
+	r.mustInstall("p1")
+	r.appendRows("object\tkey=container:nameless\tclass=container\tnonce=n\tgen=1")
+	r.confirm("yes")
+
+	if rc := r.uninstallFamily(false); rc == cliio.ExitOK {
+		t.Fatalf("the family uninstall reset the ledger over a record it could not act on\n%s", r.said())
+	}
+	if _, err := r.ledgerNow().IdentGet(); err != nil {
+		t.Fatalf("the ledger was reset anyway: %v", err)
+	}
+}
+
+func TestFamilyUninstallReadsTheListingBeforeItPrompts(t *testing.T) {
+	// A prompt that arrives about work that cannot be done either way is not a decision point. The
+	// listings are read FIRST, so an unreadable ledger refuses on its own terms — and so the
+	// --purge warning can name what it is about to destroy, instead of the one prompt guarding
+	// every volume on the machine saying "THAT IS YOUR DATA" without saying which data.
+	r := newRig(t)
+	r.writeProduct("p1")
+	r.mintIdentity()
+	r.mustInstall("p1")
+	r.appendRows("object\tmalformed-no-equals")
+
+	// No MI_CONFIRM at all: if the prompt came first, the refusal would be "not confirmed".
+	if rc := r.uninstallFamily(true); rc == cliio.ExitOK {
+		t.Fatalf("the family purge reported success\n%s", r.said())
+	}
+	r.mustSay("could not be fully read")
+	r.mustNotSay("not confirmed")
+	r.mustNotSay("THAT IS YOUR DATA")
+}
+
+func TestPurgeRefusesAProductVolumeRecordWithNoName(t *testing.T) {
+	// The product-scoped sibling of the family fail-closed name rule. A record attributed to this
+	// product but carrying no `name=` cannot be acted on: `--purge` must say so and report the
+	// failure, not step over it and then claim the purge completed.
+	r := newRig(t)
+	r.writeProduct("p1")
+	r.mintIdentity()
+	r.mustInstall("p1")
+	r.appendRows("object\tkey=volume:nameless\tclass=volume\tproduct=p1\tnonce=n\tgen=1")
+	r.confirm("yes")
+
+	if rc := r.uninstall("p1", true); rc == cliio.ExitOK {
+		t.Fatalf("the purge reported success over a record it could not act on\n%s", r.said())
+	}
+	r.mustSay("readable name; --purge cannot act on it")
+	// And the warning named it too, so the operator saw it before answering.
+	r.mustSay("(a volume whose record carries no readable name)")
+}
