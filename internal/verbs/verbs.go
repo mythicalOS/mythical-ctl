@@ -177,8 +177,14 @@ func (s *session) install(ctx context.Context, opts InstallOpts) int {
 		d.warnErr(err)
 		return cliio.ExitFail
 	}
-	// The launch must be assemblable BEFORE the existing container is replaced.
-	if err := s.checkLaunchable(pc, image, netID); err != nil {
+	// The launch is assembled ONCE, and it must be assemblable BEFORE the existing container is
+	// replaced.
+	cfg, cfgErr := s.launchConfig(pc, image, netID)
+	if cfgErr != nil {
+		d.warnErr(cfgErr)
+		return cliio.ExitFail
+	}
+	if err := s.checkLaunchable(pc, cfg); err != nil {
 		d.warnErr(err)
 		return cliio.ExitFail
 	}
@@ -189,7 +195,7 @@ func (s *session) install(ctx context.Context, opts InstallOpts) int {
 		return cliio.ExitFail
 	}
 
-	if err := s.launch(ctx, pc, image, netID, bringup.Running); err != nil {
+	if err := s.launch(ctx, pc, cfg, bringup.Running); err != nil {
 		d.warnErr(err)
 		return cliio.ExitFail
 	}
@@ -486,9 +492,14 @@ func (s *session) recreate(ctx context.Context, product string) int {
 		d.warnErr(err)
 		return cliio.ExitFail
 	}
-	// The launch must be assemblable BEFORE the working container is removed — the sibling of the
-	// image gate above, and for the same reason.
-	if err := s.checkLaunchable(pc, image, netID); err != nil {
+	// The launch is assembled ONCE, and it must be assemblable BEFORE the working container is
+	// removed — the sibling of the image gate above, and for the same reason.
+	cfg, cfgErr := s.launchConfig(pc, image, netID)
+	if cfgErr != nil {
+		d.warnErr(cfgErr)
+		return cliio.ExitFail
+	}
+	if err := s.checkLaunchable(pc, cfg); err != nil {
 		d.warnErr(err)
 		return cliio.ExitFail
 	}
@@ -496,7 +507,7 @@ func (s *session) recreate(ctx context.Context, product string) int {
 		d.warnErr(err)
 		return cliio.ExitFail
 	}
-	if err := s.launch(ctx, pc, image, netID, bringup.Preserve); err != nil {
+	if err := s.launch(ctx, pc, cfg, bringup.Preserve); err != nil {
 		d.warnErr(err)
 		return cliio.ExitFail
 	}
@@ -827,30 +838,44 @@ func (s *session) ensureVolume(ctx context.Context, ident, product, role, vol, p
 // replacement that could never have been created. In this tree the spec is assembled inside the
 // launch facade, which runs after the removal, so the same assembly is asked for here first and its
 // answer thrown away. It is the sibling of the image gate a few lines up, for the same reason.
-func (s *session) checkLaunchable(pc *productContext, image, netID string) error {
-	ident, err := s.l.IdentGet()
-	if err != nil {
-		return err
-	}
-	cfg, cerr := s.launchConfig(pc, ident, image, netID, "prelaunch-check")
-	if cerr != nil {
-		return cerr
-	}
+func (s *session) checkLaunchable(pc *productContext, cfg runtime.LaunchConfig) error {
+	// The dry run needs A nonce, because the spec validates every label it carries — but never THE
+	// nonce, which is the intent's, minted and recorded ahead of the container that will carry it.
+	// cfg is a value, so this placeholder cannot escape into the real launch, and nothing is
+	// created from it.
+	cfg.Nonce = "nprelaunchdryrun"
 	return s.rt.PrelaunchCheck(pc.Manifest, pc.Policy, cfg)
 }
 
-// launchConfig assembles what the launch varies. The nonce is a PARAMETER because the dry run and
-// the real create need different ones: the real one is the intent's, minted and recorded ahead of
-// the container; the dry run's is a placeholder that never reaches a label because nothing is
-// created from it.
-func (s *session) launchConfig(pc *productContext, ident, image, netID, nonce string) (runtime.LaunchConfig, error) {
-	ports, err := hostPorts(s.d.Home, pc.Product, pc.Manifest)
+// launchConfig assembles what the launch varies, ONCE per verb.
+//
+// IT IS READ ONCE AND CARRIED, not re-derived either side of the teardown: the dry run and the
+// real create must be judging the same launch, and re-reading mythical.conf for the second one
+// would let them disagree about which host port to publish.
+//
+// The nonce is deliberately absent here and supplied at the create: the real one is the intent's,
+// minted and recorded ahead of the container, and nothing is created from a config on its own.
+//
+// RESIDUAL, stated because it is real and narrow: the facade re-derives the MOUNTS and the
+// bootstrap secret VALUES inside the create, so those two are read from mythical.conf again after
+// the replacement. The authenticated documents cannot change under a verb (they are read into
+// memory and verified), and every sanctioned writer of mythical.conf needs the family lock this
+// verb is holding — so the only way the two reads can disagree is an operator hand-editing that
+// file during the verb. Closing it means carrying an assembled launch across the teardown, which
+// is a change to the sole-creation-site seam in the runtime facade rather than something the verb
+// layer may do: handing a pre-built spec back through this layer is exactly what that boundary
+// exists to prevent.
+func (s *session) launchConfig(pc *productContext, image, netID string) (runtime.LaunchConfig, error) {
+	ident, err := s.l.IdentGet()
 	if err != nil {
 		return runtime.LaunchConfig{}, err
 	}
+	ports, perr := hostPorts(s.d.Home, pc.Product, pc.Manifest)
+	if perr != nil {
+		return runtime.LaunchConfig{}, perr
+	}
 	return runtime.LaunchConfig{
 		Identity:  ident,
-		Nonce:     nonce,
 		NetworkID: netID,
 		Image:     image,
 		HostPorts: ports,
@@ -899,21 +924,13 @@ func (s *session) replaceContainer(ctx context.Context, container, verb string) 
 }
 
 // launch runs the full bring-up sequence for this product.
-func (s *session) launch(ctx context.Context, pc *productContext, image, netID string, desired bringup.Desired) error {
-	ident, err := s.l.IdentGet()
-	if err != nil {
-		return err
-	}
-	cfg, cerr := s.launchConfig(pc, ident, image, netID, "")
-	if cerr != nil {
-		return cerr
-	}
-	bd, berr := s.bringupDeps(pc.Index, ident)
+func (s *session) launch(ctx context.Context, pc *productContext, cfg runtime.LaunchConfig, desired bringup.Desired) error {
+	bd, berr := s.bringupDeps(pc.Index, cfg.Identity)
 	if berr != nil {
 		return berr
 	}
 	launcher := &productLauncher{rt: s.rt, m: pc.Manifest, p: pc.Policy, cfg: cfg}
-	rerr := bringup.Run(ctx, s.l, bd, launcher, pc.Container, netID, pc.Alias, desired)
+	rerr := bringup.Run(ctx, s.l, bd, launcher, pc.Container, cfg.NetworkID, pc.Alias, desired)
 	if err := s.persist(); err != nil {
 		return err
 	}

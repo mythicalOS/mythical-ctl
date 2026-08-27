@@ -579,6 +579,45 @@ func TestRecreateRefusesAnUnsetSecretWithTheContainerIntact(t *testing.T) {
 	}
 }
 
+// TestTheLaunchIsAssembledOnce is not a bats port — the shell gets this structurally, because it
+// builds its launch arguments into an array once and hands that array to the bring-up. Here the
+// two halves are a dry run and a real create, so the config that feeds both has to be READ once
+// and carried: re-reading mythical.conf on the far side of the teardown would let the launch that
+// was judged possible and the launch that actually happens disagree about what to publish.
+func TestTheLaunchIsAssembledOnce(t *testing.T) {
+	r := newRig(t)
+	r.writeProduct("p1")
+	r.mintIdentity()
+	// The operator's configured host port, in force for the whole verb.
+	r.writeFile("mythical.conf", "MYTHICAL_TELEMETRY_KEY=tk\nMYTHICAL_P1_PORT=17480\n")
+	r.mustInstall("p1")
+
+	info, err := r.c.ContainerInspect(context.Background(), r.container("p1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(info.Ports) == 0 {
+		t.Fatal("nothing was published")
+	}
+	for _, p := range info.Ports {
+		if p.HostPort != "17480" {
+			t.Fatalf("published on host port %q, want the configured 17480", p.HostPort)
+		}
+	}
+	// And the nonce the container really carries is the INTENT's, never the dry run's placeholder.
+	rec, ferr := prov.Find(r.ledgerNow(), prov.ClassContainer, r.container("p1"))
+	if ferr != nil {
+		t.Fatal(ferr)
+	}
+	recorded, _ := ledger.FieldOf(rec, "nonce")
+	if got := info.Labels["mythicalos.nonce"]; got != recorded || got == "" {
+		t.Fatalf("the container carries nonce %q, the ledger records %q", got, recorded)
+	}
+	if strings.Contains(info.Labels["mythicalos.nonce"], "prelaunch") {
+		t.Fatal("the dry run's placeholder nonce reached the real container")
+	}
+}
+
 // TestStartAcceptsTheIndexOnlyWhenItProbes is not a bats port; it pins where the family index is
 // read on the start path, which the shell gets from its call structure. Two halves:
 // a plan that live-verifies ACCEPTS the index (advancing its anti-rollback floor, because the
