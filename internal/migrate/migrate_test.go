@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"mythicalos.ai/ctl/internal/cliio"
 	"mythicalos.ai/ctl/internal/conf"
 	"mythicalos.ai/ctl/internal/engine"
 	"mythicalos.ai/ctl/internal/ledger"
@@ -961,13 +962,38 @@ func TestResumeWithoutConfirmationDoesNothing(t *testing.T) {
 }
 
 func TestResumeRefusesAPartialLedgerView(t *testing.T) {
-	// A listing that could not be fully read is a REFUSAL. Reading it as an empty list would report
+	// A LISTING THAT COULD NOT BE FULLY READ IS A REFUSAL. Reading it as an empty list would report
 	// success having resumed nothing at all — a migration abandoned mid-flight with a clean exit.
+	//
+	// The record is UNREADABLE, not merely incomplete: the two refuse in different places, and only
+	// this one exercises the listing call's own error. It is built on disk, with a correct checksum
+	// over a malformed record body — which is what a hand-edited or repair-written ledger actually
+	// looks like, and the only state that reaches the branch, since the integrity gate validates the
+	// checksum and the header while leaving record bodies for the readers.
 	f := newFx(t)
-	if err := f.l.Append(Kind, []ledger.Field{{Key: "key", Value: "p1:state"}, {Key: "role", Value: testRole}}); err != nil {
+	path := filepath.Join(f.home, ".state", "ledger")
+	body := "#mythical-ctl-ledger schema=1\n" +
+		"ident\tid=" + f.ident + "\n" +
+		Kind + "\tthis-token-is-not-a-field\n"
+	if err := os.WriteFile(path, []byte(body+"#sha256="+cliio.SHA256Hex([]byte(body))+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	mustContain(t, Resume(ctx(), f.l, f.d), "does not name a product")
+	l, err := ledger.Read(ledger.LiveRead(f.home))
+	if err != nil {
+		t.Fatalf("the fixture ledger does not pass the integrity gate, so it never reaches the listing: %v", err)
+	}
+	if _, aerr := l.All(Kind); aerr == nil {
+		t.Fatal("the fixture record lists cleanly, so this test cannot reach the listing's refusal")
+	}
+	mustContain(t, Resume(ctx(), l, f.d), "could not be fully read", "Refusing rather than resuming a partial view")
+
+	// And the SEMANTIC half, which refuses later and for a different reason: a record that lists
+	// cleanly but does not say which migration it describes.
+	f2 := newFx(t)
+	if err := f2.l.Append(Kind, []ledger.Field{{Key: "key", Value: "p1:state"}, {Key: "role", Value: testRole}}); err != nil {
+		t.Fatal(err)
+	}
+	mustContain(t, Resume(ctx(), f2.l, f2.d), "does not name a product")
 }
 
 // --- guards with no bats row of their own ---------------------------------------------------------
@@ -1865,5 +1891,37 @@ func TestPrecheckRefusesAPartialMountInspection(t *testing.T) {
 	f.objs.err = nil
 	if err := Precheck(ctx(), f.l, f.d, testProduct, testRole, f.dest); err != nil {
 		t.Fatalf("a successful inspection naming the source volume was refused: %v", err)
+	}
+}
+
+func TestPhase9PreservesAStoppedContainersOutstandingCheck(t *testing.T) {
+	// A COMMIT PRESERVES THE OUTSTANDING SET; IT VERIFIES NOTHING. The reference restores a
+	// desired-stopped container with no checks AND no declaration that none are owed — declaring
+	// "nothing is owed" beside a check that IS owed is a contradiction the state module refuses,
+	// and that refusal would wedge phase 9 for exactly the products most likely to be migrated: a
+	// stopped one whose deferred alias check is still waiting for it to come back up.
+	f := newFx(t)
+	if err := state.Commit(f.l, f.container, state.Stopped,
+		[]state.Check{{Kind: state.CheckAlias, Param: "netid-family"}}, false); err != nil {
+		t.Fatal(err)
+	}
+	f.stt.running[f.container] = false
+	if err := MigrateStorage(ctx(), f.l, f.d, testProduct, testRole, Options{ToBind: f.dest}); err != nil {
+		t.Fatalf("a stopped product with an outstanding check could not finish its migration: %v", err)
+	}
+	want, err := state.DesiredGet(f.l, f.container)
+	if err != nil || want != state.Stopped {
+		t.Fatalf("desired state %q (%v), want stopped", want, err)
+	}
+	// The check SURVIVES: nothing here verified it, so nothing here may retire it.
+	out, oerr := state.Outstanding(f.l, f.container)
+	if oerr != nil {
+		t.Fatal(oerr)
+	}
+	if len(out) != 1 || out[0].Kind != state.CheckAlias {
+		t.Fatalf("the outstanding set is %v — a migration must not retire a check it did not perform", out)
+	}
+	if _, perr := Phase(f.l, testProduct, testRole); !errors.Is(perr, ErrNoMigration) {
+		t.Fatalf("the intent survived a completed migration: %v", perr)
 	}
 }

@@ -1143,8 +1143,14 @@ func runPhase9(ctx context.Context, l *ledger.Ledger, d Deps, r record, containe
 			return err
 		}
 	case state.Stopped:
+		// NO CHECKS, AND NO DECLARATION THAT NONE ARE OWED — the reference passes neither, and the
+		// difference is load-bearing. A commit PRESERVES the outstanding set; it verifies nothing.
+		// Declaring that nothing is owed while a stopped container still owes a check is a
+		// contradiction the state module refuses outright — which would wedge phase 9 for exactly
+		// the products most likely to be migrated: a stopped one whose deferred alias check is
+		// still waiting. Passing no declaration lets the surviving set stand, as it must.
 		if err := d.staged(l, "restore the recorded desired state", func(c *ledger.Ledger) error {
-			return state.Commit(c, container, state.Stopped, nil, true)
+			return state.Commit(c, container, state.Stopped, nil, false)
 		}); err != nil {
 			return err
 		}
