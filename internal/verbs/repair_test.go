@@ -2166,3 +2166,33 @@ func TestACheckSumValidNewerLedgerIsRefusedByRepairUntouched(t *testing.T) {
 		t.Fatalf("a .corrupt.* sibling was created for a valid, merely-newer ledger: %v", sibs)
 	}
 }
+
+func TestARefusedRebuildKeepsTheProvenanceItAlreadyEstablished(t *testing.T) {
+	// The reference wrote every provenance record to the ledger file the moment it made it, so a
+	// refusal partway through left the objects already rebuilt ON DISK — which is what makes its
+	// "re-run once the runtime answers" a resumption rather than a restart from an empty ledger.
+	//
+	// This is what the refusal path's own write is FOR, now that the adopted identity is made
+	// durable earlier: without it, a repair that walked twenty objects and stopped on the
+	// twenty-first would discard all twenty and the re-run would redo every one of them against a
+	// ledger the reset had already emptied.
+	r := newRepairRig(t)
+	r.labelledVolume("v1", "n1", "insta")
+	r.labelledVolume("v2", "n2", "insta")
+	// v2's installation label answers candidate discovery once, then stops answering — so the
+	// rebuild reaches it only after v1 has already been recorded.
+	failLabelAfter(t, prov.ClassVolume, "v2", prov.LabelInstall, 1)
+
+	if rc := r.repair("insta"); rc == cliio.ExitOK {
+		t.Fatalf("the rebuild reported success over a read it could not make\n%s", r.said())
+	}
+	r.mustSay("already been reset")
+
+	l := r.ledgerNow()
+	if _, err := prov.Find(l, prov.ClassVolume, "v1"); err != nil {
+		t.Fatalf("provenance the rebuild had already established was discarded by the refusal: %v", err)
+	}
+	if _, err := prov.Find(l, prov.ClassVolume, "v2"); !errors.Is(err, ledger.ErrAbsentRecord) {
+		t.Fatalf("provenance was recorded for the object the rebuild could not ask about: %v", err)
+	}
+}
