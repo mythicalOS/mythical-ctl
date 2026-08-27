@@ -1022,6 +1022,18 @@ func indentAll(lines []string, prefix string, avail int) []string {
 // statusRunMsg is the generation envelope: every message a run produces is wrapped in one, so
 // the model can tell a fresh run's lines from a superseded run's without the message types
 // themselves having to carry a run id.
+//
+// THESE THREE TYPES ARE CONFINED TO THE DASHBOARD'S OWN PROGRAM, and that is load-bearing rather
+// than incidental. The only producer of statusRunMsg is the genSender built in runStatus, whose
+// sink is the program built around a StatusModel; a StatusModel holds no overlay stack and never
+// constructs a ConfirmOverlay. So none of them can reach ConfirmOverlay.Update, whose data
+// allowlist marks any message it does not recognise as input and thereby makes the pending line
+// unacceptable.
+//
+// IF THAT EVER STOPS BEING TRUE — if one of these is ever posted to a program driving Root, or a
+// StatusModel grows an overlay that collects a line — each type posted on that path must be added
+// to the allowlist in confirm.go, with a note saying it is data and not something the operator
+// typed. Otherwise a confirmation that happens to be open when one arrives cannot be answered.
 type statusRunMsg struct {
 	Gen int
 	Msg tea.Msg
