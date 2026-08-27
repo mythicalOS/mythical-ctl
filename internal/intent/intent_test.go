@@ -1181,3 +1181,90 @@ func TestReconcileNormalizesAbsentLabels(t *testing.T) {
 		t.Fatalf("an absent-meaning label read as a real identity: %v", err)
 	}
 }
+
+// --- an intent selected by key must describe what was asked for -----------------------------------
+
+// AN INTENT IS PROVED TO DESCRIBE THE OBJECT AT THE LOOKUP. `key`, `class` and `name` are three
+// independent fields; a row keyed `volume:v1` that describes something else answers this lookup
+// and is then consumed as v1's intent. What that costs is a runtime mutation and a lost record,
+// not a wrong report — which is why it is asserted against the reissuer and the ledger body rather
+// than against the message alone.
+func TestReconcileRefusesAnIntentAboutSomethingElse(t *testing.T) {
+	ctx := context.Background()
+	l, _ := identLedger(t)
+	// Well-formed and checksum-valid: only the agreement between the key and what the row
+	// describes is wrong, which is the case no field-level check can see.
+	l.ReplaceLines(append(l.Lines(),
+		"intent\tkey=volume:v1\tclass=container\tname=other\tnonce=n9\tcreated=1700000000"))
+	before := strings.Join(l.Lines(), "\n")
+	f := newFake()
+	r := &fakeReissuer{}
+
+	err := Reconcile(ctx, l, f, r, prov.ClassVolume, "v1")
+	if err == nil || !strings.Contains(err.Error(), "does not describe it") {
+		t.Fatalf("an intent about something else was reconciled: %v", err)
+	}
+	// IT IS A REFUSAL, NOT A RETENTION. ErrRetained tells a caller nothing is wrong and to carry
+	// on; a contradictory record is the opposite case and no later run resolves it.
+	if errors.Is(err, ErrRetained) {
+		t.Fatalf("a contradictory intent was reported as a benign retention: %v", err)
+	}
+	// NOTHING WAS CREATED. This is the half that matters: reissuing on the other object's nonce
+	// leaves a volume nothing accounts for, and the confirmation that would have caught it refuses
+	// afterwards — so the object outlives the run that made it and stops every later operation.
+	if r.calls != 0 {
+		t.Fatalf("a volume was reissued from an intent about another object: %d calls", r.calls)
+	}
+	if after := strings.Join(l.Lines(), "\n"); after != before {
+		t.Fatalf("the contradictory intent was not preserved.\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+}
+
+func TestAbandonRefusesAnIntentAboutSomethingElse(t *testing.T) {
+	ctx := context.Background()
+	l, _ := identLedger(t)
+	l.ReplaceLines(append(l.Lines(),
+		"intent\tkey=network:net\tclass=volume\tname=other\tnonce=n9\tcreated=1700000000"))
+	before := strings.Join(l.Lines(), "\n")
+	f := newFake()
+
+	// Aged well past the grace period and with zero matches — every OTHER reason to refuse is
+	// absent, so the agreement question is the only thing standing between this row and deletion.
+	err := Abandonable(ctx, l, f, prov.ClassNetwork, "net", fixedNow.Add(time.Hour), DefaultGrace)
+	if err == nil || !strings.Contains(err.Error(), "does not describe it") {
+		t.Fatalf("an intent about something else was declared abandonable: %v", err)
+	}
+	advisory, aerr := Abandon(ctx, l, f, prov.ClassNetwork, "net", fixedNow.Add(time.Hour), DefaultGrace)
+	if aerr == nil {
+		t.Fatal("an intent about something else was abandoned")
+	}
+	if advisory != "" {
+		t.Fatalf("a refused abandonment still advised the operator: %q", advisory)
+	}
+	// THE ROW SURVIVES. It is the only record of whatever it actually described; dropping it here
+	// would destroy that on behalf of an object it has nothing to do with.
+	if after := strings.Join(l.Lines(), "\n"); after != before {
+		t.Fatalf("the contradictory intent was dropped.\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+}
+
+// A CONFIRMATION DROPS THE TOMBSTONE FOR THE NAME IT CONFIRMS. A tombstone keyed for this object
+// while describing another is that other object's only surviving account — §6b's whole point is
+// that provenance outlives what it describes — and dropping it is not tidying, it is the one act
+// this module may never perform on conflicting evidence. Asked BEFORE the object record is
+// rewritten, like the cardinality question beside it.
+func TestConfirmRefusesToDropATombstoneAboutSomethingElse(t *testing.T) {
+	l := &ledger.Ledger{}
+	l.ReplaceLines([]string{
+		"intent\tkey=volume:v1\tclass=volume\tname=v1\tnonce=n1\tcreated=1700000000",
+		"tombstone\tkey=volume:v1\tclass=container\tname=other\tnonce=n9\tgen=3",
+	})
+	before := strings.Join(l.Lines(), "\n")
+	err := Confirm(l, prov.ClassVolume, "v1", "n1")
+	if err == nil || !strings.Contains(err.Error(), "does not describe it") {
+		t.Fatalf("a tombstone about something else was dropped by a confirmation: %v", err)
+	}
+	if after := strings.Join(l.Lines(), "\n"); after != before {
+		t.Fatalf("the confirmation wrote before the tombstone question was answered.\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+}

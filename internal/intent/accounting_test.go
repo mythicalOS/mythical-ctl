@@ -1,6 +1,7 @@
 package intent
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -138,5 +139,76 @@ func TestProbeIntentsReportsWhatItCannotRead(t *testing.T) {
 	}
 	if len(got) != 0 {
 		t.Fatalf("a volume intent was listed as a probe: %+v", got)
+	}
+}
+
+// PROBE INTENTS ARE SELECTED FROM A LISTING, so the two questions a keyed lookup asks — does this
+// row describe what it is filed under, and is there exactly one of it — are never asked for them.
+// And this is the listing whose rows become RUNTIME MUTATIONS: the caller removes the container
+// each row names and then drops the record by key. Both questions are therefore asked here, over
+// the whole listing, before any of it is handed back.
+func TestProbeIntentsRefusesRowsThatDisagreeWithTheirKey(t *testing.T) {
+	h := heldFor(t)
+	a, err := NewProbeAccounting(h, func() time.Time { return fixedNow })
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, _ := ledger.Live(h)
+	write := func(lines ...string) {
+		t.Helper()
+		l := &ledger.Ledger{}
+		l.ReplaceLines(lines)
+		if err := ledger.Write(h, st, l); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// THE KEY AND THE NAME DISAGREE. `name` is what gets removed; `key` is what gets dropped. This
+	// row would have had container "b" removed and the record for "a" dropped — the wrong
+	// container gone, and its own record left standing to say it is still there.
+	write("intent\tkey=probe:a\tclass=probe\tname=b\tnonce=n1\tcreated=1700000000")
+	_, err = a.ProbeIntents()
+	if err == nil || !strings.Contains(err.Error(), "filed under") {
+		t.Fatalf("a probe intent naming one object and keyed for another was listed: %v", err)
+	}
+
+	// THE OTHER DIRECTION: keyed in the probe namespace, describing a class that is not a probe.
+	// Skipping it (as a class filter alone does) hides a probe container from every reap, and the
+	// stray container then wedges the installation as an unrecorded same-identity object — which
+	// is precisely what reaping exists to prevent.
+	write("intent\tkey=probe:a\tclass=volume\tname=a\tnonce=n1\tcreated=1700000000")
+	_, err = a.ProbeIntents()
+	if err == nil || !strings.Contains(err.Error(), "filed under") {
+		t.Fatalf("a probe-keyed row describing another class was skipped rather than reported: %v", err)
+	}
+
+	// TWO ROWS ANSWERING ONE KEY. The listing used to return both, so the caller reaped the
+	// container on the first and only THEN did the keyed Drop refuse ErrAmbiguous — the runtime
+	// mutated on evidence that contradicts itself, by a refusal that arrived one step too late.
+	// Nothing is handed back at all, which is what makes the refusal arrive in time.
+	write(
+		"intent\tkey=probe:p1\tclass=probe\tname=p1\tnonce=n1\tcreated=1700000000",
+		"intent\tkey=probe:p1\tclass=probe\tname=p1\tnonce=n2\tcreated=1700000000",
+	)
+	got, err := a.ProbeIntents()
+	if err == nil || !errors.Is(err, ledger.ErrAmbiguous) {
+		t.Fatalf("two intents for one probe were both listed: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("a refused listing still handed back rows to act on: %+v", got)
+	}
+
+	// AND A WELL-FORMED SET STILL LISTS. The guard refuses disagreement, not probes.
+	write(
+		"intent\tkey=probe:p1\tclass=probe\tname=p1\tnonce=n1\tcreated=1700000000",
+		"intent\tkey=probe:p2\tclass=probe\tname=p2\tnonce=n2\tcreated=1700000000",
+		"intent\tkey=volume:v1\tclass=volume\tname=v1\tnonce=n3\tcreated=1700000000",
+	)
+	got, err = a.ProbeIntents()
+	if err != nil {
+		t.Fatalf("a well-formed probe listing was refused: %v", err)
+	}
+	if len(got) != 2 || got[0].Name != "p1" || got[1].Name != "p2" {
+		t.Fatalf("intents = %+v", got)
 	}
 }
