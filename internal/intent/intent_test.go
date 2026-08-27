@@ -1268,3 +1268,63 @@ func TestConfirmRefusesToDropATombstoneAboutSomethingElse(t *testing.T) {
 		t.Fatalf("the confirmation wrote before the tombstone question was answered.\nbefore:\n%s\nafter:\n%s", before, after)
 	}
 }
+
+// THE WRITE SIDE OF THE SAME QUESTION. Open's keyed put SUPERSEDES whatever is filed under the
+// key, and Drop's keyed delete removes it — so both destroy a row that answers for this key while
+// describing something else, on behalf of an object it has nothing to do with. prov.Record is
+// protected from exactly this by its generation read; these had nothing, which is an asymmetry
+// rather than a difference in kind. "Any mismatch preserves" has no write-side exception.
+func TestOpenAndDropPreserveARowAboutSomethingElse(t *testing.T) {
+	const stray = "intent\tkey=volume:v1\tclass=container\tname=other\tnonce=n9\tcreated=1700000000"
+
+	// OPEN would have replaced it with a fresh intent for v1.
+	l := &ledger.Ledger{}
+	l.ReplaceLines([]string{stray})
+	before := strings.Join(l.Lines(), "\n")
+	err := Open(l, prov.ClassVolume, "v1", "n1", fixedNow)
+	if err == nil || !strings.Contains(err.Error(), "does not describe it") {
+		t.Fatalf("opening an intent replaced a row about something else: %v", err)
+	}
+	if after := strings.Join(l.Lines(), "\n"); after != before {
+		t.Fatalf("the stray row was superseded.\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+
+	// DROP would have deleted it. This is the path ProbeAccounting.DropProbe takes — a bare name
+	// from the probe seam, with no lookup of its own anywhere in front of it.
+	l2 := &ledger.Ledger{}
+	l2.ReplaceLines([]string{stray})
+	before2 := strings.Join(l2.Lines(), "\n")
+	err = Drop(l2, prov.ClassVolume, "v1")
+	if err == nil || !strings.Contains(err.Error(), "does not describe it") {
+		t.Fatalf("dropping an intent deleted a row about something else: %v", err)
+	}
+	if after := strings.Join(l2.Lines(), "\n"); after != before2 {
+		t.Fatalf("the stray row was deleted.\nbefore:\n%s\nafter:\n%s", before2, after)
+	}
+
+	// AND NEITHER GUARD BLOCKS THE ORDINARY CASE. A repeat Open supersedes its own earlier intent
+	// (one live intent per object is the rule the keyed put exists to keep), a Drop of an intent
+	// that IS about this object retires it, and dropping what is absent still succeeds.
+	l3 := &ledger.Ledger{}
+	mustOpen(t, l3, prov.ClassVolume, "v1", "n1")
+	mustOpen(t, l3, prov.ClassVolume, "v1", "n2")
+	rows, rerr := All(l3)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("a repeat open appended beside instead of superseding: %d rows", len(rows))
+	}
+	if n, _ := ledger.FieldOf(rows[0], "nonce"); n != "n2" {
+		t.Fatalf("the repeat open did not supersede: nonce=%q", n)
+	}
+	if err := Drop(l3, prov.ClassVolume, "v1"); err != nil {
+		t.Fatalf("a legitimate drop was refused: %v", err)
+	}
+	if _, ferr := Find(l3, prov.ClassVolume, "v1"); !errors.Is(ferr, ledger.ErrAbsentRecord) {
+		t.Fatalf("the intent survived its drop: %v", ferr)
+	}
+	if err := Drop(l3, prov.ClassVolume, "v1"); err != nil {
+		t.Fatalf("dropping what is absent must succeed: %v", err)
+	}
+}

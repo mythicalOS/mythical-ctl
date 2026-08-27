@@ -194,6 +194,21 @@ func Open(l *ledger.Ledger, class prov.Class, name, nonce string, now time.Time,
 			"  makes it abandonable the moment it is written, and a delayed create could then surface\n"+
 			"  after abandonment. That is the bounded-retention rule this timestamp exists to enforce.", secs)
 	}
+	// WHAT A KEYED PUT SUPERSEDES MUST BE A CLAIM ABOUT THIS OBJECT. The put below DROPS whatever
+	// is filed under this key before appending — that is how a retry replaces its own earlier
+	// intent rather than appending beside it — so a row that answers for this key while describing
+	// something else is destroyed by an operation that has nothing to do with it. That row is the
+	// only record of whatever it was about, and "any mismatch preserves" does not have a write-side
+	// exception.
+	//
+	// prov.Record is protected from the same thing by its generation read; this had nothing, which
+	// is the asymmetry rather than a difference in kind. Only the MISMATCH is asked here: every
+	// other way this lookup can fail — two rows answering the key, a selector this format cannot
+	// hold — is refused by the put itself a few lines down, and a guard the put already stands in
+	// front of is one no mutation could kill.
+	if _, ferr := Find(l, class, name); errors.Is(ferr, prov.ErrMismatch) {
+		return ferr
+	}
 	k := key(class, name)
 	fields := []ledger.Field{
 		{Key: "key", Value: k},
@@ -236,10 +251,21 @@ func Find(l *ledger.Ledger, class prov.Class, name string) ([]ledger.Field, erro
 // refusal, never a shorter list.
 func All(l *ledger.Ledger) ([][]ledger.Field, error) { return l.All(kindIntent) }
 
-// Drop retires an intent record.
+// Drop retires an intent record. Deleting what is absent succeeds — a deletion that finds nothing
+// has achieved its purpose — and the same agreement question Open asks of the put is asked of the
+// delete, for the same reason and by the same route.
+//
+// It is asked HERE rather than left to each caller. Abandon reaches it having already been through
+// Find (so for that path it is the second time the question is asked, and the first was about
+// READING the row); ProbeAccounting.DropProbe reaches it from the probe seam with a bare name and
+// no lookup at all, so for that path this is the only place it is asked. A delete is its own act
+// and gets its own guard.
 func Drop(l *ledger.Ledger, class prov.Class, name string) error {
 	if !prov.ClassOK(class) {
 		return fmt.Errorf("intent: %q is not a provenance class", string(class))
+	}
+	if _, ferr := Find(l, class, name); errors.Is(ferr, prov.ErrMismatch) {
+		return ferr
 	}
 	return l.Del(kindIntent, "key", key(class, name))
 }

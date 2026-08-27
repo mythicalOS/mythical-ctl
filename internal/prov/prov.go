@@ -476,6 +476,15 @@ func Tombstone(l *ledger.Ledger, class Class, name string) error {
 // standing again, so the record of its removal is no longer the surviving account of it, and
 // leaving it beside a live object record would give the next reader two answers. Ambiguity refuses
 // here as everywhere — two contradicting tombstones are evidence, not tidying material.
+//
+// PRECONDITION, AND WHY IT IS NOT RESTATED AS A GUARD: the row must already have been proved to
+// describe class/name. Its one caller, intent.Confirm, proves it through TombstoneFind BEFORE it
+// writes anything — which is where the question has to be asked anyway, because a refusal after
+// prov.Record has run is a refusal that arrives too late to prevent a half-written confirmation.
+// Asking it again here would be a guard standing behind another one on the only path that reaches
+// it: nothing could reach it with a mismatched row, so no mutation could kill it and no test could
+// see it. A second caller must ask the same question before it writes, for the same ordering
+// reason, not by leaning on a check here.
 func TombstoneDrop(l *ledger.Ledger, class Class, name string) error {
 	if err := classCheck(class); err != nil {
 		return err
