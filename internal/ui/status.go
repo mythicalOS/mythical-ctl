@@ -988,10 +988,16 @@ func runStatus(ctx context.Context, base verbs.Deps, fn VerbFunc, mk func(Status
 	uiDone := make(chan struct{})
 	// The launch gate. THE DECISION IS A LOCK, NOT A RACE BETWEEN TWO CHANNELS. With `started`
 	// and `uiDone` both closed — which is what happens when the runtime ends after dispatching
-	// the start command but before its goroutine ran — a select over the two picks at RANDOM, and
-	// half the time it launches the report into an interface that has already gone. `barred` is
-	// set BEFORE uiDone is closed, so the goroutine either takes the lock first and runs, or takes
-	// it after and never starts; exactly one of those happens and both publish an outcome.
+	// the start command but before its goroutine ran — a select over the two picks at RANDOM.
+	// `barred` is set BEFORE uiDone is closed, so the goroutine either takes the lock first and
+	// runs, or takes it after and never starts; exactly one of those happens and both publish an
+	// outcome, which is what keeps the runner's answer agreeing with what actually happened.
+	//
+	// STATED SCOPE: this makes the decision deterministic once Run has RETURNED. A goroutine that
+	// reaches the gate first still runs, and for THIS report that is harmless — it is read-only,
+	// it starts nothing, and its output is replayed to the real streams either way. The gate is
+	// here for the answer's consistency and for parity with the sibling runner, whose verbs are
+	// not read-only; the test asserts the consistency, not a distribution.
 	var gate sync.Mutex
 	barred := false
 

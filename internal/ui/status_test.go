@@ -1014,35 +1014,58 @@ func TestRunStatusNeverStartedMeansTheReportNeverRan(t *testing.T) {
 	}
 }
 
-// TestTheReportIsNeverLaunchedIntoAnInterfaceThatHasAlreadyGone.
+// TestTheLaunchDecisionIsMadeExactlyOnceAndTheAnswerAgreesWithIt.
 //
 // The runtime can end AFTER dispatching the model's start command but BEFORE the goroutine that
-// runs it has been scheduled — and it does not wait for that goroutine. Both the "the interface
-// is live" and the "the interface is gone" signals are then true at once, and a select over the
-// two picks at random: half the time the report is launched into a program that has already
-// returned, with a Confirm nobody can answer and an outcome nobody sees.
+// runs the report has been scheduled, and it does not wait for that goroutine. Both "the
+// interface is live" and "the interface is gone" are then true at once. Whichever way the
+// decision falls, the runner's ANSWER must agree with it: a report that ran reports its own exit
+// code and NOT ErrNotStarted, and a report that did not run reports ErrNotStarted and code 0 —
+// because ErrNotStarted is exactly what licenses the dispatcher to run it again on the plain
+// path. A runner that said "never started" about a report that ran would run it twice; one that
+// returned a code for a report that never ran would announce an outcome it never had.
 //
-// Asserted over many attempts BECAUSE it is a race: one attempt passes half the time with the
-// decision left to chance, and a hundred does not.
-func TestTheReportIsNeverLaunchedIntoAnInterfaceThatHasAlreadyGone(t *testing.T) {
+// WHAT THIS DOES NOT ASSERT, and why: it does not assert which way the decision falls. The gate
+// in runStatus makes it deterministic ONCE Run has returned and barred is set, but a goroutine
+// that reaches the gate first legitimately runs; that is a scheduling window, not a coin flip,
+// and pinning a distribution is how a test becomes flaky. It was flaky, exactly once in 200
+// attempts under -race, before this was written down.
+func TestTheLaunchDecisionIsMadeExactlyOnceAndTheAnswerAgreesWithIt(t *testing.T) {
 	for i := 0; i < 200; i++ {
 		p := newFakeStatusProgram()
 		p.endAfterInit = true
 		ran := 0
-		d, _, _ := baseDeps()
+		d, out, _ := baseDeps()
 		code, err := runStatus(context.Background(), d, func(ctx context.Context, d verbs.Deps) int {
 			ran++
-			return 1
+			d.Progress(verbs.ProgressEvent{Stage: "status", Detail: "installation: 4f2ab9c1"})
+			return 3
 		}, p.make, time.Second)
-		if ran != 0 {
-			t.Fatalf("attempt %d: the report ran into an interface that had already returned", i)
-		}
-		if !errors.Is(err, ErrNotStarted) {
-			t.Fatalf("attempt %d: err %v, want ErrNotStarted — a report that never ran must say so,\n"+
-				"  or the dispatcher reports an outcome for something it never attempted", i, err)
-		}
-		if code != 0 {
-			t.Fatalf("attempt %d: code %d", i, code)
+		switch {
+		case ran > 1:
+			t.Fatalf("attempt %d: the report ran %d times", i, ran)
+		case ran == 1:
+			if errors.Is(err, ErrNotStarted) {
+				t.Fatalf("attempt %d: the report RAN and the runner said it never started — the\n"+
+					"  dispatcher would take that as licence to run it a second time", i)
+			}
+			if code != 3 {
+				t.Fatalf("attempt %d: the report returned 3 and the runner returned %d", i, code)
+			}
+			if !strings.Contains(out.String(), "installation: 4f2ab9c1") {
+				t.Fatalf("attempt %d: the report ran and its output reached neither the screen nor\n"+
+					"  the terminal: %q", i, out.String())
+			}
+		default:
+			if !errors.Is(err, ErrNotStarted) {
+				t.Fatalf("attempt %d: the report never ran and err is %v, not ErrNotStarted", i, err)
+			}
+			if code != 0 {
+				t.Fatalf("attempt %d: code %d for a report that never ran", i, code)
+			}
+			if out.String() != "" {
+				t.Fatalf("attempt %d: a report that never ran left output behind: %q", i, out.String())
+			}
 		}
 	}
 }
