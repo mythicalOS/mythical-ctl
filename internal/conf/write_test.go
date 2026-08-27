@@ -939,6 +939,21 @@ func TestFamilyCASAttemptTable(t *testing.T) {
 	if err := FamilyCAS(h, "MYTHICAL_NET", "n2", "n1", AttemptNone, nil, CASReport{}); err == nil {
 		t.Fatal("CAS accepted a core key")
 	}
+
+	// ...and it validates its VALUE and its ATTEMPT STATE, not only its key. Both refusals were
+	// implemented and unasserted. An invalid value written through the one door authorized to change
+	// mythical.conf would be a value no later reader can parse; an attempt state outside the two this
+	// core defines is a corrupt or hand-edited record, and folding it into "none" would present a
+	// migration that may ALREADY have written the file as a fresh write — the one situation the
+	// attempt field exists to tell apart.
+	h, _ = setup("")
+	if err := FamilyCAS(h, key, "not a path", "", AttemptNone, nil, CASReport{}); err == nil {
+		t.Fatal("CAS accepted a value the spec refuses")
+	}
+	h, _ = setup("")
+	if err := FamilyCAS(h, key, "/new", "", Attempt(99), nil, CASReport{}); err == nil {
+		t.Fatal("CAS accepted an attempt state this core does not define")
+	}
 }
 
 // TestFamilyCASNarratesWhatItDid pins the three lines this door says out loud.

@@ -1976,3 +1976,78 @@ func TestNoValueFromAProductConfReachesTheLaunch(t *testing.T) {
 		}
 	}
 }
+
+// TestTheReconcilersDidNothingNoteIsWiredToStderr is the WIRING half of the reconciler's two
+// informational verdicts, and the test the round-5 gate asked for.
+//
+// internal/bringup asserts that Reconcile CALLS its Note seam. Nothing asserted that this package
+// HANDS it one — so deleting the single `Note:` assignment in bringupDeps would have made the CLI
+// silently lose an operator-facing message while both the parity audit and the whole suite stayed
+// green. A seam nothing drives is a diagnostic nobody reads, and "the fix is one assignment away
+// from being inert with every test still green" is the same hazard this file already guards for the
+// probe wrapper, two tests up.
+//
+// STDERR, NOT STDOUT: these are notes, not output, and a caller parsing this verb's stdout must
+// never receive them.
+func TestTheReconcilersDidNothingNoteIsWiredToStderr(t *testing.T) {
+	r := newRig(t)
+	r.writeProduct("p1")
+	r.mintIdentity()
+
+	s, err := openSession(r.d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ident, ierr := s.l.IdentGet()
+	if ierr != nil {
+		t.Fatal(ierr)
+	}
+	bd, berr := s.bringupDeps(nil, ident)
+	if berr != nil {
+		t.Fatal(berr)
+	}
+	if bd.Note == nil {
+		t.Fatal("the bring-up sequence is handed no Note seam — the reconciler's two did-nothing verdicts go nowhere")
+	}
+	r.reset()
+	bd.Note("note: a reconciler verdict")
+	if got := r.errb.String(); !strings.Contains(got, "note: a reconciler verdict") {
+		t.Fatalf("the note did not reach stderr: %q", got)
+	}
+	if got := r.out.String(); strings.Contains(got, "a reconciler verdict") {
+		t.Fatalf("the note reached STDOUT, which callers parse: %q", got)
+	}
+}
+
+// TestBatchRefusesAVerbItDoesNotDriveAndAnEmptyBatch. Both refusals were implemented and
+// unasserted: deleting either left the suite green.
+//
+// A VERB OUTSIDE THE FIVE IS REFUSED WITH NOTHING ATTEMPTED — never a silent no-op over the whole
+// product list, which is how a mistyped verb over three products would report success having done
+// nothing to any of them. An EMPTY batch is a usage error for the same reason: exit 0 from a batch
+// that ran nothing tells a caller everything is installed.
+func TestBatchRefusesAVerbItDoesNotDriveAndAnEmptyBatch(t *testing.T) {
+	r := newRig(t)
+	r.writeProduct("p1")
+	r.mintIdentity()
+
+	if rc := Batch(context.Background(), r.d, "uninstall", []string{"p1"}); rc != cliio.ExitUsage {
+		t.Fatalf("a non-batchable verb: rc = %d, want 2\n%s", rc, r.said())
+	}
+	if !strings.Contains(r.said(), "not a batchable verb") {
+		t.Fatalf("no diagnostic naming the verb:\n%s", r.said())
+	}
+	if r.isMember("p1") {
+		t.Fatal("the refused batch ran anyway")
+	}
+	if len(r.fake.RequestLog()) != 0 {
+		t.Fatalf("the refusal reached the daemon: %v", r.fake.RequestLog())
+	}
+	r.reset()
+	if rc := Batch(context.Background(), r.d, "install", nil); rc != cliio.ExitUsage {
+		t.Fatalf("an empty batch: rc = %d, want 2\n%s", rc, r.said())
+	}
+	if !strings.Contains(r.said(), "needs at least one product") {
+		t.Fatalf("no diagnostic for the empty batch:\n%s", r.said())
+	}
+}

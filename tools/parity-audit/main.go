@@ -528,33 +528,64 @@ func parseInventory(rel string, content []byte) ([]claim, []malformed, []stray, 
 
 // lexAfter reports the block-comment and raw-string state after consuming one line.
 //
-// DELIBERATELY APPROXIMATE, AND IN A KNOWN DIRECTION. It is not a Go lexer: a backtick inside a line
-// comment, or `/*` inside a string, will move it. Every way it can be wrong makes it think it is
-// inside a comment or a string, which WIDENS the stray check and NARROWS what counts as a claim —
-// so the error is toward reporting too much, never toward accepting a claim that is really data.
-// Corpus membership is what keeps the widening quiet.
+// IT IS A SMALL GO LEXER, not a pattern match, and round 5 is why. The previous version treated any
+// `//` as a line comment and stopped scanning the line — so `const fixture = "http://" + ` + "`" + `
+// left inRaw false, and a `// PORTED:` line inside the raw literal that followed counted as real
+// coverage. A claim could be moved into data without changing any count or target and the audit
+// still exited 0.
+//
+// So the four contexts that can swallow a `//` are all tracked: interpreted strings, rune literals,
+// raw strings and block comments, with backslash escapes honoured in the two that have them. Where
+// it is still approximate it errs toward "inside something", which WIDENS the stray check and
+// NARROWS what counts as a claim — the safe direction, since a claim wrongly treated as data is
+// reported as a hidden claim rather than accepted.
 func lexAfter(inBlock, inRaw bool, line string) (bool, bool) {
+	inStr, inRune, esc := false, false, false
 	for i := 0; i < len(line); i++ {
+		c := line[i]
 		switch {
+		case esc:
+			esc = false
+		case inStr || inRune:
+			switch c {
+			case '\\':
+				esc = true
+			case '"':
+				if inStr {
+					inStr = false
+				}
+			case '\'':
+				if inRune {
+					inRune = false
+				}
+			}
 		case inRaw:
-			if line[i] == '`' {
+			if c == '`' {
 				inRaw = false
 			}
 		case inBlock:
-			if i+1 < len(line) && line[i] == '*' && line[i+1] == '/' {
+			if i+1 < len(line) && c == '*' && line[i+1] == '/' {
 				inBlock = false
 				i++
 			}
-		case line[i] == '`':
+		case c == '`':
 			inRaw = true
-		case i+1 < len(line) && line[i] == '/' && line[i+1] == '*':
+		case c == '"':
+			inStr = true
+		case c == '\'':
+			inRune = true
+		case i+1 < len(line) && c == '/' && line[i+1] == '*':
 			inBlock = true
 			i++
-		case i+1 < len(line) && line[i] == '/' && line[i+1] == '/':
-			// A line comment: nothing after it can open a block or a raw string.
+		case i+1 < len(line) && c == '/' && line[i+1] == '/':
+			// A REAL line comment: nothing after it can open a block or a raw string. Reached only
+			// in code context, which is the whole point — inside a string this branch is
+			// unreachable, and that is the defect this shape closes.
 			return inBlock, inRaw
 		}
 	}
+	// An interpreted string or rune literal cannot span lines in Go; only raw strings and block
+	// comments carry over, so the other two states are deliberately not returned.
 	return inBlock, inRaw
 }
 

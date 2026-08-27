@@ -1100,3 +1100,35 @@ func TestEndToEndCatchesASwappedManifestRowAfterTheCutover(t *testing.T) {
 		t.Fatalf("err = %v, want the digest pin to be what refuses", err)
 	}
 }
+
+// lexAfter is a small Go lexer, not a pattern match, and round 5 is why: it used to treat any `//`
+// as a line comment and stop scanning, so a `//` inside an ORDINARY string hid the backtick after it
+// and a raw literal on the next line was never entered. A real claim could then be moved into that
+// literal and still count as coverage.
+func TestLexAfterIsNotFooledByASlashInsideAString(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		line           string
+		inBlock, inRaw bool
+	}{
+		{"a URL in a string does not end the line", `const s = "http://" + ` + "`", false, true},
+		{"a plain raw-string opener", "x := `", false, true},
+		{"a raw string opened and closed", "x := `abc`", false, false},
+		{"a backtick inside an ordinary string is not a raw opener", `x := "a ` + "`" + ` b"`, false, false},
+		{"a real line comment stops the scan", "x := 1 // `", false, false},
+		{"a block comment opens", "/* hello", true, false},
+		{"an escaped quote does not end the string", `x := "a\" ` + "`" + ` b"`, false, false},
+		{"a rune literal holding a quote", `x := '"'` + " + `", false, true},
+	} {
+		gotBlock, gotRaw := lexAfter(false, false, tc.line)
+		if gotBlock != tc.inBlock || gotRaw != tc.inRaw {
+			t.Errorf("%s: lexAfter(%q) = block %v raw %v, want block %v raw %v",
+				tc.name, tc.line, gotBlock, gotRaw, tc.inBlock, tc.inRaw)
+		}
+	}
+	// ...and a raw string that opened on an earlier line stays open until its own backtick, whatever
+	// looks like a comment inside it.
+	if b, rr := lexAfter(false, true, `// PORTED: tests/unit/a.bats: "one" -> TestOne`); b || !rr {
+		t.Fatalf("a line inside a raw string closed it: block %v raw %v", b, rr)
+	}
+}
