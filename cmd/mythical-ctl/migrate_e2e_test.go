@@ -189,3 +189,67 @@ func mountsSource(t *testing.T, r *cliRig, container, source string) bool {
 	}
 	return false
 }
+
+// TestMigrateStorageOfAStoppedProductExpressesNoIntent is the other half of the rebuild seam's
+// contract: the replacement reads the desired state ALREADY RECORDED, and the migration does not
+// express one of its own.
+//
+// A MIGRATION IS NOT A START. An operator who stopped a product and then moved its storage did not
+// ask for it to come back up, and a replacement created as "running" would start it and live-verify
+// it — which is also forbidden for a product whose desired state is stopped. The observable
+// difference is the LIVE VERIFICATION: bringing a container up runs probe containers, and a
+// migration that preserved the recorded state runs none.
+func TestMigrateStorageOfAStoppedProductExpressesNoIntent(t *testing.T) {
+	r, _, base := migRig(t)
+	r.writeProduct("p1")
+	if rc := r.run(append([]string{"install", "p1"}, r.docArgs()...)...); rc != cliio.ExitOK {
+		t.Fatalf("install rc = %d\n%s", rc, r.said())
+	}
+	if rc := r.run(append([]string{"stop", "p1"}, r.docArgs()...)...); rc != cliio.ExitOK {
+		t.Fatalf("stop rc = %d\n%s", rc, r.said())
+	}
+	ident := identOf(t, r.home)
+	container, cerr := manifest.ContainerName(ident, "p1")
+	if cerr != nil {
+		t.Fatal(cerr)
+	}
+	probesBefore := probeLaunches(r)
+
+	dest := filepath.Join(base, "p1-state")
+	args := append([]string{"migrate-storage", "p1", "state", "--to-bind", dest}, r.docArgs()...)
+	if rc := r.run(args...); rc != cliio.ExitOK {
+		t.Fatalf("migrate-storage rc = %d\n%s", rc, r.said())
+	}
+	// The data moved and the container was rebuilt onto it...
+	canon, cnerr := runtime.Canon(dest)
+	if cnerr != nil {
+		t.Fatal(cnerr)
+	}
+	if !mountsSource(t, r, container, canon) {
+		t.Fatalf("the replacement container does not mount %s", canon)
+	}
+	// ...and it is still STOPPED, having never been brought up.
+	info, ierr := r.fake.Client().ContainerInspect(t.Context(), container)
+	if ierr != nil {
+		t.Fatal(ierr)
+	}
+	if info.Running {
+		t.Fatalf("migrating a stopped product started it")
+	}
+	if got := probeLaunches(r); got != probesBefore {
+		t.Fatalf("the migration live-verified a stopped product (%d probe launches, was %d) — the\n"+
+			"  replacement expressed an intent instead of preserving the recorded one", got, probesBefore)
+	}
+}
+
+// probeLaunches counts the live-verification probes run so far. A container that is brought UP is
+// live-verified; one that is created stopped is not.
+func probeLaunches(r *cliRig) int {
+	n := 0
+	for _, l := range r.fake.HelperLaunches() {
+		if len(l.Cmd) > 0 && (l.Cmd[0] == "selfcheck" || l.Cmd[0] == "resolve") {
+			n++
+		}
+	}
+	return n
+}
