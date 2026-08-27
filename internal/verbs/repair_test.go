@@ -1485,3 +1485,351 @@ func bumpSchema(t *testing.T, path, to string) {
 		t.Fatal(err)
 	}
 }
+
+// --- guards the frozen bats suite does not exercise ---------------------------------------------
+//
+// THESE CLAIM NO BATS TEST. Every one of them pins a refusal lib/repair.sh states and its own suite
+// leaves uncovered: each was found by reverting the guard in isolation and watching the whole suite
+// stay green. They are the same class as the tests above — "could not ask" must never become an
+// answer — and their mutations are killed here rather than noted as fine.
+
+// listFailer wraps the provenance read seam and makes ONE class's LISTING unanswerable, after a
+// given number of successful answers.
+type listFailer struct {
+	prov.Objects
+	class prov.Class
+	after int
+	seen  *int
+}
+
+func (f listFailer) Names(ctx context.Context, class prov.Class) ([]string, error) {
+	if class == f.class {
+		*f.seen++
+		if *f.seen > f.after {
+			return nil, errUnaskable
+		}
+	}
+	return f.Objects.Names(ctx, class)
+}
+
+func failListAfter(t *testing.T, class prov.Class, after int) {
+	t.Helper()
+	seen := 0
+	stageReads(t, func(rd repairSeams) repairSeams {
+		rd.objs = listFailer{Objects: rd.objs, class: class, after: after, seen: &seen}
+		return rd
+	})
+}
+
+// stateFailer wraps the observed-state seam and makes ONE container unanswerable after a given
+// number of successful answers.
+type stateFailer struct {
+	state.Objects
+	container string
+	after     int
+	seen      *int
+}
+
+func (f stateFailer) State(ctx context.Context, container string) (bool, string, error) {
+	if container == f.container {
+		*f.seen++
+		if *f.seen > f.after {
+			return false, "", errUnaskable
+		}
+	}
+	return f.Objects.State(ctx, container)
+}
+
+func TestCandidateDiscoveryFailsClosedOnAnUnreadableListing(t *testing.T) {
+	// A listing that could not be taken is not an empty daemon. Reading the two as one reports
+	// FEWER candidates than exist — and a repair that sees one candidate where there were two adopts
+	// an identity over another installation's objects, or offers to reinitialize over them.
+	r := newRepairRig(t)
+	r.labelledVolume("v1", "n1", "insta")
+	failListAfter(t, prov.ClassVolume, 0)
+
+	got, err := Candidates(context.Background(), r.d)
+	if err == nil {
+		t.Fatalf("candidate discovery answered %v over a listing it could not take", got)
+	}
+	mustContain(t, err.Error(), "Refusing to report a partial list")
+}
+
+func TestZeroCandidatesRefusesAnIdentityNothingCarries(t *testing.T) {
+	// Naming an identity no object carries is not a request to mint it. Falling through to the
+	// reinitialize branch would answer a specific question ("adopt insta") with a different action.
+	r := newRepairRig(t)
+
+	if rc := r.repair("insta"); rc == cliio.ExitOK {
+		t.Fatalf("repair adopted an identity nothing carries\n%s", r.said())
+	}
+	r.mustSay("no runtime object carries identity")
+	r.mustNotSay("reinitializ")
+	if id := r.identOrEmpty(); id != "" {
+		t.Fatalf("identity %q was minted by a refused repair", id)
+	}
+}
+
+func TestReinitializationRequiresConfirmation(t *testing.T) {
+	// Reinitialization resets every trust floor and mints an identity nothing existing carries. It
+	// is offered, never taken.
+	r := newRepairRig(t)
+	r.setEnv("MI_CONFIRM", "no")
+
+	if rc := r.repair(); rc == cliio.ExitOK {
+		t.Fatalf("this installation was reinitialized without confirmation\n%s", r.said())
+	}
+	r.mustSay("not confirmed")
+	if id := r.identOrEmpty(); id != "" {
+		t.Fatalf("identity %q was minted without confirmation", id)
+	}
+}
+
+func TestRebuildFailsClosedOnAnUnreadableListing(t *testing.T) {
+	// The ledger is already reset here, so a listing read as empty does not leave provenance stale —
+	// it leaves a whole CLASS of objects missing from the rebuild, permanently, while the run reports
+	// success.
+	r := newRepairRig(t)
+	r.labelledVolume("v1", "n1", "insta")
+	// Candidate discovery takes the volume listing once; the rebuild loop's is the second.
+	failListAfter(t, prov.ClassVolume, 1)
+
+	if rc := r.repair("insta"); rc == cliio.ExitOK {
+		t.Fatalf("the rebuild reported success over a listing it could not take\n%s", r.said())
+	}
+	r.mustSay("cannot be fully rebuilt")
+	if _, err := prov.Find(r.ledgerNow(), prov.ClassVolume, "v1"); !errors.Is(err, ledger.ErrAbsentRecord) {
+		t.Fatalf("provenance for v1 exists after a refused rebuild: %v", err)
+	}
+}
+
+func TestRebuildFailsClosedOnAnUnreadableNonce(t *testing.T) {
+	// A nonce that could not be READ is not an absent nonce and is certainly not a different one.
+	// Recording provenance with the wrong nonce — or none — is exactly the misidentification a nonce
+	// exists to prevent (§6a).
+	r := newRepairRig(t)
+	r.labelledVolume("v1", "n1", "insta")
+	failLabelAfter(t, prov.ClassVolume, "v1", prov.LabelNonce, 0)
+
+	if rc := r.repair("insta"); rc == cliio.ExitOK {
+		t.Fatalf("an object was adopted with a nonce nobody could read\n%s", r.said())
+	}
+	r.mustSay("its nonce could not be read")
+	if _, err := prov.Find(r.ledgerNow(), prov.ClassVolume, "v1"); !errors.Is(err, ledger.ErrAbsentRecord) {
+		t.Fatalf("provenance was written for an unreadable nonce: %v", err)
+	}
+}
+
+func TestRebuildFailsClosedOnAnUnreadableNetworkID(t *testing.T) {
+	// A network is recorded BY its id (§6a). There is nothing to record without one, and recording
+	// an empty one names a network that does not exist — a record every later authority check would
+	// resolve to nothing.
+	r := newRepairRig(t)
+	r.labelledNetwork("netA", "nA", "insta")
+	stageReads(t, func(rd repairSeams) repairSeams {
+		rd.nets = netIDFailer{Objects: rd.nets, ref: "netA"}
+		return rd
+	})
+
+	if rc := r.repair("insta"); rc == cliio.ExitOK {
+		t.Fatalf("a network was recorded with an id nobody could read\n%s", r.said())
+	}
+	r.mustSay("its id could not be read")
+	if _, err := prov.Find(r.ledgerNow(), prov.ClassNetwork, "netA"); !errors.Is(err, ledger.ErrAbsentRecord) {
+		t.Fatalf("provenance was written for a network with no id: %v", err)
+	}
+}
+
+// netIDFailer makes ONE network reference unresolvable — never engine.ErrAbsent, which is the
+// ANSWER "no such network".
+type netIDFailer struct {
+	netref.Objects
+	ref string
+}
+
+func (f netIDFailer) NetworkID(ctx context.Context, ref string) (string, error) {
+	if ref == f.ref {
+		return "", errUnaskable
+	}
+	return f.Objects.NetworkID(ctx, ref)
+}
+
+func TestVerifyLoopNeverClearsFromAnUnreadObservation(t *testing.T) {
+	// A container that could not be asked whether it is running is not a container that is not
+	// running. Its outstanding check is left exactly as recorded — never cleared on an unread state
+	// — and the rebuild as a whole still completes.
+	r := newRepairRig(t)
+	net := r.labelledNetwork("netA", "nA", "insta")
+	r.productContainer("c1", net, "p1", "insta", "nc1")
+	r.startNamed("c1")
+	// The rebuild's own observation is the first; the verify loop's is the second.
+	seen := 0
+	stageReads(t, func(rd repairSeams) repairSeams {
+		rd.state = stateFailer{Objects: rd.state, container: "c1", after: 1, seen: &seen}
+		return rd
+	})
+
+	r.mustRepair("insta")
+	r.mustSay("could not be asked whether it is running")
+	if checks := r.outstanding("c1"); len(checks) != 1 {
+		t.Fatalf("outstanding = %v, want the alias check still owed — it was cleared on an unread state", checks)
+	}
+}
+
+func TestNetreconstructionFailsClosedOnUnreadableAttachments(t *testing.T) {
+	// A container that may still be on a DIFFERENT network cannot be ruled out on an unanswered
+	// question. Recording a clean reference over it is how the ledger ends up naming a network the
+	// fleet is split from, with every product reporting healthy.
+	r := newRepairRig(t)
+	net := r.operatorNetwork("opnet")
+	_ = net
+	r.familyConf("MYTHICAL_NET=opnet\n")
+	r.productContainer("c1", r.labelledNetwork("netA", "nA", "insta"), "p1", "insta", "nc1")
+	// The rebuild's desired-state block reads the attachments first; the reconstruction's is second.
+	seen := 0
+	stageReads(t, func(rd repairSeams) repairSeams {
+		rd.live = attachmentFailerAfter{Objects: rd.live, container: "c1", after: 1, seen: &seen}
+		return rd
+	})
+
+	if rc := r.repair("insta"); rc == cliio.ExitOK {
+		t.Fatalf("a reference was recorded over a container whose attachments could not be read\n%s", r.said())
+	}
+	// The RECONSTRUCTION's own message, not the desired-state block's — they read the same
+	// attachments and both refuse, so asserting on wording they share would pass either way and
+	// prove nothing about which read was pinned.
+	r.mustSay("cannot be ruled out on an")
+	if _, err := netref.RefGet(r.ledgerNow()); !errors.Is(err, netref.ErrNoReference) {
+		t.Fatalf("a reference was recorded anyway: %v", err)
+	}
+}
+
+type attachmentFailerAfter struct {
+	bringup.Objects
+	container string
+	after     int
+	seen      *int
+}
+
+func (f attachmentFailerAfter) Attachments(ctx context.Context, container string) ([]bringup.Attachment, error) {
+	if container == f.container {
+		*f.seen++
+		if *f.seen > f.after {
+			return nil, errUnaskable
+		}
+	}
+	return f.Objects.Attachments(ctx, container)
+}
+
+func TestEnteringTheMigrationRequiresConfirmation(t *testing.T) {
+	// Entering the phased migration writes a reference the ledger did not have and an intent that
+	// authorizes a later 'net rebind' to move the whole fleet. The reset gate above it is confirmed;
+	// this one is a SECOND decision and is asked separately.
+	r := newRepairRig(t)
+	src := r.operatorNetwork("oldnet")
+	r.productContainer("c1", src, "p1", "insta", "nc1")
+	r.operatorNetwork("opnet")
+	r.familyConf("MYTHICAL_NET=opnet\n")
+	// Yes to the trust-floor reset, no to the migration: the two gates are distinct questions, and a
+	// blanket MI_CONFIRM=no could not tell them apart.
+	r.d.Confirm = func(prompt string) bool { return !strings.Contains(prompt, "phased network migration") }
+
+	if rc := r.repair("insta"); rc == cliio.ExitOK {
+		t.Fatalf("the migration was entered without confirmation\n%s", r.said())
+	}
+	r.mustSay("not confirmed. Nothing recorded")
+	l := r.ledgerNow()
+	if _, err := netref.MigGet(l); !errors.Is(err, netref.ErrNoMigration) {
+		t.Fatalf("a migration intent was recorded without confirmation: %v", err)
+	}
+	if _, err := netref.RefGet(l); !errors.Is(err, netref.ErrNoReference) {
+		t.Fatalf("a reference was recorded without confirmation: %v", err)
+	}
+}
+
+func TestNetRebindFreshRequiresConfirmation(t *testing.T) {
+	// A silent rebind is how a container gets joined to a network you did not intend.
+	r := newRepairRig(t)
+	r.mintIdentity()
+	r.operatorNetwork("opnet")
+	r.familyConf("MYTHICAL_NET=opnet\n")
+	r.setEnv("MI_CONFIRM", "no")
+
+	if rc := NetRebind(context.Background(), r.d); rc == cliio.ExitOK {
+		t.Fatalf("a fresh rebind ran without confirmation\n%s", r.said())
+	}
+	r.mustSay("not confirmed")
+	if _, err := netref.RefGet(r.ledgerNow()); !errors.Is(err, netref.ErrNoReference) {
+		t.Fatalf("a reference was recorded by a refused rebind: %v", err)
+	}
+}
+
+func TestNetRebindRefusesWithNoConfiguredNetwork(t *testing.T) {
+	// MYTHICAL_NET unset means there is no operator-supplied network to rebind ONTO — an answer.
+	// mythical.conf that could not be READ is not that answer, and taking a fleet-moving action on
+	// either would be acting on a question nobody asked.
+	r := newRepairRig(t)
+	r.mintIdentity()
+
+	if rc := NetRebind(context.Background(), r.d); rc == cliio.ExitOK {
+		t.Fatalf("a rebind ran with no configured network\n%s", r.said())
+	}
+	r.mustSay("MYTHICAL_NET is not set")
+}
+
+func TestAbandonIntentRefusesAMalformedInvocation(t *testing.T) {
+	// A blank class or name names nothing, and a grace period that is not a count of seconds fails
+	// OPEN in the reference's own comparison — every intent becomes immediately abandonable. Both
+	// refuse before the daemon is asked anything.
+	r := newRepairRig(t)
+	r.openNetworkIntent("net1")
+	before := len(r.fake.RequestLog())
+
+	for _, c := range [][2]string{{"", "net1"}, {"network", ""}} {
+		if rc := AbandonIntent(context.Background(), r.d, c[0], c[1]); rc != cliio.ExitUsage {
+			t.Fatalf("AbandonIntent(%q, %q) rc = %d, want %d (usage)", c[0], c[1], rc, cliio.ExitUsage)
+		}
+	}
+	r.setEnv("MI_INTENT_GRACE", "not-a-number")
+	if rc := AbandonIntent(context.Background(), r.d, "network", "net1"); rc == cliio.ExitOK {
+		t.Fatalf("an intent was abandoned under an unreadable grace period\n%s", r.said())
+	}
+	r.mustSay("not a number of seconds")
+	if _, err := intent.Find(r.ledgerNow(), prov.ClassNetwork, "net1"); err != nil {
+		t.Fatalf("the intent was dropped by a malformed invocation: %v", err)
+	}
+	if after := r.fake.RequestLog(); len(after) != before {
+		t.Fatalf("a malformed invocation reached the daemon: %v", after[before:])
+	}
+}
+
+func TestUnreadableLedgerPermissionsAreNeverReadAsCorruption(t *testing.T) {
+	// A permissions problem is an operational fact about THIS PROCESS, not evidence about the
+	// ledger's content — the bytes underneath may be perfectly valid. Nothing is touched and nothing
+	// is moved, which is the only honest answer to a question we structurally cannot ask.
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: every file is readable, so the refusal is unreachable")
+	}
+	r := newRepairRig(t)
+	r.mintIdentity()
+	before := readFile(t, r.ledgerPath())
+	if err := os.Chmod(r.ledgerPath(), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(r.ledgerPath(), 0o600) })
+
+	rc := r.repair(reinitialize)
+	if rc == cliio.ExitOK {
+		t.Fatalf("repair ran over a ledger it could not read at all\n%s", r.said())
+	}
+	r.mustSay("not readable by this process")
+	if sibs := r.corruptSiblings(); len(sibs) != 0 {
+		t.Fatalf("a .corrupt.* sibling was created for a permissions problem: %v", sibs)
+	}
+	if err := os.Chmod(r.ledgerPath(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if after := readFile(t, r.ledgerPath()); after != before {
+		t.Fatalf("the ledger was rewritten:\nbefore: %s\nafter:  %s", before, after)
+	}
+}
