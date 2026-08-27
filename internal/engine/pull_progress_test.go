@@ -110,6 +110,32 @@ func TestImagePullOneRecordCarryingBoth(t *testing.T) {
 	}
 }
 
+// TestImagePullIgnoresARecordWithNoStatus. The daemon emits records that carry only a
+// progressDetail, with no status at all; narrating those would put empty lines on screen for every
+// tick of a pull. The shared fake never produces one, which is why this needs its own server.
+func TestImagePullIgnoresARecordWithNoStatus(t *testing.T) {
+	c := pullServer(t, []map[string]string{
+		{"status": "Pulling from reg.example/img"},
+		{"progress": "1/2"},
+		{},
+		{"status": "Downloaded newer image"},
+	})
+	m, _ := newMutator(t, c)
+	var got []string
+	m.PullProgress = func(s string) { got = append(got, s) }
+	if err := m.ImagePull(context.Background(), "reg.example/img:v1"); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("narrated %q, want only the two records that carry a status", got)
+	}
+	for _, line := range got {
+		if line == "" || strings.HasPrefix(line, " ") {
+			t.Fatalf("a statusless record was narrated as %q", line)
+		}
+	}
+}
+
 // pullServer serves one canned image-create stream over a unix socket and returns a client for it.
 func pullServer(t *testing.T, records []map[string]string) *engine.Client {
 	t.Helper()
