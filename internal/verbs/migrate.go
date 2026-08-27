@@ -310,7 +310,19 @@ func (r *rebuilder) Prepare(ctx context.Context, l *ledger.Ledger, product, cont
 	if berr != nil {
 		return nil, berr
 	}
-	return &replacement{s: s, pc: pc, cfg: cfg, bd: bd}, nil
+	// AND SO IS THE REPLACEMENT'S OWN NONCE. Minting one is fallible — it reads the system's
+	// entropy source — and leaving it to the create makes it the LAST fallible step, on the far
+	// side of the removal, which is precisely the shape the rest of this function exists to
+	// eliminate. The bring-up mints exactly one per run (the write-ahead intent's, recorded ahead
+	// of the container that carries it), so pre-minting hands it the same value at the same
+	// moment, decided earlier. (Codex gate round 4.)
+	nonce, nerr := intent.NonceNew()
+	if nerr != nil {
+		return nil, fmt.Errorf("verbs: the replacement container's nonce could not be minted, so nothing was\n"+
+			"  removed — the old container is still there and the migration stays at phase 7: %w", nerr)
+	}
+	bd.NewNonce = func() (string, error) { return nonce, nil }
+	return &replacement{s: s, pc: pc, cfg: cfg, bd: bd, nonce: nonce}, nil
 }
 
 // image settles WHICH image the replacement runs.
@@ -347,7 +359,10 @@ type replacement struct {
 	pc  *productContext
 	cfg runtime.LaunchConfig
 	// bd is the bring-up sequence's dependencies, ASSEMBLED IN Prepare — see the note there.
-	bd        bringup.Deps
+	bd bringup.Deps
+	// nonce is the replacement's own, MINTED IN Prepare for the same reason, and the value bd's
+	// mint hands back.
+	nonce     string
 	discarded bool
 }
 

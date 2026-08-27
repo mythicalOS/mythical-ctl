@@ -510,12 +510,18 @@ func TestPrepareBuildsTheBringUpDependenciesBeforeTheRemoval(t *testing.T) {
 	case rp.bd.NewNonce == nil, rp.bd.Now == nil:
 		t.Fatal("Prepare left the nonce mint or the clock to be built after the irreversible removal")
 	}
-	// AND THE PREPARED SET IS WHAT THE CREATE USES. Building them early and then ignoring them
-	// would satisfy every assertion above while changing nothing, and on a healthy rig a late
-	// rebuild SUCCEEDS — so no outcome distinguishes the two. The prepared set is therefore given
-	// a nonce mint of its own, and the nonce a bring-up mints is stamped on the container it
-	// creates as a provenance label: reading it back says which set was used.
-	rp.bd.NewNonce = func() (string, error) { return "nfixtureprepared", nil }
+	// THE NONCE IS MINTED HERE TOO, and it is the LAST fallible step of working out what to build.
+	// Minting reads the system entropy source; left to the create it would fire on the far side of
+	// the removal, which is the one shape this split exists to eliminate.
+	if rp.nonce == "" {
+		t.Fatal("Prepare left the replacement's nonce to be minted after the irreversible removal")
+	}
+	// AND THE PREPARED SET IS WHAT THE CREATE USES. Building it early and then ignoring it would
+	// satisfy every assertion above while changing nothing, and on a healthy rig a late rebuild
+	// SUCCEEDS — so no outcome distinguishes the two. What does is the nonce: a bring-up stamps
+	// the one it was handed onto the container it creates, as a provenance label, so reading it
+	// back off the replacement says which set was used. Nothing is substituted to make this
+	// legible — the value asserted is the real prepared one.
 	if err := s.rt.ContainerRemove(context.Background(), c1); err != nil {
 		t.Fatal(err)
 	}
@@ -528,12 +534,13 @@ func TestPrepareBuildsTheBringUpDependenciesBeforeTheRemoval(t *testing.T) {
 	}
 	found := false
 	for _, v := range info.Labels {
-		if v == "nfixtureprepared" {
+		if v == rp.nonce {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("the replacement was created from dependencies the create built for itself, not from\n"+
-			"  the ones Prepare assembled while the old container was still standing. Labels: %v", info.Labels)
+		t.Fatalf("the replacement does not carry the nonce Prepare minted (%q) — it was created from\n"+
+			"  dependencies the create built for itself, on the far side of the removal. Labels: %v",
+			rp.nonce, info.Labels)
 	}
 }
