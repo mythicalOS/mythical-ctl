@@ -1137,19 +1137,40 @@ func runStatus(ctx context.Context, base verbs.Deps, fn VerbFunc, mk func(Status
 
 			p.Send(statusRunMsg{Gen: gen, Msg: statusStartMsg{}})
 			code := fn(vctx, d)
+			// SAMPLED HERE, ON THE INSTRUCTION AFTER THE RUN RETURNS, and not further down.
+			// This is the question "was this run interrupted", and the only honest evidence for
+			// it is the context's state at the moment the run ended. Asking it after the three
+			// Close calls below asks a LATER question — "has the interface gone by now" — which
+			// a run that finished perfectly can answer yes to, and then a complete report is
+			// thrown away in favour of an older one.
+			//
+			// Moving this line down is a mutation no test kills: the window it opens is three
+			// calls wide and closing an interface inside it cannot be arranged from a test. It is
+			// here because the question it asks is the right one, not because an assertion forces
+			// it to be.
+			interrupted := vctx.Err() != nil
 			// Trailing partial lines join the record before the run is published.
 			_ = outW.Close()
 			_ = errW.Close()
 			b.Close()
-			// A CANCELLED RUN DOES NOT REPLACE A COMPLETED ONE. Cancellation makes the report
+			// AN INTERRUPTED RUN DOES NOT REPLACE A COMPLETED ONE. Cancellation makes this report
 			// DEGRADE rather than stop: its reads fail, and a failed read is rendered "(unknown)"
 			// or "UNREADABLE" — which is the report's word for a question that could not be
-			// asked, not for one that was interrupted. Replaying that over a report that finished
+			// ASKED, not for one that was interrupted. Replaying that over a report that finished
 			// would leave the operator's terminal holding a torn diagnostic that reads like a
 			// diagnosis. The first run is exempt: a partial report is still better than none, and
 			// withholding it would leave `ran` false, which tells the dispatcher the report never
 			// ran and licenses it to run the whole thing again.
-			if vctx.Err() == nil || last.b == nil {
+			//
+			// STATED RESIDUAL, and its DIRECTION is the point. Sampling cannot be exact: a
+			// cancellation landing between the run returning and the line above is not seen, and
+			// one landing just before it marks a run that in fact completed. The first mistake
+			// publishes a report that finished — which is correct, because a cancellation after
+			// the run ended cannot have touched its record. The second replays the previous
+			// COMPLETE report instead of a newer complete one: stale, and the operator saw it on
+			// screen. Neither mistake replays a torn report as though it were the report, which
+			// is the only one that would mislead.
+			if !interrupted || last.b == nil {
 				last = outcome{code: code, ran: true, b: b}
 			}
 			p.Send(statusRunMsg{Gen: gen, Msg: statusDoneMsg{Code: code}})

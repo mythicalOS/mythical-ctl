@@ -1355,7 +1355,14 @@ func TestTheLaunchDecisionIsMadeExactlyOnceAndTheAnswerAgreesWithIt(t *testing.T
 // pretending otherwise is what made that version flaky.
 func TestTheLaunchGateKeepsTheReportOutOfADeadInterface(t *testing.T) {
 	const attempts = 300
-	const ceiling = attempts / 5 // 20%; measured ~1% with the gate, 100% without.
+	// THE CEILING IS DELIBERATELY FAR ABOVE THE MEASURED RATE. A threshold near it would be
+	// measuring the scheduler rather than the gate, and would fail a correct implementation on a
+	// machine that schedules differently. Measured on this code under -race: 5 of 500 launched
+	// with the gate, 500 of 500 with it removed. Half is an enormous margin over the first and
+	// still catches the second, which is the only reason a statistical assertion is defensible
+	// here at all — what the gate is FOR has no deterministic test, because the two signals it
+	// arbitrates become true at the same moment by construction.
+	const ceiling = attempts / 2
 	launched := 0
 	for i := 0; i < attempts; i++ {
 		p := newFakeStatusProgram()
