@@ -1115,19 +1115,45 @@ func TestPublishedPortsBindLoopbackOnly(t *testing.T) {
 }
 
 func TestHostNetworkModeIsRejected(t *testing.T) {
-	// A network the family cannot be placed on is a refusal, not a fallback to the installer's own:
-	// silently taking that branch would join the family to a network nobody named.
+	// MYTHICAL_NET names a network to ATTACH to. It is never a network MODE, and the two halves of
+	// that are asserted separately because they fail differently.
 	r := newRig(t)
 	r.writeProduct("p1")
 	r.mintIdentity()
 	r.writeFile("mythical.conf", "MYTHICAL_TELEMETRY_KEY=tk\nMYTHICAL_NET=host\n")
 
+	// (a) With nothing of that name to attach to, the install REFUSES. It does not fall back to the
+	// installer's own network — silently taking that branch would join the family to a network
+	// nobody named.
 	if rc := r.install("p1"); rc != cliio.ExitFail {
 		t.Fatalf("rc = %d, want 1\n%s", rc, r.said())
 	}
 	r.mustSay(`no network named "host" exists`)
 	if r.containerExists(r.container("p1")) {
 		t.Fatal("a container was created despite the unusable network")
+	}
+
+	// (b) And when a network of that name DOES exist, it is joined as an ordinary network, by id,
+	// with the product's alias on it — never as a namespace the container shares. That is the half
+	// the name of this case is really about, and in this tree it holds structurally: the launch
+	// spec cannot express a network mode at all, only an attachment. Asserting it means the day
+	// someone adds a mode there, this fails.
+	r.reset()
+	want := r.createNetwork("host")
+	if rc := r.install("p1"); rc != cliio.ExitOK {
+		t.Fatalf("rc = %d, want 0 once the named network exists\n%s", rc, r.said())
+	}
+	info, err := r.c.ContainerInspect(context.Background(), r.container("p1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(info.Networks) != 1 {
+		t.Fatalf("the container has %d attachments, want exactly 1 — a shared namespace has none", len(info.Networks))
+	}
+	for _, ep := range info.Networks {
+		if ep.NetworkID != want {
+			t.Fatalf("attached to %q, want the operator's network %q", ep.NetworkID, want)
+		}
 	}
 }
 
@@ -1139,17 +1165,62 @@ func TestConcurrentInstallsAreSerialized(t *testing.T) {
 	r.writeProduct("p1")
 	r.writeProduct("p2")
 
+	// THE OVERLAP IS FORCED, not hoped for. Left to the scheduler the two installs can run one
+	// after the other, and then this passes with no locking at all — which is the whole thing it
+	// claims to prove.
+	//
+	// The barrier is the PROGRESS SEAM, and it has to be: the first install's last narration is
+	// emitted while it still holds the family lock (the release is deferred), and it is emitted
+	// from the verb rather than from inside the fake daemon's dispatcher — so the contender can
+	// still reach the daemon while it is parked here. A barrier inside the helper fixture instead
+	// deadlocks: the fake holds its own mutex across a helper's start, so the contender's very
+	// first daemon call would block behind it and never get as far as the lock.
+	holding := make(chan struct{})
+	contended := make(chan struct{})
+	var once sync.Once
+
+	var rc1, rc2 int
 	var wg sync.WaitGroup
-	for _, p := range []string{"p1", "p2"} {
-		wg.Add(1)
-		go func(product string) {
-			defer wg.Done()
-			d := r.d
-			d.Stdout, d.Stderr = nil, nil // the buffers are not concurrency-safe
-			_ = Install(context.Background(), d, InstallOpts{Product: product})
-		}(p)
-	}
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		d := r.d
+		d.Stdout, d.Stderr = nil, nil // the buffers are not concurrency-safe
+		d.Progress = func(ProgressEvent) {
+			once.Do(func() {
+				close(holding)
+				select {
+				case <-contended:
+				case <-time.After(30 * time.Second):
+				}
+			})
+		}
+		rc1 = Install(context.Background(), d, InstallOpts{Product: "p1"})
+	}()
+	go func() {
+		defer wg.Done()
+		defer close(contended)
+		select {
+		case <-holding:
+		case <-time.After(30 * time.Second):
+			return
+		}
+		d := r.d
+		d.Stdout, d.Stderr = nil, nil
+		rc2 = Install(context.Background(), d, InstallOpts{Product: "p2"})
+	}()
 	wg.Wait()
+
+	// The winner completed; the contender REFUSED, and it refused cleanly rather than waiting.
+	if rc1 != cliio.ExitOK {
+		t.Fatalf("the install holding the lock returned %d, want 0", rc1)
+	}
+	if rc2 != cliio.ExitFail {
+		t.Fatalf("the contender returned %d, want 1 — it did not refuse", rc2)
+	}
+	if r.isMember("p2") {
+		t.Fatal("the contender wrote state despite being refused")
+	}
 
 	ident := r.ident()
 	any := false
@@ -1188,8 +1259,8 @@ func TestImageOverrideRunsWhatItRecords(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Image == digestRef("p1") {
-		t.Fatal("the container runs the manifest's image — the override was recorded but not run")
+	if info.Image != override {
+		t.Fatalf("the container runs %q, not the overridden %q", info.Image, override)
 	}
 	// And it is recorded, so a later recreate rebuilds from the same reference.
 	rec, ferr := r.ledgerNow().Find("forced", "key", "p1:image-override")
@@ -1210,8 +1281,8 @@ func TestImageOverrideRunsWhatItRecords(t *testing.T) {
 	if aerr != nil {
 		t.Fatal(aerr)
 	}
-	if after.Image != info.Image {
-		t.Fatalf("recreate rebuilt from %q, not the recorded override %q", after.Image, info.Image)
+	if after.Image != override {
+		t.Fatalf("recreate rebuilt from %q, not the recorded override %q", after.Image, override)
 	}
 
 	// A plain re-install CLEARS it: with no --image the manifest's image is what runs, so a record

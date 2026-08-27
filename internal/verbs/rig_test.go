@@ -561,6 +561,27 @@ func (r *rig) createStrayVolume(name string) {
 	})
 }
 
+// createNetwork stands an operator-supplied network at a name, out of band, and returns its id.
+func (r *rig) createNetwork(name string) string {
+	r.t.Helper()
+	var id string
+	r.withLock(func(h famlock.Held, _ ledger.Store) {
+		rt, err := runtime.New(h, r.c)
+		if err != nil {
+			r.t.Fatal(err)
+		}
+		p, perr := engine.NewProvenance("ioperatorx", "noperatorx")
+		if perr != nil {
+			r.t.Fatal(perr)
+		}
+		id, err = rt.NetworkCreate(context.Background(), name, p)
+		if err != nil {
+			r.t.Fatal(err)
+		}
+	})
+	return id
+}
+
 // removeObjects deletes containers and volumes out of band, by name — the runtime-side half of the
 // fixtures that need the ledger to say something about an object the daemon no longer holds.
 func (r *rig) removeObjects(names ...string) {
