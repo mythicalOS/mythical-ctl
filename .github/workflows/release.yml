@@ -95,9 +95,15 @@ jobs:
       # Public-safety gate — same intent as CI's hygiene job. A tag can be pushed
       # to a commit that never saw a PR, so the release must re-run it or a banned
       # internal name could be published. docs-bar.yml does NOT cover this: it
-      # triggers on pull_request and push to main only, never on tags. vendor/
+      # triggers on pull_request and push to main only, never on tags.
+      #
       # third_party/ (the bats submodule, checked out for the test step) is
-      # third-party and excluded, matching CI's plain-checkout hygiene scope.
+      # excluded as third-party text, matching CI's plain-checkout hygiene scope.
+      # It is excluded by that name and not by vendor/: the submodule moved when
+      # the Go module arrived, because a directory named vendor/ puts the go
+      # command into vendor mode. The old exclusion had stopped naming anything
+      # that exists, which would have put upstream bats text through a gate
+      # written for this project's own prose.
       #
       # The term list is sourced from the organisation secret DOCS_DENY_PATTERN,
       # never written here — see the long note in ci.yml for why an inline,
@@ -106,12 +112,6 @@ jobs:
       # No fork-PR escape hatch here, deliberately: this workflow only ever runs
       # on a tag push in this repository, where the secret is always available.
       # A release must be strictly fail-closed.
-      #
-      # third_party/ is excluded, not vendor/: the bats submodule moved there
-      # when the Go module arrived (a directory named vendor/ puts the go
-      # command into vendor mode). The old exclusion had stopped naming
-      # anything that exists, which would have put upstream bats text through a
-      # gate written for this project's own prose.
       - name: Genericize gate (banned internal names)
         env:
           DENY: ${{ secrets.DOCS_DENY_PATTERN }}
@@ -234,6 +234,17 @@ jobs:
           done
           [ "$missing" -eq 0 ] || { echo "::error::required health file(s) missing from the tree"; exit 1; }
 
+      # The bash bundler (tools/bundle.sh) is no longer built here: it produces
+      # the artifact this release stopped publishing. It stays gated on every
+      # push by ci.yml's test job for as long as the bash tree exists.
+      #
+      # tests/smoke.sh above still runs against the bash entrypoint rather than
+      # against a built binary. Re-pointing it belongs with the cutover, because
+      # its version-shape assertion rejects a prerelease suffix and that
+      # assertion cannot be edited before then; what the published artifact is
+      # held to here is release-verify's exec round-trip, which requires the
+      # exact version line from both --version and -v.
+      #
       # THE PUBLISHED ARTIFACTS. One static binary per supported platform,
       # stamped with the tag, built with the determinism flags, plus the
       # checksum file. tools/build-release.sh carries the flags and the reasons

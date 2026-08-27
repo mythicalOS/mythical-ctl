@@ -36,6 +36,15 @@
 #   GOTOOLCHAIN     pinned: two Go releases do not emit the same bytes, so "same source" is only
 #                   half of "same output"
 #
+# THE BUILD ENVIRONMENT IS NOT TRUSTED, AND THAT IS CHECKED RATHER THAN CURATED. The go command
+# honours a long list of variables that change the emitted code -- GOAMD64 and friends,
+# GOEXPERIMENT, a stray -tags carried in GOFLAGS -- and an inherited one is invisible to the
+# --repro comparison, because both builds inherit it equally and agree. The unsets below are
+# convenience; the guarantee is that release-verify requires each artifact's OWN recorded build
+# settings to be EXACTLY the pinned set, and refuses any setting it was not expecting. A
+# variable that changes the bytes changes that record, so it is caught whether or not anybody
+# remembered to name it here.
+#
 # THE LINKER IS SILENT ABOUT A -X THAT DOES NOTHING. `-X some/wrong/path.Version=1.2.3` builds
 # without a word and ships the compiled-in default (measured). That is the same shape of
 # accident as a build argument that resolves to the empty string, which this family has already
@@ -94,6 +103,9 @@ export GOTOOLCHAIN="$PIN_GOTOOLCHAIN"
 export GOFLAGS=''
 export GOENV=off
 export CGO_ENABLED=0
+# Convenience, not the guarantee -- see the note above. `unset` on an unset name is a no-op.
+unset GOEXPERIMENT GOAMD64 GOARM64 GOARM GO386 GOMIPS GOMIPS64 GOPPC64 GORISCV64 GOWASM \
+  GOFIPS140 GO_EXTLINK_ENABLED GOPGO
 
 cd "$ROOT"
 
@@ -171,7 +183,11 @@ for value in "${HOME:-}" "$(go env GOMODCACHE)" "$(go env GOCACHE)" "$(go env GO
     FORBID+=( --forbid "$value" )
   fi
 done
-go run "$VERIFIER" verify --dir "$OUT" --version "$VERSION" "${FORBID[@]}"
+go run "$VERIFIER" verify \
+  --dir "$OUT" \
+  --version "$VERSION" \
+  --toolchain "$PIN_GOTOOLCHAIN" \
+  "${FORBID[@]}"
 printf '\nartifacts: %s\n' "$OUT"
 cat "${OUT}/SHA256SUMS"
 

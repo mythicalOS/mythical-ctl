@@ -21,6 +21,19 @@ import (
 
 const testVersion = "9.8.7-verifytest"
 
+// The toolchain these tests build with, read from the go command rather than written down: a
+// literal here would go stale at the next toolchain bump and every build-info assertion would
+// start failing for a reason that has nothing to do with the code under test.
+var testToolchain = goVersionString()
+
+func goVersionString() string {
+	out, err := exec.Command("go", "env", "GOVERSION").Output()
+	if err != nil {
+		panic("cannot read GOVERSION: " + err.Error())
+	}
+	return strings.TrimSpace(string(out))
+}
+
 // Built once for the whole package: six `go build` invocations is the price of grading real
 // artifacts instead of fixtures that only look like them, and a fixture binary could not carry
 // build info at all.
@@ -191,7 +204,7 @@ func TestCheckStampAcceptsTheStampedVersion(t *testing.T) {
 // The linker accepts -X against a symbol that does not exist and says nothing, so the artifact
 // silently ships the compiled-in default. Nothing but reading the bytes back catches it.
 func TestCheckArtifactRefusesAnUnstampedBuild(t *testing.T) {
-	_, err := checkArtifact(unstampedBin, hostTarget, testVersion, forbidNothingReal())
+	_, err := checkArtifact(unstampedBin, hostTarget, testVersion, testToolchain, forbidNothingReal())
 	mustFail(t, err, "the -X stamp did not reach it")
 }
 
@@ -237,17 +250,17 @@ func TestCheckArtifactRefusesAnEmbeddedBuildPath(t *testing.T) {
 	if err := os.WriteFile(path, append(data, []byte(leak)...), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	_, err = checkArtifact(path, hostTarget, testVersion, []string{leak})
+	_, err = checkArtifact(path, hostTarget, testVersion, testToolchain, []string{leak})
 	mustFail(t, err, "not path-independent")
 }
 
 func TestCheckBuildInfoRefusesANonTrimpathBuild(t *testing.T) {
-	mustFail(t, checkBuildInfo(noTrimpathBin, hostTarget), "-trimpath")
+	mustFail(t, checkBuildInfo(noTrimpathBin, hostTarget, testToolchain), "-trimpath")
 }
 
 func TestCheckBuildInfoAcceptsAReleaseBuild(t *testing.T) {
 	for _, tg := range targets {
-		if err := checkBuildInfo(filepath.Join(builtDir, tg.Artifact()), tg); err != nil {
+		if err := checkBuildInfo(filepath.Join(builtDir, tg.Artifact()), tg, testToolchain); err != nil {
 			t.Errorf("%s: %v", tg, err)
 		}
 	}
@@ -265,7 +278,7 @@ func TestCheckArtifactRefusesTheWrongPlatform(t *testing.T) {
 			continue
 		}
 		checked++
-		_, err := checkArtifact(hostArtifact, tg, testVersion, forbidNothingReal())
+		_, err := checkArtifact(hostArtifact, tg, testVersion, testToolchain, forbidNothingReal())
 		mustFail(t, err, "build setting")
 	}
 	if checked == 0 {
@@ -281,7 +294,7 @@ func TestCheckArtifactRefusesATruncatedFile(t *testing.T) {
 	if err := os.WriteFile(path, nil, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	_, err := checkArtifact(path, hostTarget, testVersion, forbidNothingReal())
+	_, err := checkArtifact(path, hostTarget, testVersion, testToolchain, forbidNothingReal())
 	mustFail(t, err, "well-formed digest")
 }
 
@@ -295,7 +308,7 @@ func TestCheckArtifactRefusesANonExecutableFile(t *testing.T) {
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	_, err = checkArtifact(path, hostTarget, testVersion, forbidNothingReal())
+	_, err = checkArtifact(path, hostTarget, testVersion, testToolchain, forbidNothingReal())
 	mustFail(t, err, "not executable")
 }
 
@@ -362,7 +375,7 @@ func TestCheckSumsRefusesAMissingFile(t *testing.T) {
 
 func TestVerifyAcceptsAFreshlyBuiltMatrix(t *testing.T) {
 	var out bytes.Buffer
-	if err := verify(builtDir, testVersion, forbidNothingReal(), hostTarget, false, &out); err != nil {
+	if err := verify(builtDir, testVersion, testToolchain, forbidNothingReal(), hostTarget, false, &out); err != nil {
 		t.Fatalf("verify on a freshly built matrix: %v\n%s", err, out.String())
 	}
 	// Byte counts must be printed beside digests: a digest alone cannot tell a reader that the
@@ -377,7 +390,7 @@ func TestVerifyRefusesAnUnexpectedFile(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "NOTES.txt"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	mustFail(t, verify(dir, testVersion, forbidNothingReal(), hostTarget, false, &bytes.Buffer{}), "unexpected file")
+	mustFail(t, verify(dir, testVersion, testToolchain, forbidNothingReal(), hostTarget, false, &bytes.Buffer{}), "unexpected file")
 }
 
 func TestVerifyRefusesAMissingArtifact(t *testing.T) {
@@ -385,7 +398,7 @@ func TestVerifyRefusesAMissingArtifact(t *testing.T) {
 	if err := os.Remove(filepath.Join(dir, targets[0].Artifact())); err != nil {
 		t.Fatal(err)
 	}
-	mustFail(t, verify(dir, testVersion, forbidNothingReal(), hostTarget, false, &bytes.Buffer{}), "artifact set is incomplete")
+	mustFail(t, verify(dir, testVersion, testToolchain, forbidNothingReal(), hostTarget, false, &bytes.Buffer{}), "artifact set is incomplete")
 }
 
 func TestVerifyRefusesAMissingSumsFile(t *testing.T) {
@@ -393,19 +406,19 @@ func TestVerifyRefusesAMissingSumsFile(t *testing.T) {
 	if err := os.Remove(filepath.Join(dir, sumsName)); err != nil {
 		t.Fatal(err)
 	}
-	mustFail(t, verify(dir, testVersion, forbidNothingReal(), hostTarget, false, &bytes.Buffer{}), "artifact set is incomplete")
+	mustFail(t, verify(dir, testVersion, testToolchain, forbidNothingReal(), hostTarget, false, &bytes.Buffer{}), "artifact set is incomplete")
 }
 
 func TestVerifyRefusesAVersionTheArtifactsDoNotCarry(t *testing.T) {
-	mustFail(t, verify(builtDir, "1.2.3", forbidNothingReal(), hostTarget, false, &bytes.Buffer{}), "did not reach it")
+	mustFail(t, verify(builtDir, "1.2.3", testToolchain, forbidNothingReal(), hostTarget, false, &bytes.Buffer{}), "did not reach it")
 }
 
 func TestVerifyRefusesAnEmptyForbidList(t *testing.T) {
-	mustFail(t, verify(builtDir, testVersion, nil, hostTarget, false, &bytes.Buffer{}), "without reading anything")
+	mustFail(t, verify(builtDir, testVersion, testToolchain, nil, hostTarget, false, &bytes.Buffer{}), "without reading anything")
 }
 
 func TestVerifyRefusesADirectoryThatIsAFile(t *testing.T) {
-	mustFail(t, verify(hostArtifact, testVersion, forbidNothingReal(), hostTarget, false, &bytes.Buffer{}), "not a directory")
+	mustFail(t, verify(hostArtifact, testVersion, testToolchain, forbidNothingReal(), hostTarget, false, &bytes.Buffer{}), "not a directory")
 }
 
 // The host round-trip is the only proof that the version symbol still resolves; if the host is
@@ -413,10 +426,10 @@ func TestVerifyRefusesADirectoryThatIsAFile(t *testing.T) {
 // one.
 func TestVerifyRefusesToSkipTheHostRoundTripSilently(t *testing.T) {
 	outside := Target{GOOS: "plan9", GOARCH: "386"}
-	mustFail(t, verify(builtDir, testVersion, forbidNothingReal(), outside, false, &bytes.Buffer{}), "--allow-no-host-exec")
+	mustFail(t, verify(builtDir, testVersion, testToolchain, forbidNothingReal(), outside, false, &bytes.Buffer{}), "--allow-no-host-exec")
 
 	var out bytes.Buffer
-	if err := verify(builtDir, testVersion, forbidNothingReal(), outside, true, &out); err != nil {
+	if err := verify(builtDir, testVersion, testToolchain, forbidNothingReal(), outside, true, &out); err != nil {
 		t.Fatalf("verify with --allow-no-host-exec: %v", err)
 	}
 	if !strings.Contains(out.String(), "SKIPPED") {
@@ -534,7 +547,7 @@ func TestCheckArtifactRefusesANonRegularFile(t *testing.T) {
 	if err := os.Mkdir(path, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	_, err := checkArtifact(path, hostTarget, testVersion, forbidNothingReal())
+	_, err := checkArtifact(path, hostTarget, testVersion, testToolchain, forbidNothingReal())
 	mustFail(t, err, "not a regular file")
 }
 
@@ -548,7 +561,7 @@ func TestCheckBuildInfoRefusesADifferentMainPackage(t *testing.T) {
 	if b, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("building a second main package: %v: %s", err, b)
 	}
-	mustFail(t, checkBuildInfo(out, hostTarget), "built from")
+	mustFail(t, checkBuildInfo(out, hostTarget, testToolchain), "built from")
 }
 
 func TestCheckBuildInfoRefusesAForeignModule(t *testing.T) {
@@ -570,7 +583,7 @@ func TestCheckBuildInfoRefusesAForeignModule(t *testing.T) {
 	if b, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("building a foreign module: %v: %s", err, b)
 	}
-	mustFail(t, checkBuildInfo(out, hostTarget), "main module is")
+	mustFail(t, checkBuildInfo(out, hostTarget, testToolchain), "main module is")
 }
 
 // CGO_ENABLED=1 needs no C compiler for a package with no cgo in it, but it records itself in
@@ -585,7 +598,7 @@ func TestCheckBuildInfoRefusesACgoBuild(t *testing.T) {
 	if b, err := cmd.CombinedOutput(); err != nil {
 		t.Skipf("a CGO_ENABLED=1 build is not available here: %v: %s", err, b)
 	}
-	mustFail(t, checkBuildInfo(out, hostTarget), "CGO_ENABLED")
+	mustFail(t, checkBuildInfo(out, hostTarget, testToolchain), "CGO_ENABLED")
 }
 
 // --- the stamp round-trip, both spellings -------------------------------------------------
@@ -657,4 +670,93 @@ func TestBuildReleaseScriptRefusesBadInvocations(t *testing.T) {
 			}
 		})
 	}
+}
+
+// --- the build environment cannot change the bytes unnoticed --------------------------------
+
+// GOAMD64 changes the instructions the compiler emits, is read from the environment, and is
+// recorded. Both --repro builds would inherit it equally and agree, so the comparison cannot
+// see it; only the artifact's own record can.
+func TestCheckBuildInfoRefusesANonDefaultArchLevel(t *testing.T) {
+	target := Target{GOOS: "linux", GOARCH: "amd64"}
+	out := filepath.Join(t.TempDir(), target.Artifact())
+	cmd := exec.Command("go", "build", "-trimpath", "-buildvcs=false",
+		"-ldflags", "-s -w -X "+VersionSymbolForTest+"="+testVersion, "-o", out, "./cmd/mythical-ctl")
+	cmd.Dir = moduleRoot()
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOFLAGS=", "GOOS=linux", "GOARCH=amd64", "GOAMD64=v3")
+	if b, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v: %s", err, b)
+	}
+	// The SPECIFIC diagnosis, not merely a message that happens to contain "GOAMD64": dropping
+	// the pin from the expected set would still produce one, via the unexpected-setting catch-all.
+	mustFail(t, checkBuildInfo(out, target, testToolchain), `build setting GOAMD64 is "v3", want "v1"`)
+}
+
+// The catch-all: any recorded setting outside the pinned list, whether or not anybody thought
+// of it in advance. -tags stands in for the whole class.
+func TestCheckBuildInfoRefusesAnUnexpectedSetting(t *testing.T) {
+	out := filepath.Join(t.TempDir(), hostTarget.Artifact())
+	cmd := exec.Command("go", "build", "-tags", "somethingextra", "-trimpath", "-buildvcs=false",
+		"-ldflags", "-s -w -X "+VersionSymbolForTest+"="+testVersion, "-o", out, "./cmd/mythical-ctl")
+	cmd.Dir = moduleRoot()
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOFLAGS=")
+	if b, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v: %s", err, b)
+	}
+	mustFail(t, checkBuildInfo(out, hostTarget, testToolchain), "unexpected build setting")
+}
+
+func TestCheckBuildInfoRefusesAnotherToolchain(t *testing.T) {
+	mustFail(t, checkBuildInfo(hostArtifact, hostTarget, "go0.0.0"), "want the pinned go0.0.0")
+}
+
+// An empty toolchain would make the compiler-version assertion vacuous rather than absent,
+// which is the worse of the two.
+func TestCheckBuildInfoRefusesAnEmptyToolchain(t *testing.T) {
+	mustFail(t, checkBuildInfo(hostArtifact, hostTarget, ""), "would go unchecked")
+}
+
+func TestRunVerifyRequiresAToolchain(t *testing.T) {
+	err := run([]string{"verify", "--dir", builtDir, "--version", testVersion, "--forbid", "/x"}, &bytes.Buffer{})
+	mustFail(t, err, "--toolchain is required")
+}
+
+// Adding a platform must require deciding its microarchitecture level, not inheriting the
+// builder's.
+func TestExpectedSettingsRefusesAnUndecidedArchitecture(t *testing.T) {
+	_, err := expectedSettings(Target{GOOS: "linux", GOARCH: "riscv64"})
+	mustFail(t, err, "no pinned microarchitecture level")
+	for _, tg := range targets {
+		if _, err := expectedSettings(tg); err != nil {
+			t.Errorf("the shipped matrix has an undecided platform: %v", err)
+		}
+	}
+}
+
+// --- comparing a build against itself -------------------------------------------------------
+
+func TestCompareRefusesTwoSpellingsOfOneDirectory(t *testing.T) {
+	mustFail(t, compare(builtDir, builtDir+string(filepath.Separator)+".", &bytes.Buffer{}), "same directory")
+}
+
+func TestCompareRefusesASymlinkToTheSameDirectory(t *testing.T) {
+	link := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(builtDir, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	mustFail(t, compare(builtDir, link, &bytes.Buffer{}), "same directory")
+}
+
+// Distinct directories, but one artifact is a hard link to the other: its digest necessarily
+// equals itself, so that target would report "identical" having compared nothing.
+func TestCompareRefusesAHardLinkedArtifact(t *testing.T) {
+	other := copyMatrix(t)
+	name := targets[0].Artifact()
+	if err := os.Remove(filepath.Join(other, name)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(filepath.Join(builtDir, name), filepath.Join(other, name)); err != nil {
+		t.Skipf("hard links unavailable: %v", err)
+	}
+	mustFail(t, compare(builtDir, other, &bytes.Buffer{}), "same file in both directories")
 }

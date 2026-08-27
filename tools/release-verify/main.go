@@ -17,7 +17,7 @@
 // Usage:
 //
 //	release-verify targets
-//	release-verify verify --dir DIR --version V --forbid PATH [--forbid PATH ...]
+//	release-verify verify --dir DIR --version V --toolchain goX.Y.Z --forbid PATH [...]
 //	release-verify compare DIR_A DIR_B
 package main
 
@@ -96,7 +96,7 @@ func main() {
 
 func run(args []string, out io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: release-verify targets | verify --dir D --version V --forbid P... | compare A B")
+		return errors.New("usage: release-verify targets | verify --dir D --version V --toolchain T --forbid P... | compare A B")
 	}
 	switch args[0] {
 	case "targets":
@@ -130,6 +130,7 @@ func runVerify(args []string, out io.Writer) error {
 	fs.SetOutput(io.Discard)
 	dir := fs.String("dir", "", "directory holding the built artifacts")
 	version := fs.String("version", "", "the version the artifacts must report")
+	toolchain := fs.String("toolchain", "", "the pinned Go toolchain every artifact must record (e.g. go1.26.5)")
 	var forbid forbidList
 	fs.Var(&forbid, "forbid", "an absolute path that must not appear in any artifact (repeatable)")
 	// The host round-trip is the ONLY check that proves the version symbol still resolves, so
@@ -146,8 +147,11 @@ func runVerify(args []string, out io.Writer) error {
 	if *dir == "" {
 		return errors.New("--dir is required")
 	}
+	if *toolchain == "" {
+		return errors.New("--toolchain is required")
+	}
 	host := Target{GOOS: runtime.GOOS, GOARCH: runtime.GOARCH}
-	return verify(*dir, *version, forbid, host, *allowNoExec, out)
+	return verify(*dir, *version, *toolchain, forbid, host, *allowNoExec, out)
 }
 
 // checkVersion refuses an unset or free-form version.
@@ -197,7 +201,7 @@ type artifact struct {
 // verify grades a whole artifact directory. The host target is a PARAMETER rather than read
 // from runtime here, so the "no artifact could be executed" branch is reachable from a test on
 // a machine that is inside the matrix -- an unreachable refusal is a refusal nobody has proven.
-func verify(dir, version string, forbid []string, host Target, allowNoExec bool, out io.Writer) error {
+func verify(dir, version, toolchain string, forbid []string, host Target, allowNoExec bool, out io.Writer) error {
 	if err := checkVersion(version); err != nil {
 		return err
 	}
@@ -241,7 +245,7 @@ func verify(dir, version string, forbid []string, host Target, allowNoExec bool,
 	var arts []artifact
 	for _, t := range targets {
 		path := filepath.Join(dir, t.Artifact())
-		a, err := checkArtifact(path, t, version, forbid)
+		a, err := checkArtifact(path, t, version, toolchain, forbid)
 		if err != nil {
 			return fmt.Errorf("%s: %w", t.Artifact(), err)
 		}
@@ -271,7 +275,7 @@ func verify(dir, version string, forbid []string, host Target, allowNoExec bool,
 }
 
 // checkArtifact grades one built file against everything that can be read out of it.
-func checkArtifact(path string, t Target, version string, forbid []string) (artifact, error) {
+func checkArtifact(path string, t Target, version, toolchain string, forbid []string) (artifact, error) {
 	a := artifact{target: t, name: filepath.Base(path)}
 	st, err := os.Lstat(path)
 	if err != nil {
@@ -295,7 +299,7 @@ func checkArtifact(path string, t Target, version string, forbid []string) (arti
 	sum := sha256.Sum256(data)
 	a.digest = hex.EncodeToString(sum[:])
 
-	if err := checkBuildInfo(path, t); err != nil {
+	if err := checkBuildInfo(path, t, toolchain); err != nil {
 		return a, err
 	}
 
@@ -327,15 +331,64 @@ func scanForbidden(data []byte, forbid []string) error {
 	return nil
 }
 
+// expectedSettings is the COMPLETE set of build settings a release artifact may record, with
+// the value each must have. Anything recorded and not named here is a refusal.
+//
+// EXHAUSTIVE ON PURPOSE. Checking a chosen few settings and ignoring the rest leaves every
+// build-affecting environment variable the go command honours -- GOAMD64, GOEXPERIMENT, a
+// stray -tags in GOFLAGS -- free to change the bytes while the gate stays green, and the
+// --repro comparison cannot see it either because both builds inherit the same environment.
+// The artifact records what it was built with; requiring that record to be exactly this set
+// turns "the environment was not trusted" into something checked rather than assumed, without
+// anyone having to keep a list of dangerous variables up to date.
+func expectedSettings(t Target) (map[string]string, error) {
+	// The microarchitecture level. It changes the emitted instructions, it is read from the
+	// environment, and it is recorded -- so it is pinned to the toolchain default. A target
+	// whose GOARCH has no entry here is refused rather than waved through: adding a platform
+	// should require deciding this, not inheriting whatever the builder had set.
+	archLevel := map[string]struct{ key, value string }{
+		"amd64": {"GOAMD64", "v1"},
+		"arm64": {"GOARM64", "v8.0"},
+	}
+	lvl, ok := archLevel[t.GOARCH]
+	if !ok {
+		return nil, fmt.Errorf("no pinned microarchitecture level for GOARCH %q -- decide one before publishing this platform", t.GOARCH)
+	}
+	return map[string]string{
+		"-buildmode":  "exe",
+		"-compiler":   "gc",
+		"-trimpath":   "true",
+		"CGO_ENABLED": "0",
+		"GOOS":        t.GOOS,
+		"GOARCH":      t.GOARCH,
+		lvl.key:       lvl.value,
+	}, nil
+}
+
+// toleratedSettings are recorded but derived from the SOURCE (the go directive in go.mod,
+// //go:debug lines), not from the build environment, so their value is not pinned here -- it
+// would just make every toolchain bump a three-file edit. Their presence is still accounted
+// for, so they do not widen the exhaustive check above.
+var toleratedSettings = map[string]bool{"DefaultGODEBUG": true}
+
 // checkBuildInfo reads the artifact's own record of how it was built.
 //
 // This works for every platform, not just the host: the build info is a section of the file,
-// and -s -w does not strip it (measured). Two of these settings are the determinism contract
-// itself, so they are asserted per ARTIFACT rather than trusted from the build script.
-func checkBuildInfo(path string, t Target) error {
+// and -s -w does not strip it (measured). The determinism contract is asserted per ARTIFACT
+// rather than trusted from the build script, because the script can only report the intent it
+// was written with.
+func checkBuildInfo(path string, t Target, toolchain string) error {
+	if toolchain == "" {
+		return errors.New("no toolchain given: the artifact's compiler version would go unchecked")
+	}
 	bi, err := buildinfo.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("reading build info: %w", err)
+	}
+	// Two Go releases do not emit the same bytes, so the compiler version is part of what makes
+	// a published digest reproducible. The artifact records which one built it.
+	if bi.GoVersion != toolchain {
+		return fmt.Errorf("built by %s, want the pinned %s", bi.GoVersion, toolchain)
 	}
 	// Module before package, deliberately: a binary from a different module also has a
 	// different main-package path, so checking the package first would leave the module check
@@ -346,19 +399,21 @@ func checkBuildInfo(path string, t Target) error {
 	if bi.Path != mainPackage {
 		return fmt.Errorf("built from %q, want %q", bi.Path, mainPackage)
 	}
+	want, err := expectedSettings(t)
+	if err != nil {
+		return err
+	}
 	settings := map[string]string{}
 	for _, s := range bi.Settings {
 		settings[s.Key] = s.Value
 	}
+	// The PINNED settings first, so the specific diagnosis wins: a build missing -trimpath also
+	// records an -ldflags setting it would not otherwise have, and "an unexpected setting is
+	// present" is a much worse answer to that than "-trimpath is absent".
+	//
 	// -trimpath is recorded ONLY when it was on: a build without it carries no -trimpath
 	// setting at all (measured), so "absent" and "false" are the same failure and both are
-	// caught by requiring the value "true".
-	want := map[string]string{
-		"-trimpath":   "true",
-		"CGO_ENABLED": "0",
-		"GOOS":        t.GOOS,
-		"GOARCH":      t.GOARCH,
-	}
+	// caught by requiring the value below.
 	keys := make([]string, 0, len(want))
 	for k := range want {
 		keys = append(keys, k)
@@ -372,6 +427,18 @@ func checkBuildInfo(path string, t Target) error {
 		if got != want[k] {
 			return fmt.Errorf("build setting %s is %q, want %q", k, got, want[k])
 		}
+	}
+	// Then the catch-all: nothing beyond the pinned set and the source-derived tolerations.
+	extra := make([]string, 0, len(settings))
+	for k := range settings {
+		if _, pinned := want[k]; pinned || toleratedSettings[k] {
+			continue
+		}
+		extra = append(extra, k)
+	}
+	sort.Strings(extra)
+	if len(extra) > 0 {
+		return fmt.Errorf("unexpected build setting %s=%q -- a release artifact must record only the pinned set", extra[0], settings[extra[0]])
 	}
 	return nil
 }
@@ -441,13 +508,27 @@ func checkSums(path string, arts []artifact) error {
 // every target must match byte for byte. It requires the full matrix in BOTH directories, so
 // two empty directories cannot agree their way to a pass.
 func compare(dirA, dirB string, out io.Writer) error {
-	if dirA == dirB {
-		return errors.New("compare needs two different directories; comparing one against itself proves nothing")
+	// IDENTITY, not spelling. "dist" and "dist/." name one directory, and so do a directory and
+	// a symlink to it; a string comparison waves all of those through and the reproducibility
+	// check then compares a build against itself and reports four identical targets.
+	same, err := sameDir(dirA, dirB)
+	if err != nil {
+		return err
+	}
+	if same {
+		return fmt.Errorf("%q and %q are the same directory; comparing a build against itself proves nothing", dirA, dirB)
 	}
 	differ := 0
 	for _, t := range targets {
 		pa := filepath.Join(dirA, t.Artifact())
 		pb := filepath.Join(dirB, t.Artifact())
+		// The directories differ, but a hard link or a symlink between the two files would make
+		// them one file, whose digest necessarily equals itself.
+		if same, err := sameFile(pa, pb); err != nil {
+			return err
+		} else if same {
+			return fmt.Errorf("%s is the same file in both directories; comparing it against itself proves nothing", t.Artifact())
+		}
 		da, sa, err := digestFile(pa)
 		if err != nil {
 			return err
@@ -467,6 +548,40 @@ func compare(dirA, dirB string, out io.Writer) error {
 		return fmt.Errorf("%d of %d targets are not byte-reproducible", differ, len(targets))
 	}
 	return nil
+}
+
+// sameDir reports whether two paths name one directory, following symlinks and normalising
+// spellings such as a trailing "/.".
+func sameDir(a, b string) (bool, error) {
+	fa, err := os.Stat(a)
+	if err != nil {
+		return false, err
+	}
+	if !fa.IsDir() {
+		return false, fmt.Errorf("%s is not a directory", a)
+	}
+	fb, err := os.Stat(b)
+	if err != nil {
+		return false, err
+	}
+	if !fb.IsDir() {
+		return false, fmt.Errorf("%s is not a directory", b)
+	}
+	return os.SameFile(fa, fb), nil
+}
+
+// sameFile reports whether two paths resolve to one file -- a hard link, or a symlink to the
+// other.
+func sameFile(a, b string) (bool, error) {
+	fa, err := os.Stat(a)
+	if err != nil {
+		return false, err
+	}
+	fb, err := os.Stat(b)
+	if err != nil {
+		return false, err
+	}
+	return os.SameFile(fa, fb), nil
 }
 
 func digestFile(path string) (string, int64, error) {
