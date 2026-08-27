@@ -222,6 +222,18 @@ func (f *Fake) SetDown(v bool) {
 	f.Down = v
 }
 
+// RequestLog returns a COPY of the request log, taken under the fake's own lock.
+//
+// It is the only safe way to read it. Requests is appended to from the handler goroutines, so a
+// bare read of the field races with any request still in flight — including one the Down knobs are
+// about to abort, since the log entry is written before the abort. (Measured under -race by a
+// caller counting image pulls right after a verb returned.)
+func (f *Fake) RequestLog() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.Requests...)
+}
+
 // SetDownFrom is SetDown's counterpart for the DownFrom knob, for the same reason.
 func (f *Fake) SetDownFrom(v string) {
 	f.mu.Lock()

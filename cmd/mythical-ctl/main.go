@@ -7,12 +7,17 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"mythicalos.ai/ctl/internal/cliio"
+	"mythicalos.ai/ctl/internal/engine"
+	"mythicalos.ai/ctl/internal/layout"
+	"mythicalos.ai/ctl/internal/verbs"
 	"mythicalos.ai/ctl/internal/version"
 )
 
@@ -24,9 +29,18 @@ USAGE
   mythical-ctl <command> [products...] [options]
 
 COMMANDS
-  (this build carries no lifecycle verbs yet — they land verb by verb; see --version)
+  install <product>...     install (or converge) one or more products
+  start <product>...       start; sets desired state to running
+  stop <product>...        stop; sets desired state to stopped
+  restart <product>...     restart; refused on a product you have stopped
+  recreate <product>...    replace the container, preserving desired state
 
 OPTIONS
+  --index PATH             the family index (default: ~/.mythical/.state/index)
+  --policy PATH            the family policy index
+  --manifest-dir PATH      where <product>.manifest files are
+  --image REF              run this image instead of the manifest's (loud, recorded)
+  --force-install          install a product whose manifest says it has not launched
   -v, --version            print the version and exit
   -h, --help               print this help and exit
 
@@ -38,10 +52,13 @@ Documentation: https://docs.mythicalos.ai   Source: https://github.com/mythicalO
 
 // run holds the whole entrypoint so it can be exercised in-process: it takes the argument list
 // without argv[0] and reads and writes the streams it is handed instead of reaching for the
-// process globals. stdin is threaded now, unused yet — the confirmation-reading verbs need it,
-// and retrofitting the seam later would churn every call site.
+// process globals. It reads the real process environment; runEnv is the same entrypoint with the
+// environment supplied, which is what an in-process test drives.
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
-	_ = stdin
+	return runEnv(args, os.Environ(), stdin, stdout, stderr)
+}
+
+func runEnv(args, env []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
 		fmt.Fprint(stdout, usage)
 		return cliio.ExitOK
@@ -51,7 +68,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	// known option after a global flag is consumed (and then ignored by that flag), an unknown
 	// option is a usage error, and a value-taking option with no value is a usage error with
 	// nothing attempted — all measured behaviors, all pinned by tests.
-	if _, rc := parseOpts(args[1:], stderr); rc >= 0 {
+	o, rc := parseOpts(args[1:], stderr)
+	if rc >= 0 {
 		return rc
 	}
 	switch verb {
@@ -62,9 +80,122 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprint(stdout, usage)
 		return cliio.ExitOK
 	}
+	// ONE list of the five, and it is the verb layer's own: a second copy here is a copy that
+	// drifts, and the direction it drifts is a verb this dispatcher accepts and the batch driver
+	// then refuses (or the reverse — a verb nothing dispatches at all).
+	if verbs.Batchable(verb) {
+		return lifecycle(verb, o, env, stdin, stdout, stderr)
+	}
 	fmt.Fprintf(stderr, "mythical-ctl: unknown command: %s\n\n", verb)
 	fmt.Fprint(stderr, usage)
 	return cliio.ExitUsage
+}
+
+// lifecycle dispatches install/start/stop/restart/recreate.
+//
+// THE FLAG-REFUSAL MATRIX IS THE FIRST THING IT DOES, and every refusal is a usage error with
+// NOTHING attempted. --purge and --family belong to uninstall ONLY; --to-bind and
+// --map-foreign-to-operator to migrate-storage ONLY; --abandon to restore ONLY. Silently ignoring a
+// misplaced option is how `install p1 --purge` returns 0 having quietly done something other than
+// what was written.
+func lifecycle(verb string, o opts, env []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	refuse := func(msg string) int {
+		fmt.Fprintf(stderr, "mythical-ctl: %s\n", msg)
+		return cliio.ExitUsage
+	}
+	switch {
+	case o.purge:
+		return refuse("--purge applies to uninstall only")
+	case o.family:
+		return refuse("--family applies to uninstall only")
+	case o.toBind != "":
+		return refuse("--to-bind applies to migrate-storage only")
+	case o.mapForeign:
+		return refuse("--map-foreign-to-operator applies to migrate-storage only")
+	case o.abandon:
+		return refuse("--abandon applies to restore only")
+	}
+	if len(o.products) == 0 {
+		fmt.Fprintf(stderr, "mythical-ctl: %s needs at least one product\n\n", verb)
+		fmt.Fprint(stderr, usage)
+		return cliio.ExitUsage
+	}
+	// --image and --force-install are install-only AND single-product: a batch would apply one
+	// override to all of them, which is never what an operator means. The refusals are ordered as
+	// the reference orders them — the single-product rule is asked first, so `start p1 p2 --image X`
+	// reports the arity, and `start p1 --image X` reports the verb.
+	extra := o.image != "" || o.forced
+	if extra && len(o.products) > 1 {
+		return refuse("--image/--force-install take exactly one product")
+	}
+	if extra && verb != "install" {
+		return refuse("--image/--force-install apply to install only")
+	}
+
+	d, err := deps(o, env, stdin, stdout, stderr)
+	if err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return cliio.ExitFail
+	}
+	ctx := context.Background()
+	if extra {
+		return verbs.Install(ctx, d, verbs.InstallOpts{
+			Product:  o.products[0],
+			Image:    o.image,
+			ImageSet: o.image != "",
+			Force:    o.forced,
+		})
+	}
+	// One product with no per-product option goes through the batch driver too — the reference
+	// does exactly this, so the per-product report and the aggregate are the same code for one
+	// product as for five.
+	return verbs.Batch(ctx, d, verb, o.products)
+}
+
+// deps assembles the verb layer's dependencies: the daemon connection, the family home, the
+// streams and the located documents.
+//
+// THE DEFAULTS ARE RESOLVED AFTER PARSING, so an explicit flag always wins — the same ordering the
+// frozen dispatcher uses, and the reason a `--index` given anywhere on the line is honoured.
+func deps(o opts, env []string, stdin io.Reader, stdout, stderr io.Writer) (verbs.Deps, error) {
+	home, err := layout.Home(env)
+	if err != nil {
+		return verbs.Deps{}, err
+	}
+	// The OPERATING user's home, not the family home: this is where the docker CLI keeps the
+	// endpoint and the registry credentials whose daemon and identity we must match.
+	userHome := ""
+	for _, kv := range env {
+		if v, ok := strings.CutPrefix(kv, "HOME="); ok {
+			userHome = v
+		}
+	}
+	socket, serr := engine.ResolveEndpoint(env, userHome)
+	if serr != nil {
+		return verbs.Deps{}, serr
+	}
+	c := engine.Dial(socket)
+	c.SetDockerConfig(env, userHome)
+
+	stateDir := filepath.Join(home, ".state")
+	return verbs.Deps{
+		Engine:      c,
+		Home:        home,
+		Stdin:       stdin,
+		Stdout:      stdout,
+		Stderr:      stderr,
+		Env:         env,
+		IndexPath:   or(o.index, filepath.Join(stateDir, "index")),
+		PolicyPath:  or(o.policy, filepath.Join(stateDir, "policy")),
+		ManifestDir: or(o.manifestDir, stateDir),
+	}, nil
+}
+
+func or(v, fallback string) string {
+	if v == "" {
+		return fallback
+	}
+	return v
 }
 
 // opts is the parsed option set — the bash loop's locals. Verbs consume it as they land; the
