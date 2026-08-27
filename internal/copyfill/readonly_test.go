@@ -13,7 +13,11 @@ import (
 // claimed by internal/backup, and what is asserted HERE is the half that lives in this module —
 // the LAUNCH each mode makes, which no bats row in either file observes directly.
 //
-// N/A: tests/unit/backup.bats: "the manifest is produced by the pinned copy container, on stdin for verify" -- the reference states this in prose and asserts it through mi_backup_manifest_write's own transcript handling, which internal/backup claims; the launch contract underneath it (one read-only volume at /src, nothing else mounted, no --user, the manifest on the container's stdin) is what this file adds, because it is the part a caller of the seam cannot observe.
+// Inventory — NONE, and that is the point of the paragraph above. No bats row states this: the one
+// this file used to name ("the manifest is produced by the pinned copy container, on stdin for
+// verify") is not in backup.bats or anywhere else in the corpus — it was a summary of the
+// reference's prose written in claim syntax, which reads as coverage of a test that never existed.
+// The behaviour is real and asserted below; it simply has no bats row to be the port OF.
 
 // stdinSpy records what the helper was handed on its stdin, which is the only evidence that the
 // manifest crossed into the container rather than being dropped by the seam.

@@ -9,7 +9,7 @@ import (
 // Inventory — tests/unit/detect.bats:
 // PORTED: tests/unit/detect.bats: "the three required flat fields are extracted" -> TestFlatFields
 // PORTED: tests/unit/detect.bats: "whitespace around the colon is tolerated" -> TestWhitespace
-// PORTED: tests/unit/detect.bats: "leading and trailing JSON whitespace (space, tab, CR) outside the root object is tolerated" -> TestWhitespace
+// PORTED: tests/unit/detect.bats: "leading and trailing JSON whitespace (space, tab, CR) outside the root object is accepted" -> TestWhitespace
 // PORTED: tests/unit/detect.bats: "non-whitespace content after the root object is still refused" -> TestMalformed
 // PORTED: tests/unit/detect.bats: "an absent field reports rc 3, distinct from unreadable" -> TestAbsentVsUnreadable
 // PORTED: tests/unit/detect.bats: "a nested field is reported unreadable, never guessed at" -> TestAbsentVsUnreadable
@@ -17,17 +17,17 @@ import (
 // PORTED: tests/unit/detect.bats: "a non-string value is refused" -> TestAbsentVsUnreadable
 // PORTED: tests/unit/detect.bats: "a field name is matched whole, not as a substring" -> TestWholeNameMatch
 // PORTED: tests/unit/detect.bats: "a repeated field is refused as ambiguous, not merely refused for some other reason" -> TestRepeats
-// PORTED: tests/unit/detect.bats: "only a repeat of the requested field is refused; a repeat of a different one is not" -> TestRepeats
-// PORTED: tests/unit/detect.bats: "T3: a raw control byte inside a JSON string cannot forge a field via the record stream" -> TestEscapes
-// PORTED: tests/unit/detect.bats: "a key spelled only with an escape is reported absent, never matched by decoding" -> TestEscapes
-// PORTED: tests/unit/detect.bats: "an escaped-spelling key never masks or collides with the literal key of the same spelling" -> TestEscapes
+// PORTED: tests/unit/detect.bats: "only a repeat of the requested field is refused; a repeat of a different top-level key is not inspected" -> TestRepeats
+// PORTED: tests/unit/detect.bats: "T3: a raw control byte inside a JSON string cannot forge a field via the TAB-delimited record format" -> TestEscapes
+// PORTED: tests/unit/detect.bats: "a key spelled only with an escape is reported absent, never matched by its decoded spelling" -> TestEscapes
+// PORTED: tests/unit/detect.bats: "an escaped-spelling key never masks or collides with the literal key of the same name" -> TestEscapes
 // PORTED: tests/unit/detect.bats: "malformed JSON is refused, including bad member sequencing" -> TestMalformed
 // PORTED: tests/unit/detect.bats: "malformed literals, delimiters and escapes are refused" -> TestMalformed
 // PORTED: tests/unit/detect.bats: "valid literals, numbers and escapes still read" -> TestValidShapes
-// PORTED: tests/unit/detect.bats: "a raw LF inside a bare literal is refused, matching the same bytes refused in one record" -> TestMalformed
-// PORTED: tests/unit/detect.bats: "a pretty-printed response ending each member, including bare literals, on its own line reads" -> TestValidShapes
+// PORTED: tests/unit/detect.bats: "a raw LF inside a bare literal is refused, matching the same bytes refused on one line" -> TestMalformed
+// PORTED: tests/unit/detect.bats: "a pretty-printed response ending each member, including bare literals, on its own line still reads" -> TestValidShapes
 // PORTED: tests/unit/detect.bats: "well-formed responses with every value kind still read" -> TestValidShapes
-// PORTED: tests/unit/detect.bats: "a response over the byte cap is refused before parsing, and the message names both numbers" -> TestByteCap
+// PORTED: tests/unit/detect.bats: "a response over the byte cap is refused before parsing, and the message names the cap" -> TestByteCap
 // PORTED: tests/unit/detect.bats: "a response exactly at the byte cap is still read" -> TestByteCap
 // PORTED: tests/unit/detect.bats: "version is preferred, and image_version is the fallback" -> TestVersionFallback
 // PORTED: tests/unit/detect.bats: "a response with neither version field reports the unknown marker, never a fabricated value" -> TestVersionFallback

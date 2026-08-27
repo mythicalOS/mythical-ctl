@@ -1712,33 +1712,96 @@ func TestAFailedAdoptionRefusesToWrite(t *testing.T) {
 
 // --- the aggregate's own refusals ---------------------------------------------------------------------
 
-// TestWorstRefusals is not a bats port: the shell's mi_ex_worst refusals live in tests/unit/exit.bats,
-// which Wave 1 claimed. It is here because THIS package now owns the aggregate, and the refusals are
-// position-dependent in a way only a direct call can reach — Batch maps a per-product usage error to
-// a failure before aggregating, so no batch can hand Worst a 2.
+// Inventory — tests/unit/exit.bats, the mi_ex_worst/mi_ex_name half.
+//
+// THESE SEVEN ROWS WERE, UNTIL THE PARITY AUDIT, CLAIMED BY NOBODY. cliio/exit_test.go noted that
+// they "are inventoried by the verbs wave"; this file said they "live in tests/unit/exit.bats,
+// which Wave 1 claimed". Each side pointed at the other in prose neither the inventory nor any
+// gate could read, so the whole aggregate contract sat outside the checked corpus. That is the
+// exact shape the audit exists to find: not a missing test, a missing CLAIM, with a real test
+// beside it making the hole invisible to anyone reading the code.
+//
+// PORTED: tests/unit/exit.bats: "batch precedence is worst-wins: all success is 0" -> TestWorstRefusals
+// PORTED: tests/unit/exit.bats: "success plus not-launched is 3" -> TestWorstRefusals
+// PORTED: tests/unit/exit.bats: "any operational failure wins over not-launched" -> TestWorstRefusals
+// PORTED: tests/unit/exit.bats: "a usage error is never aggregated, wherever it sits in the batch" -> TestWorstRefusals
+// PORTED: tests/unit/exit.bats: "an empty batch is a usage error, not a success" -> TestWorstRefusals
+// PORTED: tests/unit/exit.bats: "an unknown code is refused rather than mapped to failure, wherever it sits in the batch" -> TestWorstRefusals
+// PORTED: tests/unit/exit.bats: "every code has a human name, for reports" -> TestExitNameNamesEveryCode
+//
+// THIS package owns them because it owns the aggregate: cliio holds the four code CONSTANTS (its
+// one row), and mi_ex_worst/mi_ex_name became Worst/ExitName here.
 func TestWorstRefusals(t *testing.T) {
 	for _, tc := range []struct {
 		in   []int
 		want int
 		bad  bool
+		// The bats rows assert the MESSAGE, not merely a non-zero status: the two refusals are
+		// different bugs in the caller (a code that must not be aggregated vs. a code that is not
+		// in the contract at all), and a test that only checks "it failed" cannot tell a port that
+		// swapped them from one that did not.
+		msg string
 	}{
-		{in: []int{0, 0}, want: cliio.ExitOK},
-		{in: []int{0, 3}, want: cliio.ExitNotLaunched},
+		{in: []int{0, 0, 0}, want: cliio.ExitOK},
+		{in: []int{0, 3, 0}, want: cliio.ExitNotLaunched},
 		{in: []int{0, 3, 1}, want: cliio.ExitFail},
-		{in: []int{2, 1}, bad: true},
-		{in: []int{1, 2}, bad: true}, // the forbidden code AFTER the worst one
-		{in: []int{1, 7}, bad: true}, // an undefined code AFTER the worst one
-		{in: nil, bad: true},
+		{in: []int{1, 3}, want: cliio.ExitFail},
+		// BOTH ORDERINGS FOR EACH REFUSAL, as the bats rows spell out. The shell's refusal was
+		// once reachable only when the bad code came FIRST — the loop returned on the first 1 it
+		// saw and never validated what followed — so `mi_ex_worst 1 2` answered 1 and exited 0.
+		// The Go loop validates the whole list before aggregating; these rows are what proves it.
+		{in: []int{0, 2}, bad: true, msg: "usage errors are not batch outcomes"},
+		{in: []int{2, 1}, bad: true, msg: "usage errors are not batch outcomes"},
+		{in: []int{1, 2}, bad: true, msg: "usage errors are not batch outcomes"},
+		{in: []int{0, 7}, bad: true, msg: "not an exit code this contract defines"},
+		{in: []int{7, 1}, bad: true, msg: "not an exit code this contract defines"},
+		{in: []int{1, 7}, bad: true, msg: "not an exit code this contract defines"},
+		{in: nil, bad: true, msg: "at least one per-product outcome"},
 	} {
 		got, err := Worst(tc.in)
 		if tc.bad {
 			if err == nil {
 				t.Fatalf("Worst(%v) = %d, want a refusal", tc.in, got)
 			}
+			if !strings.Contains(err.Error(), tc.msg) {
+				t.Fatalf("Worst(%v) refused with %q, which does not name %q — the two refusals are different caller bugs",
+					tc.in, err, tc.msg)
+			}
 			continue
 		}
 		if err != nil || got != tc.want {
 			t.Fatalf("Worst(%v) = %d, %v; want %d", tc.in, got, err, tc.want)
+		}
+	}
+}
+
+// TestExitNameNamesEveryCode ports exit.bats' "every code has a human name, for reports". The bats
+// row checks one code; every code is checked here because the batch report prints this string per
+// product, and a code with no name of its own would surface as another code's word — a report that
+// is wrong rather than a report that is missing.
+func TestExitNameNamesEveryCode(t *testing.T) {
+	for _, tc := range []struct {
+		code int
+		want string
+	}{
+		{cliio.ExitOK, "completed"},
+		{cliio.ExitFail, "failed"},
+		{cliio.ExitUsage, "usage error"},
+		{cliio.ExitNotLaunched, "not launched"},
+	} {
+		if got := ExitName(tc.code); !strings.Contains(got, tc.want) {
+			t.Fatalf("ExitName(%d) = %q, want it to contain %q", tc.code, got, tc.want)
+		}
+	}
+	// A code outside the contract must be reported AS unknown, carrying the number. Returning one
+	// of the four names would put a plausible word in a report about an outcome nobody defined.
+	got := ExitName(7)
+	if !strings.Contains(got, "unknown") || !strings.Contains(got, "7") {
+		t.Fatalf("ExitName(7) = %q, want it to say unknown and carry the code", got)
+	}
+	for _, name := range []string{"completed", "failed", "usage error", "not launched"} {
+		if strings.Contains(got, name) {
+			t.Fatalf("ExitName(7) = %q, which reads as %q — an undefined code must not borrow a defined code's word", got, name)
 		}
 	}
 }

@@ -17,7 +17,7 @@ import (
 // PORTED: tests/unit/config_family.bats: "the path is ~/.mythical/mythical.conf" -> TestFamilyPathShape
 // PORTED: tests/unit/config_family.bats: "the first set creates the file at mode 0600" -> TestFamilyAddCreatesAt0600
 // PORTED: tests/unit/config_family.bats: "a second key is added additively, leaving the first untouched" -> TestFamilyAddPreservesBytes
-// PORTED: tests/unit/config_family.bats: "adding a key preserves comments, blank lines, order and unrelated keys" -> TestFamilyAddPreservesBytes
+// PORTED: tests/unit/config_family.bats: "adding a key preserves comments, blank lines, order and unrelated keys byte-for-byte" -> TestFamilyAddPreservesBytes
 // PORTED: tests/unit/config_family.bats: "adding a key that already holds a DIFFERENT value is refused, and the file is untouched" -> TestFamilyAddAdditiveGate
 // PORTED: tests/unit/config_family.bats: "adding a key that already holds the SAME value is a no-op success" -> TestFamilyAddAdditiveGate
 // N/A: tests/unit/config_family.bats: "a call with the wrong number of arguments refuses instead of aborting under set -u" -- Go signatures fix arity at compile time
@@ -31,7 +31,7 @@ import (
 // PORTED: tests/unit/config_family.bats: "a change landing under us is refused, not overwritten" -> TestFamilyAddCASRefusesConcurrentChange (the CAS seam is exercised at the narrowest point Go exposes)
 // N/A: tests/unit/config_family.bats: "bytes swapped in during the copy are validated, not persisted" -- the Go writer reads ONCE and builds from those bytes; there is no copy window with a second read to swap under (structural: single os.ReadFile)
 // PORTED: tests/unit/config_family.bats: "same-value no-op does not report success if the file changed under us" -> TestFamilyAddCASRefusesConcurrentChange
-// PORTED: tests/unit/config_family.bats: "a symlink planted after the first identity check is still refused before the write" -> TestFamilySymlinkRefused (the pre-replace identity re-check is the same code path; the plant-between-checks window is the accepted pathname residual, as in bash)
+// PORTED: tests/unit/config_family.bats: "a symlink planted after the first identity check is still refused before the replace" -> TestFamilySymlinkRefused (the pre-replace identity re-check is the same code path; the plant-between-checks window is the accepted pathname residual, as in bash)
 // PORTED: tests/unit/config_family.bats: "a symlinked mythical.conf is refused, not followed and adopted" -> TestFamilySymlinkRefused
 // PORTED: tests/unit/config_family.bats: "a hardlinked mythical.conf is refused, leaving the other name untouched" -> TestFamilyHardlinkRefused
 // PORTED: tests/unit/config_family.bats: "an existing file that does not parse is never overwritten" -> TestFamilyAddNeverModifiesUnparseable
@@ -50,7 +50,7 @@ import (
 // PORTED: tests/unit/config_product.bats: "the marker is a checksum of everything above it" -> TestProductAddCreatesMarkered
 // PORTED: tests/unit/config_product.bats: "the file lands at 0660 with the family gid when chgrp succeeds" -> TestProductOwnershipApplied
 // PORTED: tests/unit/config_product.bats: "when chgrp fails the write reports rc 5 and leaves the file at 0600" -> TestProductOwnershipFailure
-// N/A: tests/unit/config_product.bats: "a failure while re-reading the body refuses instead of writing a truncated one" -- the Go writer never re-reads: the body is built from the one snapshot already in memory (structural)
+// N/A: tests/unit/config_product.bats: "a failure while re-reading the body refuses instead of writing a truncated file" -- the Go writer never re-reads: the body is built from the one snapshot already in memory (structural)
 // PORTED: tests/unit/config_product.bats: "an oversized product conf is refused, and leaves no snapshot behind" -> TestProductOversizedRefused (Go's snapshot is in-memory; "no snapshot file behind" has no on-disk artifact to leak)
 // PORTED: tests/unit/config_product.bats: "a retry after rc 5 repairs the mode and the group" -> TestProductOwnershipFailure
 // PORTED: tests/unit/config_product.bats: "a no-op merge does not rewrite the file" -> TestProductNoOpKeepsBytesAndInode
@@ -61,7 +61,7 @@ import (
 // PORTED: tests/unit/config_product.bats: "one bad pair in a batch rejects the whole write — no partial file" -> TestProductAddRefusals
 // PORTED: tests/unit/config_product.bats: "the same key given twice in one call is refused" -> TestProductAddRefusals
 // N/A: tests/unit/config_product.bats: "an odd number of arguments is refused" -- []KV cannot express an odd pair; the shape is the type
-// PORTED: tests/unit/config_product.bats: "a KEYLESS create produces a valid, marker-terminated, 0660 file that loads empty" -> TestProductEnsureKeylessCreate
+// PORTED: tests/unit/config_product.bats: "a KEYLESS create produces a valid, marker-terminated, 0660 file that loads" -> TestProductEnsureKeylessCreate
 // PORTED: tests/unit/config_product.bats: "adding a key preserves comments, ordering and untouched keys" -> TestProductAddPreservesBytes
 // PORTED: tests/unit/config_product.bats: "adding a key that already holds a different value is refused" -> TestProductAdditiveGate
 // PORTED: tests/unit/config_product.bats: "a marker-prefix line in the body is rejected, not treated as a comment" -> TestScanRefusals
@@ -79,7 +79,7 @@ import (
 // PORTED: tests/unit/config_product.bats: "a matching marker over a malformed body is rejected, not reported as torn" -> TestProductTornAndMalformed
 // PORTED: tests/unit/config_product.bats: "reading never rewrites the file" -> TestProductLoadRoundTrip
 // PORTED: tests/unit/config_product.bats: "a torn file reports rc 4 so the caller uses defaults, and names both remedies" -> TestProductTornAndMalformed
-// PORTED: tests/unit/config_product.bats: "a file with no marker at all is torn — a writer that skipped the contract" -> TestProductTornAndMalformed
+// PORTED: tests/unit/config_product.bats: "a file with no marker at all is torn — a writer that skipped the contract is not trusted" -> TestProductTornAndMalformed
 // N/A: tests/unit/config_product.bats: "the torn contract holds under set -euo pipefail" -- shell-option machinery; Go error returns cannot be silently exited past
 // PORTED: tests/unit/config_product.bats: "an invalid product name is refused and creates nothing" -> TestProductPathShape
 // PORTED: tests/unit/config_product.bats: "valid product names are accepted" -> TestProductPathShape

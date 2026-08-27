@@ -263,6 +263,15 @@ jobs:
       - name: check.sh go
         run: bash check.sh go
 
+      # The parity audit. It proves every @test in the frozen bats corpus is accounted for
+      # exactly once by the Go tree's PORTED:/N/A: inventory, and that every PORTED line names a
+      # test that really runs — which is the whole evidence that deleting the bash tree loses
+      # nothing. It runs HERE, on every pull request, rather than once at the cutover: an audit
+      # nobody invokes protects only the day it was run. It also keeps running after the
+      # deletion, from the committed tests/parity-manifest.tsv.
+      - name: check.sh parity
+        run: bash check.sh parity
+
       # The release build runs on EVERY pull request, not only at a tag. A
       # release lane that carries checks the PR lane does not is a lane whose
       # breakage is discovered while somebody is waiting to ship; this stage
