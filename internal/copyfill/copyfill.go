@@ -169,6 +169,25 @@ func (c *Copier) Available(ctx context.Context, ix *trust.Index) error {
 // answer: a helper that could not be LAUNCHED and a check that ran and failed are different
 // facts, and only the answer is parsed.
 func (c *Copier) helper(ctx context.Context, ix *trust.Index, cmd engine.HelperCommand, runAs string, args []string, mounts []engine.Mount) ([]byte, int64, error) {
+	return c.helperStdin(ctx, ix, cmd, runAs, args, mounts, nil)
+}
+
+// helperStdin is helper with the ONE extra knob the restore direction needs: bytes handed to the
+// helper on its STDIN.
+//
+// IT EXISTS SO THE MANIFEST IS NOT A THIRD HOST MOUNT. Verifying a just-filled volume against the
+// backup's per-entry manifest has to get that manifest INTO the container, and the alternative the
+// design explicitly refuses is binding a third, operator-named host path to carry it — the helper's
+// mount vocabulary is closed precisely so no caller can hand it an extra host tree. stdin carries
+// the bytes and adds no mount at all. (The reference spells the same thing `stdin=1` in its helper
+// spec vocabulary; see lib/runtime.sh's mi_rt_run_helper.)
+//
+// AN EMPTY stdin IS NOT AN OPENED-AND-NEVER-WRITTEN STREAM: the engine opens the container's stdin
+// only when there are bytes to write, so every caller that passes none keeps exactly the launch it
+// had before this parameter existed, and an EMPTY manifest — which is legal — reaches the helper as
+// an immediately-closed stdin, the same EOF-at-once the reference's redirect from an empty file
+// produces.
+func (c *Copier) helperStdin(ctx context.Context, ix *trust.Index, cmd engine.HelperCommand, runAs string, args []string, mounts []engine.Mount, stdin []byte) ([]byte, int64, error) {
 	ref, err := c.Image(ix)
 	if err != nil {
 		return nil, 0, err
@@ -189,6 +208,7 @@ func (c *Copier) helper(ctx context.Context, ix *trust.Index, cmd engine.HelperC
 		RunAs:  runAs,
 		Args:   args,
 		Mounts: mounts,
+		Stdin:  stdin,
 	})
 	if err != nil {
 		return nil, 0, err
@@ -793,6 +813,75 @@ func (c *Copier) Verify(ctx context.Context, ix *trust.Index, sourceVolume, dst 
 	}
 	fmt.Fprintf(c.out, "copy: verified %s entries against the source over the per-entry contract.\n", n)
 	return nil
+}
+
+// --- the three READ-ONLY modes of `verify` (the backup/restore direction) ---------------------
+//
+// THREE MORE MODES OF THE SAME CLOSED COMMAND WORD, never a new one (D49): new command
+// ARGUMENTS. They are distinguished from the ordinary four-argument `verify` by their SECOND
+// argument, which can never be the literal `/dst` every ordinary caller passes. All three read a
+// single volume, mounted READ-ONLY at /src, and take no destination, no uids and no ACL step —
+// they enumerate or compare, they never map ownership and they never write.
+//
+// THEY HAND BACK THE TRANSCRIPT UNREAD, and that is deliberate rather than lazy. The refusals
+// these three feed are specified against the transcript — which observation was missing, which
+// mismatch names nothing, and the count that binds a verification to the manifest it claims to
+// have checked — and those refusals belong to the backup/restore module, whose own tests pin
+// them. A second reading of the same lines here would be a second implementation of the same
+// rules, which is the drift this codebase's one-implementation rule exists to prevent. What this
+// module owes them is the LAUNCH: the pinned image, the read-only volume mount, private
+// networking, the provenance labels, and — for the third — the manifest on stdin rather than as a
+// third host mount.
+//
+// AN ERROR MEANS THE HELPER COULD NOT BE RUN, exactly as everywhere else here; a helper that ran
+// and failed reports itself in the returned exit status, and a caller that formed its verdict
+// from the transcript alone would still see the launch failure on the diagnostics stream.
+//
+// `Available` IS NOT RE-ASKED HERE. Every caller of these three asks it immediately before, as
+// the reference's own three callers do; a second image inspect is not a second guarantee, and
+// duplicating it would put the same question in two places to drift.
+
+// Enumerate is `verify <src> --manifest`: the BACKUP MANIFEST for one volume — per entry its
+// TYPE, and per type the content digest, the verbatim link target, the hardlink group, mode,
+// ownership and mtime. The transcript IS the manifest the backup stores; nothing here reshapes
+// it, because a manifest that is re-rendered on the way out is not the evidence the helper
+// produced.
+func (c *Copier) Enumerate(ctx context.Context, ix *trust.Index, volume string) (string, int, error) {
+	return c.readOnlyVerify(ctx, ix, volume, "--manifest", nil)
+}
+
+// Count is `verify <src> --count`: how many entries a volume holds, which is how a restore
+// establishes that a volume it has just created is EMPTY before it fills it. Emptiness must be
+// observed THROUGH the daemon — the host cannot read a named volume at all (D54) — so it is a
+// helper run and not a directory listing.
+func (c *Copier) Count(ctx context.Context, ix *trust.Index, volume string) (string, int, error) {
+	return c.readOnlyVerify(ctx, ix, volume, "--count", nil)
+}
+
+// VerifyAgainstManifest is `verify <src> --against-stdin`: compare a filled volume against the
+// backup's OWN per-entry manifest, handed to the helper on stdin.
+//
+// IT IS A DIFFERENT QUESTION FROM Verify, and the two must not be confused. Verify compares a
+// VOLUME at /src against a HOST tree at /dst over a count the copy step itself derived — the
+// copy→verify pair. This one has no /dst at all: the evidence is the manifest bytes, and the
+// count that binds it is the manifest's own entry count, established by the caller that holds
+// the manifest.
+func (c *Copier) VerifyAgainstManifest(ctx context.Context, ix *trust.Index, volume string, manifest []byte) (string, int, error) {
+	return c.readOnlyVerify(ctx, ix, volume, "--against-stdin", manifest)
+}
+
+// readOnlyVerify is the shared launch of the three modes above: the volume READ-ONLY at /src and
+// NOTHING ELSE mounted, the mode as the second argument, private networking, and no `--user` —
+// these modes read, and a reader that ran as a mapped principal would be answering a question
+// about that principal rather than about the volume.
+func (c *Copier) readOnlyVerify(ctx context.Context, ix *trust.Index, volume, mode string, stdin []byte) (string, int, error) {
+	src, err := engine.NewHelperSrcVolume(volume)
+	if err != nil {
+		return "", 0, err
+	}
+	out, code, runErr := c.helperStdin(ctx, ix, engine.HelperVerify, "",
+		[]string{"/src", mode}, []engine.Mount{src}, stdin)
+	return string(out), int(code), runErr
 }
 
 // AccessCheck is CONTAINER-SIDE EFFECTIVE ACCESS, by OUR helper running AS THE PRODUCT'S

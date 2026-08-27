@@ -232,17 +232,28 @@ func (s *session) close() { _ = famlock.Release(s.h) }
 // perform their own read-modify-write against the ledger FILE (they take the lock token, not a
 // ledger), so an in-memory copy taken before them is stale the moment they return — and persisting
 // that stale copy afterwards would silently erase the floor or the intent they just recorded.
+//
+// IT UPDATES THE SESSION'S LEDGER IN PLACE, never publishing a new one. Publishing a replacement
+// silently splits the session in two whenever anything downstream is already holding the ledger:
+// the holder goes on editing an object nothing will ever persist, while the session persists an
+// object the holder never saw. That is not hypothetical — a storage migration hands its ledger to
+// a phase machine that runs for the whole verb and re-authenticates documents (a disk write, and
+// therefore a reload) at every phase, so a replacing reload would drop every ledger edit made
+// after the first one. The only difference from adoptDisk is what each makes of an ABSENT ledger:
+// here it is legitimate first use and empties the copy; there something has just written the file,
+// so an absence is a record we know exists and cannot see, and it poisons the session.
 func (s *session) reload() error {
-	l, err := ledger.Read(s.st)
+	fresh, err := ledger.Read(s.st)
 	if errors.Is(err, ledger.ErrMissingLedger) {
-		s.l = &ledger.Ledger{}
-		return nil
-	}
-	if err != nil {
+		fresh = &ledger.Ledger{}
+	} else if err != nil {
 		return err
 	}
-	s.l = l
-	return nil
+	if s.l == nil {
+		s.l = fresh
+		return nil
+	}
+	return s.l.Adopt(fresh)
 }
 
 func (s *session) persist() error {
@@ -434,6 +445,14 @@ func (s *session) prepare(ctx context.Context) error {
 // is "not set" (the installer's own network); a file that could not be READ refuses — silently
 // taking the owned-network branch would join the family to a network nobody named.
 func (s *session) netTarget(ctx context.Context) (string, error) {
+	return s.netTargetOn(ctx, s.l)
+}
+
+// netTargetOn is netTarget over an EXPLICITLY NAMED ledger. The storage migration reaches the
+// network resolution through a seam that is handed the ledger the phase machine is driving, and a
+// resolution that quietly used the session's own field instead would be resolving against a
+// different object the moment those two were ever not the same.
+func (s *session) netTargetOn(ctx context.Context, l *ledger.Ledger) (string, error) {
 	name, set, err := familyNet(s.d.Home)
 	if err != nil {
 		return "", fmt.Errorf("netref: mythical.conf could not be read, so which network this family joins cannot be\n"+
@@ -446,7 +465,7 @@ func (s *session) netTarget(ctx context.Context) (string, error) {
 		Now:        time.Now,
 		Persist:    s.persistFn(),
 	}
-	id, err := netref.Target(ctx, s.l, netref.Engine(s.d.Engine), s.rt, name, set, nd)
+	id, err := netref.Target(ctx, l, netref.Engine(s.d.Engine), s.rt, name, set, nd)
 	if err != nil {
 		return "", err
 	}
@@ -459,7 +478,7 @@ func (s *session) netTarget(ctx context.Context) (string, error) {
 	// re-pointed in between, the second run adopts the replacement network without the split
 	// refusal ever seeing a recorded reference to disagree with. The reference is durable at once
 	// in the reference implementation, which is what this restores.
-	if perr := s.persist(); perr != nil {
+	if perr := s.persistFn()(l); perr != nil {
 		return "", perr
 	}
 	return id, nil

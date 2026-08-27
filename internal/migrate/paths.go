@@ -229,10 +229,28 @@ func ancestorChain(path string) ([]string, error) {
 	return out, nil
 }
 
+// VerifyChainOwnerSafe is the PUBLIC form of the ancestor-chain ownership check, on the pattern
+// the copy module's LinkEscapes already uses for its escape rule.
+//
+// IT IS EXPORTED SO THERE IS STILL EXACTLY ONE IMPLEMENTATION. The backup and restore verbs face
+// the identical problem for the directory the OPERATOR names on the command line — an
+// attacker-writable component anywhere on that path can be renamed away and replaced between this
+// process naming it and ever reading or writing it, and there is no fd-relative operation here that
+// would make a re-check atomic. That is the same TOCTOU class this walk already closes for a
+// migration's destination, and it is also the ONLY authentication a backup gets: there is no secret
+// to sign a tree with, so what stands in for a signature is LOCATION. A second, hand-written copy of
+// a security check is exactly the drift the one-implementation rule exists to prevent, so the seam
+// there is wired to THIS.
+//
+// The signature is deliberately the seam's own — (canonical path, what it is) — and the path must
+// ALREADY be canonical: this walks it, it does not resolve it.
+func VerifyChainOwnerSafe(canon, what string) error { return verifyChainOwnerSafe(canon, what) }
+
 // verifyChainOwnerSafe WALKS THE WHOLE ANCESTOR CHAIN of a canonical path (from / down to and
 // including it) and refuses if ANY component fails dirOwnerSafe — the ONE walk-and-report
-// implementation, shared by secureStateDir (the leaf it creates) and CheckParentTrust (the
-// destination's parent), rather than two that can drift.
+// implementation, shared by secureStateDir (the leaf it creates), CheckParentTrust (the
+// destination's parent) and, through VerifyChainOwnerSafe above, the backup/restore verbs' own
+// operator-named directory — rather than several that can drift.
 //
 // `what` names what the path IS, in the caller's own voice ("the destination's parent directory",
 // "the installer's own secure scratch location"), so one shared walk still reads naturally

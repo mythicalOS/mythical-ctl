@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"path/filepath"
 
 	"mythicalos.ai/ctl/internal/cliio"
+	"mythicalos.ai/ctl/internal/migrate"
+	"mythicalos.ai/ctl/internal/verbs"
 )
 
 // migrateStorage is the `migrate-storage` dispatch, ported from the frozen entrypoint's own case.
@@ -15,7 +18,7 @@ import (
 // anyway, and an option belonging to a different verb is REFUSED, not ignored — silently honouring
 // `migrate-storage p1 state --to-bind /x --purge` would run something other than what was written.
 // Every refusal below happens before any machinery is reached.
-func migrateStorage(o opts, stderr io.Writer) int {
+func migrateStorage(o opts, env []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if o.purge || o.family || o.image != "" || o.forced || o.abandon {
 		fmt.Fprintln(stderr, "mythical-ctl: migrate-storage takes only --to-bind and --map-foreign-to-operator")
 		return cliio.ExitUsage
@@ -38,12 +41,17 @@ func migrateStorage(o opts, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "mythical-ctl: --to-bind needs an absolute path")
 		return cliio.ExitUsage
 	}
-	// THE MACHINE IS internal/migrate; WHAT IS NOT HERE YET IS ITS RUNTIME WIRING. MigrateStorage
-	// takes a Deps carrying the copy-helper seam (the volume fill/copy/verify module) and the
-	// rebuild seam (product bring-up), neither of which this build composes yet. Reporting that
-	// plainly — and exiting with the OPERATIONAL failure code, not the usage code, because the
-	// invocation itself was well formed — is what the frozen entrypoint does for a verb whose
-	// mechanism is present and whose CLI wrapper is not. It degrades cleanly instead of pretending.
-	fmt.Fprintln(stderr, "mythical-ctl: migrate-storage is not available in this build yet")
-	return cliio.ExitFail
+	// THE MACHINE IS internal/migrate AND ITS RUNTIME WIRING IS internal/verbs — the one layer that
+	// holds the lock, the store, the ledger, the authenticated documents, the runtime facade and the
+	// bring-up sequence at the same time, which is what the phase machine's copy and rebuild seams
+	// need. Assembling that here would be a second copy of the session preamble every other verb
+	// already goes through, so the dispatcher does what it does for every other verb: judge the
+	// invocation, then hand it over.
+	d, err := deps(o, env, stdin, stdout, stderr)
+	if err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return cliio.ExitFail
+	}
+	return verbs.MigrateStorage(context.Background(), d, o.products[0], o.products[1],
+		migrate.Options{ToBind: o.toBind, MapForeign: o.mapForeign})
 }

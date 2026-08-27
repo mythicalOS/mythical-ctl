@@ -46,7 +46,13 @@ type cliRig struct {
 	errb bytes.Buffer
 }
 
-func newCLIRig(t *testing.T) *cliRig {
+func newCLIRig(t *testing.T) *cliRig { return newCLIRigIn(t, t.TempDir()) }
+
+// newCLIRigIn is newCLIRig over a family home the caller chose. The verbs that move data judge
+// the ANCESTOR CHAIN of the locations they touch, and the system temp root is world-writable on
+// most Linux hosts — so those tests have to place the home somewhere the check accepts, and this
+// is the one knob they need.
+func newCLIRigIn(t *testing.T, home string) *cliRig {
 	t.Helper()
 	f := enginetest.NewFake()
 	t.Cleanup(f.Close)
@@ -63,7 +69,6 @@ func newCLIRig(t *testing.T) *cliRig {
 		}
 		return 2, nil
 	}
-	home := t.TempDir()
 	r := &cliRig{
 		t:    t,
 		fake: f,
