@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"mythicalos.ai/ctl/internal/conf"
 	"mythicalos.ai/ctl/internal/engine"
@@ -165,13 +166,33 @@ func (d Deps) logf(format string, a ...any) {
 	fmt.Fprintf(d.Log, format+"\n", a...)
 }
 
-func (d Deps) persist(l *ledger.Ledger) error {
+// staged runs edit on a COPY of the ledger, PERSISTS the copy, and only then publishes it into the
+// caller's ledger — so a failed write leaves the caller's ledger exactly as it found it.
+//
+// THE ORDER IS THE WHOLE POINT (round 1, finding 2). Editing the caller's ledger first and
+// persisting afterwards leaves, on a failed or absent write, an in-memory phase that was never
+// durable: a caller reusing that ledger reads a phase disk does not have, and phase 9's own
+// deletion would leave the intent gone in memory while disk still carries it — a same-process
+// resume would then answer "nothing to resume" about a migration that is still recorded. The
+// reference cannot produce that state at all, because its ledger editor writes the FILE.
+//
+// A nil Persist is REFUSED, never skipped: silently proceeding would restore the defect this seam
+// closes, and it would do so invisibly — the operation would succeed and only a crash would reveal
+// that nothing was ever written ahead.
+func (d Deps) staged(l *ledger.Ledger, what string, edit func(*ledger.Ledger) error) error {
 	if d.Persist == nil {
-		return errors.New("migrate: no way to write the intent down before acting on it. A phase recorded only in\n" +
-			"  memory is a phase no crash can resume from, which is the whole of the durable-phase\n" +
-			"  contract. Nothing is done.")
+		return fmt.Errorf("migrate: no way to write the intent down before acting on it (%s). A phase recorded only\n"+
+			"  in memory is a phase no crash can resume from, which is the whole of the durable-phase\n"+
+			"  contract. Nothing is done.", what)
 	}
-	return d.Persist(l)
+	cp := l.Clone()
+	if err := edit(cp); err != nil {
+		return err
+	}
+	if err := d.Persist(cp); err != nil {
+		return fmt.Errorf("migrate: the record written ahead of %s could not be persisted, so nothing is done: %w", what, err)
+	}
+	return l.Adopt(cp)
 }
 
 func recordKey(product, role string) string { return product + ":" + role }
@@ -205,6 +226,13 @@ type record struct {
 	Desired string
 	Mount   string
 	StageID string
+	// attemptPresent and desiredPresent record whether the FIELD WAS THERE, not whether it had a
+	// value. Only these two carry a non-empty default, and defaulting on emptiness rather than on
+	// absence is a silent upgrade of a corrupt record: `desired=` (present, empty) must reach
+	// phase 9's "neither running nor stopped" refusal, not be restored as `running`, and
+	// `attempt=` must not be presented to the compare-and-set as a fresh write.
+	attemptPresent bool
+	desiredPresent bool
 }
 
 func (r record) fields() []ledger.Field {
@@ -227,13 +255,15 @@ func (r record) fields() []ledger.Field {
 	}
 }
 
-// put writes the record and PERSISTS IT, in that order and as one step. A phase marker held only in
-// memory while the phase's own action runs is a marker no crash can resume from.
+// put writes the record and PERSISTS IT as ONE step, through the staging seam. A phase marker held
+// only in memory while the phase's own action runs is a marker no crash can resume from — and a
+// marker published into the caller's ledger before the write succeeded is worse, because it reads
+// as durable.
 func (r record) put(l *ledger.Ledger, d Deps) error {
-	if err := l.Put(Kind, "key", recordKey(r.Product, r.Role), r.fields()); err != nil {
-		return err
-	}
-	return d.persist(l)
+	return d.staged(l, fmt.Sprintf("entering phase %d of %s/%s", r.Phase, r.Product, r.Role),
+		func(c *ledger.Ledger) error {
+			return c.Put(Kind, "key", recordKey(r.Product, r.Role), r.fields())
+		})
 }
 
 // ErrNoMigration means no migration is recorded for this product/role — an ANSWER, not a refusal.
@@ -251,6 +281,8 @@ func find(l *ledger.Ledger, product, role string) (record, error) {
 			"  over a ledger this core cannot read. Run 'mythical-ctl state repair': %w", product, role, err)
 	}
 	get := func(k string) string { v, _ := ledger.FieldOf(fields, k); return v }
+	_, attemptPresent := ledger.FieldOf(fields, "attempt")
+	_, desiredPresent := ledger.FieldOf(fields, "desired")
 	ps := get("phase")
 	if ps == "" {
 		return record{}, fmt.Errorf("migrate: the recorded migration for %s/%s does not name a phase. Run\n"+
@@ -266,6 +298,7 @@ func find(l *ledger.Ledger, product, role string) (record, error) {
 		Dest: get("dest"), SrcVol: get("srcvol"), Staging: get("staging"), Nonce: get("nonce"),
 		ConfKey: get("confkey"), Prior: get("prior"), Attempt: get("attempt"),
 		Desired: get("desired"), Mount: get("mount"), StageID: get("stageid"),
+		attemptPresent: attemptPresent, desiredPresent: desiredPresent,
 	}, nil
 }
 
@@ -588,8 +621,10 @@ func Run(ctx context.Context, l *ledger.Ledger, d Deps, product, role, dest stri
 	// dropped on the way through one phase and not another.
 	next := record{
 		Product: product, Role: role, Dest: dest, SrcVol: srcvol, ConfKey: key, Mount: mount,
-		Nonce: prev.Nonce, Prior: prev.Prior, Attempt: orDefault(prev.Attempt, "none"),
-		Desired: orDefault(prev.Desired, string(state.Running)), StageID: prev.StageID,
+		Nonce: prev.Nonce, Prior: prev.Prior, StageID: prev.StageID,
+		Attempt:        carried(prev.Attempt, prev.attemptPresent, "none"),
+		Desired:        carried(prev.Desired, prev.desiredPresent, string(state.Running)),
+		attemptPresent: true, desiredPresent: true,
 	}
 	// ALWAYS DERIVED FROM THE CANONICAL DEST, NEVER THE LEDGER'S CARRIED RAW VALUE. A record written
 	// by a caller that never canonicalized can carry a raw staging path through a symlinked alias;
@@ -624,11 +659,13 @@ func Run(ctx context.Context, l *ledger.Ledger, d Deps, product, role, dest stri
 	return fmt.Errorf("migrate: %d is not a migration phase", phase)
 }
 
-func orDefault(v, dflt string) string {
-	if v == "" {
-		return dflt
+// carried applies a default ONLY when the field was absent. A field that is there and empty is
+// carried forward verbatim, so the phase that consumes it sees the record as it actually is.
+func carried(v string, present bool, dflt string) string {
+	if present {
+		return v
 	}
-	return v
+	return dflt
 }
 
 // runPhase1 opens the intent. EACH ATTEMPT ALLOCATES A FRESH NONCE AND A FRESH STAGING PATH. The
@@ -717,15 +754,18 @@ func runPhase3(ctx context.Context, l *ledger.Ledger, d Deps, r record, ruid, ou
 	}
 	if err := os.Mkdir(r.Staging, 0o755); err != nil {
 		if _, lerr := os.Lstat(r.Staging); lerr == nil {
-			// STEP BACK TO PHASE 1 WITH THE NONCE AND STAGING PATH CLEARED, so the next attempt
-			// mints fresh ones and proceeds BESIDE the leftover. The leftover is preserved.
+			// THE PATH IS CAPTURED BEFORE IT IS CLEARED. The record steps back to phase 1 with the
+			// nonce and staging path emptied, so the next attempt mints fresh ones and proceeds
+			// BESIDE the leftover — but the refusal must still NAME the directory being preserved,
+			// or the operator has nothing to inspect or reclaim.
+			leftover := r.Staging
 			r.Phase, r.Staging, r.Nonce, r.StageID = 1, "", "", ""
 			if perr := r.put(l, d); perr != nil {
 				return perr
 			}
 			return fmt.Errorf("migrate: %q already exists, so this attempt cannot prove the directory is its\n"+
 				"  own. It is preserved and reported; re-run to proceed beside it with a fresh nonce\n"+
-				"  and a fresh staging path. Reclaiming the space is your decision.", r.Staging)
+				"  and a fresh staging path. Reclaiming the space is your decision.", leftover)
 		}
 		return fmt.Errorf("migrate: cannot create the staging directory %s: %w", r.Staging, err)
 	}
@@ -764,7 +804,13 @@ func runPhase3(ctx context.Context, l *ledger.Ledger, d Deps, r record, ruid, ou
 // EXACTLY as one during phase 3 — the ledger still names phase 3, so a resumed process re-enters
 // phase 3, and the non-adopting mkdir refuses to take over the unconfirmed copy.
 func runPhase4(ctx context.Context, d Deps, prev, r record, ruid, ouid string) error {
-	st, serr := os.Lstat(r.Staging)
+	// os.Stat, NOT Lstat: the question here is "is there a directory at this name", which the
+	// reference asks with `[ -d ]` — and that FOLLOWS a symlink. Reading a symlink-to-directory as
+	// "there is nothing to verify" would skip the whole verification and advance the phase, where
+	// the reference instead proceeds and lets the Lstat-based identity check report the
+	// substitution. The identity question below is still asked by Lstat, which is what makes a swap
+	// to a symlink observable at all.
+	st, serr := os.Stat(r.Staging)
 	if serr != nil || !st.IsDir() {
 		// A resume that reaches this with no staging directory has nothing to verify. That can only
 		// happen from a corrective ledger edit, never from a real crash — phase 3 always creates it
@@ -859,7 +905,12 @@ func runPhase5(l *ledger.Ledger, d Deps, r record) error {
 	// down beside whatever the attacker put there — non-atomic, and wrong in a way nothing
 	// afterward would notice.
 	if _, err := os.Lstat(r.Dest); err == nil {
-		_ = os.Remove(r.Dest)
+		// rmdir(2), NOT a general remove. A general remove unlinks a NON-directory too, so a symlink
+		// planted at the destination after the precheck would be silently deleted and the staged
+		// tree committed in its place — the migration would then quietly redefine where the
+		// operator's destination points. rmdir refuses anything that is not an EMPTY directory,
+		// which is exactly the two cases this commit is allowed to replace.
+		_ = syscall.Rmdir(r.Dest)
 		if _, err := os.Lstat(r.Dest); err == nil {
 			return fmt.Errorf("migrate: %q is no longer the empty or absent directory this migration\n"+
 				"  verified — something exists there now that could not be removed (it is not\n"+
@@ -900,9 +951,21 @@ func runPhase5(l *ledger.Ledger, d Deps, r record) error {
 // compare-and-set completed) it reads "started" from that crashed attempt's own write. That is
 // exactly the distinction the compare-and-set needs to tell a crash from a hand edit.
 func runPhase6(l *ledger.Ledger, d Deps, prev, r record) error {
-	attempt := conf.AttemptNone
-	if prev.Attempt == "started" {
+	// THE RECORDED STATE IS MAPPED, NOT COERCED. A value that is neither of the two this core
+	// defines is a corrupt or hand-edited record, and folding it into "none" would present a
+	// migration that may already have written mythical.conf to the compare-and-set as a FRESH
+	// write — the one situation the attempt field exists to tell apart.
+	var attempt conf.Attempt
+	switch r.Attempt {
+	case "none":
+		attempt = conf.AttemptNone
+	case "started":
 		attempt = conf.AttemptStarted
+	default:
+		return fmt.Errorf("migrate: the recorded write-attempt state %q for %s/%s is neither 'none' nor\n"+
+			"  'started'. Refusing to present it to the one door authorized to change a value in\n"+
+			"  mythical.conf — a crash and a hand edit are told apart by this field alone.\n"+
+			"  Run 'mythical-ctl state repair'.", r.Attempt, r.Product, r.Role)
 	}
 	r.Phase, r.Attempt = 6, "started"
 	if err := r.put(l, d); err != nil {
@@ -950,13 +1013,12 @@ func runPhase7(ctx context.Context, l *ledger.Ledger, d Deps, r record, containe
 		return fmt.Errorf("migrate: refusing to replace %q at phase 7. The migration stays at\n"+
 			"  phase 7 with its intent intact and can be resumed once the container is resolved: %w", container, aerr)
 	}
-	if err := prov.Tombstone(l, prov.ClassContainer, container); err != nil {
+	if err := d.staged(l, "tombstone the replaced container", func(c *ledger.Ledger) error {
+		return prov.Tombstone(c, prov.ClassContainer, container)
+	}); err != nil {
 		return fmt.Errorf("migrate: could not tombstone the removed container %q. The migration stays at phase\n"+
 			"  7 and can be resumed; run 'mythical-ctl state repair' if a later step reports the\n"+
 			"  object as already accounted for: %w", container, err)
-	}
-	if err := d.persist(l); err != nil {
-		return err
 	}
 	return d.Build.Rebuild(ctx, l, r.Product, container, netID)
 }
@@ -1014,21 +1076,24 @@ func runPhase9(ctx context.Context, l *ledger.Ledger, d Deps, r record, containe
 	}
 	switch state.Desired(r.Desired) {
 	case state.Running:
-		if err := state.Commit(l, container, state.Running, []state.Check{{Kind: state.CheckAlias, Param: netID}}, false); err != nil {
+		if err := d.staged(l, "restore the recorded desired state", func(c *ledger.Ledger) error {
+			return state.Commit(c, container, state.Running, []state.Check{{Kind: state.CheckAlias, Param: netID}}, false)
+		}); err != nil {
 			return err
 		}
 	case state.Stopped:
-		if err := state.Commit(l, container, state.Stopped, nil, true); err != nil {
+		if err := d.staged(l, "restore the recorded desired state", func(c *ledger.Ledger) error {
+			return state.Commit(c, container, state.Stopped, nil, true)
+		}); err != nil {
 			return err
 		}
 	default:
 		return fmt.Errorf("migrate: the recorded desired state %q for %q is neither running nor\n"+
 			"  stopped — refusing to restore it blindly. Run 'mythical-ctl state repair'.", r.Desired, container)
 	}
-	if err := l.Del(Kind, "key", recordKey(r.Product, r.Role)); err != nil {
-		return err
-	}
-	if err := d.persist(l); err != nil {
+	if err := d.staged(l, "clear the completed intent", func(c *ledger.Ledger) error {
+		return c.Del(Kind, "key", recordKey(r.Product, r.Role))
+	}); err != nil {
 		return err
 	}
 	// Report a failed reconciliation rather than swallowing it: the data has moved and the config

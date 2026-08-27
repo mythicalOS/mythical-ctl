@@ -652,7 +652,13 @@ func ResumePhase(phase int, dest, stageid string) int {
 // This is a TOOL, not a step any flow calls on its own: reclaiming an operator's disk space is never
 // automatic.
 func StagingReclaim(home, stage, recordedNonce, recordedID, pathNonce string) error {
-	st, err := os.Lstat(stage)
+	// os.Stat, NOT Lstat, for the PRESENCE question — the reference asks it with `[ -d ]`, which
+	// FOLLOWS a symlink. Reading a symlink-to-directory at the staging name as "there is nothing
+	// here" would return SUCCESS having said nothing about an object standing where this
+	// installer's own staging directory should be; the identity check below is what reports it,
+	// and it can only run if the presence question does not swallow the case first. The identity
+	// itself is still read by Lstat, which is what makes the substitution visible.
+	st, err := os.Stat(stage)
 	if err != nil || !st.IsDir() {
 		return nil // nothing there: nothing to reclaim, and nothing to report
 	}
