@@ -525,6 +525,22 @@ func (c *Client) ImageInspect(ctx context.Context, ref string) (*ImageInfo, erro
 type Mutator struct {
 	c *Client
 	h famlock.Held
+
+	// PullProgress, when set, is called once per status record the daemon emits while an image is
+	// being pulled. A pull is the one step of an install that can take minutes, and a front-end
+	// with no way to see inside it can only show a frozen screen.
+	//
+	// ADDITIVE AND nil BY DEFAULT: with no callback the pull behaves exactly as it always did, so
+	// every existing caller — and every non-interactive invocation — is unchanged. It is a plain
+	// field rather than a constructor argument because NewMutator's callers are pinned by the
+	// boundary gate to the runtime facade, and a front-end that wants the stream sets it on the
+	// Mutator the facade hands out rather than by threading a parameter through every layer
+	// between.
+	//
+	// It is called ON THE PULLING GOROUTINE, synchronously, between stream records: an
+	// implementation that blocks stalls the pull, so the one in this tree posts a message and
+	// returns.
+	PullProgress func(status string)
 }
 
 // NewMutator is the ONLY way to a Mutator, and check.sh's boundary gate pins its callers to
@@ -808,7 +824,10 @@ func (m *Mutator) ImagePull(ctx context.Context, refWithDigest string) error {
 	dec := json.NewDecoder(resp.Body)
 	for {
 		var rec struct {
-			Error string `json:"error"`
+			Error    string `json:"error"`
+			Status   string `json:"status"`
+			Progress string `json:"progress"`
+			ID       string `json:"id"`
 		}
 		if err := dec.Decode(&rec); err != nil {
 			if errors.Is(err, io.EOF) {
@@ -817,9 +836,28 @@ func (m *Mutator) ImagePull(ctx context.Context, refWithDigest string) error {
 			return fmt.Errorf("engine: the pull stream broke off: %v", err)
 		}
 		if rec.Error != "" {
+			// THE ERROR IS REPORTED BEFORE ANY PROGRESS FROM THE SAME RECORD. A record carrying
+			// both would otherwise narrate the failure as if it were a step.
 			return fmt.Errorf("engine: pull failed: %s", rec.Error)
 		}
+		if m.PullProgress != nil && rec.Status != "" {
+			m.PullProgress(pullStatusLine(rec.ID, rec.Status, rec.Progress))
+		}
 	}
+}
+
+// pullStatusLine composes one pull status record into the line a front-end shows. The layer id
+// leads when the daemon supplied one, and the bar follows the status — the order `docker pull`
+// itself prints them in, so an operator reads the same shape they already know.
+func pullStatusLine(id, status, progress string) string {
+	line := status
+	if id != "" {
+		line = id + ": " + line
+	}
+	if progress != "" {
+		line += " " + progress
+	}
+	return line
 }
 
 // HelperResult is what a helper run reports. Stdout is the helper's ANSWER — the `key=value`
