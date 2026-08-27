@@ -1140,6 +1140,64 @@ func TestConcurrentInstallsAreSerialized(t *testing.T) {
 	}
 }
 
+// TestImageOverrideRunsWhatItRecords is not a bats port — the shell tests that report an override
+// through `status` belong to the task that lands status. It is here because THIS task added the
+// launch parameter the override travels on, and an override that is recorded but not RUN is the
+// worst of both: `status` names one image while the container runs another, and a later recreate
+// rebuilds from the recorded reference against an image that was never pulled.
+func TestImageOverrideRunsWhatItRecords(t *testing.T) {
+	r := newRig(t)
+	r.writeProduct("p1")
+	r.mintIdentity()
+	override := digestRef("p1-local-build")
+
+	if rc := r.install("p1", withImage(override)); rc != cliio.ExitOK {
+		t.Fatalf("rc = %d, want 0\n%s", rc, r.said())
+	}
+	// It is LOUD.
+	r.mustSay("IMAGE OVERRIDE")
+	// The container really runs the overridden reference, not the manifest's.
+	info, err := r.c.ContainerInspect(context.Background(), r.container("p1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Image == digestRef("p1") {
+		t.Fatal("the container runs the manifest's image — the override was recorded but not run")
+	}
+	// And it is recorded, so a later recreate rebuilds from the same reference.
+	rec, ferr := r.ledgerNow().Find("forced", "key", "p1:image-override")
+	if ferr != nil {
+		t.Fatalf("no override record: %v", ferr)
+	}
+	if ref, ok := ledger.FieldOf(rec, "ref"); !ok || ref != override {
+		t.Fatalf("the override record names %q, want %q", ref, override)
+	}
+	r.reset()
+	if rc := r.recreate("p1"); rc != cliio.ExitOK {
+		t.Fatalf("recreate rc = %d, want 0\n%s", rc, r.said())
+	}
+	r.mustSay("image override preserved")
+	// SAYING SO IS NOT DOING IT: the rebuilt container must actually run the recorded reference,
+	// or `status` names one image while the container runs another.
+	after, aerr := r.c.ContainerInspect(context.Background(), r.container("p1"))
+	if aerr != nil {
+		t.Fatal(aerr)
+	}
+	if after.Image != info.Image {
+		t.Fatalf("recreate rebuilt from %q, not the recorded override %q", after.Image, info.Image)
+	}
+
+	// A plain re-install CLEARS it: with no --image the manifest's image is what runs, so a record
+	// naming the old override would send a later recreate at an image nothing selected.
+	r.reset()
+	if rc := r.install("p1"); rc != cliio.ExitOK {
+		t.Fatalf("plain re-install rc = %d\n%s", rc, r.said())
+	}
+	if _, ferr := r.ledgerNow().Find("forced", "key", "p1:image-override"); !errors.Is(ferr, ledger.ErrAbsentRecord) {
+		t.Fatalf("a plain install left the override record behind: %v", ferr)
+	}
+}
+
 // --- the aggregate's own refusals ---------------------------------------------------------------------
 
 // TestWorstRefusals is not a bats port: the shell's mi_ex_worst refusals live in tests/unit/exit.bats,
