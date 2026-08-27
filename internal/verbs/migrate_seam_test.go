@@ -5,9 +5,11 @@ import (
 	"strings"
 	"testing"
 
+	"mythicalos.ai/ctl/internal/engine/enginetest"
 	"mythicalos.ai/ctl/internal/ledger"
 	"mythicalos.ai/ctl/internal/manifest"
 	"mythicalos.ai/ctl/internal/migrate"
+	"mythicalos.ai/ctl/internal/state"
 	"mythicalos.ai/ctl/internal/trust"
 )
 
@@ -262,12 +264,64 @@ func TestRebuilderSatisfiesThePhaseMachinesSeam(t *testing.T) {
 	var _ migrate.Copier = migrateCopier{}
 	var _ migrate.Documents = sessionDocs{}
 	var _ migrate.Objects = migrateObjects{}
-	// And the alias the reconcile half derives is the one the launch itself registers — the seam
-	// takes no alias, so a second derivation here would settle a container under a name the
-	// bring-up never registered.
-	a, err := manifest.Alias("p1")
-	if err != nil || a == "" {
-		t.Fatalf("alias: %q %v", a, err)
+}
+
+// TestReconcileSettlesUnderTheProductsOwnAlias measures the one thing the seam's shape leaves to
+// this side: Reconcile takes NO alias, so it derives one, and a container settled under a name the
+// bring-up never registered would never verify.
+//
+// THE ALIAS IS ONLY OBSERVABLE THROUGH THE PROBE. Settling an outstanding alias check resolves that
+// name from inside the family network, so the name the probe is asked for IS the name this seam
+// derived — and a wrong one does not merely go unnoticed, it fails to resolve and the check stays
+// outstanding. Both are asserted: the name asked for, and that the check actually cleared.
+func TestReconcileSettlesUnderTheProductsOwnAlias(t *testing.T) {
+	r, s, rb, c1, _ := preparedRig(t)
+	netID := netFor(t, s, rb)
+
+	// Exactly what phase 9 records before it asks the seam to settle: the recorded desired state,
+	// with the alias check outstanding.
+	if err := state.Commit(s.l, c1, state.Running, []state.Check{{Kind: state.CheckAlias, Param: netID}}, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.persistFn()(s.l); err != nil {
+		t.Fatal(err)
+	}
+
+	var asked []string
+	base := r.fake.HelperEntry
+	r.fake.HelperEntry = func(cmd string, args []string, view enginetest.HelperNetView, stdin []byte) (int, []byte) {
+		// `resolve` ONLY. The probe first proves its own resolver works by looking up the
+		// per-run alias it registered itself under (`selfcheck`); the name under discussion here
+		// is the one it is then asked to RESOLVE.
+		if cmd == "resolve" && len(args) > 0 {
+			asked = append(asked, args[0])
+		}
+		return base(cmd, args, view, stdin)
+	}
+
+	if err := rb.Reconcile(context.Background(), s.l, c1, netID); err != nil {
+		t.Fatalf("reconcile: %v\n%s", err, r.said())
+	}
+	want, aerr := manifest.Alias("p1")
+	if aerr != nil {
+		t.Fatal(aerr)
+	}
+	if len(asked) == 0 {
+		t.Fatal("nothing was resolved, so the alias this seam derived was never exercised")
+	}
+	for _, a := range asked {
+		if a != want {
+			t.Fatalf("the reconciliation resolved %q, but the launch registers %q", a, want)
+		}
+	}
+	// AND THE CHECK CLEARED. A resolution that answered about the wrong name would leave it
+	// outstanding, which is the half an alias assertion alone would miss.
+	out, oerr := state.Outstanding(s.l, c1)
+	if oerr != nil {
+		t.Fatal(oerr)
+	}
+	if len(out) != 0 {
+		t.Fatalf("the alias check is still outstanding after a successful reconcile: %+v", out)
 	}
 }
 
