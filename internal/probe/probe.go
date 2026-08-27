@@ -286,6 +286,14 @@ func field(out []byte, key string) (val string, found bool, err error) {
 	return val, true, nil
 }
 
+// Field is field, exported for the ONE other reader of the same response format — the copy
+// container's transcript (internal/copyfill). The two pinned helpers share one entrypoint
+// contract, so they share one reader: a second implementation would be a second, drifting
+// opinion about what a repeated key means, and the duplicate rule above is precisely the rule
+// a second copy loses. The reference states this as an identity — `_mi_copy_field() {
+// _mi_probe_field "$@"; }` — and this is that identity.
+func Field(out []byte, key string) (val string, found bool, err error) { return field(out, key) }
+
 // asserted: AN EXIT STATUS IS NOT A RESULT — the check passes only when the answer STATES
 // `<key>=ok`. A pinned image that regressed to exiting 0 while printing nothing, or printing
 // `<key>=fail`, would otherwise be accepted as proof. FAIL CLOSED: the absence of the

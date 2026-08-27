@@ -202,6 +202,10 @@ type Fake struct {
 	LastPullRef  string
 	LastPullAuth map[string]string
 
+	// helperLaunches records every helper CREATE — see HelperLaunch. Read it through
+	// HelperLaunches(), which copies under the fake's lock.
+	helperLaunches []HelperLaunch
+
 	containers map[string]*fakeContainer
 	volumes    map[string]*fakeVolume
 	networks   []*fakeNetwork
@@ -273,6 +277,40 @@ func (f *Fake) registerImage(ref string) {
 	if _, ok := f.images[ref]; !ok {
 		f.images[ref] = fmt.Sprintf("sha256:%064d", f.mintID())
 	}
+}
+
+// HelperMount is one mount as the daemon received it on a helper create.
+type HelperMount struct {
+	Type     string // "bind" | "volume"
+	Source   string // host path (bind) or volume name (volume)
+	Target   string
+	ReadOnly bool
+}
+
+// HelperLaunch is one helper create, recorded AS SUBMITTED — the analogue of the reference
+// harness's `calls.log` line for the `docker run` a helper is.
+//
+// IT EXISTS BECAUSE NO HELPER OUTLIVES ITS OWN INVOCATION: the client force-removes the
+// container on every path that created one, so by the time a test can look, there is nothing
+// to inspect. The launch contract — the source mounted READ-ONLY, staging the ONLY writable
+// mount, NOTHING ELSE from the host mounted at all, private (`none`) networking, and the uid
+// an effective-access check runs as — is therefore asserted from this record.
+type HelperLaunch struct {
+	Image   string
+	Name    string
+	Cmd     []string // the closed command word, then its own arguments
+	User    string   // the `--user` uid, "" when the image's own user is kept
+	NetMode string   // "none" for private-mode helpers, else ""
+	Network string   // the network reference submitted at create, "" in private mode
+	Aliases []string // the network aliases submitted at create
+	Mounts  []HelperMount
+}
+
+// HelperLaunches returns every helper create so far, oldest first.
+func (f *Fake) HelperLaunches() []HelperLaunch {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]HelperLaunch(nil), f.helperLaunches...)
 }
 
 // ContainerCount reports how many containers the daemon holds, in any state.
@@ -687,6 +725,27 @@ func (f *Fake) createContainer(w http.ResponseWriter, r *http.Request) {
 	}
 	c.id = f.longID()
 	f.containers[name] = c
+	// A helper carries a command; a product container does not. Recorded HERE — at create,
+	// where the launch is decided, and BEFORE the CreateResponseLost unwind below — so an
+	// ambiguous create is still visible as the launch it was.
+	if len(c.cmd) > 0 {
+		rec := HelperLaunch{
+			Image: c.image, Name: c.name, Cmd: append([]string(nil), c.cmd...),
+			User: c.user, NetMode: c.netmode,
+		}
+		if len(c.endpoints) == 1 {
+			rec.Network = c.endpoints[0].netName
+			rec.Aliases = append([]string(nil), c.endpoints[0].aliases...)
+		}
+		for _, m := range c.mounts {
+			src := m.source
+			if m.typ == "volume" {
+				src = m.name
+			}
+			rec.Mounts = append(rec.Mounts, HelperMount{Type: m.typ, Source: src, Target: m.target, ReadOnly: !m.rw})
+		}
+		f.helperLaunches = append(f.helperLaunches, rec)
+	}
 	if f.CreateResponseLost {
 		// The record is written; the answer never arrives. The dispatcher's deferred unlock
 		// runs during the unwind, so the fake stays answerable for the sweep that follows.
