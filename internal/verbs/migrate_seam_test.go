@@ -8,6 +8,7 @@ import (
 	"mythicalos.ai/ctl/internal/ledger"
 	"mythicalos.ai/ctl/internal/manifest"
 	"mythicalos.ai/ctl/internal/migrate"
+	"mythicalos.ai/ctl/internal/trust"
 )
 
 // Inventory — the rebuild seam. IT CLAIMS NO BATS ROW: in the reference the migration's phase 7
@@ -50,9 +51,27 @@ func netFor(t *testing.T, s *session, rb *rebuilder) string {
 // the alias it settles from the field this rebuilder was built with — so preparing one product
 // through another's rebuilder would build one container and settle a different one.
 func TestPrepareRefusesAnotherProduct(t *testing.T) {
-	r, s, rb, _, c2 := preparedRig(t)
+	r := newRig(t)
+	// BOTH products are real, attested and launchable. A rig with only p1 would refuse p2 for a
+	// reason of its own — the family index does not vouch for it — and the guard would then be
+	// subsumed by an unrelated refusal rather than measured.
+	r.writeProduct("p1")
+	r.writeProduct("p2")
+	for _, p := range []string{"p1", "p2"} {
+		if rc := r.install(p); rc != 0 {
+			t.Fatalf("install %s rc = %d\n%s", p, rc, r.said())
+		}
+	}
+	c2 := r.container("p2")
+	s, oerr := openSession(r.d)
+	if oerr != nil {
+		t.Fatal(oerr)
+	}
+	defer s.close()
+	rb := &rebuilder{s: s, product: "p1"}
+	netID := netFor(t, s, rb)
 	before := r.fake.Snapshot()
-	_, err := rb.Prepare(context.Background(), s.l, "p2", c2, "")
+	_, err := rb.Prepare(context.Background(), s.l, "p2", c2, netID)
 	if err == nil {
 		t.Fatal("a rebuilder bound to p1 prepared p2")
 	}
@@ -70,8 +89,11 @@ func TestPrepareRefusesAnotherProduct(t *testing.T) {
 // container while the phase removes something else.
 func TestPrepareRefusesAContainerThisInstallationDoesNotDerive(t *testing.T) {
 	r, s, rb, _, _ := preparedRig(t)
+	// A RESOLVED NETWORK, so the only thing that can refuse this call is the guard: with an
+	// unresolved one the launch assembly refuses first and the guard is never measured.
+	netID := netFor(t, s, rb)
 	before := r.fake.Snapshot()
-	_, err := rb.Prepare(context.Background(), s.l, "p1", "mythical-someoneelse-p1", "")
+	_, err := rb.Prepare(context.Background(), s.l, "p1", "mythical-someoneelse-p1", netID)
 	if err == nil {
 		t.Fatal("a container this installation does not derive was accepted")
 	}
@@ -213,6 +235,12 @@ func TestDiscardedReplacementRefusesToCreate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare: %v\n%s", err, r.said())
 	}
+	// THE OLD CONTAINER IS GONE, exactly as it is when phase 7 reaches the create. Leaving it
+	// standing would have the daemon refuse the create for a name conflict, and the release path
+	// would then look like it held when it was the daemon holding.
+	if err := s.rt.ContainerRemove(context.Background(), c1); err != nil {
+		t.Fatal(err)
+	}
 	rep.Discard()
 	before := r.fake.Snapshot()
 	if cerr := rep.Create(context.Background(), s.l); cerr == nil {
@@ -240,5 +268,156 @@ func TestRebuilderSatisfiesThePhaseMachinesSeam(t *testing.T) {
 	a, err := manifest.Alias("p1")
 	if err != nil || a == "" {
 		t.Fatalf("alias: %q %v", a, err)
+	}
+}
+
+// TestCopySeamForwardsTheEscapeRule: the phase machine re-walks the staged tree host-side
+// immediately before the commit, and asks THIS seam whether each symlink target leaves the tree.
+//
+// IT MUST BE THE COPY MODULE'S OWN DEFINITION, forwarded. That rule is enforced during the copy
+// itself by the same module; a second spelling here is how one of the two stops matching, and the
+// one that stops matching is the one that lets an escaping symlink through into a tree the product
+// is about to be handed. Asserted over the three shapes the rule turns on rather than by
+// inspection, so a forwarding replaced by a private answer reddens.
+func TestCopySeamForwardsTheEscapeRule(t *testing.T) {
+	var esc migrate.Escaper = migrateCopier{}
+	root := "/staging"
+	for _, tc := range []struct {
+		name   string
+		link   string
+		target string
+		want   bool
+	}{
+		{"an absolute target leaves the tree", root + "/evil", "/etc/passwd", true},
+		{"a climbing relative target leaves the tree", root + "/evil", "../../etc/passwd", true},
+		{"a target inside the tree does not", root + "/data/link", "../data/f", false},
+	} {
+		if got := esc.LinkEscapes(tc.link, tc.target, root); got != tc.want {
+			t.Fatalf("%s: LinkEscapes(%q, %q, %q) = %v, want %v",
+				tc.name, tc.link, tc.target, root, got, tc.want)
+		}
+	}
+}
+
+// --- the ledger the phase machine holds ----------------------------------------------------------
+//
+// A STORAGE MIGRATION HOLDS ONE LEDGER FOR THE WHOLE VERB and hands it back through every seam
+// call, and both seams below re-authenticate documents — which is a write to the ledger FILE
+// performed by the acceptor itself, since the acceptors take the lock token rather than a ledger.
+// So the caller's copy is stale the instant either returns, and the caller's very next write is
+// what erases the floor that was just recorded. These two tests are the only thing standing
+// between that and an anti-rollback floor silently reverting mid-migration.
+
+// floorOn reads a document's recorded version floor from the store this session opened, WITHOUT
+// taking the family lock — the session is already holding it.
+func floorOn(t *testing.T, s *session, docid string) string {
+	t.Helper()
+	v, err := trust.FloorGet(s.st, docid)
+	if err != nil {
+		t.Fatalf("floor for %s: %v", docid, err)
+	}
+	return v
+}
+
+func TestPrepareLeavesTheCallersLedgerAbleToCarryTheFloor(t *testing.T) {
+	r := newRig(t)
+	r.writeProduct("p1")
+	if rc := r.install("p1"); rc != 0 {
+		t.Fatalf("install rc = %d\n%s", rc, r.said())
+	}
+	c1 := r.container("p1")
+	// A GENUINE DOCUMENT ADVANCE, so the acceptance inside Prepare really does write a new floor.
+	r.writeProduct("p1", docVersion("2"))
+
+	s, oerr := openSession(r.d)
+	if oerr != nil {
+		t.Fatal(oerr)
+	}
+	defer s.close()
+	rb := &rebuilder{s: s, product: "p1"}
+	netID := netFor(t, s, rb)
+	// The ledger the phase machine holds, captured BEFORE the seam call, exactly as phase 7 holds it.
+	l := s.l
+	rep, err := rb.Prepare(context.Background(), l, "p1", c1, netID)
+	if err != nil {
+		t.Fatalf("prepare: %v\n%s", err, r.said())
+	}
+	defer rep.Discard()
+	if got := floorOn(t, s, "manifest:p1"); got != "2" {
+		t.Fatalf("the acceptance inside Prepare did not advance the floor on disk: %q", got)
+	}
+	// THE CALLER'S NEXT WRITE MUST NOT REVERT IT. This is the whole failure: the phase machine
+	// persists the ledger it holds after every phase, and a copy that never learned about the
+	// floor writes the old one straight back over it.
+	if perr := s.persistFn()(l); perr != nil {
+		t.Fatal(perr)
+	}
+	if got := floorOn(t, s, "manifest:p1"); got != "2" {
+		t.Fatalf("the phase machine's own ledger reverted the trust floor to %q — an anti-rollback\n"+
+			"  floor silently undone by the write that follows the phase", got)
+	}
+}
+
+func TestTheDocumentSeamLeavesTheCallersLedgerAbleToCarryTheFloor(t *testing.T) {
+	r := newRig(t)
+	r.writeProduct("p1")
+	if rc := r.install("p1"); rc != 0 {
+		t.Fatalf("install rc = %d\n%s", rc, r.said())
+	}
+	r.writeProduct("p1", docVersion("2"))
+
+	s, oerr := openSession(r.d)
+	if oerr != nil {
+		t.Fatal(oerr)
+	}
+	defer s.close()
+	l := s.l
+	docs := sessionDocs{s: s}
+	if _, err := docs.AcceptManifest("p1"); err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	if got := floorOn(t, s, "manifest:p1"); got != "2" {
+		t.Fatalf("the acceptance did not advance the floor on disk: %q", got)
+	}
+	// NOTHING ELSE IS CALLED IN BETWEEN. Any other seam call would re-read the ledger for its own
+	// reasons and refresh the caller's copy behind this assertion, which is exactly how a missing
+	// re-read on ONE of the two document acceptances hides.
+	if perr := s.persistFn()(l); perr != nil {
+		t.Fatal(perr)
+	}
+	if got := floorOn(t, s, "manifest:p1"); got != "2" {
+		t.Fatalf("the caller's ledger reverted the trust floor to %q after the manifest acceptance", got)
+	}
+}
+
+// The policy half, separately — see the note above: the two acceptances have to be measured on
+// their own, or one of them refreshes the ledger the other's mutation would have staled.
+func TestThePolicyAcceptanceLeavesTheCallersLedgerAbleToCarryTheFloor(t *testing.T) {
+	r := newRig(t)
+	r.writeProduct("p1")
+	if rc := r.install("p1"); rc != 0 {
+		t.Fatalf("install rc = %d\n%s", rc, r.said())
+	}
+	r.policyVersion = "2"
+	r.writeProduct("p1")
+
+	s, oerr := openSession(r.d)
+	if oerr != nil {
+		t.Fatal(oerr)
+	}
+	defer s.close()
+	l := s.l
+	docs := sessionDocs{s: s}
+	if _, err := docs.AcceptPolicy(); err != nil {
+		t.Fatalf("accept policy: %v", err)
+	}
+	if got := floorOn(t, s, "policy"); got != "2" {
+		t.Fatalf("the acceptance did not advance the policy floor on disk: %q", got)
+	}
+	if perr := s.persistFn()(l); perr != nil {
+		t.Fatal(perr)
+	}
+	if got := floorOn(t, s, "policy"); got != "2" {
+		t.Fatalf("the caller's ledger reverted the policy floor to %q after the policy acceptance", got)
 	}
 }
