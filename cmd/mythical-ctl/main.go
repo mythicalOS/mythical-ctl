@@ -34,6 +34,12 @@ COMMANDS
   stop <product>...        stop; sets desired state to stopped
   restart <product>...     restart; refused on a product you have stopped
   recreate <product>...    replace the container, preserving desired state
+  status [product...]      report desired vs actual, outstanding checks, unattributed objects
+  uninstall <product>      remove the container; keeps your data and the rollback floor
+                             --purge   also remove this product's named volumes
+  uninstall --family       remove EVERY product and reset the ledger entirely - identity,
+                           membership, every rollback floor, the family-index anchor
+                             --purge   also remove every named volume (your data)
 
 OPTIONS
   --index PATH             the family index (default: ~/.mythical/.state/index)
@@ -85,6 +91,12 @@ func runEnv(args, env []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	// then refuses (or the reverse — a verb nothing dispatches at all).
 	if verbs.Batchable(verb) {
 		return lifecycle(verb, o, env, stdin, stdout, stderr)
+	}
+	switch verb {
+	case "status":
+		return status(o, env, stdin, stdout, stderr)
+	case "uninstall":
+		return uninstall(o, env, stdin, stdout, stderr)
 	}
 	fmt.Fprintf(stderr, "mythical-ctl: unknown command: %s\n\n", verb)
 	fmt.Fprint(stderr, usage)
@@ -150,6 +162,56 @@ func lifecycle(verb string, o opts, env []string, stdin io.Reader, stdout, stder
 	// does exactly this, so the per-product report and the aggregate are the same code for one
 	// product as for five.
 	return verbs.Batch(ctx, d, verb, o.products)
+}
+
+// status dispatches the read-only report.
+//
+// IT READS, so a stray MUTATING option is a usage error rather than something to accept and ignore:
+// `status p1 --purge` must not be answered with a report that quietly did nothing destructive this
+// time. --index/--policy/--manifest-dir are the document locators every verb shares and are
+// accepted here exactly as the frozen dispatcher accepts them.
+func status(o opts, env []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if o.image != "" || o.forced || o.purge || o.family || o.toBind != "" || o.mapForeign || o.abandon {
+		fmt.Fprintln(stderr, "mythical-ctl: status takes no options other than --index")
+		return cliio.ExitUsage
+	}
+	d, err := deps(o, env, stdin, stdout, stderr)
+	if err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return cliio.ExitFail
+	}
+	return verbs.Status(context.Background(), d, o.products)
+}
+
+// uninstall dispatches the two scopes.
+//
+// `uninstall <product> --family` IS A USAGE ERROR, and refusing it is the whole point of checking:
+// --family removes the WHOLE family, so silently honouring the flag while dropping the product
+// argument runs a materially MORE destructive operation than the one written. It is refused FIRST,
+// before anything is opened — a confirmation cannot rescue an operator from a wipe they never asked
+// for, because the prompt they answer would be about the wipe.
+func uninstall(o opts, env []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if o.image != "" || o.forced || o.toBind != "" || o.mapForeign || o.abandon {
+		fmt.Fprintln(stderr, "mythical-ctl: --image/--force-install/--to-bind/--map-foreign-to-operator/--abandon apply elsewhere")
+		return cliio.ExitUsage
+	}
+	if o.family && len(o.products) != 0 {
+		fmt.Fprintln(stderr, "mythical-ctl: uninstall --family takes no product")
+		return cliio.ExitUsage
+	}
+	if !o.family && len(o.products) != 1 {
+		fmt.Fprintln(stderr, "mythical-ctl: uninstall takes exactly one product")
+		return cliio.ExitUsage
+	}
+	d, err := deps(o, env, stdin, stdout, stderr)
+	if err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return cliio.ExitFail
+	}
+	if o.family {
+		return verbs.UninstallFamily(context.Background(), d, o.purge)
+	}
+	return verbs.Uninstall(context.Background(), d, o.products[0], o.purge)
 }
 
 // deps assembles the verb layer's dependencies: the daemon connection, the family home, the
