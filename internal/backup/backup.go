@@ -614,6 +614,32 @@ func Run(ctx context.Context, d Deps, rawDir string) error {
 		return err
 	}
 
+	// AN OUTPUT DIRECTORY IS USED ONCE. Writing a second backup over an existing one MERGES
+	// them: every entry the new capture produces overwrites its namesake, and every entry the
+	// installation no longer has is simply left there. The result reports success while being a
+	// backup of no installation that ever existed — and a restore from it silently resurrects
+	// files the installation had already dropped. (The volumes' half fails loudly instead: the
+	// per-entry manifest is re-enumerated from the volume, so a stale file left in the contents
+	// directory has no manifest entry and verification refuses. The tree's half has no such
+	// check, which is exactly why this one is here.)
+	//
+	// REFUSED, NOT CLEARED. Emptying a directory an operator named is deleting data on the
+	// strength of a guess about what is in it, which is the one thing a backup verb may never
+	// do. Naming a fresh path, or removing the old backup deliberately, is the operator's call.
+	if ents, rerr := os.ReadDir(dir); rerr == nil {
+		if len(ents) > 0 {
+			d.warn("backup: %q already has contents.", dir)
+			d.warn("  A backup is written to a directory of its own: writing over an existing one merges")
+			d.warn("  the two, leaving behind every file this installation no longer has, and a restore")
+			d.warn("  from the result would bring them back. Name a new directory, or remove that one")
+			d.warn("  yourself — this will not empty it for you.")
+			return fmt.Errorf("backup: the output directory %q already has contents", dir)
+		}
+	} else if !os.IsNotExist(rerr) {
+		d.warn("backup: %q cannot be read as a directory — refusing to write a backup into it: %v", dir, rerr)
+		return fmt.Errorf("backup: %q cannot be read as a directory: %w", dir, rerr)
+	}
+
 	if err := os.MkdirAll(filepath.Join(dir, "volumes"), 0o700); err != nil {
 		d.warn("backup: cannot create %q: %v", dir, err)
 		return fmt.Errorf("backup: cannot create %q: %w", dir, err)

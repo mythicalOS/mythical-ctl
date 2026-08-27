@@ -1079,3 +1079,50 @@ func TestChtimesZeroLeavesTheOtherTimeAlone(t *testing.T) {
 			fi.ModTime(), want)
 	}
 }
+
+// TestBackupRefusesAReusedOutputDirectory: writing a second backup over an existing one MERGES
+// them — every entry the new capture produces overwrites its namesake, and every entry the
+// installation no longer has is left behind. The result reports success while being a backup of
+// no installation that ever existed, and a restore from it silently resurrects files the
+// installation had already dropped.
+//
+// It refuses rather than clearing: emptying a directory an operator named is deleting data on
+// the strength of a guess about what is in it.
+func TestBackupRefusesAReusedOutputDirectory(t *testing.T) {
+	r := newRig(t)
+	if err := Run(context.Background(), r.deps(), r.bk); err != nil {
+		t.Fatalf("the first backup: %v\n%s", err, r.stderr())
+	}
+	dir := canon(t, r.bk)
+	stale := filepath.Join(dir, "tree", "obsolete.conf")
+	write(t, stale, []byte("a file this installation no longer has\n"))
+	r.reset()
+
+	if err := Run(context.Background(), r.deps(), r.bk); err == nil {
+		t.Fatal("a second backup was merged into the first")
+	}
+	mustContain(t, r.stderr(), "already has contents", "the refusal")
+	// The operator's directory is left exactly as it was — the refusal deletes nothing.
+	if !exists(stale) {
+		t.Fatal("the refused backup removed contents of the directory it refused")
+	}
+	if !exists(filepath.Join(dir, "ledger")) {
+		t.Fatal("the refused backup removed the previous backup's ledger")
+	}
+}
+
+// TestBackupRefusesAnOutputThatIsNotADirectory: a plain file at the output name is not a
+// directory to write a backup into, and "cannot read it as one" is not "it is empty".
+func TestBackupRefusesAnOutputThatIsNotADirectory(t *testing.T) {
+	r := newRig(t)
+	out := filepath.Join(canon(t, t.TempDir()), "not-a-dir")
+	write(t, out, []byte("occupied\n"))
+	if err := Run(context.Background(), r.deps(), out); err == nil {
+		t.Fatal("a backup was written over a plain file")
+	}
+	mustContain(t, r.stderr(), "cannot be read as a directory", "the refusal")
+	b, err := os.ReadFile(out)
+	if err != nil || string(b) != "occupied\n" {
+		t.Fatal("the refused backup overwrote the file it refused")
+	}
+}
