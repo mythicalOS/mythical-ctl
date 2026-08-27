@@ -322,14 +322,27 @@ func (m StatusModel) update(msg tea.Msg) (StatusModel, tea.Cmd) {
 		return m, nil
 
 	case ProgressMsg:
-		return m.ingest(msg.Event.Detail, false).clamp(), nil
+		// NOT CLAMPED HERE. Clamping asks for maxOffset, which lays the whole report out, and
+		// doing that once per ingested line makes a long report quadratic in its own length.
+		// It is not needed either: appending lines only ever RAISES the maximum offset, so a
+		// position that was valid before the line stays valid after it.
+		return m.ingest(msg.Event.Detail, false), nil
 
 	case OutputMsg:
-		return m.ingest(msg.Line, msg.Stderr).clamp(), nil
+		return m.ingest(msg.Line, msg.Stderr), nil
 
 	case statusDoneMsg:
 		m.done, m.code, m.running = true, msg.Code, false
 		return m.clamp(), nil
+
+	case ConfirmRequestMsg:
+		// REFUSED WITHOUT BEING SHOWN, and refused rather than ignored. This view has no
+		// overlay: the report is read-only and asks nothing today. If one ever did, ignoring
+		// the request would park it on an answer that can only arrive when the operator closes
+		// the dashboard — a report that appears to have finished while the verb behind it is
+		// still blocked. Refusing is the same answer an empty stdin gives the plain path.
+		msg.Reply.Resolve(false)
+		return m, nil
 	}
 	return m, nil
 }
@@ -527,34 +540,52 @@ func (m StatusModel) footer(total, off, end int) string {
 	if m.onRefresh == nil {
 		keys = "↑/↓ scroll · q closes"
 	}
+	line := keys
 	if total > m.body() {
-		return dimStyle.Render(fmt.Sprintf("lines %d-%d of %d · %s", off+1, end, total, keys))
+		// THE POSITION COMES FIRST so that on a terminal too narrow for the whole footer it is
+		// the keymap that is cut, not the fact that there is more report below.
+		line = fmt.Sprintf("lines %d-%d of %d · %s", off+1, end, total, keys)
 	}
-	return dimStyle.Render(keys)
+	return dimStyle.Render(fit(line, m.width))
+}
+
+// fit cuts one already-composed line to the terminal. It is for the view's OWN furniture — the
+// title, the section headings, the footer — none of which is a fact from the report; the report's
+// own lines are wrapped instead, because cutting a sentence drops the half that says what to do.
+func fit(s string, width int) string {
+	if width <= 0 || ansi.StringWidth(s) <= width {
+		return s
+	}
+	return ansi.Truncate(s, width, "…")
 }
 
 // render lays the whole report out, unwindowed.
 func (m StatusModel) render() []string {
 	avail := m.avail()
-	out := []string{titleStyle.Render("mythical-ctl status")}
+	width := 0
+	if m.hasSize {
+		width = m.width
+	}
+	out := []string{titleStyle.Render(fit("mythical-ctl status", width))}
 
 	if len(m.entries) == 0 {
 		if m.done {
 			// A REPORT WITH NO LINES IS NOT AN EMPTY INSTALLATION. The verb always says
 			// something — at minimum "No installation state found" — so an empty screen here
 			// means the report did not reach this view, and saying so is the whole point.
-			return append(out, "", alarmStyle.Render("The report produced no output."),
-				"This is not an empty installation: the report always says at least one thing.",
-				"Run 'mythical-ctl status --plain' to see what the report writes.")
+			out = append(out, "")
+			out = append(out, styleAll(alarmStyle, wrapAt("The report produced no output.", "", avail))...)
+			out = append(out, wrapAt("This is not an empty installation: the report always says at least one thing.", "", avail)...)
+			return append(out, wrapAt("Run 'mythical-ctl status --plain' to see what the report writes.", "", avail)...)
 		}
-		return append(out, "", "reading the installation state…")
+		return append(out, wrapAt("reading the installation state…", "", avail)...)
 	}
 
 	// The banner first: it qualifies everything below it.
 	if runtimeEntries := m.of(kindRuntime); len(runtimeEntries) > 0 {
 		out = append(out, "")
 		if m.notObserved {
-			out = append(out, alarmStyle.Render("NOT OBSERVED LIVE"))
+			out = append(out, styleAll(alarmStyle, wrapAt("NOT OBSERVED LIVE", "", avail))...)
 		}
 		for _, e := range runtimeEntries {
 			out = append(out, indentAll(e.lines(), "  ", avail)...)
@@ -569,19 +600,20 @@ func (m StatusModel) render() []string {
 		if len(entries) == 0 {
 			continue
 		}
-		out = append(out, "", headingStyle.Render(sec.title))
+		out = append(out, "", headingStyle.Render(fit(sec.title, width)))
 		out = append(out, m.renderSection(sec.title, entries, avail)...)
 	}
 	return out
 }
 
-// avail is the width the body may use, the two-space indent already deducted. Zero means the
-// width is not known and nothing is truncated.
+// avail is the line budget: the whole terminal. Every layout below deducts its own indent from
+// it. Zero means the width is not known, and then nothing is wrapped or cut — guessing a width
+// would lay the report out against a number nobody supplied.
 func (m StatusModel) avail() int {
-	if !m.hasSize || m.width <= 4 {
+	if !m.hasSize || m.width <= 0 {
 		return 0
 	}
-	return m.width - 2
+	return m.width
 }
 
 // of collects the entries of the given kinds, in the order the report produced them.
@@ -606,6 +638,11 @@ func (m StatusModel) renderSection(title string, entries []statusEntry, avail in
 	case "VOLUMES":
 		return renderVolumes(entries, avail)
 	}
+	return verbatim(entries, avail)
+}
+
+// verbatim renders entries as the report wrote them.
+func verbatim(entries []statusEntry, avail int) []string {
 	var out []string
 	for _, e := range entries {
 		out = append(out, indentAll(e.lines(), "  ", avail)...)
@@ -629,7 +666,10 @@ func renderProducts(entries []statusEntry, avail int) []string {
 			notes: e.cont,
 		})
 	}
-	out := t.render(avail)
+	out, laidOut := t.render(avail)
+	if !laidOut {
+		return verbatim(entries, avail)
+	}
 	if t.hasUnknown() {
 		out = append(out, styleAll(dimStyle, wrapAt(
 			"(unknown) / ? — the runtime did not answer; not an observation of absence.", "  ", avail))...)
@@ -658,7 +698,10 @@ func renderVolumes(entries []statusEntry, avail int) []string {
 		seen[v.State] = true
 		t.rows = append(t.rows, tableRow{cells: []string{v.Name, v.Role, v.Data, v.State}, notes: e.cont})
 	}
-	out := t.render(avail)
+	out, laidOut := t.render(avail)
+	if !laidOut {
+		return verbatim(entries, avail)
+	}
 	for _, short := range volumeStateOrder {
 		if !seen[short] {
 			continue
@@ -705,11 +748,21 @@ func (t table) hasUnknown() bool {
 // WIDTHS ARE MEASURED AND CUT IN THE SAME UNIT — terminal cells, over grapheme clusters, via
 // ansi.StringWidth and ansi.Truncate. Measuring in bytes or runes and cutting in cells (or the
 // reverse) is how a table with an East-Asian name in it wraps every row.
-func (t table) render(avail int) []string {
+func (t table) render(avail int) ([]string, bool) {
 	if len(t.rows) == 0 {
-		return nil
+		return nil, true
 	}
 	cols := len(t.head)
+	const gap = 2
+	const indent = 2
+	// A TERMINAL TOO NARROW FOR THE TABLE GETS NO TABLE. Below this the columns cannot all reach
+	// their minimum, and drawing anyway would put rows wider than the terminal on screen — every
+	// one of them wrapped by the terminal itself, in the middle of a cell, with no ellipsis to
+	// say so. The caller falls back to the lines as the report wrote them, which always fit
+	// because prose wraps.
+	if avail > 0 && avail-indent-gap*(cols-1) < cols*minColumn {
+		return nil, false
+	}
 	widths := make([]int, cols)
 	for i, h := range t.head {
 		widths[i] = ansi.StringWidth(h)
@@ -721,8 +774,6 @@ func (t table) render(avail int) []string {
 			}
 		}
 	}
-	const gap = 2
-	const indent = 2
 	truncated := false
 	if avail > 0 {
 		widths, truncated = fitColumns(widths, avail-indent-gap*(cols-1))
@@ -739,13 +790,17 @@ func (t table) render(avail int) []string {
 			"some columns are truncated to fit this terminal — 'mythical-ctl status --plain' prints the report whole.",
 			"  ", avail))...)
 	}
-	return out
+	return out, true
 }
+
+// minColumn is the narrowest a column may become. Below it a cell is the ellipsis and nothing
+// else, which conveys less than the line the report wrote.
+const minColumn = 4
 
 // fitColumns shrinks the widest column until the row fits, and reports whether anything had to
 // give. A minimum is kept so a column never collapses to the ellipsis alone.
 func fitColumns(widths []int, avail int) ([]int, bool) {
-	const min = 4
+	const min = minColumn
 	if avail <= 0 {
 		return widths, false
 	}
@@ -763,8 +818,9 @@ func fitColumns(widths []int, avail int) ([]int, bool) {
 			}
 		}
 		if at < 0 {
-			// Every column is at its minimum and it still does not fit. The row is left as it
-			// is rather than cut to nothing, and the caller says so.
+			// Unreachable given render's precondition (the budget is at least cols*min, so
+			// shrinking every column to min always fits). Kept because the alternative failure
+			// mode of a wrong precondition is a loop that never ends.
 			return out, true
 		}
 		out[at]--
@@ -827,13 +883,17 @@ func wrapAt(text, prefix string, avail int) []string {
 		return []string{prefix + s}
 	}
 	limit := avail - ansi.StringWidth(prefix)
-	if limit < 8 {
-		// The terminal is barely wider than the indent. Cutting is all that is left, and the
+	if limit < 1 {
+		// The terminal is no wider than the indent. Cutting is all that is left, and the
 		// ellipsis is what says it happened.
 		return []string{ansi.Truncate(prefix+s, avail, "…")}
 	}
+	// SPACE IS THE ONLY BREAKPOINT. Volume and container names are full of hyphens, and a name
+	// broken at one reads as two names. A token wider than the limit is hard-broken by the
+	// wrapper, which is ugly and lossless — the right trade for a report whose whole point is
+	// that nothing goes missing.
 	var out []string
-	for _, l := range strings.Split(ansi.Wrap(s, limit, " -/"), "\n") {
+	for _, l := range strings.Split(ansi.Wrap(s, limit, " "), "\n") {
 		line := prefix + l
 		// A belt over the wrapper's braces: a single unbreakable token wider than the limit
 		// would otherwise leave one row of the frame overflowing the terminal.
@@ -962,7 +1022,7 @@ func runStatus(ctx context.Context, base verbs.Deps, fn VerbFunc, mk func(Status
 				// A refresh can be QUEUED at the moment the interface goes away, and a plain
 				// three-way select would then pick it at random and run the report again with
 				// nothing to show it on. Re-asked here, deterministically.
-				if stopped(uiDone, vctx) {
+				if stopped(vctx, uiDone) {
 					done <- last
 					return
 				}
@@ -996,7 +1056,7 @@ func runStatus(ctx context.Context, base verbs.Deps, fn VerbFunc, mk func(Status
 }
 
 // stopped reports that the interface has gone or the context has been cancelled.
-func stopped(uiDone <-chan struct{}, ctx context.Context) bool {
+func stopped(ctx context.Context, uiDone <-chan struct{}) bool {
 	select {
 	case <-uiDone:
 		return true

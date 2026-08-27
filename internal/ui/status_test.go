@@ -458,7 +458,9 @@ func TestANarrowTerminalTruncatesAndSaysSo(t *testing.T) {
 	if !strings.Contains(v, "truncated") {
 		t.Fatalf("a truncated table does not say so:\n%s", v)
 	}
-	if !strings.Contains(v, "--plain") {
+	// The notice is prose and wraps like prose, so the flag can land across a line break at this
+	// width; what matters is that it is there to be read.
+	if !strings.Contains(strings.Join(strings.Fields(v), ""), "--plain") {
 		t.Fatalf("the truncated table does not name the way to see it whole:\n%s", v)
 	}
 	for _, line := range strings.Split(v, "\n") {
@@ -537,6 +539,96 @@ func TestControlCharactersNeverReachTheScreen(t *testing.T) {
 	if n := strings.Count(v, "\ufffd"); n != 4 {
 		t.Fatalf("%d replacement runes on screen, want 4 (ESC and RLO in the cell, ESC and BEL in\n"+
 			"  the prose) — the offending runes were dropped rather than shown as replaced:\n%s", n, plain(m))
+	}
+}
+
+// TestATerminalTooNarrowForTheTableStillShowsEveryRow. Below the width at which the columns can
+// all reach their minimum, no table is drawn: the rows are shown as the report wrote them, and
+// prose wraps, so every fact survives however narrow the terminal is. Drawing anyway would put
+// rows wider than the terminal on screen, wrapped by the terminal itself in the middle of a
+// cell, with nothing to say so.
+func TestATerminalTooNarrowForTheTableStillShowsEveryRow(t *testing.T) {
+	// All of these are narrower than either table's minimum, so both fall back to the report's
+	// own lines and nothing is cut.
+	for _, w := range []int{4, 6, 10, 14, 18, 22} {
+		m := narrowReport(w)
+		// Asserted on the whole laid-out report rather than on the viewport: at these widths it
+		// wraps to more lines than any terminal shows, and where the window sits is what the
+		// scrolling tests are for. Whitespace is removed because the wrapper hard-breaks tokens
+		// here — ugly, and LOSSLESS, which is the trade this report wants.
+		flat := strings.Join(strings.Fields(strings.Join(m.render(), "\n")), "")
+		// One fact from EVERY section, and each one distinctive enough that another section
+		// cannot satisfy it: a bare "brokkr" is also in the volume line's product= field, so a
+		// products section that vanished entirely would go unnoticed.
+		for _, want := range []string{
+			"NOTOBSERVEDLIVE",
+			"installation:4f2ab9c1",
+			"brokkr:desired=runningobserved=running",
+			"volumevol-a:role=datadata=UNREGENERABLE",
+			"GONEfromtheruntime",
+			"PENDING:volumevol-b",
+			"alinenoclassifierknows",
+			"ledger:awarning",
+		} {
+			if !strings.Contains(flat, want) {
+				t.Fatalf("width %d: %q is not in the report:\n%s", w, want, strings.Join(m.render(), "\n"))
+			}
+		}
+	}
+}
+
+// TestNoWidthOverflowsTheTerminal. Every line the view draws — the title, a heading, a table row,
+// a wrapped sentence, the footer — fits the terminal it was told about. A row that overflows is
+// wrapped by the terminal in the middle of a cell, which is the one way this view could lose
+// something without saying so.
+func TestNoWidthOverflowsTheTerminal(t *testing.T) {
+	for w := 4; w <= 120; w++ {
+		m := narrowReport(w)
+		for _, line := range strings.Split(plain(m), "\n") {
+			if got := ansi.StringWidth(line); got > w {
+				t.Fatalf("width %d: a line is %d cells wide: %q", w, got, line)
+			}
+		}
+		for _, line := range m.render() {
+			if got := ansi.StringWidth(ansi.Strip(line)); got > w {
+				t.Fatalf("width %d: a laid-out line is %d cells wide: %q", w, got, line)
+			}
+		}
+	}
+}
+
+// narrowReport is one small report of every shape, laid out for a terminal w cells wide.
+func narrowReport(w int) StatusModel {
+	m := sized(NewStatusModel(func() {}), w, 60)
+	m = say(m, "runtime:      UNAVAILABLE — there is no container runtime connection, so nothing below can")
+	m = say(m, "  be observed. Live answers are reported as unknown rather than invented.")
+	m = say(m, "installation: 4f2ab9c1")
+	m = say(m, "brokkr: desired=running observed=running outstanding=none next=none")
+	m = say(m, "volume vol-a: role=data data=UNREGENERABLE product=brokkr — recorded but GONE from the runtime")
+	m = say(m, "PENDING: volume vol-b — created and not yet confirmed")
+	m = say(m, "a line no classifier knows")
+	m = warn(m, "ledger: a warning")
+	m, _ = sstep(m, statusDoneMsg{})
+	return m
+}
+
+// TestAQuestionReachingTheDashboardIsRefusedRatherThanParked. This view has no overlay because
+// the report asks nothing. A request that arrived anyway must be answered — with a refusal —
+// rather than dropped, or the verb behind it waits for an answer that can only come when the
+// operator closes a dashboard that looks finished.
+func TestAQuestionReachingTheDashboardIsRefusedRatherThanParked(t *testing.T) {
+	r := NewReply()
+	m, _ := sstep(NewStatusModel(nil), ConfirmRequestMsg{Prompt: "destroy everything?", Reply: r})
+	select {
+	case ok := <-r.C():
+		if ok {
+			t.Fatal("a question no one was shown was answered yes")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("the question was dropped: the asker is still waiting on an answer that cannot come")
+	}
+	if v := plain(m); strings.Contains(v, "destroy everything?") {
+		t.Fatalf("the question was put on screen by a view that cannot take an answer:\n%s", v)
 	}
 }
 
