@@ -147,12 +147,21 @@ func (e engineObjects) Names(ctx context.Context, class Class) ([]string, error)
 	if err := classCheck(class); err != nil {
 		return nil, err
 	}
-	// An UNFILTERED listing: nil labels, not an empty map — only first-use needs this, and it has
-	// no identity to filter by (the ledger that held it is absent). Everything else works from
-	// labels, because §6a rejects names as reassignable.
+	// AN UNFILTERED LISTING, through the engine's own unfiltered doors.
+	//
+	// It has to be unfiltered, and passing a nil filter to the label-selecting listings does NOT
+	// give one: those refuse a label-less call by design, so this once asked them for the world and
+	// got a refusal every time — which the unaccounted gate reads, correctly, as "the runtime could
+	// not be asked", and which therefore stopped every mutating verb. (Measured when the verb layer
+	// first composed the two; the seam's own tests stand a fake behind this interface, so neither
+	// side could see it alone.)
+	//
+	// The listing must see UNLABELLED objects: first use asks whether the daemon holds anything of
+	// ours at all, and the gate must notice a stranger's object standing at a name this installer
+	// would create. A label filter can never return either.
 	switch class {
 	case ClassVolume:
-		rows, err := e.c.VolumeList(ctx, nil)
+		rows, err := e.c.VolumeListAll(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -162,7 +171,7 @@ func (e engineObjects) Names(ctx context.Context, class Class) ([]string, error)
 		}
 		return out, nil
 	case ClassNetwork:
-		rows, err := e.c.NetworkList(ctx, nil)
+		rows, err := e.c.NetworkListAll(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -172,7 +181,7 @@ func (e engineObjects) Names(ctx context.Context, class Class) ([]string, error)
 		}
 		return out, nil
 	case ClassContainer:
-		rows, err := e.c.ContainerList(ctx, nil)
+		rows, err := e.c.ContainerListAll(ctx)
 		if err != nil {
 			return nil, err
 		}

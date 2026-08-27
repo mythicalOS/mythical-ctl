@@ -356,13 +356,33 @@ func (c *Client) ContainerList(ctx context.Context, labels map[string]string) ([
 	if err != nil {
 		return nil, err
 	}
+	return c.containerList(ctx, f)
+}
+
+// ContainerListAll is the UNFILTERED listing: every container the daemon holds, labelled or not.
+//
+// IT IS A SEPARATE DOOR FROM ContainerList, NOT A nil-FILTER SHORTCUT THROUGH IT. The label filter
+// is mandatory on the ordinary listing because discovery-for-action goes by label and never by
+// name; relaxing that would let any caller list the world by passing nothing. But two questions
+// genuinely need the world: "is this machine a first install" and the unaccounted-object gate,
+// which must see an UNLABELLED object standing at a name this installer would create — and no
+// label filter can ever return one. Naming those doors separately keeps the guard on the door it
+// guards, and makes every unfiltered listing in the tree visible at a grep.
+func (c *Client) ContainerListAll(ctx context.Context) ([]ContainerSummary, error) {
+	return c.containerList(ctx, "")
+}
+
+func (c *Client) containerList(ctx context.Context, filter string) ([]ContainerSummary, error) {
 	var raw []struct {
 		ID     string            `json:"Id"`
 		Names  []string          `json:"Names"`
 		State  string            `json:"State"`
 		Labels map[string]string `json:"Labels"`
 	}
-	q := url.Values{"all": {"1"}, "filters": {f}}
+	q := url.Values{"all": {"1"}}
+	if filter != "" {
+		q.Set("filters", filter)
+	}
 	if err := c.do(ctx, http.MethodGet, "/containers/json", q, nil, &raw); err != nil {
 		return nil, err
 	}
@@ -383,13 +403,26 @@ func (c *Client) VolumeList(ctx context.Context, labels map[string]string) ([]Vo
 	if err != nil {
 		return nil, err
 	}
+	return c.volumeList(ctx, f)
+}
+
+// VolumeListAll is the unfiltered listing — see ContainerListAll for why it is its own door.
+func (c *Client) VolumeListAll(ctx context.Context) ([]VolumeSummary, error) {
+	return c.volumeList(ctx, "")
+}
+
+func (c *Client) volumeList(ctx context.Context, filter string) ([]VolumeSummary, error) {
 	var raw struct {
 		Volumes []struct {
 			Name   string            `json:"Name"`
 			Labels map[string]string `json:"Labels"`
 		} `json:"Volumes"`
 	}
-	if err := c.do(ctx, http.MethodGet, "/volumes", url.Values{"filters": {f}}, nil, &raw); err != nil {
+	q := url.Values{}
+	if filter != "" {
+		q.Set("filters", filter)
+	}
+	if err := c.do(ctx, http.MethodGet, "/volumes", q, nil, &raw); err != nil {
 		return nil, err
 	}
 	var out []VolumeSummary
@@ -405,12 +438,25 @@ func (c *Client) NetworkList(ctx context.Context, labels map[string]string) ([]N
 	if err != nil {
 		return nil, err
 	}
+	return c.networkList(ctx, f)
+}
+
+// NetworkListAll is the unfiltered listing — see ContainerListAll for why it is its own door.
+func (c *Client) NetworkListAll(ctx context.Context) ([]NetworkSummary, error) {
+	return c.networkList(ctx, "")
+}
+
+func (c *Client) networkList(ctx context.Context, filter string) ([]NetworkSummary, error) {
 	var raw []struct {
 		ID     string            `json:"Id"`
 		Name   string            `json:"Name"`
 		Labels map[string]string `json:"Labels"`
 	}
-	if err := c.do(ctx, http.MethodGet, "/networks", url.Values{"filters": {f}}, nil, &raw); err != nil {
+	q := url.Values{}
+	if filter != "" {
+		q.Set("filters", filter)
+	}
+	if err := c.do(ctx, http.MethodGet, "/networks", q, nil, &raw); err != nil {
 		return nil, err
 	}
 	var out []NetworkSummary

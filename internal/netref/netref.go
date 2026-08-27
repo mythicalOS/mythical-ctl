@@ -142,8 +142,13 @@ func (e engineObjects) NetworkID(ctx context.Context, ref string) (string, error
 	return info.ID, nil
 }
 
+// NetworkNames is UNFILTERED, and it must go through the engine's unfiltered door: the
+// label-selecting listing refuses a label-less call by design, so asking IT for the world returned
+// a refusal every time — read here, correctly, as "the runtime could not be asked", which stopped
+// every operator-network resolution. The listing also has to see networks this installer did not
+// label at all, since seeing that TWO networks answer one name is the whole point of it.
 func (e engineObjects) NetworkNames(ctx context.Context) ([]string, error) {
-	rows, err := e.c.NetworkList(ctx, nil)
+	rows, err := e.c.NetworkListAll(ctx)
 	if err != nil {
 		return nil, err
 	}
