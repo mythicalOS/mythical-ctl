@@ -544,3 +544,56 @@ func TestPrepareBuildsTheBringUpDependenciesBeforeTheRemoval(t *testing.T) {
 			rp.nonce, info.Labels)
 	}
 }
+
+// TestPrepareRefusesWhenThereIsNoRecordedDesiredStateToPreserve is the last thing that could fail
+// on the far side of phase 7's removal.
+//
+// THE CREATE PRESERVES THE RECORDED DESIRED STATE, AND PRESERVING REFUSES WHEN THERE IS NOTHING
+// RECORDED — guessing "running" would start something nobody asked for and "stopped" would take a
+// working install down. That refusal is correct; what is not correct is where it used to fire.
+// Left to the create, it lands after the old container has been removed and tombstoned, so the
+// product ends up with no container because of a missing ledger row that was fully readable while
+// it was still standing. The phase machine's own phase 1 tolerates that absence and defaults its
+// RECORD to running, so this is reachable rather than theoretical.
+//
+// PREPARE MUST NOT ANSWER THE QUESTION, only establish that it can be answered: passing the
+// migration's own remembered state into the create would make the migration EXPRESS an intent,
+// which is what the seam's shape forbids.
+func TestPrepareRefusesWhenThereIsNoRecordedDesiredStateToPreserve(t *testing.T) {
+	r := newRig(t)
+	r.writeProduct("p1")
+	if rc := r.install("p1"); rc != 0 {
+		t.Fatalf("install rc = %d\n%s", rc, r.said())
+	}
+	c1 := r.container("p1")
+	// The desired-state row goes away — a repaired or hand-edited ledger, which phase 1 accepts.
+	r.editLedger(func(l *ledger.Ledger) {
+		if err := l.Del("desired", "container", c1); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	s, oerr := openSession(r.d)
+	if oerr != nil {
+		t.Fatal(oerr)
+	}
+	defer s.close()
+	rb := &rebuilder{s: s, product: "p1"}
+	netID := netFor(t, s, rb)
+	before := r.fake.Snapshot()
+	_, err := rb.Prepare(context.Background(), s.l, "p1", c1, netID)
+	if err == nil {
+		t.Fatal("a replacement was prepared for a container with no recorded desired state to preserve")
+	}
+	if !strings.Contains(err.Error(), "must not decide for you") {
+		t.Fatalf("the refusal does not say why: %v", err)
+	}
+	// AND NOTHING WAS TOUCHED. The whole point is that this refusal arrives while the old
+	// container is still standing.
+	if after := r.fake.Snapshot(); after != before {
+		t.Fatalf("the refusal changed the runtime:\n%s\n---\n%s", before, after)
+	}
+	if !r.containerExists(c1) {
+		t.Fatal("the working container was taken down by a preparation that failed")
+	}
+}

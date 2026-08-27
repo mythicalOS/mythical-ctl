@@ -275,6 +275,28 @@ func (r *rebuilder) Prepare(ctx context.Context, l *ledger.Ledger, product, cont
 			"  %q. Refusing rather than replacing a container this installation does not own.",
 			container, product, pc.Container)
 	}
+	// THE RECORDED DESIRED STATE MUST BE READABLE, AND THAT IS ESTABLISHED HERE.
+	//
+	// The create PRESERVES it rather than expressing one — a migration must not decide for the
+	// operator what their product should be doing — but "preserve" REFUSES when there is nothing
+	// recorded to preserve, and refuses again when the record cannot be read. Left to the create,
+	// that refusal fires past phase 7's removal and tombstone, over a fact that was fully knowable
+	// while the old container was still standing: the product ends up with no container because of
+	// a ledger row, which is the exact shape this seam is split in two to eliminate. (The phase
+	// machine's own phase 1 tolerates an absent row and defaults its RECORD to running, so this is
+	// reachable rather than theoretical.)
+	//
+	// IT DOES NOT DECIDE ANYTHING. The value is not read out, carried, or substituted — asking
+	// here and preserving there is the same question asked earlier, not a second answer, and the
+	// row cannot move in between: one lock, one process, and phase 7 writes only the tombstone.
+	// Passing the migration record's own remembered state instead would make the migration express
+	// an intent, which is precisely what the seam's shape forbids.
+	if _, derr := state.DesiredGet(l, container); derr != nil {
+		return nil, fmt.Errorf("verbs: the recorded desired state for %q could not be read, so a replacement cannot\n"+
+			"  preserve it — and this migration must not decide for you what %q should be doing.\n"+
+			"  Nothing was removed; the old container is still there and the migration stays at\n"+
+			"  phase 7. Run 'mythical-ctl state repair': %w", container, product, derr)
+	}
 	image, ierr := r.image(l, pc)
 	if ierr != nil {
 		return nil, ierr
