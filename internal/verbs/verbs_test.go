@@ -689,10 +689,13 @@ func TestRecreateReadsTheLaunchConfigOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, p := range info.Ports {
-		if p.HostPort != "20001" {
-			t.Fatalf("published on %q, want the port the FIRST read named (20001)", p.HostPort)
-		}
+	// NON-VACUOUSLY: the manifest declares exactly one port, so an empty set is a recreate that
+	// silently published nothing — which a bare range over the set would have passed.
+	if len(info.Ports) != 1 {
+		t.Fatalf("the runtime object publishes %d ports, want exactly the 1 the manifest declares", len(info.Ports))
+	}
+	if got := info.Ports[0].HostPort; got != "20001" {
+		t.Fatalf("published on %q, want the port the FIRST read named (20001)", got)
 	}
 }
 
