@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -36,7 +37,11 @@ type fakeProgram struct {
 	// neverStart makes Run return without ever calling Init — the "the interface could not come
 	// up" case.
 	neverStart bool
-	runErr     error
+	// startThenDie runs the start hook and returns immediately, leaving `started` and `uiDone`
+	// closed at essentially the same instant. Bubble Tea can produce exactly this: it dispatches
+	// the Init command to a goroutine and does not wait for it during shutdown.
+	startThenDie bool
+	runErr       error
 
 	// onUpdate is called after every Update, with the current model. Tests use it to react to what
 	// is on screen (answer a question, interrupt, kill the program).
@@ -80,6 +85,10 @@ func (p *fakeProgram) Run() (tea.Model, error) {
 	defer p.cancel()
 	m := p.model
 	if p.neverStart {
+		return m, p.runErr
+	}
+	if p.startThenDie {
+		p.exec(m.Init())
 		return m, p.runErr
 	}
 	if p.exec(m.Init()) {
@@ -334,6 +343,48 @@ func TestRunDoesNotInvokeTheVerbIfTheInterfaceNeverStarts(t *testing.T) {
 	}
 }
 
+// TestRunNeverLaunchesAVerbIntoAnInterfaceThatHasGone.
+//
+// The runtime can end AFTER dispatching the start announcement but BEFORE the goroutine carrying it
+// runs — Bubble Tea does not wait for that goroutine on the way out — so the verb goroutine can find
+// `started` and `uiDone` both closed. A select over the two then picks at random, and half the time
+// it launches a mutating verb into an interface nobody can answer. The decision must be a lock, not
+// a race, and this drives the interleaving repeatedly to say so.
+//
+// The assertion is the INVARIANT, not a fixed outcome: exactly one of "the verb ran and its code
+// came back" or "ErrNotStarted and the verb never ran" must hold, every time, and run must always
+// return.
+func TestRunNeverLaunchesAVerbIntoAnInterfaceThatHasGone(t *testing.T) {
+	for i := 0; i < 300; i++ {
+		p := newFakeProgram()
+		p.startThenDie = true
+		d, _, _ := baseDeps()
+		var ran int32
+		code, err := run(context.Background(), d, func(ctx context.Context, d verbs.Deps) int {
+			atomic.AddInt32(&ran, 1)
+			return 6
+		}, p.make, time.Second)
+		switch {
+		case errors.Is(err, ErrNotStarted):
+			if n := atomic.LoadInt32(&ran); n != 0 {
+				t.Fatalf("iteration %d: ErrNotStarted, but the verb ran %d time(s)", i, n)
+			}
+			if code != 0 {
+				t.Fatalf("iteration %d: a verb that never ran reported code %d", i, code)
+			}
+		case err == nil:
+			if n := atomic.LoadInt32(&ran); n != 1 {
+				t.Fatalf("iteration %d: no error, but the verb ran %d time(s)", i, n)
+			}
+			if code != 6 {
+				t.Fatalf("iteration %d: code %d, want the verb's own", i, code)
+			}
+		default:
+			t.Fatalf("iteration %d: unexpected error %v", i, err)
+		}
+	}
+}
+
 // TestRunWaitsForAVerbThatOutlivesTheInterface, and says out loud that it is waiting. Returning
 // while the verb is still mutating would exit the process mid-operation; waiting in silence, after
 // the frame is gone, looks like a hang.
@@ -529,8 +580,21 @@ func TestBridgePostsNothingToADeadInterface(t *testing.T) {
 	}
 }
 
+// postedSender reports when a message has actually been posted, so a test can release an asker at a
+// point where the asker is PROVABLY outstanding.
+type postedSender struct{ posted chan tea.Msg }
+
+func newPostedSender() *postedSender { return &postedSender{posted: make(chan tea.Msg, 8)} }
+
+func (s *postedSender) Send(m tea.Msg) { s.posted <- m }
+
 // TestBridgeConfirmRefusesWhenClosed covers both orderings: closed before the question, and closed
 // while it is outstanding.
+//
+// THE SECOND ORDERING IS ESTABLISHED BY THE POST, NOT BY A SLEEP. A sleep is not a happens-before
+// edge: the asking goroutine might not have started at all, take the preflight refusal instead, and
+// pass a test whose whole claim is about the other path. Waiting for the request to appear proves
+// the preflight is behind us and the asker is in its select.
 func TestBridgeConfirmRefusesWhenClosed(t *testing.T) {
 	b := NewBridge(context.Background(), blackHole{})
 	b.Close()
@@ -540,11 +604,19 @@ func TestBridgeConfirmRefusesWhenClosed(t *testing.T) {
 	// Idempotent: a second Close must not panic on an already-closed channel.
 	b.Close()
 
-	b2 := NewBridge(context.Background(), blackHole{})
+	send := newPostedSender()
+	b2 := NewBridge(context.Background(), send)
 	answered := make(chan bool, 1)
 	go func() { answered <- b2.Confirm("?") }()
-	// The question is outstanding — nothing is listening, so nothing can answer it.
-	time.Sleep(10 * time.Millisecond)
+	select {
+	case msg := <-send.posted:
+		if _, ok := msg.(ConfirmRequestMsg); !ok {
+			t.Fatalf("posted %T", msg)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the question was never posted")
+	}
+	// The question is outstanding — nothing will answer it.
 	b2.Close()
 	select {
 	case ok := <-answered:
@@ -556,13 +628,21 @@ func TestBridgeConfirmRefusesWhenClosed(t *testing.T) {
 	}
 }
 
-// TestBridgeConfirmRefusesWhenTheContextIsCancelled.
+// TestBridgeConfirmRefusesWhenTheContextIsCancelled, with the same ordering discipline.
 func TestBridgeConfirmRefusesWhenTheContextIsCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	b := NewBridge(ctx, blackHole{})
+	send := newPostedSender()
+	b := NewBridge(ctx, send)
 	answered := make(chan bool, 1)
 	go func() { answered <- b.Confirm("?") }()
-	time.Sleep(10 * time.Millisecond)
+	select {
+	case msg := <-send.posted:
+		if _, ok := msg.(ConfirmRequestMsg); !ok {
+			t.Fatalf("posted %T", msg)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the question was never posted")
+	}
 	cancel()
 	select {
 	case ok := <-answered:
@@ -575,6 +655,11 @@ func TestBridgeConfirmRefusesWhenTheContextIsCancelled(t *testing.T) {
 	// And a question asked after cancellation refuses without ever being posted.
 	if b.Confirm("?") {
 		t.Fatal("a question asked after cancellation was accepted")
+	}
+	select {
+	case msg := <-send.posted:
+		t.Fatalf("a question asked after cancellation was posted: %T", msg)
+	default:
 	}
 }
 

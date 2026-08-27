@@ -236,6 +236,42 @@ func TestRootSizesAnOverlayOnPush(t *testing.T) {
 	}
 }
 
+// TestRootPushDoesNotReInitTheLayerUnderneath. If the overlay being pushed dissolves while handling
+// the size it is immediately given, the top becomes the one that was ALREADY installed and already
+// initialised — and calling Init on it again re-runs whatever it started.
+func TestRootPushDoesNotReInitTheLayerUnderneath(t *testing.T) {
+	underInits := 0
+	m := NewRoot(func() {})
+	m, _ = step(m, tea.WindowSizeMsg{Width: 80, Height: 24})
+	m, _ = step(m, PushOverlayMsg{Overlay: stubOverlay{name: "under", inits: &underInits}})
+	if underInits != 1 {
+		t.Fatalf("the first push initialised %d times", underInits)
+	}
+	// This one dissolves the moment it is handed its size.
+	m, _ = step(m, PushOverlayMsg{Overlay: dissolveOnSize{}})
+	if m.Overlays() != 1 {
+		t.Fatalf("depth %d — the dissolving overlay should have gone", m.Overlays())
+	}
+	if got := m.Overlay().(stubOverlay).name; got != "under" {
+		t.Fatalf("top is %q", got)
+	}
+	if underInits != 1 {
+		t.Fatalf("the layer underneath was initialised %d times", underInits)
+	}
+}
+
+// dissolveOnSize vanishes as soon as it is told the terminal size.
+type dissolveOnSize struct{}
+
+func (dissolveOnSize) Init() tea.Cmd { panic("Init on an overlay that already dissolved") }
+func (d dissolveOnSize) Update(msg tea.Msg) (Overlay, tea.Cmd) {
+	if _, ok := msg.(tea.WindowSizeMsg); ok {
+		return nil, nil
+	}
+	return d, nil
+}
+func (dissolveOnSize) View() string { return "" }
+
 // TestRootReachesEveryLayerOnResize — a layer behind a modal that missed a resize is drawn wrong the
 // moment it comes back.
 func TestRootReachesEveryLayerOnResize(t *testing.T) {

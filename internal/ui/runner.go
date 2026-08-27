@@ -224,21 +224,23 @@ func (w *StreamWriter) Write(p []byte) (int, error) {
 	// RECORDED FIRST, RAW, AND IN THE SAME CRITICAL SECTION as the line splitting: the record's
 	// order is the order the verb wrote in, and a chunk appended after another goroutine's would
 	// replay out of sequence.
+	// RECORDED AND DRAWN UNDER ONE LOCK, so the two agree on order. Releasing between them let two
+	// concurrent writers record A-then-B and draw B-then-A: the replay and the screen would then
+	// disagree about what happened first. The lock is held across the post to the message loop;
+	// that post is the only thing here that can block, it is bounded by the program's lifetime, and
+	// nothing the message loop runs writes back to a StreamWriter, so there is no cycle to close.
 	w.mu.Lock()
+	defer w.mu.Unlock()
 	w.b.appendRecord(w.stderr, string(p))
 	w.buf = append(w.buf, p...)
-	var lines []string
 	for {
 		i := bytes.IndexByte(w.buf, '\n')
 		if i < 0 {
 			break
 		}
-		lines = append(lines, string(w.buf[:i]))
+		line := string(w.buf[:i])
 		w.buf = w.buf[i+1:]
-	}
-	w.mu.Unlock()
-	for _, l := range lines {
-		w.emit(l)
+		w.emit(line)
 	}
 	return len(p), nil
 }
@@ -247,9 +249,9 @@ func (w *StreamWriter) Write(p []byte) (int, error) {
 // exactly as they were written.
 func (w *StreamWriter) Close() error {
 	w.mu.Lock()
+	defer w.mu.Unlock()
 	rest := string(w.buf)
 	w.buf = nil
-	w.mu.Unlock()
 	if rest != "" {
 		w.emit(rest)
 	}
@@ -322,6 +324,15 @@ func run(ctx context.Context, base verbs.Deps, fn VerbFunc, mk func(Root) progra
 	}
 	done := make(chan outcome, 1)
 	uiDone := make(chan struct{})
+	// The launch gate. THE DECISION IS A LOCK, NOT A RACE BETWEEN TWO CHANNELS: with `started` and
+	// `uiDone` both closed — which happens whenever the runtime ends after dispatching the start
+	// command but before its goroutine ran, and Bubble Tea does not wait for that goroutine — a
+	// select over the two picks at random, and half the time it launches a verb into an interface
+	// that has already gone. `barred` is set BEFORE uiDone is closed, so the verb goroutine either
+	// takes the lock first and runs, or takes it after and never starts. Exactly one of those
+	// happens, and both publish an outcome.
+	var gate sync.Mutex
+	barred := false
 
 	go func() {
 		// THE VERB DOES NOT START UNTIL THE INTERFACE IS LIVE. Starting it first would mean that a
@@ -331,9 +342,14 @@ func run(ctx context.Context, base verbs.Deps, fn VerbFunc, mk func(Root) progra
 		select {
 		case <-started:
 		case <-uiDone:
+		}
+		gate.Lock()
+		if barred {
+			gate.Unlock()
 			done <- outcome{}
 			return
 		}
+		gate.Unlock()
 		code := fn(vctx, d)
 		// Trailing partial lines are flushed into the record BEFORE the code is published, so the
 		// replay below sees the whole of what the verb wrote.
@@ -346,6 +362,10 @@ func run(ctx context.Context, base verbs.Deps, fn VerbFunc, mk func(Root) progra
 	}()
 
 	_, runErr := p.Run()
+	// Barred BEFORE uiDone is closed: a verb that has not taken the gate by now never will.
+	gate.Lock()
+	barred = true
+	gate.Unlock()
 	close(uiDone)
 	// The interface is gone. Release the verb from everything it can be blocked on BEFORE waiting
 	// for it — this is the whole reason a blocking Confirm bridged over a channel is safe.

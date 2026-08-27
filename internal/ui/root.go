@@ -171,6 +171,7 @@ func (m Root) push(o Overlay) (Root, tea.Cmd) {
 		return m, nil
 	}
 	m.overlays = m.overlays.push(o)
+	depth := len(m.overlays)
 	var cmds []tea.Cmd
 	// The overlay is told the current size IMMEDIATELY: it was built by a caller that has no
 	// window size of its own and would otherwise stay unsized until the next resize, which may
@@ -180,9 +181,12 @@ func (m Root) push(o Overlay) (Root, tea.Cmd) {
 		m, sizeCmd = m.routeToTop(tea.WindowSizeMsg{Width: m.width, Height: m.height})
 		cmds = append(cmds, sizeCmd)
 	}
-	// The step above can dissolve the overlay, so Init is only reached while one is still there.
-	if top := m.overlays.top(); top != nil {
-		cmds = append(cmds, top.Init())
+	// The step above can dissolve the overlay, and then the top is the one UNDERNEATH — which is
+	// already installed and already initialised. Init is reached only while the overlay this call
+	// pushed is still the top, which the depth says exactly; asking `top != nil` instead
+	// re-initialised the layer below, duplicating whatever its Init had started.
+	if len(m.overlays) == depth {
+		cmds = append(cmds, m.overlays.top().Init())
 	}
 	return m, tea.Batch(cmds...)
 }
