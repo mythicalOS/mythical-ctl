@@ -455,11 +455,20 @@ func (m StatusModel) clamp() StatusModel {
 	return m
 }
 
-// body is how many lines the viewport shows, the footer excluded. Zero means "no windowing" —
-// the size is not known yet, and cutting the report against a guess is worse than a long frame.
+// body is how many lines the viewport shows, the footer excluded.
+//
+// ZERO MEANS "NO WINDOWING", AND ONLY AN UNKNOWN SIZE MEANS ZERO. A known height of one used to
+// mean it too, which read as "render everything" and handed a one-row terminal the whole report
+// to swallow: no viewport, no position, no scrolling — the report hidden by the terminal with
+// nothing saying so. At one row there is no space for both a line of report and the note that
+// there is more, and a line of report is the better use of it; the footer is suppressed there and
+// nowhere else.
 func (m StatusModel) body() int {
-	if !m.hasSize || m.height <= 1 {
+	if !m.hasSize || m.height <= 0 {
 		return 0
+	}
+	if m.height == 1 {
+		return 1
 	}
 	return m.height - 1
 }
@@ -494,13 +503,18 @@ var statusSections = []struct {
 	title string
 	kinds []statusKind
 }{
+	// DIAGNOSTICS COMES FIRST, and that is not a matter of taste. The report writes a warning to
+	// stderr and then, on the very next line, a refusal that says "(see the warning above)". The
+	// plain path puts the two next to each other. Grouping the warnings into a section BELOW the
+	// refusals made the report's own cross-reference point at nothing — the operator is told to
+	// look above and there is nothing above. Above is where they are now.
+	{"DIAGNOSTICS — the warnings the refusals below refer to", []statusKind{kindDiagnostic}},
 	{"INSTALLATION", []statusKind{kindInstallation}},
 	{"NETWORK MIGRATION", []statusKind{kindMigration}},
 	{"PRODUCTS", []statusKind{kindProduct, kindNote}},
 	{"VOLUMES", []statusKind{kindVolume}},
 	{"PENDING", []statusKind{kindPending}},
 	{"UNACCOUNTED OBJECTS", []statusKind{kindUnaccounted}},
-	{"DIAGNOSTICS — the warnings this report refers to", []statusKind{kindDiagnostic}},
 	{"LINES THIS VIEW DID NOT RECOGNISE — shown as the report wrote them", []statusKind{kindUnrecognised}},
 	// kindRuntime is rendered by the banner, ABOVE every section, because it is the one fact
 	// that qualifies all the others. It is listed here so the coverage assertion sees it.
@@ -534,6 +548,9 @@ func (m StatusModel) View() string {
 	window := append([]string(nil), lines[off:end]...)
 	for len(window) < body {
 		window = append(window, "")
+	}
+	if m.height <= 1 {
+		return strings.Join(window, "\n")
 	}
 	return strings.Join(append(window, m.footer(len(lines), off, end)), "\n")
 }

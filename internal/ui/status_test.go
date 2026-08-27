@@ -74,11 +74,72 @@ var sampleReport = []string{
 
 // --- classification and completeness --------------------------------------------------------------
 
-// TestEveryKindIsRenderedBySomeSection is the completeness proof this view rests on: a line is
-// filed under exactly one kind, and every kind has a section that draws it. A kind that no
-// section names would be a line ingested and then silently never shown — which is precisely the
-// "nothing shown means could not be read" failure, moved to the last step.
-func TestEveryKindIsRenderedBySomeSection(t *testing.T) {
+// kindSamples is one real report line per kind. The map is REQUIRED to be total: a kind added to
+// the classifier with no sample here fails the test below rather than quietly going unrendered.
+var kindSamples = map[statusKind]struct {
+	line   string
+	stderr bool
+}{
+	kindUnrecognised: {line: "zzunclassifiable line"},
+	kindRuntime:      {line: "runtime:      UNAVAILABLE — there is no zzruntime connection, so nothing below can"},
+	kindInstallation: {line: "installation: zzident"},
+	kindMigration:    {line: "NETWORK MIGRATION IN PROGRESS — phase zzphase"},
+	kindProduct:      {line: "zzproduct: desired=running observed=running outstanding=none next=none"},
+	kindVolume:       {line: "volume zzvol: role=data data=UNREGENERABLE product=p — present, created by this installation"},
+	kindPending:      {line: "PENDING: volume zzpending — created and not yet confirmed"},
+	kindUnaccounted:  {line: "unattributed container: zzunaccounted"},
+	kindNote:         {line: "note:         zznote could not be read — repair advised."},
+	kindDiagnostic:   {line: "ledger: zzdiagnostic", stderr: true},
+}
+
+// TestEveryKindIsRendered is the completeness proof this view rests on.
+//
+// IT DRIVES A LINE OF EVERY KIND THROUGH THE MODEL AND LOOKS FOR IT ON SCREEN. Checking instead
+// that every kind appears in the statusSections table proves only that a kind was ASSIGNED a
+// heading — it says nothing about whether anything draws it, and the runtime kind is deliberately
+// drawn by the banner rather than by the section loop, so a membership check kept passing with
+// the banner deleted. Exactly once, too: a kind claimed by two sections would be drawn twice, and
+// a report that showed one volume as two rows is its own kind of wrong answer.
+func TestEveryKindIsRendered(t *testing.T) {
+	for k := statusKind(0); k < kindCount; k++ {
+		sample, ok := kindSamples[k]
+		if !ok {
+			t.Fatalf("kind %d has no sample line: a kind the classifier can produce and this test\n"+
+				"  has never seen is a kind nothing here proves is drawn", k)
+		}
+		if got := classify(sample.line, sample.stderr).kind; got != k {
+			t.Fatalf("kind %d's sample %q classifies as %d", k, sample.line, got)
+		}
+		m := sized(NewStatusModel(nil), 200, 200)
+		if sample.stderr {
+			m = warn(m, sample.line)
+		} else {
+			m = say(m, sample.line)
+		}
+		m, _ = sstep(m, statusDoneMsg{})
+		token := distinctToken(t, sample.line)
+		if n := strings.Count(plain(m), token); n != 1 {
+			t.Fatalf("kind %d: %q appears %d times on screen, want exactly 1 — a line of that kind\n"+
+				"  is either not drawn at all or drawn by two sections:\n%s", k, token, n, plain(m))
+		}
+	}
+}
+
+// distinctToken picks the zz-prefixed marker out of a sample line.
+func distinctToken(t *testing.T, line string) string {
+	t.Helper()
+	for _, f := range strings.FieldsFunc(line, func(r rune) bool { return r == ' ' || r == '=' || r == ':' }) {
+		if strings.HasPrefix(f, "zz") {
+			return f
+		}
+	}
+	t.Fatalf("sample %q carries no zz-marker to look for", line)
+	return ""
+}
+
+// TestNoKindIsClaimedByTwoSections — the sections table is still checked for a double claim,
+// which the rendering test above would only catch for the kinds whose sample lands in both.
+func TestNoKindIsClaimedByTwoSections(t *testing.T) {
 	seen := map[statusKind]string{}
 	for _, sec := range statusSections {
 		for _, k := range sec.kinds {
@@ -88,11 +149,37 @@ func TestEveryKindIsRenderedBySomeSection(t *testing.T) {
 			seen[k] = sec.title
 		}
 	}
-	for k := statusKind(0); k < kindCount; k++ {
-		if _, ok := seen[k]; !ok {
-			t.Fatalf("kind %d is filed by the classifier and drawn by no section — a line of that\n"+
-				"kind would be ingested and never shown", k)
-		}
+}
+
+// TestTheDiagnosticsAreDrawnAboveTheRefusalsThatPointAtThem. The report writes a warning and then,
+// on the next line, a refusal that says "(see the warning above)". A view that gathered the
+// warnings into a section BELOW those refusals would make the report's own cross-reference point
+// at nothing.
+func TestTheDiagnosticsAreDrawnAboveTheRefusalsThatPointAtThem(t *testing.T) {
+	m := sized(NewStatusModel(nil), 200, 200)
+	m = warn(m, "ledger: the identity record is ambiguous")
+	m = say(m, "installation: UNREADABLE — an identity is recorded but could not be read (see the warning")
+	m = say(m, "  above). This is NOT 'nothing installed'; objects this installation named may be orphaned.")
+	m = warn(m, "prov: the volume could not be inspected")
+	m = say(m, "volume v1: role=data data=UNREGENERABLE product=p — provenance NOT established (see above); 'uninstall --purge' will preserve it")
+	m, _ = sstep(m, statusDoneMsg{})
+	v := plain(m)
+	warning := strings.Index(v, "ledger: the identity record is ambiguous")
+	second := strings.Index(v, "prov: the volume could not be inspected")
+	refusal := strings.Index(v, "installation: UNREADABLE")
+	volume := strings.Index(v, "UNPROVEN")
+	if warning < 0 || second < 0 || refusal < 0 || volume < 0 {
+		t.Fatalf("something is missing from:\n%s", v)
+	}
+	if warning > refusal || second > refusal {
+		t.Fatalf("a warning is drawn below the refusal that says to look above it:\n%s", v)
+	}
+	if warning > volume || second > volume {
+		t.Fatalf("a warning is drawn below the volume row that says to look above it:\n%s", v)
+	}
+	// And they keep the report's own order, so several of them can still be told apart.
+	if warning > second {
+		t.Fatalf("the warnings are not in the order the report wrote them:\n%s", v)
 	}
 }
 
@@ -395,6 +482,75 @@ func TestEachTableNamesExactlyTheFactsTheReportGives(t *testing.T) {
 		t.Fatalf("volume table columns %v, want %v.\n"+
 			"  A volume has no SIZE among these facts, and every fact it does have must have a\n"+
 			"  heading of its own or its value is drawn under the next column's name.", got, want)
+	}
+}
+
+// TestEachTableDrawsEveryValueUnderItsOwnHeading. Naming the columns is only half the contract:
+// the values have to line up with them. Two row cells swapped leaves both the header check and
+// the every-capture-is-on-screen check passing while the report reads wrong — a role shown as a
+// data class, a desired state shown as an observed one.
+func TestEachTableDrawsEveryValueUnderItsOwnHeading(t *testing.T) {
+	m := sized(NewStatusModel(nil), 200, 60)
+	m = say(m, "zzprod: desired=zzdesired observed=zzobserved outstanding=zzoutstanding next=zznext")
+	m = say(m, "volume zzname: role=zzrole data=zzdata product=zzproduct — present, created by this installation")
+	v := plain(m)
+	for _, c := range []struct {
+		first string
+		head  []string
+		row   []string
+	}{
+		{"PRODUCT", []string{"PRODUCT", "DESIRED", "OBSERVED", "OUTSTANDING", "NEXT"},
+			[]string{"zzprod", "zzdesired", "zzobserved", "zzoutstanding", "zznext"}},
+		{"VOLUME", []string{"VOLUME", "ROLE", "DATA", "PRODUCT", "STATE"},
+			[]string{"zzname", "zzrole", "zzdata", "zzproduct", "present"}},
+	} {
+		head := headerOf(t, v, c.first)
+		row := rowStartingWith(t, v, c.row[0])
+		if !reflect.DeepEqual(head, c.head) {
+			t.Fatalf("%s header %v, want %v", c.first, head, c.head)
+		}
+		if len(row) != len(head) {
+			t.Fatalf("%s row %v has %d cells under %d headings", c.first, row, len(row), len(head))
+		}
+		for i := range head {
+			if row[i] != c.row[i] {
+				t.Fatalf("under heading %q the row shows %q, want %q — the cells and the headings\n"+
+					"  are not in the same order:\n    %v\n    %v", head[i], row[i], c.row[i], head, row)
+			}
+		}
+	}
+}
+
+// rowStartingWith returns the fields of the table row whose first cell is the given value.
+func rowStartingWith(t *testing.T, view, first string) []string {
+	t.Helper()
+	for _, line := range strings.Split(view, "\n") {
+		f := strings.Fields(line)
+		if len(f) > 0 && f[0] == first {
+			return f
+		}
+	}
+	t.Fatalf("no table row starting with %q in:\n%s", first, view)
+	return nil
+}
+
+// TestNoHeightOverflowsTheTerminal. The viewport never draws more rows than the terminal has, and
+// it never falls back to dumping the whole report into one that is merely SMALL — a known height
+// of one used to mean "no windowing", which handed a one-row terminal every line of the report.
+func TestNoHeightOverflowsTheTerminal(t *testing.T) {
+	for h := 1; h <= 40; h++ {
+		m := sized(NewStatusModel(func() {}), 100, h)
+		for i := 0; i < 40; i++ {
+			m = say(m, fmt.Sprintf("zzline %d that no classifier knows", i))
+		}
+		m, _ = sstep(m, statusDoneMsg{})
+		if got := len(strings.Split(m.View(), "\n")); got > h {
+			t.Fatalf("height %d: the view drew %d rows", h, got)
+		}
+		// And it is still SHOWING something, at every height.
+		if strings.TrimSpace(plain(m)) == "" {
+			t.Fatalf("height %d: the view is blank", h)
+		}
 	}
 }
 
