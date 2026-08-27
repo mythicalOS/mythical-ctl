@@ -566,10 +566,11 @@ var (
 
 // section is one heading and the kinds filed under it.
 //
-// THE TABLE IS THE COMPLETENESS PROOF. Every statusKind appears in exactly one section, and
-// that is asserted (TestEveryKindIsRenderedBySomeSection) rather than trusted — which is what
-// makes "a line this view cannot classify is still shown" a property of the structure instead
-// of a promise about the classifier.
+// EVERY statusKind IS DRAWN BY EXACTLY ONE OF THESE, and that is asserted rather than trusted:
+// TestEveryKindIsRendered drives a line of every kind through the model and requires it on screen
+// exactly once, and TestNoKindIsClaimedByTwoSections guards the table itself. Membership alone was
+// the weaker claim it started as — a kind can be listed here and still be drawn by nothing, which
+// is what the runtime kind (drawn by the banner, not by this loop) proved.
 var statusSections = []struct {
 	title string
 	kinds []statusKind
