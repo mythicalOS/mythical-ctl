@@ -47,8 +47,43 @@ type Escaper interface {
 // parent, which the kernel refuses (ENOTEMPTY). A sibling on the same filesystem renames correctly
 // onto a destination that does not exist OR is empty — the only two cases the non-empty-destination
 // rule permits.
+
+// splitPath is `dirname`/`basename`, and it is written by hand because filepath.Dir is NOT dirname.
+//
+// filepath.Dir CLEANS its result, and cleaning collapses `..` LEXICALLY — which is the wrong answer
+// whenever a component is a symlink. With /safe/link -> /other/child, the destination
+// /safe/link/../dest names /safe/dest lexically and /other/dest physically, and those are two
+// different directories: one of them would be checked and the other written to. `dirname` does no
+// such thing — it hands back the literal prefix, and the PHYSICAL resolution happens afterwards, in
+// the canonicalizer, which is the only thing that can resolve a `..` correctly at all.
+//
+// What it DOES do, and what filepath.Dir does not, is strip trailing separators before splitting:
+// `/target/dir/` is parent `/target`, leaf `dir`, not parent `/target/dir`. A trailing slash is an
+// ordinary way to write a directory path, so both halves of this matter.
+func splitPath(p string) (dir, base string) {
+	for len(p) > 1 && p[len(p)-1] == '/' {
+		p = p[:len(p)-1]
+	}
+	i := strings.LastIndexByte(p, '/')
+	if i < 0 {
+		return ".", p
+	}
+	if i == 0 {
+		if p == "/" {
+			return "/", "/"
+		}
+		return "/", p[1:]
+	}
+	dir = p[:i]
+	for len(dir) > 1 && dir[len(dir)-1] == '/' {
+		dir = dir[:len(dir)-1]
+	}
+	return dir, p[i+1:]
+}
+
 func StagingPath(dest, nonce string) string {
-	return filepath.Join(filepath.Dir(filepath.Clean(dest)), ".mythical-staging-"+nonce)
+	dir, _ := splitPath(dest)
+	return filepath.Join(dir, ".mythical-staging-"+nonce)
 }
 
 // Identity is a path's `device:inode`. rename() PRESERVES both, which is what makes the destination
@@ -534,10 +569,10 @@ func deviceOf(p string) (int64, error) {
 // ancestor's symlink component resolving into it) can be renamed or repointed by someone else the
 // instant after this check passes.
 func CheckParentTrust(dest string) error {
-	// Cleaned for the same reason canonDest cleans: this is a public entry point, and a trailing
+	// Split the way `dirname` splits — see splitPath. This is a public entry point, and a trailing
 	// slash would otherwise make it verify the chain to the destination ITSELF rather than to its
-	// parent.
-	pdir := filepath.Dir(filepath.Clean(dest))
+	// parent, while a lexical clean would resolve a `..` through a symlink to the wrong directory.
+	pdir, _ := splitPath(dest)
 	canon, err := runtime.Canon(pdir)
 	if err != nil {
 		return fmt.Errorf("migrate: the destination's parent directory %q does not resolve. Refusing: %w", pdir, err)
@@ -562,18 +597,15 @@ func CheckParentTrust(dest string) error {
 // resolved via its PARENT, which the other precheck rules already require to exist. A failed resolve
 // is a REFUSAL, never a silent fall-back to the raw value.
 func canonDest(dest string) (string, error) {
-	// CLEANED FIRST. `dirname`/`basename` strip trailing slashes before splitting, so the reference
-	// reads `/target/dir/` as parent `/target` and leaf `dir`. Go's Dir does NOT: it reads the same
-	// spelling as parent `/target/dir`, while Base still answers `dir` — joining the two produces
-	// `/target/dir/dir`, a directory one level below the one the operator named. A trailing slash
-	// is an ordinary way to write a directory path, so this is not an exotic input.
-	dest = filepath.Clean(dest)
-	pdir := filepath.Dir(dest)
+	// SPLIT THE WAY `dirname`/`basename` SPLIT — see splitPath. The parent is then resolved
+	// PHYSICALLY, which is the only resolution that answers a `..` correctly when a component on
+	// the way is a symlink.
+	pdir, base := splitPath(dest)
 	pcanon, err := runtime.Canon(pdir)
 	if err != nil {
 		return "", fmt.Errorf("migrate: the destination's parent directory %q does not resolve. Refusing: %w", pdir, err)
 	}
-	return filepath.Join(pcanon, filepath.Base(dest)), nil
+	return filepath.Join(pcanon, base), nil
 }
 
 // Where names which of the two candidate paths carries the recorded identity.

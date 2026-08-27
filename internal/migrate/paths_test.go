@@ -767,3 +767,61 @@ func TestReclaimRefusesAColludingPrivatePath(t *testing.T) {
 		t.Fatal("the occupied private path's contents were disturbed")
 	}
 }
+
+func TestSplitPathIsDirnameAndBasename(t *testing.T) {
+	// MEASURED AGAINST `dirname`/`basename`, not against filepath.Dir/Base — the two disagree on
+	// exactly the spellings this module receives from an operator. A `..` is left ALONE for the
+	// physical canonicalizer to resolve; trailing separators are stripped before the split.
+	for _, tc := range []struct{ in, dir, base string }{
+		{"/safe/target", "/safe", "target"},
+		{"/safe/target/", "/safe", "target"},
+		{"/safe/target//", "/safe", "target"},
+		{"/safe/", "/", "safe"},
+		{"/safe", "/", "safe"},
+		{"/", "/", "/"},
+		{"/safe/link/../dest", "/safe/link/..", "dest"},
+		{"/safe/link/..", "/safe/link", ".."},
+		{"/a//b/c", "/a//b", "c"},
+		{"relative/dest", "relative", "dest"},
+		{"dest", ".", "dest"},
+	} {
+		dir, base := splitPath(tc.in)
+		if dir != tc.dir || base != tc.base {
+			t.Fatalf("splitPath(%q) = (%q, %q), want (%q, %q)", tc.in, dir, base, tc.dir, tc.base)
+		}
+	}
+}
+
+func TestCanonDestResolvesDotDotPhysically(t *testing.T) {
+	// A `..` AFTER A SYMLINK RESOLVES THROUGH THE LINK'S TARGET, NOT LEXICALLY. With
+	// <base>/link -> <base>/other/child, the destination <base>/link/../dest names <base>/dest if
+	// the `..` is collapsed as text, and <base>/other/dest if it is resolved on disk — two
+	// different directories, and only one of them is the one the operator's path actually reaches.
+	// Lexical cleaning would check one and write to the other.
+	base := safeBase(t)
+	child := filepath.Join(base, "other", "child")
+	if err := os.MkdirAll(child, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(child, filepath.Join(base, "link")); err != nil {
+		t.Fatal(err)
+	}
+	// Built by concatenation, NOT filepath.Join — Join cleans, which would collapse the '..' in the
+	// test's own input and leave it asserting nothing.
+	got, err := canonDest(base + "/link/../dest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherCanon, err := runtime.Canon(filepath.Join(base, "other"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(otherCanon, "dest")
+	if got != want {
+		t.Fatalf("canonDest resolved the '..' to %q, want the physical %q", got, want)
+	}
+	baseCanon, _ := runtime.Canon(base)
+	if got == filepath.Join(baseCanon, "dest") {
+		t.Fatal("the '..' was collapsed lexically, naming a directory the operator's path does not reach")
+	}
+}

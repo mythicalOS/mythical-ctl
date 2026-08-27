@@ -1328,6 +1328,43 @@ func TestAFailedWriteLeavesTheCallersLedgerAlone(t *testing.T) {
 	if p, perr := Phase(f2.l, testProduct, testRole); perr != nil || p != 9 {
 		t.Fatalf("the intent was cleared in memory despite the write failing: %d %v", p, perr)
 	}
+
+	// AND THE SECOND STAGED WRITE OF THE SAME PHASE. Phase 9 restores the desired state and THEN
+	// clears the intent; a Persist that fails immediately only ever exercises the first of those,
+	// so the deletion could still be mutating the caller's ledger before its own write and nothing
+	// would notice. Here the restore is allowed to land and only the DELETION's write fails.
+	f3 := newFx(t)
+	canon3 := f3.canonDest()
+	if err := os.Mkdir(canon3, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f3.seed(record{Phase: 9, Dest: canon3, Nonce: "nz", Staging: StagingPath(canon3, "nz"),
+		Attempt: "started", Desired: "running"})
+	real := f3.d.Persist
+	writes := 0
+	f3.d.Persist = func(l *ledger.Ledger) error {
+		writes++
+		if writes > 1 {
+			return errors.New("disk is full")
+		}
+		return real(l)
+	}
+	if err := Run(ctx(), f3.l, f3.d, testProduct, testRole, canon3, 9); err == nil {
+		t.Fatal("a phase 9 whose second write failed reported success")
+	}
+	if writes < 2 {
+		t.Fatalf("phase 9 performed %d staged writes; the second one was never reached", writes)
+	}
+	// The restore landed; the deletion did not, in memory OR on disk.
+	if want, werr := state.DesiredGet(f3.l, f3.container); werr != nil || want != state.Running {
+		t.Fatalf("the desired state was not restored: %q %v", want, werr)
+	}
+	if p, perr := Phase(f3.l, testProduct, testRole); perr != nil || p != 9 {
+		t.Fatalf("the intent was cleared in memory despite its write failing: %d %v", p, perr)
+	}
+	if f3.diskPhase() != 9 {
+		t.Fatalf("the persisted intent is at %d, want 9", f3.diskPhase())
+	}
 }
 
 func TestPhase3NamesTheLeftoverItPreserves(t *testing.T) {
@@ -1766,13 +1803,47 @@ func TestPhase7PreparesTheReplacementBeforeRemovingTheOldOne(t *testing.T) {
 		t.Fatalf("the prepared replacement was discarded %d times, want 1", f2.bld.discarded)
 	}
 
-	// And on a FAILED create, too — the phase must not leak what it rendered.
-	f3 := newFx(t)
-	f3.bld.rebuildErr = errors.New("the daemon refused the create")
-	if err := MigrateStorage(ctx(), f3.l, f3.d, testProduct, testRole, Options{ToBind: f3.dest}); err == nil {
-		t.Fatal("a failed create reported success")
-	}
-	if f3.bld.discarded != 1 {
-		t.Fatalf("a failed create discarded %d times, want 1", f3.bld.discarded)
+	// ON EVERY PATH OUT means every one — not just success and a failed create. After Prepare has
+	// rendered something (a secrets env file, say), each early return below it must release it too,
+	// or the phase leaks it. The reference removes its rendered file before every one of those
+	// returns as well as after bring-up.
+	for _, tc := range []struct {
+		name  string
+		arm   func(*fx)
+		wants string
+	}{
+		{"the removal fails", func(x *fx) { x.mut.rmErr = errors.New("the daemon refused") },
+			"could not remove the old container"},
+		{"the container is not ours", func(x *fx) {
+			x.prv.put(prov.ClassContainer, x.container, "another-installation", "n-con")
+		}, "refusing to replace"},
+		{"the create fails", func(x *fx) { x.bld.rebuildErr = errors.New("the daemon refused the create") },
+			""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			x := newFx(t)
+			cd := x.canonDest()
+			if err := os.Mkdir(cd, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			id, _ := Identity(cd)
+			x.seed(record{Phase: 7, Dest: cd, Nonce: "nz", Staging: StagingPath(cd, "nz"),
+				StageID: id, Attempt: "started", Desired: "running"})
+			tc.arm(x)
+			err := Run(ctx(), x.l, x.d, testProduct, testRole, cd, 7)
+			if err == nil {
+				t.Fatal("the armed failure reported success")
+			}
+			if tc.wants != "" {
+				mustContain(t, err, tc.wants)
+			}
+			if len(x.bld.prepared) != 1 {
+				t.Fatalf("the replacement was prepared %d times, want 1", len(x.bld.prepared))
+			}
+			if x.bld.discarded != 1 {
+				t.Fatalf("what Prepare rendered was discarded %d times, want 1 — this path leaks it",
+					x.bld.discarded)
+			}
+		})
 	}
 }
