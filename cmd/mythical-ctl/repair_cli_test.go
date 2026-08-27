@@ -3,6 +3,11 @@ package main
 import (
 	"context"
 	"errors"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -135,6 +140,12 @@ func TestCLINetRebindSurplusOperandIsUsage(t *testing.T) {
 	// invocation.
 	r := newCLIRig(t).confirming()
 	r.writeProduct("p1")
+	// THE REBIND MUST BE POSSIBLE FOR ITS ABSENCE TO MEAN ANYTHING. Without a resolvable
+	// MYTHICAL_NET the verb refuses on its own, so "no reference was recorded" would hold whether
+	// the dispatcher stopped the call or ran it — the assertion would pass over the very defect it
+	// exists to catch. With the network configured, a dispatcher that let this through records one.
+	r.operatorNetwork("opnet")
+	r.writeFamilyConf("MYTHICAL_NET=opnet\n")
 
 	args := append([]string{"net", "rebind", "extra-garbage"}, r.docArgs()...)
 	if rc := r.run(args...); rc != cliio.ExitUsage {
@@ -142,5 +153,43 @@ func TestCLINetRebindSurplusOperandIsUsage(t *testing.T) {
 	}
 	if _, err := netref.RefGet(r.ledgerNow()); !errors.Is(err, netref.ErrNoReference) {
 		t.Fatalf("a network reference was recorded by a malformed invocation: %v", err)
+	}
+}
+
+// operatorNetwork stands a network with NO installation label — an operator's own, which the engine
+// client cannot create (NetworkCreate requires provenance, deliberately), so the fixture speaks to
+// the fake daemon's API directly, exactly as `docker network create` would.
+func (r *cliRig) operatorNetwork(name string) string {
+	r.t.Helper()
+	client := &http.Client{Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", r.fake.Socket())
+		},
+	}}
+	body := strings.NewReader(`{"Name":"` + name + `","Driver":"bridge","Labels":{}}`)
+	req, err := http.NewRequest(http.MethodPost, "http://docker/"+engine.APIVersion+"/networks/create", body)
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, derr := client.Do(req)
+	if derr != nil {
+		r.t.Fatal(derr)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		r.t.Fatalf("creating operator network %s: status %d", name, resp.StatusCode)
+	}
+	id, ierr := netref.Engine(r.fake.Client()).NetworkID(context.Background(), name)
+	if ierr != nil {
+		r.t.Fatal(ierr)
+	}
+	return id
+}
+
+func (r *cliRig) writeFamilyConf(body string) {
+	r.t.Helper()
+	if err := os.WriteFile(filepath.Join(r.home, "mythical.conf"), []byte(body), 0o600); err != nil {
+		r.t.Fatal(err)
 	}
 }

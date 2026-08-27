@@ -302,6 +302,24 @@ func (r *rig) identOrEmpty() string {
 	return id
 }
 
+// mustHaveNoIdentity asserts the ANSWER "none is recorded" — not merely that one could not be read.
+//
+// The two are different facts and the shell suite asserts the first (its `mi_ident_get` returns the
+// absent code, never the failure one). A helper that mapped every failure to "no identity" would let
+// a refused path get away with writing a malformed or duplicated identity row: the read would fail,
+// the helper would answer "none", and the assertion would pass over exactly the damage it is there
+// to forbid.
+func (r *rig) mustHaveNoIdentity(what string) {
+	r.t.Helper()
+	id, err := r.ledgerNow().IdentGet()
+	if err == nil {
+		r.t.Fatalf("%s: identity %q is recorded, want none", what, id)
+	}
+	if !errors.Is(err, ledger.ErrAbsentRecord) {
+		r.t.Fatalf("%s: the identity is not ABSENT, it is unreadable — %v", what, err)
+	}
+}
+
 func (r *rig) corruptSiblings() []string {
 	r.t.Helper()
 	matches, err := filepath.Glob(filepath.Join(r.home, ".state", "ledger.corrupt.*"))
@@ -383,6 +401,15 @@ func TestRepairRecordKinds(t *testing.T) {
 	got, err := l.IdentGet()
 	if err != nil || got != "insta" {
 		t.Fatalf("identity kind %q does not round-trip through ledger.IdentGet: %q, %v", kindIdentity, got, err)
+	}
+	// AND AN UNREADABLE IDENTITY IS NOT AN ABSENT ONE. Every "nothing was adopted" assertion in this
+	// file demands the ABSENCE sentinel rather than merely a failed read (mustHaveNoIdentity), which
+	// is only worth demanding if the two are actually distinguishable — a second identity row must
+	// answer with something other than ErrAbsentRecord, or that stricter assertion buys nothing.
+	two := &ledger.Ledger{}
+	two.ReplaceLines([]string{kindIdentity + "\tid=insta", kindIdentity + "\tid=instb"})
+	if _, derr := two.IdentGet(); derr == nil || errors.Is(derr, ledger.ErrAbsentRecord) {
+		t.Fatalf("two identity rows read as %v — absence and unreadability are not distinguishable, so every 'nothing was adopted' assertion here is weaker than it claims", derr)
 	}
 
 	if err := (&sessionless{l}).putRef("netid1", "opnet"); err != nil {
@@ -599,15 +626,21 @@ func TestNewlineLabelIsNeverSplitIntoCandidates(t *testing.T) {
 		}
 	}
 	r.mustSay("not a single")
+	// NOWHERE IN WHAT DISCOVERY SAID, not merely absent from the list it returned — the shell suite
+	// asserts on its whole merged output, and a diagnostic that echoed the raw rejected label would
+	// put a forged identity in front of the operator as something to type back.
+	r.mustNotSay("victim")
+	r.mustNotSay("foreign")
 
-	// ...and neither half is adoptable.
+	// ...and neither half is adoptable. The output is reset first: the refusal below NAMES the
+	// identity it is refusing, so leaving it in would make the assertion above unsatisfiable for a
+	// reason that has nothing to do with discovery.
+	r.reset()
 	if rc := r.repair("victim"); rc == cliio.ExitOK {
 		t.Fatalf("repair adopted the forged identity\n%s", r.said())
 	}
 	r.mustSay("not one of the identities found")
-	if id := r.identOrEmpty(); id != "" {
-		t.Fatalf("an identity (%q) was recorded by a refused repair", id)
-	}
+	r.mustHaveNoIdentity("a refused repair")
 }
 
 func TestCandidateDiscoveryFailsClosedOnAnUnreadableLabel(t *testing.T) {
@@ -653,9 +686,7 @@ func TestARealCandidateIsNeverTreatedAsZero(t *testing.T) {
 	r.mustSay("insta")
 	r.mustSay("found 1 installation identity")
 	r.mustNotSay("reinitializ")
-	if id := r.identOrEmpty(); id != "" {
-		t.Fatalf("an identity (%q) was minted over a real candidate", id)
-	}
+	r.mustHaveNoIdentity("a repair with a real candidate and no choice")
 }
 
 func TestTwoCandidatesBothShownNothingTouched(t *testing.T) {
@@ -696,9 +727,7 @@ func TestStateRepairRejectsASurplusOperand(t *testing.T) {
 	if rc := r.repair("insta", "stray"); rc != cliio.ExitUsage {
 		t.Fatalf("rc = %d, want %d (usage)\n%s", rc, cliio.ExitUsage, r.said())
 	}
-	if id := r.identOrEmpty(); id != "" {
-		t.Fatalf("a malformed call adopted identity %q", id)
-	}
+	r.mustHaveNoIdentity("a malformed call")
 	// NOTHING ATTEMPTED is half the contract: the refusal has to come before the daemon is asked
 	// anything, not after a preflight that already spoke to it.
 	if after := r.fake.RequestLog(); len(after) != before {
@@ -852,9 +881,15 @@ func TestTrustFloorsAreResetWithTheWindowStated(t *testing.T) {
 	r.mustRepair("insta")
 
 	// THE FLOOR IS GONE — that is the rollback window the operator was told they were accepting.
-	if got := r.floorNow("manifest:p1"); got != "" {
-		t.Fatalf("floor manifest:p1 = %q after the repair, want it reset", got)
-	}
+	//
+	// ABSENT, not merely unreadable. A reset that left a duplicated or malformed floor row behind
+	// would make every later read of it FAIL, which is not the same as the floor being reset — and a
+	// helper that reported any failure as "no floor" would pass over exactly that.
+	r.withLock(func(_ famlock.Held, st ledger.Store) {
+		if _, err := trust.FloorGet(st, "manifest:p1"); !errors.Is(err, ledger.ErrAbsentRecord) {
+			t.Fatalf("floor manifest:p1 after the repair: %v, want it ABSENT", err)
+		}
+	})
 	// AND THE ANCHOR IS NOT. Dropping it would force a fresh online bootstrap for no security
 	// benefit, and would make live verification impossible for the rest of the same repair run.
 	if got := r.anchorNow(); got != anchorBefore {
@@ -862,7 +897,11 @@ func TestTrustFloorsAreResetWithTheWindowStated(t *testing.T) {
 	}
 }
 
-// floorNow reads one document's recorded version floor; "" means none is recorded.
+// floorNow reads one document's recorded version floor, or "" when it could not be read at all.
+//
+// USE IT ONLY TO PROVE A FLOOR IS STILL THERE. It cannot prove one is gone: absent and unreadable
+// both come back "", and those are different facts — see the absence assertion in
+// TestTrustFloorsAreResetWithTheWindowStated, which asks trust.FloorGet directly for that reason.
 func (r *rig) floorNow(docid string) string {
 	r.t.Helper()
 	out := ""
@@ -1665,9 +1704,7 @@ func TestZeroCandidatesRefusesAnIdentityNothingCarries(t *testing.T) {
 	}
 	r.mustSay("no runtime object carries identity")
 	r.mustNotSay("reinitializ")
-	if id := r.identOrEmpty(); id != "" {
-		t.Fatalf("identity %q was minted by a refused repair", id)
-	}
+	r.mustHaveNoIdentity("a repair refused for naming an identity nothing carries")
 }
 
 func TestReinitializationRequiresConfirmation(t *testing.T) {
@@ -1680,9 +1717,7 @@ func TestReinitializationRequiresConfirmation(t *testing.T) {
 		t.Fatalf("this installation was reinitialized without confirmation\n%s", r.said())
 	}
 	r.mustSay("not confirmed")
-	if id := r.identOrEmpty(); id != "" {
-		t.Fatalf("identity %q was minted without confirmation", id)
-	}
+	r.mustHaveNoIdentity("an unconfirmed reinitialization")
 }
 
 func TestRebuildFailsClosedOnAnUnreadableListing(t *testing.T) {
