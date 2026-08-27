@@ -623,6 +623,13 @@ func btoi(b bool) int {
 //
 // The direction matters: correcting always-forwards would make scrolling UP out of a blank run
 // snap straight back down to where it started, so the operator could not get past it.
+//
+// THE RESULT IS CLAMPED BACK INTO RANGE. A blank run longer than the viewport near the end of the
+// report puts the nearest visible LINE past the last legal OFFSET, and storing that leaves the
+// model holding a position it considers to be beyond its own end: the scroll loop then treats it
+// as "nowhere further to go" and the next press moves BACKWARDS. Clamping cannot re-blank the
+// window — the line that was found is always inside the clamped one, because clamping only ever
+// widens the window downwards towards it.
 func visibleFrom(content []string, off, body, dir int) int {
 	if !windowBlank(content, off, body) {
 		return off
@@ -632,10 +639,10 @@ func visibleFrom(content []string, off, body, dir int) int {
 		first, second = -1, 1
 	}
 	if i := scanVisible(content, off, first); i >= 0 {
-		return i
+		return clampOffset(i, len(content), body)
 	}
 	if i := scanVisible(content, off, second); i >= 0 {
-		return i
+		return clampOffset(i, len(content), body)
 	}
 	return off
 }

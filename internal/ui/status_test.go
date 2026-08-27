@@ -605,36 +605,55 @@ func TestTheStoredOffsetAlwaysShowsSomething(t *testing.T) {
 		if windowBlank(m.render(), m.Offset(), body) {
 			t.Fatalf("%s: the stored offset %d shows nothing", what, m.Offset())
 		}
+		// AND IT IS A POSITION THE MODEL AGREES EXISTS. An offset past its own maximum is one the
+		// scroll loop reads as "nowhere further to go", so the next press moves backwards.
+		if m.Offset() > m.maxOffset() {
+			t.Fatalf("%s: the stored offset %d is past the last position %d", what, m.Offset(), m.maxOffset())
+		}
 	}
-	for _, h := range []int{1, 2, 3, 7} {
-		// A report whose LAST line is blank, so the end of it is the awkward case.
-		m := sized(NewStatusModel(nil), 100, h)
-		m = say(m, "installation: zzident")
-		m = say(m, "unattributed container: zzthing")
-		m = say(m, "")
-		m = say(m, "")
-		m, _ = sstep(m, statusDoneMsg{})
-		check(t, m, fmt.Sprintf("height %d, opening", h))
-		m, _ = sstep(m, tea.KeyMsg{Type: tea.KeyEnd})
-		check(t, m, fmt.Sprintf("height %d, after End", h))
-		m, _ = sstep(m, tea.KeyMsg{Type: tea.KeyHome})
-		check(t, m, fmt.Sprintf("height %d, after Home", h))
-		for i := 0; i < 30; i++ {
-			m, _ = sstep(m, tea.KeyMsg{Type: tea.KeyDown})
-			check(t, m, fmt.Sprintf("height %d, down %d", h, i+1))
-		}
-		for i := 0; i < 30; i++ {
-			m, _ = sstep(m, tea.KeyMsg{Type: tea.KeyUp})
-			check(t, m, fmt.Sprintf("height %d, up %d", h, i+1))
-		}
-		// A RESIZE can strand it too, and that is the path the keys do not cover: an offset whose
-		// window shows plenty at seven rows can show one blank line at one row, and the terminal
-		// changes size without the operator pressing anything.
-		for k := range m.render() {
-			shrunk := m
-			shrunk.offset = k
-			check(t, sized(shrunk, 100, 1), fmt.Sprintf("height %d, offset %d resized to one row", h, k))
-			check(t, sized(shrunk, 40, 3), fmt.Sprintf("height %d, offset %d resized to three rows", h, k))
+	// TWO REPORT SHAPES, and the second is the one that took a round of review to find. A blank
+	// run followed by a FINAL non-blank line puts the nearest visible line past the last legal
+	// offset, and a correction that did not clamp stored it there — a position the model itself
+	// considers to be beyond its own end.
+	shapes := map[string][]string{
+		"a blank tail": {
+			"installation: zzident", "unattributed container: zzthing",
+			"zzfirst unclassifiable", "", "", "", "", "zzlast unclassifiable", "", "",
+		},
+		"a blank run before the last line": {
+			"installation: zzident", "unattributed container: zzthing",
+			"zzfirst unclassifiable", "", "", "", "", "zzlast unclassifiable",
+		},
+	}
+	for shape, lines := range shapes {
+		for _, h := range []int{1, 2, 3, 4, 5, 6, 7} {
+			m := sized(NewStatusModel(nil), 100, h)
+			for _, l := range lines {
+				m = say(m, l)
+			}
+			m, _ = sstep(m, statusDoneMsg{})
+			check(t, m, fmt.Sprintf("%s, height %d, opening", shape, h))
+			m, _ = sstep(m, tea.KeyMsg{Type: tea.KeyEnd})
+			check(t, m, fmt.Sprintf("%s, height %d, after End", shape, h))
+			m, _ = sstep(m, tea.KeyMsg{Type: tea.KeyHome})
+			check(t, m, fmt.Sprintf("%s, height %d, after Home", shape, h))
+			for i := 0; i < 30; i++ {
+				m, _ = sstep(m, tea.KeyMsg{Type: tea.KeyDown})
+				check(t, m, fmt.Sprintf("%s, height %d, down %d", shape, h, i+1))
+			}
+			for i := 0; i < 30; i++ {
+				m, _ = sstep(m, tea.KeyMsg{Type: tea.KeyUp})
+				check(t, m, fmt.Sprintf("%s, height %d, up %d", shape, h, i+1))
+			}
+			// A RESIZE can strand it too, and that is the path the keys do not cover: an offset whose
+			// window shows plenty at seven rows can show one blank line at one row, and the terminal
+			// changes size without the operator pressing anything.
+			for k := range m.render() {
+				shrunk := m
+				shrunk.offset = k
+				check(t, sized(shrunk, 100, 1), fmt.Sprintf("%s, height %d, offset %d resized to one row", shape, h, k))
+				check(t, sized(shrunk, 40, 3), fmt.Sprintf("%s, height %d, offset %d resized to three rows", shape, h, k))
+			}
 		}
 	}
 }
