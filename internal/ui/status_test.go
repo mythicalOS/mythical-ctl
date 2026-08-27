@@ -534,27 +534,80 @@ func rowStartingWith(t *testing.T, view, first string) []string {
 	return nil
 }
 
-// TestNoHeightOverflowsTheTerminal. The viewport never draws more rows than the terminal has, and
-// it never falls back to dumping the whole report into one that is merely SMALL — a known height
-// of one used to mean "no windowing", which handed a one-row terminal every line of the report.
-func TestNoHeightOverflowsTheTerminal(t *testing.T) {
-	for h := 1; h <= 40; h++ {
-		m := sized(NewStatusModel(func() {}), 100, h)
-		for i := 0; i < 40; i++ {
-			m = say(m, fmt.Sprintf("zzline %d that no classifier knows", i))
-		}
-		m, _ = sstep(m, statusDoneMsg{})
-		if got := len(strings.Split(m.View(), "\n")); got > h {
-			t.Fatalf("height %d: the view drew %d rows", h, got)
-		}
-		// And it is still SHOWING something, at every height.
-		if strings.TrimSpace(plain(m)) == "" {
-			t.Fatalf("height %d: the view is blank", h)
+// TestNoHeightOverflowsTheTerminalAtAnyScrollPosition.
+//
+// AT EVERY HEIGHT AND EVERY SCROLL POSITION, not just at the top. The view draws no more rows than
+// the terminal has, and it is never entirely blank. Checking only the opening view misses both of
+// the ways a short terminal goes wrong: the opening view is the one that carries the title, so it
+// is never blank by accident, and the report has blank lines between its sections that a one-row
+// viewport can land squarely on.
+func TestNoHeightOverflowsTheTerminalAtAnyScrollPosition(t *testing.T) {
+	for h := 1; h <= 20; h++ {
+		m := narrowReport(100)
+		m = sized(m, 100, h)
+		total := len(m.render())
+		for off := 0; off <= total+2; off++ {
+			m.offset = off
+			m = m.clamp()
+			v := m.View()
+			if got := len(strings.Split(v, "\n")); got > h {
+				t.Fatalf("height %d offset %d: the view drew %d rows", h, off, got)
+			}
+			if strings.TrimSpace(ansi.Strip(v)) == "" {
+				t.Fatalf("height %d offset %d: the view is entirely blank — a dashboard showing\n"+
+					"  nothing is how 'could not be read' must never be rendered", h, off)
+			}
 		}
 	}
 }
 
-// TestATableWhoseHeaderDoesNotNameEveryCellIsNotDrawn — the fail-safe behind the assertion above:
+// TestAReportEndingInBlankLinesStillShowsSomething. A report line CAN be empty — an error whose
+// text ends in a newline is split into a last, empty line — so the end of the laid-out report can
+// be blank. Scrolled to the bottom of one on a one-row terminal, the viewport lands on the blank
+// and there is nothing after it to move to; it has to look back instead.
+func TestAReportEndingInBlankLinesStillShowsSomething(t *testing.T) {
+	m := sized(NewStatusModel(nil), 100, 1)
+	m = say(m, "installation: zzident")
+	m = say(m, "")
+	m = say(m, "")
+	m, _ = sstep(m, statusDoneMsg{})
+	m, _ = sstep(m, tea.KeyMsg{Type: tea.KeyEnd})
+	if v := m.View(); strings.TrimSpace(ansi.Strip(v)) == "" {
+		t.Fatalf("scrolled to a blank tail, the view shows nothing at all: %q", v)
+	}
+}
+
+// TestAOneRowTerminalSpendsItsRowOnTheReport. Every row this view spends on ITSELF is a row of
+// report the operator does not see, and at one row the title alone filled the whole terminal: a
+// dashboard whose entire content was its own name, with the report unreachable behind it. The row
+// goes to the report now — its first line is that section's heading, which is where a pager opens
+// and is one keystroke from the line under it.
+func TestAOneRowTerminalSpendsItsRowOnTheReport(t *testing.T) {
+	m := sized(NewStatusModel(nil), 100, 1)
+	m = say(m, "installation: zzident")
+	m, _ = sstep(m, statusDoneMsg{})
+	if v := plain(m); strings.Contains(v, "mythical-ctl status") {
+		t.Fatalf("the one row went to the view's own title:\n%q", v)
+	}
+	// And the report is reachable from there.
+	found := false
+	for i := 0; i < 8 && !found; i++ {
+		m, _ = sstep(m, tea.KeyMsg{Type: tea.KeyDown})
+		found = strings.Contains(plain(m), "zzident")
+	}
+	if !found {
+		t.Fatal("the report line cannot be scrolled to on a one-row terminal")
+	}
+	// At two rows the footer earns its place back; at three, the title.
+	if v := plain(sized(m, 100, 2)); !strings.Contains(v, "closes") || strings.Contains(v, "mythical-ctl status") {
+		t.Fatalf("two rows: %q", v)
+	}
+	if v := plain(sized(m, 100, 3)); !strings.Contains(v, "mythical-ctl status") || !strings.Contains(v, "closes") {
+		t.Fatalf("three rows: %q", v)
+	}
+}
+
+// TestATableWhoseHeaderDoesNotNameEveryCellIsNotDrawn// TestATableWhoseHeaderDoesNotNameEveryCellIsNotDrawn// TestATableWhoseHeaderDoesNotNameEveryCellIsNotDrawn — the fail-safe behind the assertion above:
 // a mismatch degrades to the report's own lines rather than to values under wrong headings.
 func TestATableWhoseHeaderDoesNotNameEveryCellIsNotDrawn(t *testing.T) {
 	tb := table{head: []string{"A", "B"}, rows: []tableRow{{cells: []string{"1", "2", "3"}}}}

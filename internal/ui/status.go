@@ -455,22 +455,35 @@ func (m StatusModel) clamp() StatusModel {
 	return m
 }
 
-// body is how many lines the viewport shows, the footer excluded.
+// layout decides the frame: whether there is room for the title line, whether there is room for
+// the footer, and how many rows are left for the report itself.
 //
-// ZERO MEANS "NO WINDOWING", AND ONLY AN UNKNOWN SIZE MEANS ZERO. A known height of one used to
-// mean it too, which read as "render everything" and handed a one-row terminal the whole report
-// to swallow: no viewport, no position, no scrolling — the report hidden by the terminal with
-// nothing saying so. At one row there is no space for both a line of report and the note that
-// there is more, and a line of report is the better use of it; the footer is suppressed there and
-// nowhere else.
-func (m StatusModel) body() int {
+// THE TITLE AND THE FOOTER ARE FURNITURE AND GIVE WAY FIRST. Every row this view spends on itself
+// is a row of report the operator does not see, and on a very short terminal that arithmetic runs
+// out fast: with the title always drawn, a one-row terminal showed the words "mythical-ctl status"
+// and NOTHING ELSE — a dashboard whose entire content was its own name. The report gets the last
+// row; the footer gives way at two, the title at three.
+//
+// A ZERO BODY MEANS "NO WINDOWING", and only an unknown size produces it: cutting the report
+// against a height nobody supplied is worse than a long frame.
+func (m StatusModel) layout() (title, footer bool, body int) {
 	if !m.hasSize || m.height <= 0 {
-		return 0
+		return true, false, 0
 	}
-	if m.height == 1 {
-		return 1
+	switch {
+	case m.height >= 3:
+		return true, true, m.height - 2
+	case m.height == 2:
+		return false, true, 1
+	default:
+		return false, false, 1
 	}
-	return m.height - 1
+}
+
+// body is how many rows of report the viewport shows.
+func (m StatusModel) body() int {
+	_, _, b := m.layout()
+	return b
 }
 
 func (m StatusModel) maxOffset() int {
@@ -529,42 +542,101 @@ func (m StatusModel) View() string {
 		// what stays in the terminal is the report, not a windowed pane of it.
 		return ""
 	}
-	lines := m.render()
-	body := m.body()
+	content := m.render()
+	title, footer, body := m.layout()
 	if body == 0 {
-		return strings.Join(lines, "\n")
+		return strings.Join(append([]string{m.titleLine()}, content...), "\n")
 	}
 	off := m.offset
-	if max := len(lines) - body; off > max {
+	if max := len(content) - body; off > max {
 		off = max
 	}
 	if off < 0 {
 		off = 0
 	}
+	// THE VIEWPORT IS NEVER ENTIRELY BLANK while there is anything to show. The report is laid
+	// out with blank lines between its sections, and on a one- or two-row terminal a scroll
+	// position can land squarely on one — leaving a dashboard showing nothing at all, which is
+	// the exact thing this view exists not to do.
+	off = firstVisible(content, off, body)
 	end := off + body
-	if end > len(lines) {
-		end = len(lines)
+	if end > len(content) {
+		end = len(content)
 	}
-	window := append([]string(nil), lines[off:end]...)
-	for len(window) < body {
-		window = append(window, "")
+	out := make([]string, 0, body+2)
+	if title {
+		out = append(out, m.titleLine())
 	}
-	if m.height <= 1 {
-		return strings.Join(window, "\n")
+	out = append(out, content[off:end]...)
+	for len(out) < body+btoi(title) {
+		out = append(out, "")
 	}
-	return strings.Join(append(window, m.footer(len(lines), off, end)), "\n")
+	if footer {
+		out = append(out, m.footer(len(content), off, end, body))
+	}
+	return strings.Join(out, "\n")
+}
+
+func btoi(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// firstVisible moves an offset to the nearest position whose window shows at least one line with
+// something on it — forwards first, so scrolling down keeps going down.
+func firstVisible(content []string, off, body int) int {
+	end := off + body
+	if end > len(content) {
+		end = len(content)
+	}
+	if !allBlank(content[off:end]) {
+		return off
+	}
+	for i := off + 1; i < len(content); i++ {
+		if !blank(content[i]) {
+			return i
+		}
+	}
+	for i := off - 1; i >= 0; i-- {
+		if !blank(content[i]) {
+			return i
+		}
+	}
+	return off
+}
+
+func blank(s string) bool { return strings.TrimSpace(ansi.Strip(s)) == "" }
+
+func allBlank(lines []string) bool {
+	for _, l := range lines {
+		if !blank(l) {
+			return false
+		}
+	}
+	return true
+}
+
+// titleLine is the view's own name for itself, fitted to the terminal.
+func (m StatusModel) titleLine() string {
+	width := 0
+	if m.hasSize {
+		width = m.width
+	}
+	return titleStyle.Render(fit("mythical-ctl status", width))
 }
 
 // footer says where the operator is in the report and what the keys do. IT ALWAYS REPORTS THE
 // POSITION when the report does not fit: a view that cut the tail without saying so would be
 // the "nothing shown" failure wearing a different hat.
-func (m StatusModel) footer(total, off, end int) string {
+func (m StatusModel) footer(total, off, end, body int) string {
 	keys := "↑/↓ scroll · r refreshes · q closes"
 	if m.onRefresh == nil {
 		keys = "↑/↓ scroll · q closes"
 	}
 	line := keys
-	if total > m.body() {
+	if total > body {
 		// THE POSITION COMES FIRST so that on a terminal too narrow for the whole footer it is
 		// the keymap that is cut, not the fact that there is more report below.
 		line = fmt.Sprintf("lines %d-%d of %d · %s", off+1, end, total, keys)
@@ -589,14 +661,13 @@ func (m StatusModel) render() []string {
 	if m.hasSize {
 		width = m.width
 	}
-	out := []string{titleStyle.Render(fit("mythical-ctl status", width))}
+	var out []string
 
 	if len(m.entries) == 0 {
 		if m.done {
 			// A REPORT WITH NO LINES IS NOT AN EMPTY INSTALLATION. The verb always says
 			// something — at minimum "No installation state found" — so an empty screen here
 			// means the report did not reach this view, and saying so is the whole point.
-			out = append(out, "")
 			out = append(out, styleAll(alarmStyle, wrapAt("The report produced no output.", "", avail))...)
 			out = append(out, wrapAt("This is not an empty installation: the report always says at least one thing.", "", avail)...)
 			return append(out, wrapAt("Run 'mythical-ctl status --plain' to see what the report writes.", "", avail)...)
@@ -606,7 +677,6 @@ func (m StatusModel) render() []string {
 
 	// The banner first: it qualifies everything below it.
 	if runtimeEntries := m.of(kindRuntime); len(runtimeEntries) > 0 {
-		out = append(out, "")
 		if m.notObserved {
 			out = append(out, styleAll(alarmStyle, wrapAt("NOT OBSERVED LIVE", "", avail))...)
 		}
