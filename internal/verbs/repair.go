@@ -1291,8 +1291,16 @@ func (s *session) resetLedger() error {
 	return s.reload()
 }
 
-// anchorRows returns the digest field of every trust-anchor row, INCLUDING rows whose digest is
-// missing or empty (as the empty string) — a count that skipped them would read two anchors as one.
+// anchorRows returns the digest of every trust-anchor row, INCLUDING rows that carry no usable one
+// (as the empty string) — a count that skipped them would read two anchors as one.
+//
+// A ROW MUST CARRY EXACTLY ONE `digest=` FIELD to have a digest at all. Taking the last of several
+// would resolve an ambiguity by picking one, which is the single thing this module never does — and
+// it would resolve it INVISIBLY: the rebuilt ledger would carry one clean anchor row, so nothing
+// downstream could ever tell that the record it came from named two different digests. The
+// authoritative reader refuses such a ledger outright (it collects every `digest=` value across
+// every anchor row and refuses more than one), so preserving a guess here would also disagree with
+// the only code that has to live with the answer.
 func anchorRows(l *ledger.Ledger) []string {
 	var out []string
 	for _, line := range l.Lines() {
@@ -1300,11 +1308,15 @@ func anchorRows(l *ledger.Ledger) []string {
 		if !ok {
 			continue
 		}
-		digest := ""
+		digest, seen := "", 0
 		for _, tok := range strings.Split(rest, "\t") {
 			if v, ok := strings.CutPrefix(tok, "digest="); ok {
 				digest = v
+				seen++
 			}
+		}
+		if seen != 1 {
+			digest = ""
 		}
 		out = append(out, digest)
 	}

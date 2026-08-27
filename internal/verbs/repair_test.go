@@ -1917,3 +1917,25 @@ func TestNetRebindRefusesAnUnreadableConfig(t *testing.T) {
 	r.mustSay("cannot be")
 	r.mustNotSay("MYTHICAL_NET is not set")
 }
+
+func TestAnchorRowNamingTwoDigestsIsDropped(t *testing.T) {
+	// ONE anchor row carrying TWO `digest=` fields. Both are well-formed, so a reader that took the
+	// last would keep a perfectly valid-looking anchor — and the rebuilt ledger would then carry one
+	// clean row, with nothing downstream able to tell it came from a record that named two different
+	// digests. The authoritative trust reader refuses such a record rather than choosing; so does
+	// this gate.
+	r := newRig(t)
+	r.setEnv("MI_CONFIRM", "yes")
+	r.mintIdentity()
+	r.appendRows("trust-anchor\tdigest=" + hex64 + "\tdigest=" + strings.Repeat("b", 64))
+
+	if rc := r.repair(reinitialize); rc != cliio.ExitOK {
+		t.Fatalf("rc = %d, want 0\n%s", rc, r.said())
+	}
+	r.mustSay("not a usable digest")
+	var got error
+	r.withLock(func(_ famlock.Held, st ledger.Store) { _, got = trust.AnchorGet(st) })
+	if !errors.Is(got, ledger.ErrAbsentRecord) {
+		t.Fatalf("an anchor was preserved from a record naming two digests: %v", got)
+	}
+}
