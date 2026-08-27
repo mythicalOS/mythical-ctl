@@ -1,8 +1,9 @@
-// No bats inventory: this is Wave 8 release tooling, not a port of a bash module. The frozen
-// tests/unit/bundle.bats covers the retiring bash bundler's inline-the-modules mechanism, and
-// the rewrite plan assigns it to the parity audit as a declared N/A whose successor property is
-// the build-twice digest comparison exercised here (TestCompareDetectsADifferingArtifact, and
-// the --repro path of tools/build-release.sh).
+// NO PORTED/N/A INVENTORY HERE, deliberately. This package is release tooling with no bash
+// counterpart to port: the only bats file adjacent to it is tests/unit/bundle.bats, which tests
+// the retiring bundler's inline-the-modules mechanism — a mechanism that goes away with the
+// bundler rather than being reimplemented. Its underlying property, "the same source produces
+// the same artifact", survives as the build-twice digest comparison exercised here
+// (TestCompareDetectsADifferingArtifact) and by tools/build-release.sh --repro.
 package main
 
 import (
