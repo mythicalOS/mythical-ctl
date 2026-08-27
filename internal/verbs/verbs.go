@@ -601,13 +601,29 @@ func (s *session) authorityOK(ctx context.Context, container string) error {
 // that verdict as-is would leak an exit code the contract does not define. It — and anything else
 // non-zero — maps to operational failure, naming the recovery.
 func (s *session) reconcile(ctx context.Context, product, container, netID, alias string) int {
-	bd, err := s.bringupDeps(nil, "")
+	// THE IDENTITY AND THE VERIFIED INDEX ARE BOTH REQUIRED, and both are read here rather than
+	// defaulted. The probe arm scopes every removal by the identity and takes its pinned image from
+	// the index, so an empty identity or an unread index does not degrade the reconciliation — it
+	// makes it impossible, and passing either as a zero value turns every start and restart into a
+	// refusal that names the probe instead of the real problem. (Measured: an empty identity here
+	// made start and restart fail before the reconciler ran at all, while the tests that expected a
+	// failure still passed — for the wrong reason.)
+	ident, ierr := s.l.IdentGet()
+	if ierr != nil {
+		s.d.warnErr(ierr)
+		return cliio.ExitFail
+	}
+	ix, xerr := trust.CheckIndex(s.st, s.d.IndexPath)
+	if xerr != nil {
+		s.d.warn("verbs: the family index could not be authenticated, so %q cannot be verified after it", product)
+		s.d.warn("  starts — and an unverified start is the one this installer does not report as done.")
+		s.d.warnErr(xerr)
+		return cliio.ExitFail
+	}
+	bd, err := s.bringupDeps(ix, ident)
 	if err != nil {
 		s.d.warnErr(err)
 		return cliio.ExitFail
-	}
-	if ix, ierr := trust.CheckIndex(s.st, s.d.IndexPath); ierr == nil {
-		bd.Index = ix
 	}
 	rerr := bringup.Reconcile(ctx, s.l, bd, container, netID, alias)
 	if perr := s.persist(); perr != nil {

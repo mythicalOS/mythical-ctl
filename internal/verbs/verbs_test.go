@@ -100,6 +100,15 @@ func TestInstallConverges(t *testing.T) {
 	if !r.containerExists(c) {
 		t.Fatal("the container was not created")
 	}
+	// AND THE ANTI-ROLLBACK FLOORS SURVIVED THE INSTALL THAT ESTABLISHED THEM. The document door
+	// writes them to the ledger FILE itself, so an install that went on editing an in-memory copy
+	// taken before that door would erase all three the moment it persisted — silently, and only a
+	// later replay of a withdrawn document would reveal it.
+	for _, docid := range []string{"index", "policy", "manifest:p1"} {
+		if got := r.floorOf(docid); got != "1" {
+			t.Fatalf("the trust floor for %s is %q after a successful install, want 1", docid, got)
+		}
+	}
 }
 
 func TestInstallIsIdempotent(t *testing.T) {
@@ -403,7 +412,7 @@ func TestRestartRefusedOnAStoppedProduct(t *testing.T) {
 	if rc := r.restart("p1"); rc == cliio.ExitOK {
 		t.Fatalf("restart succeeded on a stopped product\n%s", r.said())
 	}
-	r.mustSay("stopped")
+	r.mustSay("is stopped, so there is nothing to restart")
 	if got := r.observed(r.container("p1")); got != state.ObsStopped {
 		t.Fatalf("observed %q — restart started a product the operator stopped", got)
 	}
@@ -423,6 +432,10 @@ func TestRestartFailsOnASwallowedStop(t *testing.T) {
 	if rc := r.restart("p1"); rc != cliio.ExitFail {
 		t.Fatalf("rc = %d, want 1\n%s", rc, r.said())
 	}
+	// The identity of the failure: it is the STOP that did not happen. Without this the reconciler
+	// finds a live container whose alias resolves, clears the check and reports success — a restart
+	// that never restarted, which is the whole point of the assertion.
+	r.mustSay("could not be restarted")
 	if !r.running(c) {
 		t.Fatal("the container is not running, so the fixture did not fabricate a swallowed stop")
 	}
@@ -785,6 +798,20 @@ func TestInstallRefusesAnUnreadableVolumeRecord(t *testing.T) {
 	if rc := r.install("p1"); rc == cliio.ExitOK {
 		t.Fatalf("install proceeded over an ambiguous volume record\n%s", r.said())
 	}
+	// With the volume STANDING, the unaccounted gate reaches it first and stops there — a ledger that
+	// cannot say what accounts for an object it can see is exactly what that gate refuses on.
+	r.mustSay("could not be asked about")
+
+	// AND THE VERB'S OWN READ FAILS CLOSED TOO, which is the guard this test is really about. Take
+	// the objects away so the gate has nothing to see — it scans what the runtime holds — and the
+	// ambiguous record is then met by install's own provenance read, which must refuse rather than
+	// create a second volume under the same name.
+	r.reset()
+	r.removeObjects(r.container("p1"), vol)
+	if rc := r.install("p1"); rc == cliio.ExitOK {
+		t.Fatalf("install created over an ambiguous volume record\n%s", r.said())
+	}
+	r.mustSay("could not be read; refusing to create a")
 }
 
 func TestInstallRefusesAnAmbiguousContainerRecord(t *testing.T) {
@@ -800,6 +827,10 @@ func TestInstallRefusesAnAmbiguousContainerRecord(t *testing.T) {
 	if rc := r.install("p1"); rc == cliio.ExitOK {
 		t.Fatalf("install proceeded over an ambiguous container record\n%s", r.said())
 	}
+	// The identity of the refusal: this install cannot TELL whether a container already stands
+	// under that name. Removing the guard lets the ownership check downstream refuse instead, for a
+	// different reason — an assertion that accepts either proves nothing about this one.
+	r.mustSay("ambiguous or unreadable, so this")
 	if r.containerExists(c) {
 		t.Fatal("a container was created over an ambiguous ledger")
 	}
@@ -840,6 +871,17 @@ func TestStartReportsAmbiguousProvenanceAsUnreadable(t *testing.T) {
 	// An unreadable record is NOT "not installed": that answer sends the operator to install rather
 	// than to repair.
 	r.mustNotSay("is not installed")
+
+	// The container STANDING is what the unaccounted gate stops on first. Take it away — the gate
+	// scans what the runtime holds — and start's own record read is what must draw the same
+	// distinction, because "absent" and "the ledger cannot say" send the operator to opposite places.
+	r.reset()
+	r.removeObjects(r.container("p1"))
+	if rc := r.start("p1"); rc == cliio.ExitOK {
+		t.Fatalf("start ran over an ambiguous container record\n%s", r.said())
+	}
+	r.mustNotSay("is not installed")
+	r.mustSay("ambiguous or unreadable — this is not the same")
 }
 
 func TestStartNormalizesARebuildPlan(t *testing.T) {
@@ -862,6 +904,41 @@ func TestStartNormalizesARebuildPlan(t *testing.T) {
 
 	if rc := r.start("p1"); rc != cliio.ExitFail {
 		t.Fatalf("rc = %d, want 1\n%s", rc, r.said())
+	}
+	// It is the REBUILD verdict that was normalized, named as such — not some other failure that
+	// happens to also exit 1.
+	r.mustSay("needs a rebuild that start/restart cannot perform")
+}
+
+// TestStartBringsAStoppedProductBackUp is not a bats port: it is the positive half of the
+// reconciliation seam, and it exists because the negative half can pass for the wrong reason.
+// MEASURED: reconcile was handing the probe arm an empty installation identity, so start and
+// restart refused before the reconciler ever ran — and every owned test that expected a failure
+// still passed, because it got one. A verb whose success path nothing exercises is a verb whose
+// failure assertions prove nothing.
+func TestStartBringsAStoppedProductBackUp(t *testing.T) {
+	r := newRig(t)
+	r.writeProduct("p1")
+	r.mintIdentity()
+	r.mustInstall("p1")
+	c := r.container("p1")
+	if rc := r.stop("p1"); rc != cliio.ExitOK {
+		t.Fatalf("stop rc = %d\n%s", rc, r.said())
+	}
+	r.reset()
+
+	if rc := r.start("p1"); rc != cliio.ExitOK {
+		t.Fatalf("start rc = %d, want 0\n%s", rc, r.said())
+	}
+	if got := r.desired(c); got != state.Running {
+		t.Fatalf("desired %q, want running", got)
+	}
+	if got := r.observed(c); got != state.ObsRunning {
+		t.Fatalf("observed %q, want running", got)
+	}
+	// And the alias check it owed was PERFORMED, not merely declared.
+	if out := r.outstanding(c); len(out) != 0 {
+		t.Fatalf("start left %v outstanding — it did not verify what it started", out)
 	}
 }
 
@@ -934,6 +1011,28 @@ func TestBatchDoesNotAbortOnTheFirstFailure(t *testing.T) {
 	}
 	if !r.isMember("p1") {
 		t.Fatal("the later product was never installed — the batch aborted on the first failure")
+	}
+}
+
+// TestBatchMapsAPerProductUsageErrorToAFailure is not a bats port: the shell aggregate's own
+// refusals live in tests/unit/exit.bats. It is here because the MAPPING is this driver's, and it is
+// what keeps the aggregate's contract reachable — a usage error means nothing was attempted, so it
+// cannot be one product's outcome inside a batch that attempted others. Without the mapping the
+// aggregate is handed a code it must refuse, and the batch reports a malformed call as a plain
+// failure with no report of its own.
+func TestBatchMapsAPerProductUsageErrorToAFailure(t *testing.T) {
+	r := newRig(t)
+	r.writeProduct("p1")
+	// An empty product name is a usage error from the verb — and the batch's own invocation was
+	// still correct, so from here it is that product's operational failure.
+	if rc := Batch(context.Background(), r.d, "install", []string{"", "p1"}); rc != cliio.ExitFail {
+		t.Fatalf("rc = %d, want 1\n%s", rc, r.said())
+	}
+	r.mustSay(": failed")
+	r.mustNotSay(": usage error")
+	// The later product still ran.
+	if !r.isMember("p1") {
+		t.Fatal("the batch aborted on the malformed product")
 	}
 }
 

@@ -189,6 +189,14 @@ func TestCLIInstallWithNoProductAttemptsNothing(t *testing.T) {
 	if after := r.fake.Snapshot(); after != before {
 		t.Fatalf("the runtime changed:\n--- before ---\n%s\n--- after ---\n%s", before, after)
 	}
+	// The DISPATCHER'S own refusal, named: it says which verb needed a product and prints the usage
+	// surface beside it. The batch driver refuses an empty product list too, so a test that only
+	// checked the exit code could not tell the two apart — and would still pass with the
+	// dispatcher's check deleted.
+	if !strings.Contains(r.said(), "install needs at least one product") ||
+		!strings.Contains(r.said(), "USAGE") {
+		t.Fatalf("not the dispatcher's own refusal:\n%s", r.said())
+	}
 }
 
 func TestCLIValuelessOptionIsAUsageError(t *testing.T) {

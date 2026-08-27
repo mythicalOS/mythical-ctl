@@ -28,6 +28,7 @@ import (
 	"mythicalos.ai/ctl/internal/famlock"
 	"mythicalos.ai/ctl/internal/layout"
 	"mythicalos.ai/ctl/internal/ledger"
+	"mythicalos.ai/ctl/internal/runtime"
 	"mythicalos.ai/ctl/internal/state"
 	"mythicalos.ai/ctl/internal/trust"
 )
@@ -549,6 +550,32 @@ func (r *rig) createStrayVolume(name string) {
 		}
 		if err := m.VolumeCreate(context.Background(), name, p); err != nil {
 			r.t.Fatal(err)
+		}
+	})
+}
+
+// removeObjects deletes containers and volumes out of band, by name — the runtime-side half of the
+// fixtures that need the ledger to say something about an object the daemon no longer holds.
+func (r *rig) removeObjects(names ...string) {
+	r.t.Helper()
+	ctx := context.Background()
+	r.withLock(func(h famlock.Held, _ ledger.Store) {
+		rt, err := runtime.New(h, r.c)
+		if err != nil {
+			r.t.Fatal(err)
+		}
+		for _, n := range names {
+			if r.containerExists(n) {
+				if err := rt.ContainerRemove(ctx, n); err != nil {
+					r.t.Fatalf("removing container %s: %v", n, err)
+				}
+				continue
+			}
+			if r.volumeExists(n) {
+				if err := rt.VolumeRemove(ctx, n); err != nil {
+					r.t.Fatalf("removing volume %s: %v", n, err)
+				}
+			}
 		}
 	})
 }
