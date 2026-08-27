@@ -7,12 +7,14 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"mythicalos.ai/ctl/internal/backup"
 	"mythicalos.ai/ctl/internal/cliio"
 	"mythicalos.ai/ctl/internal/engine"
 	"mythicalos.ai/ctl/internal/famlock"
 	"mythicalos.ai/ctl/internal/layout"
+	"mythicalos.ai/ctl/internal/migrate"
 	"mythicalos.ai/ctl/internal/preflight"
 	"mythicalos.ai/ctl/internal/prov"
 	"mythicalos.ai/ctl/internal/runtime"
@@ -29,20 +31,25 @@ import (
 // newCopier is the seam onto the pinned copy container — the host cannot read a named volume
 // at all (D54), so every question about a volume's contents is asked through it.
 //
-// IT IS NIL IN THIS BUILD. The copy module lands as its own port task; until it does, these
-// two verbs degrade cleanly — a usage error is still a usage error, and an attempt to actually
-// run reports that the build does not carry the capability yet, rather than calling something
-// that does not exist. The frozen dispatcher does exactly this for the verbs whose mechanism
-// had not landed yet. Wiring it is one assignment: an adapter satisfying backup.Copier over
-// the copy module's own functions.
-var newCopier func(rt *runtime.Runtime, indexPath string) (backup.Copier, error)
+// IT IS WIRED (see copyseam.go): an adapter satisfying backup.Copier over internal/copyfill's
+// own functions, carrying the transcript across unread. It stays a VARIABLE rather than a
+// direct call because the nil-seam refusal below is a real contract — a build assembled without
+// it must report a missing capability rather than dereference nothing — and because a test must
+// be able to prove that refusal still fires.
+//
+// The identity is the installation the helper containers belong to; the writers are the verb's
+// own streams, so the copier's narration and the helper's stderr reach whoever invoked it rather
+// than the process globals.
+var newCopier = buildCopier
 
 // safeChain is the ownership-safety check for the operator-named backup/restore directory —
-// the ONLY authentication a backup gets, since there is no secret to sign a tree with. It is
-// migrate-storage's own hardened primitive; a second, hand-written copy of a security check is
-// exactly the drift the "one implementation" rule exists to prevent, so this is a seam too,
-// nil until that module lands, and a nil one refuses rather than defaulting to permissive.
-var safeChain backup.SafeChain
+// the ONLY authentication a backup gets, since there is no secret to sign a tree with.
+//
+// IT IS migrate-storage's OWN HARDENED PRIMITIVE, reached here rather than reimplemented: a
+// second, hand-written copy of a security check is exactly the drift the "one implementation"
+// rule exists to prevent, and this is the check that stands in for a signature. A nil one
+// refuses every operation rather than defaulting to permissive.
+var safeChain backup.SafeChain = migrate.VerifyChainOwnerSafe
 
 // unavailable reports a capability this build does not carry yet. It is an OPERATIONAL
 // failure, not a usage error: the invocation was well formed.
@@ -53,7 +60,7 @@ func unavailable(stderr io.Writer, what string) int {
 
 // runBackup is the `backup` arm: exactly one operand (the output directory) and only the three
 // document options.
-func runBackup(o opts, stdin io.Reader, stdout, stderr io.Writer) int {
+func runBackup(o opts, env []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if o.purge || o.family || o.image != "" || o.forced || o.toBind != "" || o.mapForeign || o.abandon {
 		fmt.Fprintln(stderr, "mythical-ctl: backup takes only --index/--policy/--manifest-dir and an output directory")
 		return cliio.ExitUsage
@@ -65,7 +72,7 @@ func runBackup(o opts, stdin io.Reader, stdout, stderr io.Writer) int {
 	if newCopier == nil || safeChain == nil {
 		return unavailable(stderr, "backup")
 	}
-	d, rc, done := openBackupDeps(o, stdin, stdout, stderr)
+	d, rc, done := openBackupDeps(o, env, stdin, stdout, stderr)
 	if rc != cliio.ExitOK {
 		return rc
 	}
@@ -78,7 +85,7 @@ func runBackup(o opts, stdin io.Reader, stdout, stderr io.Writer) int {
 
 // runRestore is the `restore` arm: EITHER exactly one operand (the backup directory) OR
 // --abandon on its own — never both, never neither.
-func runRestore(o opts, stdin io.Reader, stdout, stderr io.Writer) int {
+func runRestore(o opts, env []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if o.purge || o.family || o.image != "" || o.forced || o.toBind != "" || o.mapForeign {
 		fmt.Fprintln(stderr, "mythical-ctl: restore takes only --index/--policy/--manifest-dir, --abandon, and a backup directory")
 		return cliio.ExitUsage
@@ -95,7 +102,7 @@ func runRestore(o opts, stdin io.Reader, stdout, stderr io.Writer) int {
 	if newCopier == nil || safeChain == nil {
 		return unavailable(stderr, "restore")
 	}
-	d, rc, done := openBackupDeps(o, stdin, stdout, stderr)
+	d, rc, done := openBackupDeps(o, env, stdin, stdout, stderr)
 	if rc != cliio.ExitOK {
 		return rc
 	}
@@ -116,8 +123,13 @@ func runRestore(o opts, stdin io.Reader, stdout, stderr io.Writer) int {
 // lock, the runtime facade — and hands back a release function. The refusal PROSE is written
 // by the module itself, exactly as the reference's verbs print and return a status; the caller
 // maps the error to an exit code and prints nothing further.
-func openBackupDeps(o opts, stdin io.Reader, stdout, stderr io.Writer) (backup.Deps, int, func()) {
-	env := os.Environ()
+//
+// THE ENVIRONMENT IS THREADED, not read from the process. Every other verb here takes the
+// environment its caller was given (that is what runEnv exists for), and a verb that reached for
+// os.Environ() instead would ignore a caller that supplied one — silently running against a
+// different family home, a different daemon and a different confirmation setting than the one it
+// was asked about. Nothing here may be the exception, least of all the two verbs that move data.
+func openBackupDeps(o opts, env []string, stdin io.Reader, stdout, stderr io.Writer) (backup.Deps, int, func()) {
 	home, err := layout.Home(env)
 	if err != nil {
 		cliio.Warnf(stderr, "%v", err)
@@ -127,7 +139,11 @@ func openBackupDeps(o opts, stdin io.Reader, stdout, stderr io.Writer) (backup.D
 		cliio.Warnf(stderr, "%v", err)
 		return backup.Deps{}, cliio.ExitFail, nil
 	}
-	client, err := engine.Connect(env, home)
+	// THE OPERATING USER'S HOME, NOT THE FAMILY HOME — the same distinction the lifecycle verbs
+	// draw. The docker context store and the registry credentials live under $HOME; resolving them
+	// against ~/.mythical instead finds neither, so a copy image behind an authenticated registry
+	// would be pulled anonymously and fail with a denial the operator has already logged in past.
+	client, err := engine.Connect(env, userHome(env))
 	if err != nil {
 		cliio.Warnf(stderr, "%v", err)
 		return backup.Deps{}, cliio.ExitFail, nil
@@ -159,7 +175,13 @@ func openBackupDeps(o opts, stdin io.Reader, stdout, stderr io.Writer) (backup.D
 	if mdir == "" {
 		mdir = filepath.Join(home, ".state")
 	}
-	cop, err := newCopier(rt, idx)
+	ident, err := copierIdent(h)
+	if err != nil {
+		release()
+		cliio.Warnf(stderr, "%v", err)
+		return backup.Deps{}, cliio.ExitFail, nil
+	}
+	cop, err := newCopier(rt, ident, stdout, stderr)
 	if err != nil {
 		release()
 		cliio.Warnf(stderr, "%v", err)
@@ -171,6 +193,23 @@ func openBackupDeps(o opts, stdin io.Reader, stdout, stderr io.Writer) (backup.D
 		Confirm: func(prompt string) bool { return cliio.Confirm(env, stdin, stderr, prompt) },
 		Out:     stdout, Err: stderr,
 		Index: idx, Policy: pol, ManifestDir: mdir,
-		OperatorUID: strconv.Itoa(os.Getuid()),
+		// THE EFFECTIVE uid, which is what `id -u` reports and what every other consumer of "the
+		// operator" in this tree uses — the migration's own operator uid, and the ownership-chain
+		// check this verb now shares with it, both read the effective one. Two different answers
+		// to "who is the operator" inside one verb is a contract nobody could satisfy.
+		OperatorUID: strconv.Itoa(os.Geteuid()),
 	}, cliio.ExitOK, release
+}
+
+// userHome is the OPERATING user's home directory as the environment reports it — where the
+// docker CLI keeps its context store and registry credentials. Empty when HOME is unset, which
+// the endpoint resolver already treats as "no config to read" rather than guessing.
+func userHome(env []string) string {
+	home := ""
+	for _, kv := range env {
+		if v, ok := strings.CutPrefix(kv, "HOME="); ok {
+			home = v
+		}
+	}
+	return home
 }

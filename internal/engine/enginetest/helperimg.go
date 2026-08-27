@@ -57,13 +57,44 @@ import (
 // TYPE first (a path may legally contain a colon), `refused=` puts the REASON last, and
 // `linktarget=` is length-delimited because BOTH the path and the target may contain colons.
 //
-// THE RESTORE-SIDE `verify` MODES ARE NOT HERE. The reference contract also defines three
-// read-only modes of the same `verify` command word — `verify <src> --manifest`,
-// `--count` and `--against-stdin` — distinguished by their SECOND argument, which can never be
-// the literal `/dst` every ordinary caller passes. They belong to the backup/restore port and
-// are added by it, with the fixtures its own tests pin; a mode invented here without those
-// tests would be a shape nothing measures. Until then this fixture answers them with the
-// contract's own "not implemented" status (2) rather than pretending.
+// THE RESTORE-SIDE `verify` MODES ARE THE THREE READ-ONLY ONES BELOW, added with the seam that
+// first drives them (a mode invented without the tests that pin it would be a shape nothing
+// measures). The reference contract defines them as modes of the SAME `verify` command word
+// (D49: new command ARGUMENTS, never a new command word), distinguished by their SECOND
+// argument, which can never be the literal `/dst` every ordinary caller passes:
+//
+//	verify <src> --manifest        THE BACKUP MANIFEST for the volume at /src: per entry its
+//	                               TYPE, and per type the content digest, the verbatim
+//	                               (length-delimited) link target, the hardlink group, mode,
+//	                               ownership and mtime — the contract, not bytes alone, so a
+//	                               restore can catch a symlink recreated as a file or a
+//	                               hardlink group flattened, both of which digest identically.
+//	                                 manifest=<type>:<path>   type ∈ file|dir|symlink|hardlink
+//	                                 digest=<path>:<sha256>   linktarget=<path><target>:<len>
+//	                                 mode=<path>:<octal>      owner=<path>:<uid>:<gid>
+//	                                 mtime=<path>:<epoch>     hardlink=<path>:<groupid>
+//	                                 done=ok
+//	                               No <dst>/<ruid>/<ouid>: this is enumeration, not a mapping
+//	                               or an access check.
+//	verify <src> --count           EMPTINESS, for the restore's re-inspection of a volume it
+//	                               has just created: it must be provably empty before it is
+//	                               filled, and a same-name survivor carrying our nonce but
+//	                               leftover contents from an interrupted attempt must never be
+//	                               filled over.
+//	                                 checked=<n>   done=ok        (0 = empty; the field name is
+//	                                                               reused deliberately, same
+//	                                                               meaning as the 4-arg verify's)
+//	verify <src> --against-stdin   Verify the just-filled volume against the backup's OWN
+//	                               per-entry manifest, handed on STDIN rather than mounted as a
+//	                               third host path.
+//	                                 mismatch=<path>:type|hardlink|mode|owner|mtime|digest|linktarget
+//	                                 checked=<n>   done=ok
+//	                               exit 0 with no mismatch, 1 otherwise. This fixture cannot
+//	                               really re-derive a volume's contents, so it COUNTS the
+//	                               manifest it was handed — which is also what proves the bytes
+//	                               reached the container on stdin at all — and states mismatches
+//	                               by knob; the caller-side parsing and refusal logic is what
+//	                               these tests actually pin.
 type HelperImage struct {
 	// Preflight, Copy, Verify, Access and ACL are the reference's HELPER_* knobs: they make
 	// the image state a particular finding without a real daemon. "" means the conforming
@@ -73,6 +104,22 @@ type HelperImage struct {
 	Verify    string
 	Access    string
 	ACL       string
+	// Manifest, Count and RestoreVerify are the same knobs for the three read-only modes above
+	// — the reference's HELPER_MANIFEST, HELPER_COUNT and HELPER_RESTORE_VERIFY. "" means each
+	// mode's own default, which for Count is `empty` (the freshly created volume a restore
+	// expects) and for the other two is the conforming answer.
+	//
+	// THEIR ACCEPTED VALUES ARE EXACTLY THE FROZEN FIXTURE'S, and no others. This type stands in
+	// for the pinned image's CONTRACT, so a setting invented here is a transcript the real image
+	// can never produce — and a test written against one measures a behaviour nothing will ever
+	// exhibit while reading as though it measured the image. A caller-side defence that needs a
+	// shape outside the contract (a count that is not a number, a problem record with no value)
+	// is exercised against a fake that does not claim to be this image; internal/backup's own
+	// copier fake is that vehicle. Anything unrecognised answers with the contract's own "not
+	// implemented" status (2), exactly as the reference does.
+	Manifest      string
+	Count         string
+	RestoreVerify string
 	// Exit0 is the reference's HELPER_EXIT0: AN EXIT STATUS IS NOT A RESULT. With it set the
 	// image states exactly the findings it otherwise would and then exits 0 anyway — the
 	// regression a caller must survive by reading the STATED result rather than the status
@@ -83,14 +130,14 @@ type HelperImage struct {
 
 // Entry is the HelperEntryFunc the Fake drives. It ignores the network views: every command
 // here runs in the copy container's private (`none`) mode, where there is no resolver at all.
-func (h *HelperImage) Entry(cmd string, args []string, _ HelperNetView, _ []byte) (int, []byte) {
+func (h *HelperImage) Entry(cmd string, args []string, _ HelperNetView, stdin []byte) (int, []byte) {
 	switch cmd {
 	case "preflight":
 		return h.preflight(args)
 	case "copy":
 		return h.copy(args)
 	case "verify":
-		return h.verify(args)
+		return h.verify(args, stdin)
 	case "acl":
 		return h.acl(args)
 	case "access":
@@ -452,15 +499,17 @@ func (h *HelperImage) copy(args []string) (int, []byte) {
 	return h.fin(rc, out.String())
 }
 
-func (h *HelperImage) verify(args []string) (int, []byte) {
+func (h *HelperImage) verify(args []string, stdin []byte) (int, []byte) {
 	// The restore-side read-only modes are distinguished by the SECOND argument, which can
-	// never be the literal `/dst` an ordinary caller passes. They are not implemented here —
-	// see the type's doc — so they answer with the contract's "not implemented" status rather
-	// than a fabricated transcript.
+	// never be the literal `/dst` an ordinary caller passes.
 	if len(args) > 1 {
 		switch args[1] {
-		case "--manifest", "--count", "--against-stdin":
-			return 2, nil
+		case "--manifest":
+			return h.manifestMode(args)
+		case "--count":
+			return h.countMode(args)
+		case "--against-stdin":
+			return h.againstStdinMode(args, stdin)
 		}
 	}
 	if len(args) < 4 || args[0] == "" || args[1] == "" || args[2] == "" || args[3] == "" {
@@ -552,6 +601,127 @@ func (h *HelperImage) verify(args []string) (int, []byte) {
 		return 2, nil
 	}
 	return 0, []byte(out.String())
+}
+
+// hex64 renders one deterministic 64-character digest from a single filler byte, the way the
+// reference builds its fixture digests.
+func hex64(fill byte) string { return strings.Repeat(string(fill), 64) }
+
+// manifestMode is `verify <src> --manifest`. ONE deterministic tree — a directory, two regular
+// files, a symlink and a two-member hardlink group — one example of every TYPE the contract
+// distinguishes, so a caller's per-type reading is exercised by a single fixture.
+func (h *HelperImage) manifestMode(args []string) (int, []byte) {
+	src := args[0]
+	if src == "" {
+		return 1, nil
+	}
+	k := knob(h.Manifest)
+	// `silent`: exits 0 having stated NOTHING. A completion claim with no transcript at all is
+	// the vacuity every reader here must refuse rather than read as a pass.
+	if k == "silent" {
+		return 0, nil
+	}
+	var out strings.Builder
+	switch k {
+	case "ok":
+	// `empty-vol`: a volume with no entries. `done=ok` over no `manifest=` lines is LEGAL here —
+	// an empty volume is a real thing to back up — and the restore's own count binding is what
+	// makes it safe (it verifies against zero entries, not against nothing).
+	case "empty-vol":
+		return 0, []byte("done=ok\n")
+	default:
+		return 2, nil
+	}
+	fmt.Fprintf(&out, "manifest=dir:%s/data\n", src)
+	fmt.Fprintf(&out, "manifest=file:%s/data/f\n", src)
+	fmt.Fprintf(&out, "digest=%s/data/f:%s\n", src, hex64('f'))
+	fmt.Fprintf(&out, "mode=%s/data/f:0644\n", src)
+	fmt.Fprintf(&out, "owner=%s/data/f:1000:1000\n", src)
+	fmt.Fprintf(&out, "mtime=%s/data/f:1700000000\n", src)
+	fmt.Fprintf(&out, "manifest=file:%s/data/f3\n", src)
+	fmt.Fprintf(&out, "digest=%s/data/f3:%s\n", src, hex64('3'))
+	fmt.Fprintf(&out, "mode=%s/data/f3:0644\n", src)
+	fmt.Fprintf(&out, "owner=%s/data/f3:1000:1000\n", src)
+	fmt.Fprintf(&out, "mtime=%s/data/f3:1700000000\n", src)
+	fmt.Fprintf(&out, "manifest=symlink:%s/data/link\n", src)
+	out.WriteString(emitLinktarget(src+"/data/link", "../data/f"))
+	fmt.Fprintf(&out, "mode=%s/data/link:0777\n", src)
+	fmt.Fprintf(&out, "owner=%s/data/link:1000:1000\n", src)
+	fmt.Fprintf(&out, "mtime=%s/data/link:1700000000\n", src)
+	fmt.Fprintf(&out, "manifest=hardlink:%s/data/f2\n", src)
+	fmt.Fprintf(&out, "hardlink=%s/data/f2:g1\n", src)
+	fmt.Fprintf(&out, "digest=%s/data/f2:%s\n", src, hex64('f'))
+	fmt.Fprintf(&out, "mode=%s/data/f2:0644\n", src)
+	fmt.Fprintf(&out, "owner=%s/data/f2:1000:1000\n", src)
+	fmt.Fprintf(&out, "mtime=%s/data/f2:1700000000\n", src)
+	out.WriteString("done=ok\n")
+	return 0, []byte(out.String())
+}
+
+// countMode is `verify <src> --count`. The DEFAULT is `empty`, because the only caller is a
+// restore re-inspecting a volume it has just created.
+func (h *HelperImage) countMode(args []string) (int, []byte) {
+	if args[0] == "" {
+		return 1, nil
+	}
+	k := h.Count
+	if k == "" {
+		k = "empty"
+	}
+	switch k {
+	case "empty":
+		return 0, []byte("checked=0\ndone=ok\n")
+	// `nonempty`: a same-name survivor holding leftover contents. The restore must refuse to
+	// fill over it rather than treat "the volume exists and carries our nonce" as sufficient.
+	case "nonempty":
+		return 0, []byte("checked=3\ndone=ok\n")
+	// `silent`: exits 0 stating no count at all — "I could not tell you how many" read as
+	// "there are none" is exactly the fail-open this mode's caller must refuse.
+	case "silent":
+		return 0, nil
+	}
+	return 2, nil
+}
+
+// againstStdinMode is `verify <src> --against-stdin`. The manifest arrives on STDIN; the fixture
+// counts its `manifest=` lines, which is both the contract's own `checked=` answer and the proof
+// that the bytes reached the container at all.
+func (h *HelperImage) againstStdinMode(args []string, stdin []byte) (int, []byte) {
+	if args[0] == "" {
+		return 1, nil
+	}
+	k := knob(h.RestoreVerify)
+	if k == "silent" {
+		return 0, nil
+	}
+	n := 0
+	for _, line := range strings.Split(string(stdin), "\n") {
+		if strings.HasPrefix(line, "manifest=") {
+			n++
+		}
+	}
+	switch k {
+	case "ok":
+		return 0, []byte(fmt.Sprintf("checked=%d\ndone=ok\n", n))
+	// A restored SYMLINK re-created as a plain FILE — no bytes to mismatch, only the TYPE differs.
+	case "type-symlink-as-file":
+		return h.fin(1, fmt.Sprintf("mismatch=%s/data/link:type\nchecked=%d\ndone=ok\n", args[0], n))
+	// A restored hardlink GROUP flattened into independent copies — the digests still agree.
+	case "hardlink-flattened":
+		return h.fin(1, fmt.Sprintf("mismatch=%s/data/f2:hardlink\nchecked=%d\ndone=ok\n", args[0], n))
+	// A restored file whose MODE was not carried (an ordinary archive copy would not carry it either).
+	case "mode-dropped":
+		return h.fin(1, fmt.Sprintf("mismatch=%s/data/f:mode\nchecked=%d\ndone=ok\n", args[0], n))
+	// Completion claimed with NO checked= at all — nothing in the answer says the manifest was
+	// measured against anything.
+	case "nocount":
+		return 0, []byte("done=ok\n")
+	// A count that UNDERSTATES the manifest: completion claimed having checked fewer entries
+	// than the manifest actually names.
+	case "understate":
+		return 0, []byte("checked=1\ndone=ok\n")
+	}
+	return 2, nil
 }
 
 func (h *HelperImage) acl(args []string) (int, []byte) {

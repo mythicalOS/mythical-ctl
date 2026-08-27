@@ -630,28 +630,7 @@ func (s *session) reconcile(ctx context.Context, product, container, netID, alia
 	// refusal that names the probe instead of the real problem. (Measured: an empty identity here
 	// made start and restart fail before the reconciler ran at all, while the tests that expected a
 	// failure still passed — for the wrong reason.)
-	ident, ierr := s.l.IdentGet()
-	if ierr != nil {
-		s.d.warnErr(ierr)
-		return cliio.ExitFail
-	}
-	// THE INDEX IS NOT FETCHED HERE. The reconciler computes its plan first, and only a plan that
-	// live-verifies needs the family index at all — so authenticating it up front would refuse a
-	// start whose plan is "nothing to do", "deferred" or "stop", which the reference completes
-	// without ever reading the index. It is accepted lazily, at the moment a probe actually runs,
-	// by the wrapper around the probe arm; that is also the door that ADVANCES the index's
-	// anti-rollback floor, which a read-only check here would have skipped while still consuming
-	// the newer document.
-	bd, err := s.bringupDeps(nil, ident)
-	if err != nil {
-		s.d.warnErr(err)
-		return cliio.ExitFail
-	}
-	rerr := bringup.Reconcile(ctx, s.l, bd, container, netID, alias)
-	if perr := s.persist(); perr != nil {
-		s.d.warnErr(perr)
-		return cliio.ExitFail
-	}
+	rerr := s.reconcileOn(ctx, s.l, container, netID, alias)
 	if rerr == nil {
 		return cliio.ExitOK
 	}
@@ -662,6 +641,45 @@ func (s *session) reconcile(ctx context.Context, product, container, netID, alia
 	}
 	s.d.warnErr(rerr)
 	return cliio.ExitFail
+}
+
+// reconcileOn drives one container toward its recorded desired state, over an EXPLICITLY NAMED
+// ledger, and reports the outcome as an ERROR rather than an exit code — which is what both
+// callers need: the verb above maps it to the verb contract, and the storage migration's final
+// phase reports it without failing the migration (the data has moved and the configuration names
+// it; a container that did not settle is a separate, smaller fact).
+//
+// THE IDENTITY AND THE VERIFIED INDEX ARE BOTH REQUIRED, and both are read here rather than
+// defaulted. The probe arm scopes every removal by the identity and takes its pinned image from
+// the index, so an empty identity or an unread index does not degrade the reconciliation — it
+// makes it impossible, and passing either as a zero value turns every start and restart into a
+// refusal that names the probe instead of the real problem. (Measured: an empty identity here made
+// start and restart fail before the reconciler ran at all, while the tests that expected a failure
+// still passed — for the wrong reason.)
+//
+// THE INDEX IS NOT FETCHED HERE. The reconciler computes its plan first, and only a plan that
+// live-verifies needs the family index at all — so authenticating it up front would refuse a start
+// whose plan is "nothing to do", "deferred" or "stop", which the reference completes without ever
+// reading the index. It is accepted lazily, at the moment a probe actually runs, by the wrapper
+// around the probe arm; that is also the door that ADVANCES the index's anti-rollback floor, which
+// a read-only check here would have skipped while still consuming the newer document.
+func (s *session) reconcileOn(ctx context.Context, l *ledger.Ledger, container, netID, alias string) error {
+	ident, ierr := l.IdentGet()
+	if ierr != nil {
+		return ierr
+	}
+	bd, err := s.bringupDeps(nil, ident)
+	if err != nil {
+		return err
+	}
+	rerr := bringup.Reconcile(ctx, l, bd, container, netID, alias)
+	// THE PERSIST FAILURE WINS. A reconciliation whose result could not be written down is not a
+	// reconciliation that happened, and reporting the reconciler's own (possibly nil) verdict over
+	// it would announce a settled container whose record is not on disk.
+	if perr := s.persistFn()(l); perr != nil {
+		return perr
+	}
+	return rerr
 }
 
 // ensureImage makes the selected image present, and records it.
@@ -925,13 +943,33 @@ func (s *session) replaceContainer(ctx context.Context, container, verb string) 
 
 // launch runs the full bring-up sequence for this product.
 func (s *session) launch(ctx context.Context, pc *productContext, cfg runtime.LaunchConfig, desired bringup.Desired) error {
+	return s.launchOn(ctx, s.l, pc, cfg, desired)
+}
+
+// launchOn is launch over an EXPLICITLY NAMED ledger — see netTargetOn for why the migration's
+// seams name the ledger they act on rather than reaching for the session's field.
+func (s *session) launchOn(ctx context.Context, l *ledger.Ledger, pc *productContext, cfg runtime.LaunchConfig, desired bringup.Desired) error {
 	bd, berr := s.bringupDeps(pc.Index, cfg.Identity)
 	if berr != nil {
 		return berr
 	}
+	return s.launchWith(ctx, l, bd, pc, cfg, desired)
+}
+
+// launchWith is the launch over dependencies the caller ALREADY BUILT.
+//
+// IT EXISTS FOR THE ONE CALLER THAT CANNOT AFFORD TO BUILD THEM LATE. Assembling the bring-up
+// dependencies is itself fallible — the probe accounting opens the ledger store, the probe arm
+// validates the installation identity and its diagnostics writer — and the storage migration
+// reaches its create only AFTER it has removed the old container, which cannot be undone. Every
+// verb above builds them at the moment of the launch, which is correct for them because nothing
+// irreversible has happened yet; the migration's rebuild seam builds them in its Prepare instead
+// and hands them here, so a failure that has nothing to do with the container itself cannot be
+// what leaves the product with none.
+func (s *session) launchWith(ctx context.Context, l *ledger.Ledger, bd bringup.Deps, pc *productContext, cfg runtime.LaunchConfig, desired bringup.Desired) error {
 	launcher := &productLauncher{rt: s.rt, m: pc.Manifest, p: pc.Policy, cfg: cfg}
-	rerr := bringup.Run(ctx, s.l, bd, launcher, pc.Container, cfg.NetworkID, pc.Alias, desired)
-	if err := s.persist(); err != nil {
+	rerr := bringup.Run(ctx, l, bd, launcher, pc.Container, cfg.NetworkID, pc.Alias, desired)
+	if err := s.persistFn()(l); err != nil {
 		return err
 	}
 	return rerr

@@ -82,6 +82,11 @@ type rig struct {
 	// indexVersion is the family index's document version — the number its anti-rollback floor
 	// records. Bumping it is how a test asks whether a newer index was ACCEPTED or merely read.
 	indexVersion string
+	// policyVersion is the policy index's own document version, for the same reason. It is a
+	// FIELD rather than a literal because the policy's floor is the only evidence that an
+	// acceptance of the policy actually wrote anything — with a version that never moves, a
+	// commit and a no-op are indistinguishable.
+	policyVersion string
 }
 
 func newRig(t *testing.T) *rig {
@@ -91,14 +96,15 @@ func newRig(t *testing.T) *rig {
 	home := t.TempDir()
 	userHome := t.TempDir()
 	r := &rig{
-		t:            t,
-		fake:         f,
-		c:            f.Client(),
-		home:         home,
-		env:          []string{"MYTHICAL_HOME=" + home, "HOME=" + userHome},
-		out:          &bytes.Buffer{},
-		errb:         &bytes.Buffer{},
-		indexVersion: "1",
+		t:             t,
+		fake:          f,
+		c:             f.Client(),
+		home:          home,
+		env:           []string{"MYTHICAL_HOME=" + home, "HOME=" + userHome},
+		out:           &bytes.Buffer{},
+		errb:          &bytes.Buffer{},
+		indexVersion:  "1",
+		policyVersion: "1",
 	}
 	f.HelperEntry = r.helper
 	if err := layout.Ensure(home); err != nil {
@@ -172,7 +178,7 @@ func (r *rig) writeDocs() {
 
 	var pol strings.Builder
 	pol.WriteString("mythical-policy 1\n")
-	pol.WriteString("version=1\n")
+	pol.WriteString("version=" + r.policyVersion + "\n")
 	pol.WriteString("expires=" + exp + "\n")
 	// The operating group, so the published ownership spec actually applies on the machine running
 	// the suite; a fixed foreign gid would exercise the group-failure path in every test instead of

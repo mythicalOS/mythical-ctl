@@ -99,11 +99,11 @@ func runEnv(args, env []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 	switch verb {
 	case "backup":
-		return runBackup(o, stdin, stdout, stderr)
+		return runBackup(o, env, stdin, stdout, stderr)
 	case "restore":
-		return runRestore(o, stdin, stdout, stderr)
+		return runRestore(o, env, stdin, stdout, stderr)
 	case "migrate-storage":
-		return migrateStorage(o, stderr)
+		return migrateStorage(o, env, stdin, stdout, stderr)
 	case "-v", "--version":
 		fmt.Fprintf(stdout, "mythical-ctl %s\n", version.Version)
 		return cliio.ExitOK
@@ -374,18 +374,13 @@ func deps(o opts, env []string, stdin io.Reader, stdout, stderr io.Writer) (verb
 	}
 	// The OPERATING user's home, not the family home: this is where the docker CLI keeps the
 	// endpoint and the registry credentials whose daemon and identity we must match.
-	userHome := ""
-	for _, kv := range env {
-		if v, ok := strings.CutPrefix(kv, "HOME="); ok {
-			userHome = v
-		}
-	}
-	socket, serr := engine.ResolveEndpoint(env, userHome)
+	uh := userHome(env)
+	socket, serr := engine.ResolveEndpoint(env, uh)
 	if serr != nil {
 		return verbs.Deps{}, serr
 	}
 	c := engine.Dial(socket)
-	c.SetDockerConfig(env, userHome)
+	c.SetDockerConfig(env, uh)
 
 	stateDir := filepath.Join(home, ".state")
 	return verbs.Deps{

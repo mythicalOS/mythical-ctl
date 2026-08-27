@@ -15,7 +15,7 @@ import (
 // PORTED: tests/acceptance/restore.bats: "mi_verb_backup/mi_verb_restore reject the wrong number of arguments as a usage error" -> TestBackupOperandMatrix, TestRestoreOperandMatrix
 // PORTED: tests/unit/backup.bats: "mi_verb_backup and mi_verb_restore reject bad arity as a USAGE error (rc 2)" -> TestBackupOperandMatrix, TestRestoreOperandMatrix
 //
-// N/A: tests/acceptance/restore.bats: "backup then restore: through the actual CLI (bin/mythical-ctl)" -- an end-to-end round trip through the CLI needs the PRODUCTION copy seam, and the copy module is its own port task: newCopier is nil in this build, so the CLI's own run path stops at the capability check (TestWellFormedInvocationReachesTheCapabilitySeam pins that it stops there and nowhere earlier). The round trip itself is covered at the library level by internal/backup's TestFullRoundTripPassesEveryIdentityCheck; when the copy module lands, this row becomes a CLI-level test.
+// N/A: tests/acceptance/restore.bats: "backup then restore: through the actual CLI (bin/mythical-ctl)" -- claimed elsewhere: it is a CLI-level test now that the production copy seam is wired, and it lives in roundtrip_test.go as TestBackupRestoreRoundTripThroughTheCLI.
 // N/A: tests/acceptance/restore.bats: "CLI: --abandon on other verbs is refused, not silently ignored" -- the verb it names (install) is not wired in this build; refusing --abandon there belongs to that verb's own option matrix, which lands with it. Asserting exit 2 for `install p1 --abandon` today would pass on "unknown command", not on the refusal — a test that cannot fail for the reason it claims. The half of the rule this build CAN prove — that --abandon is refused by a verb that does not take it — is asserted by TestBackupRefusesOtherVerbsOptions.
 
 // rcOf runs the entrypoint in process and returns its exit code and both streams.
@@ -129,26 +129,42 @@ func TestRestoreRefusesOtherVerbsOptions(t *testing.T) {
 // If that order inverted, every usage error on these two verbs would report "not available"
 // (exit 1) and the whole matrix above would stop being reachable at all.
 //
-// It also pins that a build with no copy module attempts NOTHING — no daemon connection, no
-// lock, no filesystem — rather than calling a seam that does not exist.
+// IT ALSO PINS THE NIL-SEAM REFUSAL ITSELF, which is still a live contract now that the seams are
+// wired. A build assembled without them must report a missing capability and attempt NOTHING — no
+// daemon connection, no lock, no filesystem — rather than dereferencing a seam that is not there,
+// and the two seams are refused SEPARATELY, because a check that only looked at one of them would
+// let a build with no location gate run a backup whose only authentication is that gate.
+//
+// The seams are package variables precisely so this remains measurable; they are restored on every
+// path out, and nothing here runs in parallel.
 func TestWellFormedInvocationReachesTheCapabilitySeam(t *testing.T) {
-	if newCopier != nil || safeChain != nil {
-		t.Skip("the copy/location seams are wired in this build; this test pins the unwired one")
-	}
-	for _, args := range [][]string{
-		{"backup", "/tmp/bk"},
-		{"restore", "/tmp/bk"},
-		{"restore", "--abandon"},
-	} {
-		rc, out, errb := rcOf(args...)
-		if rc != 1 {
-			t.Fatalf("%v: rc = %d, want 1 (operational failure — the invocation was well formed)", args, rc)
+	origCopier, origSafe := newCopier, safeChain
+	t.Cleanup(func() { newCopier, safeChain = origCopier, origSafe })
+	for _, missing := range []string{"the copy seam", "the location seam", "both"} {
+		newCopier, safeChain = origCopier, origSafe
+		switch missing {
+		case "the copy seam":
+			newCopier = nil
+		case "the location seam":
+			safeChain = nil
+		default:
+			newCopier, safeChain = nil, nil
 		}
-		if out != "" {
-			t.Fatalf("%v: leaked to stdout: %q", args, out)
-		}
-		if !strings.Contains(errb, "not available in this build yet") {
-			t.Fatalf("%v: stderr %q lacks the diagnostic", args, errb)
+		for _, args := range [][]string{
+			{"backup", "/tmp/bk"},
+			{"restore", "/tmp/bk"},
+			{"restore", "--abandon"},
+		} {
+			rc, out, errb := rcOf(args...)
+			if rc != 1 {
+				t.Fatalf("%s missing, %v: rc = %d, want 1 (operational failure — the invocation was well formed)", missing, args, rc)
+			}
+			if out != "" {
+				t.Fatalf("%s missing, %v: leaked to stdout: %q", missing, args, out)
+			}
+			if !strings.Contains(errb, "not available in this build yet") {
+				t.Fatalf("%s missing, %v: stderr %q lacks the diagnostic", missing, args, errb)
+			}
 		}
 	}
 }

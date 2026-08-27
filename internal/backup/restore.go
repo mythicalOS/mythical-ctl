@@ -374,10 +374,10 @@ func (d Deps) restoreVolume(ctx context.Context, ch Chain, dir, ident string, v 
 			return ierr
 		}
 		if aerr := d.Copier.Available(ctx, ix); aerr != nil {
-			return aerr
+			return d.reported(aerr)
 		}
 		if ferr := d.Copier.Fill(ctx, ix, datacanon, v.name, ruid, d.OperatorUID); ferr != nil {
-			return ferr
+			return d.reported(ferr)
 		}
 		// Phase 4: against THE MANIFEST'S contract, not bytes alone.
 		if verr := d.verify(ctx, ch, v.name, mancanon); verr != nil {
@@ -395,9 +395,22 @@ func (d Deps) restoreVolume(ctx context.Context, ch Chain, dir, ident string, v 
 	// is already done and the loop moves on; if it does not, it genuinely holds partial
 	// contents from an interrupted fill (or is a real survivor), and there is no safe way to
 	// tell those apart except refusing and pointing at abandonment.
-	if verr := d.verify(ctx, ch, v.name, mancanon); verr == nil {
+	verr := d.verify(ctx, ch, v.name, mancanon)
+	if verr == nil {
 		d.log("restore: volume %s already filled and verified (resumed).", v.name)
 		return nil
+	}
+	// A VERIFICATION THAT COULD NOT BE PERFORMED IS NOT A FINDING ABOUT THE DATA. Both outcomes
+	// refuse and neither fills over anything, but only one of them may say what is in the volume —
+	// and only one may recommend `restore --abandon`, which REMOVES volumes.
+	if errors.Is(verr, errUnmeasured) {
+		d.warn("restore: volume %q carries our nonce and is NOT EMPTY, and whether its contents match", v.name)
+		d.warn("  the backup's manifest could not be established at all — the refusal above says why.")
+		d.warn("  Refusing rather than filling over whatever is there blindly. This is NOT a finding")
+		d.warn("  that the volume holds partial contents: nothing measured it. Resolve the reason above")
+		d.warn("  and re-run; only if it then turns out to be a partial fill does abandoning the")
+		d.warn("  restore ('restore --abandon') apply.")
+		return fmt.Errorf("restore: volume %q is not empty and could not be verified against the backup's manifest: %w", v.name, errUnmeasured)
 	}
 	d.warn("restore: volume %q carries our nonce but is NOT EMPTY and does not verify against", v.name)
 	d.warn("  the backup's manifest — it holds partial contents from an interrupted attempt.")
@@ -597,6 +610,23 @@ func (d Deps) reportBlocking(ctx context.Context) {
 	d.warn("  explicit call: remove them with the container runtime's own volume-removal command.")
 }
 
+// errUnmeasured marks a verification that COULD NOT BE PERFORMED, as distinct from one that ran
+// and DISAGREED.
+//
+// THE DIFFERENCE DECIDES WHAT AN OPERATOR IS TOLD ABOUT THEIR DATA, and it is the
+// answer-versus-refusal rule at its sharpest. A verifier that reported a `mismatch=` measured this
+// volume and found it wrong. A copy image that could not be obtained, a manifest that could not be
+// read, a helper that never launched, a transcript outside the grammar, a completion nobody
+// claimed, a count that binds to nothing — none of those establish ANYTHING about the volume's
+// contents. Reporting them as "it holds partial contents from an interrupted attempt" states a
+// fact nothing measured, and it steers the operator to `restore --abandon`, which REMOVES volumes.
+// Recommending a destructive recovery on an unestablished premise is the one outcome this module
+// exists to prevent.
+//
+// Both still REFUSE, and neither fills over anything: refusing is correct either way. Only the
+// words differ, and the words are the whole of what the operator acts on.
+var errUnmeasured = errors.New("restore: the volume's contents could not be measured against the backup's manifest")
+
 // volumeEmpty observes emptiness THROUGH the daemon — the host cannot read a named volume
 // (D54). A count that cannot be obtained, or that is not a number, REFUSES rather than
 // assuming: "assume empty" fills over survivors and "assume non-empty" wedges a fresh restore.
@@ -606,7 +636,7 @@ func (d Deps) volumeEmpty(ctx context.Context, ch Chain, vol string) (bool, erro
 		return false, ierr
 	}
 	if err := d.Copier.Available(ctx, ix); err != nil {
-		return false, err
+		return false, d.reported(err)
 	}
 	t, err := d.Copier.Count(ctx, ix, vol)
 	if err != nil || t.Code != 0 {
@@ -652,21 +682,21 @@ func digitsOnly(s string) bool {
 func (d Deps) verify(ctx context.Context, ch Chain, vol, man string) error {
 	ix, ierr := d.acceptIndex(ch)
 	if ierr != nil {
-		return ierr
+		return fmt.Errorf("%w: %w", errUnmeasured, ierr)
 	}
 	if err := d.Copier.Available(ctx, ix); err != nil {
-		return err
+		return fmt.Errorf("%w: %w", errUnmeasured, d.reported(err))
 	}
 	fi, lerr := os.Lstat(man)
 	if lerr != nil || !fi.Mode().IsRegular() {
 		d.warn("restore: the manifest for volume %q is missing or not a plain file — refusing to", vol)
 		d.warn("  verify without it.")
-		return fmt.Errorf("restore: the manifest for volume %q is missing or not a plain file", vol)
+		return fmt.Errorf("restore: the manifest for volume %q is missing or not a plain file: %w", vol, errUnmeasured)
 	}
 	manifestBytes, rerr := os.ReadFile(man)
 	if rerr != nil {
 		d.warn("restore: could not read the manifest for volume %q: %v", vol, rerr)
-		return fmt.Errorf("restore: could not read the manifest for volume %q: %w", vol, rerr)
+		return fmt.Errorf("restore: could not read the manifest for volume %q (%v): %w", vol, rerr, errUnmeasured)
 	}
 
 	t, herr := d.Copier.Verify(ctx, ix, vol, manifestBytes)
@@ -677,10 +707,14 @@ func (d Deps) verify(ctx context.Context, ch Chain, vol, man string) error {
 	}
 	text := body(t.Text)
 	if gerr := d.grammarOK(text, "mismatch", "checked", "done"); gerr != nil {
-		return gerr
+		return fmt.Errorf("%w: %w", errUnmeasured, gerr)
 	}
 
-	bad := false
+	// `bad` is "this verification did not pass"; `mismatched` is the narrower "the verifier
+	// MEASURED this volume against this manifest and they disagree". Every other refusal below
+	// leaves the second false, because none of them establishes anything about the contents — see
+	// errUnmeasured.
+	bad, mismatched := false, false
 	for _, v := range fields(text, "mismatch") {
 		if v == "" {
 			continue
@@ -689,11 +723,11 @@ func (d Deps) verify(ctx context.Context, ch Chain, vol, man string) error {
 		d.warn("  The manifest authenticates type, link targets, hardlink topology, mode, ownership and")
 		d.warn("  mtime — not bytes alone. A symlink re-created as a file has no bytes to mismatch, and")
 		d.warn("  flattened hardlinks digest identically.")
-		bad = true
+		bad, mismatched = true, true
 	}
 	if hasKey(text, "mismatch") && !bad {
 		d.warn("restore: the verifier reported a mismatch that names nothing — treated as a mismatch.")
-		bad = true
+		bad, mismatched = true, true
 	}
 	if t.Code != 0 && !bad {
 		d.warn("restore: verification of volume %q did not complete.", vol)
@@ -746,6 +780,9 @@ func (d Deps) verify(ctx context.Context, ch Chain, vol, man string) error {
 	}
 
 	if bad {
+		if !mismatched {
+			return fmt.Errorf("restore: volume %q could not be verified against the backup's per-entry manifest: %w", vol, errUnmeasured)
+		}
 		return fmt.Errorf("restore: volume %q did not verify against the backup's per-entry manifest", vol)
 	}
 	return nil

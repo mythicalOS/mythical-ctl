@@ -81,17 +81,20 @@ func TestMigrateStorageDispatchRefusals(t *testing.T) {
 // A WELL-FORMED invocation is NOT a usage error. Reporting one would hide a real dispatch defect
 // behind the same exit code every malformed call produces, and would make the matrix above pass no
 // matter what it did.
+//
+// It runs against a REAL (fake) daemon and an installer home with nothing installed in it, so the
+// failure it meets is the verb's own — there is no family index to authenticate — rather than an
+// artefact of whatever container runtime the machine running the tests happens to have.
 func TestMigrateStorageWellFormedIsNotAUsageError(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("MYTHICAL_HOME", home)
+	r := newCLIRig(t)
 	var out, errb bytes.Buffer
-	rc := run([]string{"migrate-storage", "p1", "state", "--to-bind", "/data/p1"},
-		strings.NewReader(""), &out, &errb)
+	rc := runEnv([]string{"migrate-storage", "p1", "state", "--to-bind", "/data/p1"},
+		r.env, strings.NewReader(""), &out, &errb)
 	if rc == 2 {
 		t.Fatalf("a well-formed invocation reported a usage error: %q", errb.String())
 	}
 	if rc != 1 {
-		t.Fatalf("rc = %d, want 1 (operational) while the runtime seams are unwired", rc)
+		t.Fatalf("rc = %d, want 1 (operational): %q", rc, errb.String())
 	}
 	if out.Len() != 0 {
 		t.Fatalf("leaked to stdout: %q", out.String())
