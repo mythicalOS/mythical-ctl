@@ -316,6 +316,12 @@ func (d Deps) runtimeUID(ch Chain, product, vol string) (string, error) {
 		d.warn("  refusing to guess its runtime uid: %v", err)
 		return "", fmt.Errorf("backup: cannot authenticate the manifest for %q — refusing to guess its runtime uid: %w", product, err)
 	}
+	// A SECOND DOOR THE SCHEMA CURRENTLY MAKES UNREACHABLE: `runtime_uid` is a required
+	// manifest key, so a manifest without one does not parse and the acceptance above refuses
+	// first (TestManifestWithNoRuntimeUIDIsRefusedByTheChain measures exactly that). It is kept
+	// because "unstated silently meaning uid 0" is the one answer that is never safe here —
+	// ownership of every copied file rides on it — and a later schema change must not be able
+	// to open that path quietly.
 	ruid := m.RuntimeUID()
 	if ruid == "" {
 		d.warn("backup: the manifest for product %q (volume %q) declares no runtime_uid —", product, vol)
