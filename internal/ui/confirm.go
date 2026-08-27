@@ -79,14 +79,13 @@ type ConfirmRequestMsg struct {
 // Esc refuses. So does ^D, which is the operator saying there is no more input. So does the
 // interface going away without an answer — see Bridge.
 //
-// STATED RESIDUAL, narrowed to what it really is (measured against bubbletea v1.3.10): inside a
-// BRACKETED PASTE, and only there, the decoder drops every rune that decodes to U+FFFD — an invalid
-// byte, or a correctly encoded U+FFFD, both — before any model sees it. So pasting "y" followed by
-// such a byte arrives here as plain "y" and is accepted, where the same bytes down a pipe refuse.
-// Nothing in a model can restore an event it is never given. TYPED input is not affected: an
-// invalid byte outside a paste is delivered as its own message and marks the line (see Update).
-// The exposure is nil in the sense that matters: a confirmation exists to establish that the person
-// at the keyboard deliberately said yes, and the person pasted a "y".
+// BRACKETED PASTE IS DISABLED AT THE PROGRAM (see programOptions), which closes the two holes a
+// model cannot close for itself: the decoder silently drops runes decoding to U+FFFD inside a
+// paste, and a clipboard containing the paste terminator ends the paste early so its tail is
+// decoded as ordinary input — both of which can deliver a clean "y" for bytes a pipe would refuse.
+// With it off, pasted bytes arrive as the key events they describe and take the same paths as
+// typing. The paste branch below is kept anyway: this overlay must answer correctly for whatever
+// it is handed, whoever configured the program.
 //
 // Signature note (a deliberate, documented widening of the plan's `Confirm(prompt string)
 // Overlay`): the constructor takes the Reply as well. An overlay with nowhere to send its answer

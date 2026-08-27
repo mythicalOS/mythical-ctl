@@ -571,6 +571,39 @@ func TestRunKeepsTheVerbsStreamsOffTheRealTerminal(t *testing.T) {
 	}
 }
 
+// TestProgramOptionsDisableBracketedPaste. A bracketed paste is the one input path a MODEL cannot
+// make safe: the decoder drops runes decoding to U+FFFD inside it, and a clipboard containing the
+// paste TERMINATOR ends the paste early so its tail is decoded as ordinary input — either of which
+// can hand a confirmation a clean "y" for bytes a pipe would refuse. Bubble Tea's options are
+// opaque, so the assertion is on the SHAPE of the list: the safety option is first and is always
+// present, and dropping it changes the count.
+func TestProgramOptionsDisableBracketedPaste(t *testing.T) {
+	var in, out bytes.Buffer
+	cases := []struct {
+		name string
+		d    verbs.Deps
+		want int
+	}{
+		{"both streams", verbs.Deps{Stdin: &in, Stdout: &out}, 3},
+		{"stdout only", verbs.Deps{Stdout: &out}, 2},
+		{"stdin only", verbs.Deps{Stdin: &in}, 2},
+		{"neither", verbs.Deps{}, 1},
+	}
+	for _, tc := range cases {
+		got := programOptions(tc.d)
+		if len(got) != tc.want {
+			t.Fatalf("%s: %d options, want %d — the paste guard or a stream option was dropped",
+				tc.name, len(got), tc.want)
+		}
+	}
+	// It is applied to a real program without panicking, which is the only other thing that can be
+	// checked about an opaque option.
+	p := tea.NewProgram(NewRoot(nil), programOptions(verbs.Deps{Stdin: &in, Stdout: &out})...)
+	if p == nil {
+		t.Fatal("NewProgram returned nil")
+	}
+}
+
 // TestRunSuppliesBothSeams — a nil Confirm or Progress would silently fall back to the plain-CLI
 // defaults, which read a stdin the renderer has taken over and print into the live frame.
 func TestRunSuppliesBothSeams(t *testing.T) {

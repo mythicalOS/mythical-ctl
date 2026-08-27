@@ -305,18 +305,33 @@ func (w *StreamWriter) emit(line string) {
 // front-end that can lie to a script.
 func Run(ctx context.Context, d verbs.Deps, fn VerbFunc) (int, error) {
 	return run(ctx, d, fn, func(root Root) program {
-		// The program reads and draws on the streams the process was handed, not on os.Stdin and
-		// os.Stdout: those are what the caller proved were terminals, and reaching for the globals
-		// instead would put the interface on a different pair.
-		opts := []tea.ProgramOption{}
-		if d.Stdin != nil {
-			opts = append(opts, tea.WithInput(d.Stdin))
-		}
-		if d.Stdout != nil {
-			opts = append(opts, tea.WithOutput(d.Stdout))
-		}
-		return tea.NewProgram(root, opts...)
+		return tea.NewProgram(root, programOptions(d)...)
 	}, waitForVerbGrace)
+}
+
+// programOptions is the program's configuration, named so it can be asserted rather than trusted.
+//
+// The streams are the ones the process was HANDED, not os.Stdin and os.Stdout: those are what the
+// caller proved were terminals, and reaching for the globals would put the interface on a different
+// pair.
+//
+// BRACKETED PASTE IS OFF, and that is a safety decision rather than a preference. With it on, a
+// clipboard whose own contents contain the paste TERMINATOR (\x1b[201~) ends the paste early and the
+// remainder is decoded as ordinary input — so pasting `y\x1b[201~\n` delivers a clean `y` followed
+// by a line terminator, and the confirmation ACCEPTS where the same bytes down a pipe refuse. The
+// decoder also drops runes decoding to U+FFFD inside a paste, silently, before any model can see
+// them. With it off, a paste arrives as the ordinary key events its bytes describe: the ESC marks
+// or cancels, an invalid byte marks, and pasting a plain `yes` still works exactly as typing it
+// does. Nothing legitimate is lost and two divergences go away at the source.
+func programOptions(d verbs.Deps) []tea.ProgramOption {
+	opts := []tea.ProgramOption{tea.WithoutBracketedPaste()}
+	if d.Stdin != nil {
+		opts = append(opts, tea.WithInput(d.Stdin))
+	}
+	if d.Stdout != nil {
+		opts = append(opts, tea.WithOutput(d.Stdout))
+	}
+	return opts
 }
 
 // run is Run with the program construction and the grace period injected, so the failure modes —
