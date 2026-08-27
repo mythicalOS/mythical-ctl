@@ -658,6 +658,41 @@ func TestTheStoredOffsetAlwaysShowsSomething(t *testing.T) {
 	}
 }
 
+// TestAReportGrowingUnderTheViewportKeepsTheStoredOffsetHonest.
+//
+// A line does not simply append to the end of what is on screen. The sections are laid out in a
+// fixed order, so a warning arriving late inserts rows ABOVE everything but the banner and pushes
+// every later line down — and an offset that showed a heading a moment ago is then pointing at a
+// separator. This is the one path that does not go through a key or a resize, so it was the one
+// place the stored and the drawn offset could still part company.
+func TestAReportGrowingUnderTheViewportKeepsTheStoredOffsetHonest(t *testing.T) {
+	for _, h := range []int{1, 2, 4} {
+		m := sized(NewStatusModel(nil), 100, h)
+		m = say(m, "installation: zzident")
+		m = say(m, "unattributed container: zzthing")
+		m = say(m, "zztail unclassifiable")
+		// The operator scrolls while the report is still arriving.
+		for i := 0; i < 4; i++ {
+			m, _ = sstep(m, tea.KeyMsg{Type: tea.KeyDown})
+		}
+		for i := 0; i < 8; i++ {
+			// A warning is filed FIRST, so every one of these inserts rows above where the
+			// viewport is sitting.
+			m = warn(m, fmt.Sprintf("ledger: zzwarning %d", i))
+			if body := m.body(); body > 0 {
+				if windowBlank(m.render(), m.Offset(), body) {
+					t.Fatalf("height %d, after %d late warnings: the stored offset %d shows nothing",
+						h, i+1, m.Offset())
+				}
+				if m.Offset() > m.maxOffset() {
+					t.Fatalf("height %d, after %d late warnings: the stored offset %d is past the\n"+
+						"  last position %d", h, i+1, m.Offset(), m.maxOffset())
+				}
+			}
+		}
+	}
+}
+
 // TestNoScrollKeystrokeIsInert. A key the operator presses must move the report, every time,
 // until there is no more report to move. The failure this pins is subtle and reads as a frozen
 // dashboard: the correction that keeps a viewport off a blank run used to be applied when
