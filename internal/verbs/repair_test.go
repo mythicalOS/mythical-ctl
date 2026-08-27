@@ -733,6 +733,17 @@ func TestRepairNeverRebuildsImageProvenance(t *testing.T) {
 
 	// Images carry no installation label (D37), so the list lived only in the ledger being
 	// repaired; inventing one is what this refuses to do.
+	//
+	// THE KIND IS PINNED FIRST. An absence assertion over a record kind nothing writes is an
+	// absence assertion that passes for free, so the same listing is shown to SEE an image record
+	// the provenance writer actually produces before it is used to prove there are none.
+	probe := &ledger.Ledger{}
+	if err := prov.ImageRecord(probe, "ghcr.io/x@sha256:"+hex64, "p1"); err != nil {
+		t.Fatal(err)
+	}
+	if seen, err := probe.All("image"); err != nil || len(seen) != 1 {
+		t.Fatalf(`l.All("image") does not see what prov.ImageRecord writes (%d, %v) — the absence check below would pass vacuously`, len(seen), err)
+	}
 	imgs, err := r.ledgerNow().All("image")
 	if err != nil {
 		t.Fatal(err)
