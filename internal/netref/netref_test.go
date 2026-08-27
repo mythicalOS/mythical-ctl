@@ -1452,6 +1452,13 @@ func TestMigrationConsumesOnlyDescribingRecords(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "does not describe it") {
 		t.Fatalf("the migration consumed a record about another object: %v", err)
 	}
+	// AND IT NAMES THE REAL FACT. The question is asked at the lookup now, so the refusal arrives
+	// where "the ledger could not be read" is also a possible outcome — and those are two
+	// situations with two different remedies. A ledger that read fine and holds a contradiction
+	// must not be reported as one that could not be read.
+	if strings.Contains(err.Error(), "could not be read") {
+		t.Fatalf("a contradictory record was reported as an unreadable ledger: %v", err)
+	}
 	if len(r.mut.connects) != 0 {
 		t.Fatal("the fleet was connected on the strength of a record about something else")
 	}
@@ -1465,5 +1472,14 @@ func TestMigrationConsumesOnlyDescribingRecords(t *testing.T) {
 	_, err = OwnedEnsure(ctx, r2.l, r2.objs, r2.mut, r2.d.Deps)
 	if err == nil || !strings.Contains(err.Error(), "does not describe it") {
 		t.Fatalf("owned-network adoption consumed a record about another object: %v", err)
+	}
+	if strings.Contains(err.Error(), "could not be read") {
+		t.Fatalf("a contradictory record was reported as an unreadable ledger: %v", err)
+	}
+	// AND NO SECOND NETWORK WAS CREATED. A network is never reissued (D38), and a contradictory
+	// record is the case where creating one is most tempting and most destructive: it would stand
+	// a second network beside whatever the record actually describes.
+	if r2.mut.createCalls != 0 {
+		t.Fatalf("a network was created over a contradictory record: %d creates", r2.mut.createCalls)
 	}
 }
