@@ -263,6 +263,16 @@ jobs:
       - name: check.sh go
         run: bash check.sh go
 
+      # The release build runs on EVERY pull request, not only at a tag. A
+      # release lane that carries checks the PR lane does not is a lane whose
+      # breakage is discovered while somebody is waiting to ship; this stage
+      # builds the whole published platform matrix twice — the second time from
+      # a copy of the source at a different absolute path with a cold build
+      # cache — and requires the artifacts to be byte-identical, so the
+      # reproducibility claim is exercised continuously rather than asserted.
+      - name: check.sh release
+        run: bash check.sh release
+
   test:
     name: test
     runs-on: ubuntu-latest

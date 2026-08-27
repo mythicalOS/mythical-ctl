@@ -4,14 +4,20 @@ name: Release
 # signed build-provenance attestation, on a `v*` tag.
 #
 # Why a GitHub Release and not a package registry: mythical-ctl runs BEFORE any
-# language runtime is guaranteed to exist on the machine — that is the whole
-# reason it is shell — so a registry that presupposes one cannot be the primary
-# channel. get.mythicalos.ai serves a pinned release artifact from here.
+# language runtime is guaranteed to exist on the machine, so a registry that
+# presupposes one cannot be the primary channel. The artifacts are static
+# binaries with no runtime dependency at all — one per supported platform.
+# get.mythicalos.ai serves a pinned release artifact from here.
 #
 # The provenance attestation is the counterpart to package provenance elsewhere
-# in the family, and it matters more here than anywhere: users are asked to pipe
-# this script into their shell, so "prove this is the artifact your workflow
-# built from this tag" is the security story, not a formality.
+# in the family, and it matters more here than anywhere: what is downloaded is
+# an executable, so "prove this is the artifact your workflow built from this
+# tag" is the security story, not a formality.
+#
+# THE RELEASE LANE RUNS THE SAME GATES AS THE PULL-REQUEST LANE, from the same
+# script (check.sh). A tag can be pushed to a commit that never saw a pull
+# request, and a release lane that spells its own checks out drifts away from
+# the PR lane in exactly one direction — laxer. See check.sh's header.
 
 on:
   push:
@@ -27,25 +33,36 @@ jobs:
   release:
     name: release
     runs-on: ubuntu-latest
+    # The same pin as ci.yml's go job. tools/build-release.sh REFUSES to run under a different
+    # one: two Go releases do not emit the same bytes, so a drifted pin would publish an
+    # artifact nobody can reproduce. Bump all three together, deliberately, in one commit.
+    env:
+      GOTOOLCHAIN: go1.26.5
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
 
-      # A tag that disagrees with the version the script reports would ship an
-      # artifact that lies about itself — every later "which version do I have?"
-      # answer descends from this, so it is checked before anything is built.
-      - name: Tag must match the version the CLI reports
+      # The version the binaries will report is the tag with its "v" stripped —
+      # it is stamped in, not read out of the source — so the only thing to
+      # check here is that the tag is a version at all. Checked FIRST, before
+      # minutes of gates, because a malformed tag can never produce a release.
+      # That the built artifacts actually REPORT it is proved after the build,
+      # by executing one of them.
+      - name: Tag is a usable version
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME#v}"
-          reported="$(./bin/mythical-ctl --version | awk '{print $2}')"
-          echo "tag=${tag} reported=${reported}"
-          if [ "$tag" != "$reported" ]; then
-            echo "::error::tag v${tag} does not match the version the CLI reports (${reported})"
+          if [ -z "$tag" ]; then
+            echo "::error::the tag carries no version"
             exit 1
           fi
+          if ! printf '%s' "$tag" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::tag ${GITHUB_REF_NAME} is not vX.Y.Z[-suffix]"
+            exit 1
+          fi
+          echo "version to stamp: ${tag}"
 
       # The release runs the same gates as CI. A tag can be pushed to a commit
       # that never saw a pull request, so re-running them here is the difference
@@ -62,12 +79,31 @@ jobs:
       - name: Bats unit tests
         run: third_party/bats-core/bin/bats tests/unit
 
+      # The Go lane, byte-identical to the pull-request lane: same script, same
+      # stages. `release` builds the whole published matrix twice — the second
+      # time from a copy of the source at a different absolute path with a cold
+      # build cache — and requires every artifact to be byte-identical. That is
+      # the reproducibility claim being exercised rather than asserted, and it
+      # runs here as well as on every pull request so a broken release script is
+      # found before somebody is waiting on a tag.
+      - name: check.sh go
+        run: bash check.sh go
+
+      - name: check.sh release
+        run: bash check.sh release
+
       # Public-safety gate — same intent as CI's hygiene job. A tag can be pushed
       # to a commit that never saw a PR, so the release must re-run it or a banned
       # internal name could be published. docs-bar.yml does NOT cover this: it
-      # triggers on pull_request and push to main only, never on tags. vendor/
-      # (the bats submodule, checked out for the test step) is third-party and
-      # excluded, matching CI's plain-checkout hygiene scope.
+      # triggers on pull_request and push to main only, never on tags.
+      #
+      # third_party/ (the bats submodule, checked out for the test step) is
+      # excluded as third-party text, matching CI's plain-checkout hygiene scope.
+      # It is excluded by that name and not by vendor/: the submodule moved when
+      # the Go module arrived, because a directory named vendor/ puts the go
+      # command into vendor mode. The old exclusion had stopped naming anything
+      # that exists, which would have put upstream bats text through a gate
+      # written for this project's own prose.
       #
       # The term list is sourced from the organisation secret DOCS_DENY_PATTERN,
       # never written here — see the long note in ci.yml for why an inline,
@@ -114,7 +150,7 @@ jobs:
           # PASS 1 — the combined pattern, .github excluded so the repo-local
           # EXTRAS spelled out in this file cannot match it.
           hits="$(grep -rlaiE -e "$FULL" . \
-              --exclude-dir=.git --exclude-dir=.github --exclude-dir=node_modules --exclude-dir=vendor)" && rc=0 || rc=$?
+              --exclude-dir=.git --exclude-dir=.github --exclude-dir=node_modules --exclude-dir=third_party)" && rc=0 || rc=$?
           [ "$rc" -le 1 ] || { echo "::error::tree scan failed (grep rc=$rc) — the tree was NOT fully scanned"; exit 1; }
           if [ -n "$hits" ]; then
             # A path is printed, never the matched line. Workflow commands are
@@ -132,10 +168,10 @@ jobs:
           # PASS 2 — the SECRET half over the WHOLE tree, .github INCLUDED. See
           # the long note in ci.yml: --exclude-dir skips that directory name at
           # EVERY depth, so pass 1 alone is blind to nested .github paths too.
-          # vendor/ stays excluded in both passes: it is the third-party bats
-          # submodule, not this project's text.
+          # third_party/ stays excluded in both passes: it is the third-party
+          # bats submodule, not this project's text.
           ghits="$(grep -rlaiE -e "$DENY" . \
-              --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=vendor)" && rc=0 || rc=$?
+              --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=third_party)" && rc=0 || rc=$?
           [ "$rc" -le 1 ] || { echo "::error::whole-tree scan failed (grep rc=$rc) — NOT fully scanned"; exit 1; }
           if [ -n "$ghits" ]; then
             # A path is printed, never the matched line. Workflow commands are
@@ -172,7 +208,7 @@ jobs:
           # here, so the old .github exclusion would only cost a blind spot.
           # grep rc >=2 means the scan failed, not that the tree is clean.
           hits="$(grep -rlaE -e "$DENY_CS" . \
-              --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=vendor)" && rc=0 || rc=$?
+              --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=third_party)" && rc=0 || rc=$?
           [ "$rc" -le 1 ] || { echo "::error::tree scan failed (grep rc=$rc) — the tree was NOT fully scanned"; exit 1; }
           if [ -n "$hits" ]; then
             # A path is printed, never the matched line. Workflow commands are
@@ -198,52 +234,56 @@ jobs:
           done
           [ "$missing" -eq 0 ] || { echo "::error::required health file(s) missing from the tree"; exit 1; }
 
-      # The published artifact is a single self-contained file: the entrypoint with lib/*.sh inlined.
-      # There is deliberately no installed lib/ directory — one artifact, one digest, one attestation,
-      # and no directory on disk for the installed CLI to source code out of at every later run.
-      - name: Build the release bundle
-        run: |
-          set -euo pipefail
-          tools/bundle.sh dist/mythical-ctl
-
-      # Gates on the BUNDLE, before anything is staged or attested. Everything above tested the
-      # repository tree; these test the bytes that will actually be published.
+      # The bash bundler (tools/bundle.sh) is no longer built here: it produces
+      # the artifact this release stopped publishing. It stays gated on every
+      # push by ci.yml's test job for as long as the bash tree exists.
       #
-      # No -x: the bundle has nothing left to follow, and that is the property under test.
-      - name: shellcheck the bundle
-        run: |
-          set -euo pipefail
-          shellcheck dist/mythical-ctl
-          echo "shellcheck (bundle): clean"
-
-      - name: Smoke tests against the bundle
-        run: MCTL_BIN="$PWD/dist/mythical-ctl" ./tests/smoke.sh
-
-      # The tag was already checked against the repo entrypoint. Check it again against the artifact:
-      # a bundle that reports a different version than the tag must never reach a release page, and
-      # only this check is looking at the file the user will actually download.
-      - name: Bundle must report the tagged version
+      # tests/smoke.sh above still runs against the bash entrypoint rather than
+      # against a built binary. Re-pointing it belongs with the cutover, because
+      # its version-shape assertion rejects a prerelease suffix and that
+      # assertion cannot be edited before then; what the published artifact is
+      # held to here is release-verify's exec round-trip, which requires the
+      # exact version line from both --version and -v.
+      #
+      # THE PUBLISHED ARTIFACTS. One static binary per supported platform,
+      # stamped with the tag, built with the determinism flags, plus the
+      # checksum file. tools/build-release.sh carries the flags and the reasons
+      # for each one; tools/release-verify grades what came out — it reads the
+      # FILES, not the commands that made them, which is the only way to notice
+      # that the intent and the bytes disagree.
+      #
+      # It is the same script `check.sh release` just ran, so nothing about the
+      # published build is exercised for the first time here. The difference is
+      # the version: this one stamps the tag.
+      - name: Build the release artifacts
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME#v}"
-          reported="$(./dist/mythical-ctl --version | awk '{print $2}')"
-          echo "tag=${tag} bundle reported=${reported}"
-          if [ "$tag" != "$reported" ]; then
-            echo "::error::the release bundle reports ${reported}, not the tagged version ${tag}"
-            exit 1
-          fi
+          bash tools/build-release.sh "$tag" dist
 
-      - name: Stage release artifacts
+      # The artifacts are staged by the build; this is the human-readable record
+      # of exactly what is about to be published, digests beside byte counts.
+      # A digest on its own cannot tell a reader that the thing hashed had any
+      # content at all — sha256 of nothing is a perfectly healthy-looking
+      # e3b0c442... — so the sizes are printed next to it.
+      - name: Show what will be published
         run: |
           set -euo pipefail
-          chmod +x dist/mythical-ctl
-          ( cd dist && sha256sum mythical-ctl > SHA256SUMS )
+          ls -l dist
           cat dist/SHA256SUMS
+          ( cd dist && sha256sum -c SHA256SUMS )
 
+      # Every binary is attested. SHA256SUMS is not: it is not an artifact
+      # anybody executes, and its integrity is the digests it carries, each of
+      # which names an attested file.
       - name: Attest build provenance
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
-          subject-path: dist/mythical-ctl
+          subject-path: |
+            dist/mythical-ctl_darwin_amd64
+            dist/mythical-ctl_darwin_arm64
+            dist/mythical-ctl_linux_amd64
+            dist/mythical-ctl_linux_arm64
 
       # ACCIDENT GUARD, not an immutability guarantee (design D20).
       #
@@ -275,11 +315,25 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh release create "$GITHUB_REF_NAME" dist/mythical-ctl dist/SHA256SUMS \
+          # The four artifacts are NAMED, not globbed. A glob uploads whatever
+          # happens to be there: if a target had silently not been built, a
+          # glob would publish a three-platform release that looks complete.
+          # Naming them makes a missing platform a failed release.
+          gh release create "$GITHUB_REF_NAME" \
+            dist/mythical-ctl_darwin_amd64 \
+            dist/mythical-ctl_darwin_arm64 \
+            dist/mythical-ctl_linux_amd64 \
+            dist/mythical-ctl_linux_arm64 \
+            dist/SHA256SUMS \
             --title "$GITHUB_REF_NAME" \
             --notes "mythical-ctl $GITHUB_REF_NAME
 
+          Static binaries — no runtime to install. Pick the one for your
+          platform, verify it, then move it onto your PATH.
+
           Verify the download before running it:
 
-              sha256sum -c SHA256SUMS
-              gh attestation verify mythical-ctl --repo mythicalOS/mythical-ctl"
+              sha256sum --ignore-missing -c SHA256SUMS
+              gh attestation verify mythical-ctl_<os>_<arch> --repo mythicalOS/mythical-ctl
+
+          The digest is the identity — verify that, not the version string."
