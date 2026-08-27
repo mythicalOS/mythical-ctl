@@ -335,7 +335,7 @@ func (r *rig) createVolume(name, nonce, ident string) {
 // Names is a STUB, and it has to be: prov.Engine's own Names cannot answer at all. It asks for
 // an UNFILTERED listing (nil labels), and engine's list filter refuses a listing with no label
 // to select on, so every class errors before a request is even made. That is a defect in a
-// neighbouring module, reported to the integrator and pinned by
+// neighbouring module, reported rather than fixed here, and pinned by
 // TestUnfilteredListingIsCurrentlyUnavailable below; when it is fixed, that tripwire reddens
 // and this stub should be deleted in favour of prov.Engine's own.
 //
