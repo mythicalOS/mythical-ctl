@@ -745,6 +745,16 @@ func TestStrippedBitsReported(t *testing.T) {
 	}
 	mustContain(t, r.said(), "stripped")
 	mustContain(t, r.said(), "/src/bin/tool")
+	// EACH strip is reported, which one record cannot demonstrate: a reader that processed only
+	// the first would pass the assertions above. Three records, all three named.
+	r2 := newRig(t)
+	r2.img.Copy = "setuid-many"
+	if _, err := r2.run(); err != nil {
+		t.Fatalf("stripping is reported, not refused: %v", err)
+	}
+	for _, p := range []string{"/src/bin/suid:4755", "/src/bin/sgid:2755", "/src/bin/sticky:1755"} {
+		mustContain(t, r2.said(), p)
+	}
 }
 
 func TestForeignUid(t *testing.T) {
@@ -756,6 +766,19 @@ func TestForeignUid(t *testing.T) {
 	}
 	mustContain(t, err.Error(), "uid 4242")
 	mustContain(t, err.Error(), "--map-foreign-to-operator")
+
+	// EACH foreign entry is named, which one record cannot demonstrate. Two refusals, different
+	// paths AND different uids, so neither can stand in for the other and a reader that stopped
+	// at the first fails.
+	rm := newRig(t)
+	rm.img.Copy = "foreign-many"
+	_, merr := rm.run()
+	if merr == nil {
+		t.Fatal("foreign uids are refused by default")
+	}
+	for _, want := range []string{"/src/data/alien", "uid 4242", "/src/data/other", "uid 4343"} {
+		mustContain(t, merr.Error(), want)
+	}
 
 	// With the opt-in they are folded in, and the numeric information is preserved in the
 	// report.
@@ -783,6 +806,27 @@ func TestRefusedPathWithColonReportedWhole(t *testing.T) {
 		t.Fatal("a special entry must be refused")
 	}
 	mustContain(t, err.Error(), "/src/od:d/dev/thing")
+	// ...and it must be the PARSED refusal that names it, not the raw value echoed by the
+	// "cannot read this refusal" fallback. The colon fixture also enumerates the same path as a
+	// special ENTRY, so the refusal above could be produced without the reason-last parse
+	// working at all. This transcript carries a colon-bearing refused= AND NOTHING ELSE: no
+	// entry line to derive it from, and a reason (escaped-write) no entry type can produce.
+	r2 := newRig(t)
+	r2.img.Copy = "colon-refused-only"
+	_, err = r2.run()
+	if err == nil {
+		t.Fatal("a colon-bearing refusal must be refused")
+	}
+	mustContain(t, err.Error(), "/src/od:d/data/f")
+	// The escaped-write-specific wording proves the reason was READ from the end of the value.
+	mustContain(t, err.Error(), "would land outside the")
+	// And it is not the fallback, which would echo the raw value (reason and all).
+	if strings.Contains(err.Error(), "cannot read") {
+		t.Fatalf("the refusal was not parsed, only echoed:\n%s", err.Error())
+	}
+	if strings.Contains(err.Error(), ":escaped-write") {
+		t.Fatalf("the reason leaked into the reported path:\n%s", err.Error())
+	}
 }
 
 func TestCopySilentIsNotCompletion(t *testing.T) {
@@ -1394,6 +1438,62 @@ func TestGuardsTheReferenceFixtureCannotReach(t *testing.T) {
 		t.Fatal("a checked= that is not a count must be refused")
 	} else {
 		mustContain(t, err.Error(), "did not say how many entries it checked")
+	}
+}
+
+// A NUL byte is where being FAITHFUL TO THE BYTES would make this port weaker than the shell it
+// replaces. The reference never sees one — `$(…)` deletes NULs — so bash reads a different
+// string than the helper wrote, and in both shapes below its accidental strip is what refuses
+// the copy. A byte-faithful reader gets both wrong in the unsafe direction, so the transcript is
+// refused outright instead (stripping would silently rewrite a path into a different path).
+func TestNulBytesRefuseTheWholeTranscript(t *testing.T) {
+	// An absolute symlink target hidden behind a NUL: "\x00/etc/passwd" does not begin with '/',
+	// so a byte-faithful escape check reads it as RELATIVE and carries the link into the tree.
+	r := newRig(t)
+	r.img.Copy = "nul-linktarget"
+	if _, err := r.run(); err == nil {
+		t.Fatal("a NUL-bearing linktarget must be refused, not read as a relative target")
+	} else {
+		mustContain(t, err.Error(), "NUL byte")
+	}
+
+	// Two spellings of ONE source object: a byte-faithful reader counts 2, and a `checked=2`
+	// then matches a total that covered one real entry.
+	r2 := newRig(t)
+	r2.img.Copy = "nul-entry"
+	if _, err := r2.run(); err == nil {
+		t.Fatal("a NUL-bearing entry path must be refused, not counted as a distinct entry")
+	} else {
+		mustContain(t, err.Error(), "NUL byte")
+	}
+}
+
+// "I COULD NOT ASK" IS NOT "IT ANSWERED BADLY". When the daemon refuses the launch outright the
+// transcript is empty, so every observation is missing — and reporting only that tells the
+// operator the helper said nothing, when the truth is that no helper ever ran. The reference put
+// the runtime's own words on inherited stderr; here they are a value, and both the diagnostics
+// channel and the returned error must carry them.
+func TestALaunchFailureIsNotAMissingObservation(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name string
+		call func(*rig) error
+	}{
+		{"preflight", func(r *rig) error { return r.preflight("900", "1000") }},
+		{"access", func(r *rig) error { return r.c.AccessCheck(ctx, r.ix, r.stage, "900") }},
+	} {
+		r := newRig(t)
+		r.fake.HelperFail = "permission denied while trying to connect to the daemon socket"
+		err := tc.call(r)
+		if err == nil {
+			t.Fatalf("%s: a helper that could not be launched must not pass", tc.name)
+		}
+		if !strings.Contains(err.Error(), "permission denied") {
+			t.Fatalf("%s: the refusal lost the reason there was no answer:\n%s", tc.name, err.Error())
+		}
+		if !strings.Contains(r.said(), "could not be run") {
+			t.Fatalf("%s: the operator was never told the helper could not be run:\n%s", tc.name, r.said())
+		}
 	}
 }
 

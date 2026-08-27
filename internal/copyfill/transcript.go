@@ -1,6 +1,7 @@
 package copyfill
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"strconv"
@@ -87,6 +88,32 @@ func hasEmpty(out []byte, key string) bool {
 // diagnostic. A blank line only matters as an INTERIOR one, amid real content — that is the
 // truncated-continuation shape.
 func grammarOK(out []byte, allowed ...string) error {
+	// A NUL BYTE ANYWHERE IN THE TRANSCRIPT REFUSES THE WHOLE ANSWER, before any field is read.
+	//
+	// This is the one place the Go port could be WEAKER than the reference by being more
+	// faithful to the bytes. The reference never sees a NUL at all: `$(…)` command substitution
+	// DELETES them, so bash reads a different string than the helper actually wrote. Two
+	// measured consequences, both of which a NUL-preserving reader gets wrong in the unsafe
+	// direction:
+	//
+	//	linktarget=/src/evil\x00/etc/passwd:9
+	//	  bash reads target "/etc/passwd" -> ABSOLUTE -> escaping-symlink, REFUSED.
+	//	  A byte-faithful reader sees "\x00/etc/passwd", which does not begin with '/', so the
+	//	  target is read as RELATIVE and the escape is MISSED — an absolute symlink carried into
+	//	  the tree with a clean exit.
+	//
+	//	entry=file:/src/a  and  entry=file:/src/a\x00
+	//	  bash reads the same path twice -> duplicate -> REFUSED (a padded count).
+	//	  A byte-faithful reader sees two DISTINCT paths, counts 2, and a `checked=2` then
+	//	  matches a total that covered one real entry.
+	//
+	// EMULATING bash's strip would be worse than either: deleting a byte silently rewrites a
+	// path into a different path. So the answer is refused outright — the rule this module
+	// already applies to a blank line, and for the same reason. A NUL means the record grammar
+	// is no longer a faithful record of anything, and no conforming helper emits one.
+	if i := bytes.IndexByte(out, 0); i >= 0 {
+		return fmt.Errorf("copy: the helper's transcript contains a NUL byte (at offset %d). A NUL is not part of the record grammar, and it cannot be read past safely: it hides an absolute symlink target from the escape check and makes one source path look like two. Refused rather than stripped — deleting the byte would silently rewrite a path into a different path", i)
+	}
 	ls := lines(out)
 	content := false
 	for _, l := range ls {

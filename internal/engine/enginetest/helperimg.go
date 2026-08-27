@@ -370,6 +370,48 @@ func (h *HelperImage) copy(args []string) (int, []byte) {
 	// the mapping on a DEFAULT invocation — one that never received --map-foreign.
 	case "foreign-mapped-unrequested":
 		fmt.Fprintf(&out, "mapped=%s/data/alien:4242\n", src)
+	// A NUL BYTE inside a linktarget's TARGET. The reference never sees it — command
+	// substitution deletes NULs — so bash reads "/etc/passwd", an ABSOLUTE target, and refuses.
+	// A byte-faithful reader sees a target starting with \x00, reads it as RELATIVE, and misses
+	// the escape entirely.
+	case "nul-linktarget":
+		out.Reset()
+		out.WriteString("entry=symlink:/src/evil\n")
+		out.WriteString("linktarget=/src/evil\x00/etc/passwd:9\n")
+		out.WriteString("done=ok\n")
+		return h.fin(0, out.String())
+	// A NUL BYTE inside an entry PATH: two spellings of ONE source object that a byte-faithful
+	// reader counts as two, padding the count that binds verification.
+	case "nul-entry":
+		out.Reset()
+		out.WriteString("entry=file:/src/a\n")
+		out.WriteString("entry=file:/src/a\x00\n")
+		out.WriteString("done=ok\n")
+		return h.fin(0, out.String())
+	// A colon-bearing refused= path AND NOTHING ELSE THAT NAMES IT — no `entry=` line to produce
+	// the same refusal independently, and a reason (`escaped-write`) no entry type can derive.
+	// This is what makes the reason-last parse testable: with a first-colon split the path is
+	// reported as "/src/od", and with the reason unrecognised it falls back to echoing the raw
+	// value, so an assertion on the escaped-write WORDING plus the whole path pins both halves.
+	case "colon-refused-only":
+		out.Reset()
+		out.WriteString("refused=/src/od:d/data/f:escaped-write\n")
+		return h.fin(1, out.String())
+	// THREE stripped= records, so "each strip is reported" is a claim a reader that processed
+	// only the first would fail.
+	case "setuid-many":
+		fmt.Fprintf(&out, "entry=file:%s/bin/suid\n", src)
+		fmt.Fprintf(&out, "entry=file:%s/bin/sgid\n", src)
+		fmt.Fprintf(&out, "entry=file:%s/bin/sticky\n", src)
+		fmt.Fprintf(&out, "stripped=%s/bin/suid:4755\n", src)
+		fmt.Fprintf(&out, "stripped=%s/bin/sgid:2755\n", src)
+		fmt.Fprintf(&out, "stripped=%s/bin/sticky:1755\n", src)
+	// TWO foreign-uid refusals, so "each named" is a claim a reader that stopped at the first
+	// would fail. Different paths AND different uids, so neither can stand in for the other.
+	case "foreign-many":
+		fmt.Fprintf(&out, "refused=%s/data/alien:foreign-uid:4242\n", src)
+		fmt.Fprintf(&out, "refused=%s/data/other:foreign-uid:4343\n", src)
+		rc = 1
 	// A ZERO-PADDED <pathlen>. The reference reads that token in bash arithmetic, where a leading
 	// zero means OCTAL — ":010" splits its body at 8, not 10 — so the escape check runs over the
 	// wrong bytes. Here the true path is 21 bytes ("/src/data/od/evillink") and the length is

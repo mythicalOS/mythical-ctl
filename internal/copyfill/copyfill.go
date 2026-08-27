@@ -199,6 +199,15 @@ func (c *Copier) helper(ctx context.Context, ix *trust.Index, cmd engine.HelperC
 	if len(res.Stderr) > 0 {
 		_, _ = c.diag.Write(res.Stderr)
 	}
+	// AND SO DOES A LAUNCH FAILURE. In the reference the runtime's own words are on the
+	// terminal's stderr, inherited, so an operator sees "permission denied" BESIDE the
+	// missing-observation refusal that follows from it. Here the failure is a value, and a
+	// caller that forms its verdict from the observations alone would drop it — leaving the
+	// operator told "the helper stated nothing about ownership" when the truth is that no
+	// helper ever ran. "I could not ask" and "it answered badly" are different facts.
+	if runErr != nil {
+		fmt.Fprintf(c.diag, "copy: the %s helper could not be run: %v\n", cmd, runErr)
+	}
 	return res.Stdout, res.Code, runErr
 }
 
@@ -296,14 +305,25 @@ func (c *Copier) Preflight(ctx context.Context, ix *trust.Index, staging, runtim
 	}
 	out, code, runErr := c.helper(ctx, ix, engine.HelperPreflight, "",
 		[]string{"/dst", runtimeUID, operatorUID}, []engine.Mount{mount})
-	if err := grammarOK(out, "ownership", "permissions", "symlink", "acl", "inherit", "done"); err != nil {
+	// A REFUSAL FORMED FROM THE ANSWER MUST STILL CARRY WHY THERE WAS NO ANSWER. The reference
+	// checks the observations before the exit status, and so does this — but a helper that never
+	// LAUNCHED produces an empty transcript, and every observation is then missing for one
+	// reason: the run failed. Joined rather than reordered, so the operator gets the same
+	// message the reference gives AND the cause the reference put on stderr.
+	because := func(err error) error {
+		if runErr != nil {
+			return errors.Join(err, runErr)
+		}
 		return err
+	}
+	if err := grammarOK(out, "ownership", "permissions", "symlink", "acl", "inherit", "done"); err != nil {
+		return because(err)
 	}
 
 	for _, k := range []string{"ownership", "permissions", "symlink", "inherit"} {
 		v, err := stated(out, k, "preflight", "")
 		if err != nil {
-			return err
+			return because(err)
 		}
 		if v != "ok" {
 			return fmt.Errorf("copy: the destination did not pass the '%s' check of the copy contract (%s=%s).\n"+
@@ -314,7 +334,7 @@ func (c *Copier) Preflight(ctx context.Context, ix *trust.Index, staging, runtim
 
 	v, err := stated(out, "acl", "preflight", "")
 	if err != nil {
-		return err
+		return because(err)
 	}
 	switch v {
 	case "ok":
@@ -800,13 +820,21 @@ func (c *Copier) AccessCheck(ctx context.Context, ix *trust.Index, dst, runtimeU
 		return err
 	}
 	out, code, runErr := c.helper(ctx, ix, engine.HelperAccess, runtimeUID, []string{"/dst"}, []engine.Mount{mount})
-	if err := grammarOK(out, "traverse", "read", "write"); err != nil {
+	// See Preflight: an empty transcript from a helper that never launched must not be reported
+	// as an answer that merely omitted something.
+	because := func(err error) error {
+		if runErr != nil {
+			return errors.Join(err, runErr)
+		}
 		return err
+	}
+	if err := grammarOK(out, "traverse", "read", "write"); err != nil {
+		return because(err)
 	}
 	for _, k := range []string{"traverse", "read", "write"} {
 		v, err := stated(out, k, "access", "")
 		if err != nil {
-			return err
+			return because(err)
 		}
 		if v != "ok" {
 			return fmt.Errorf("copy: as uid %s, the destination failed the '%s' check (%s=%s).\n"+
