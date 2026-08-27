@@ -870,7 +870,7 @@ func (s *session) launchConfig(pc *productContext, image, netID string) (runtime
 	if err != nil {
 		return runtime.LaunchConfig{}, err
 	}
-	ports, perr := hostPorts(s.d.Home, pc.Product, pc.Manifest)
+	ports, perr := readHostPorts(s.d.Home, pc.Product, pc.Manifest)
 	if perr != nil {
 		return runtime.LaunchConfig{}, perr
 	}

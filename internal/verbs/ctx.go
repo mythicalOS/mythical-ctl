@@ -446,7 +446,23 @@ func (s *session) netTarget(ctx context.Context) (string, error) {
 		Now:        time.Now,
 		Persist:    s.persistFn(),
 	}
-	return netref.Target(ctx, s.l, netref.Engine(s.d.Engine), s.rt, name, set, nd)
+	id, err := netref.Target(ctx, s.l, netref.Engine(s.d.Engine), s.rt, name, set, nd)
+	if err != nil {
+		return "", err
+	}
+	// THE TARGET IS MADE DURABLE HERE, BEFORE THE CALLER GOES ON TO ANYTHING THAT CAN FAIL.
+	//
+	// Adopting an operator network for the first time records the reference by editing the ledger
+	// IN MEMORY (that path takes no write-ahead seam), so nothing had written it yet. The next
+	// write in an install is on the far side of the image gate — so a pull that fails discards the
+	// pinned network id, and a re-run resolves the configured NAME again. If that name has been
+	// re-pointed in between, the second run adopts the replacement network without the split
+	// refusal ever seeing a recorded reference to disagree with. The reference is durable at once
+	// in the reference implementation, which is what this restores.
+	if perr := s.persist(); perr != nil {
+		return "", perr
+	}
+	return id, nil
 }
 
 // familyNet reads MYTHICAL_NET. (value, set, error) — a missing FILE is "not set", a file that
@@ -586,6 +602,15 @@ func (s *session) productCtx(product, manifestPath string) (*productContext, err
 	}
 	return pc, nil
 }
+
+// readHostPorts is the one door the launch config reads mythical.conf's port through.
+//
+// A SEAM, on the pattern the configuration reader already uses for its own file access: the
+// property that matters here is that a verb reads this ONCE and carries the answer across the
+// container replacement, and an outcome assertion cannot see the difference — with an unchanged
+// file, reading once and reading twice produce the same launch. Counting the reads through the
+// real verb is the only thing that can.
+var readHostPorts = hostPorts
 
 // hostPorts maps each declared container port to the host port to publish it at.
 //

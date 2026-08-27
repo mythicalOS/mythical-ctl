@@ -18,6 +18,8 @@ import (
 	"mythicalos.ai/ctl/internal/famlock"
 	"mythicalos.ai/ctl/internal/intent"
 	"mythicalos.ai/ctl/internal/ledger"
+	"mythicalos.ai/ctl/internal/manifest"
+	"mythicalos.ai/ctl/internal/netref"
 	"mythicalos.ai/ctl/internal/prov"
 	"mythicalos.ai/ctl/internal/runtime"
 	"mythicalos.ai/ctl/internal/state"
@@ -653,6 +655,44 @@ func TestTheLaunchIsAssembledOnce(t *testing.T) {
 	// the one this installer recorded.
 	if got := info.Labels["mythicalos.nonce"]; got != "nlaunchtest" {
 		t.Fatalf("the container carries nonce %q, want the one the create was given", got)
+	}
+}
+
+// TestRecreateReadsTheLaunchConfigOnce drives the REAL verb and counts. The case above proves the
+// launcher honours the config it is carrying, and the one below proves the config is read on the
+// near side of the teardown — but neither can see a verb that reads correctly BEFORE the preflight
+// and then reads again AFTER the container is gone, which is exactly the shape the fix removed.
+// Counting through the real Recreate is what distinguishes it.
+func TestRecreateReadsTheLaunchConfigOnce(t *testing.T) {
+	r := newRig(t)
+	r.writeProduct("p1")
+	r.mintIdentity()
+	r.mustInstall("p1")
+
+	reads := 0
+	real := readHostPorts
+	// Every read answers a DIFFERENT port, so a second read is visible in the runtime object as
+	// well as in the count — a counter alone would not say which answer was used.
+	readHostPorts = func(home, product string, m *manifest.Manifest) (map[uint16]uint16, error) {
+		reads++
+		return map[uint16]uint16{7480: uint16(20000 + reads)}, nil
+	}
+	defer func() { readHostPorts = real }()
+
+	if rc := r.recreate("p1"); rc != cliio.ExitOK {
+		t.Fatalf("recreate rc = %d\n%s", rc, r.said())
+	}
+	if reads != 1 {
+		t.Fatalf("the verb read the launch config %d times, want 1 — the preflight and the create are judging different launches", reads)
+	}
+	info, err := r.c.ContainerInspect(context.Background(), r.container("p1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range info.Ports {
+		if p.HostPort != "20001" {
+			t.Fatalf("published on %q, want the port the FIRST read named (20001)", p.HostPort)
+		}
 	}
 }
 
@@ -1707,4 +1747,73 @@ func readAll(t *testing.T, path string) string {
 		t.Fatal(err)
 	}
 	return string(b)
+}
+
+// TestTheNetworkReferenceIsDurableBeforeTheImageGate is not a bats port; the reference gets it
+// structurally, because its record-writer writes the ledger FILE. Here the first-time adoption of
+// an operator network records the reference by editing the ledger in MEMORY, and the next write in
+// an install is on the far side of the image gate — so a pull that fails would discard the pinned
+// network id, and a re-run would resolve the configured NAME again. If that name has been
+// re-pointed in between, the second run adopts the replacement network with no recorded reference
+// left for the split refusal to disagree with.
+func TestTheNetworkReferenceIsDurableBeforeTheImageGate(t *testing.T) {
+	r := newRig(t)
+	r.writeProduct("p1")
+	r.mintIdentity()
+	want := r.createNetwork("operator-net")
+	r.writeFile("mythical.conf", "MYTHICAL_TELEMETRY_KEY=tk\nMYTHICAL_NET=operator-net\n")
+
+	// The install gets as far as the image and dies there.
+	r.fake.PullOutcome = "neterr"
+	if rc := r.install("p1"); rc != cliio.ExitFail {
+		t.Fatalf("rc = %d, want 1\n%s", rc, r.said())
+	}
+
+	// The reference the install pinned is ON DISK, so a re-run re-verifies THAT id rather than
+	// resolving the name afresh.
+	got, err := netref.RefGet(r.ledgerNow())
+	if err != nil {
+		t.Fatalf("no operator-network reference survived the failed install: %v", err)
+	}
+	if got != want {
+		t.Fatalf("the recorded reference is %q, want the network that was resolved (%q)", got, want)
+	}
+}
+
+// TestStopCommitsTheIntentBeforeItActs is not a bats port — the shell gets the ordering from its
+// call structure and pins the outcome. Asserting the outcome cannot see the ordering: moving the
+// commit to AFTER the runtime stop, but before its result is handled, leaves every outcome
+// assertion in this file passing while reopening the crash window the ordering exists to close (a
+// container stopped with no record saying that is what was wanted).
+//
+// So the ordering is proved by REFUSING THE WRITE. With the session poisoned, the commit cannot be
+// made durable — and if the commit really does come first, the verb stops there and the runtime is
+// never asked to do anything. A commit that had moved after the stop would have issued it.
+func TestStopCommitsTheIntentBeforeItActs(t *testing.T) {
+	r := newRig(t)
+	r.writeProduct("p1")
+	r.mintIdentity()
+	r.mustInstall("p1")
+	c := r.container("p1")
+
+	s, serr := openSession(r.d)
+	if serr != nil {
+		t.Fatal(serr)
+	}
+	defer s.close()
+	before := len(r.fake.RequestLog())
+	s.stale = true // every write from here refuses
+
+	if rc := s.stop(context.Background(), "p1"); rc != cliio.ExitFail {
+		t.Fatalf("rc = %d, want 1 — the verb wrote nothing and must not report success", rc)
+	}
+	for _, req := range r.fake.RequestLog()[before:] {
+		if strings.Contains(req, "/containers/"+c+"/stop") {
+			t.Fatal("the runtime was asked to stop the container even though the intent was never recorded — the commit does not come first")
+		}
+	}
+	// And the container is untouched, which is the operator-visible half of the same fact.
+	if !r.running(c) {
+		t.Fatal("the container is not running")
+	}
 }
