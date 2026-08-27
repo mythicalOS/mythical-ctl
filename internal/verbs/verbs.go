@@ -177,6 +177,11 @@ func (s *session) install(ctx context.Context, opts InstallOpts) int {
 		d.warnErr(err)
 		return cliio.ExitFail
 	}
+	// The launch must be assemblable BEFORE the existing container is replaced.
+	if err := s.checkLaunchable(pc); err != nil {
+		d.warnErr(err)
+		return cliio.ExitFail
+	}
 
 	// The replacement branch, gated on provenance exactly as recreate's is.
 	if err := s.replaceContainer(ctx, pc.Container, "install"); err != nil {
@@ -478,6 +483,12 @@ func (s *session) recreate(ctx context.Context, product string) int {
 	// A recreate after a manual deletion of transcripts/ or logs/ must re-create them rather than
 	// refuse.
 	if err := ensureMountPoints(d.Home); err != nil {
+		d.warnErr(err)
+		return cliio.ExitFail
+	}
+	// The launch must be assemblable BEFORE the working container is removed — the sibling of the
+	// image gate above, and for the same reason.
+	if err := s.checkLaunchable(pc); err != nil {
 		d.warnErr(err)
 		return cliio.ExitFail
 	}
@@ -805,6 +816,23 @@ func (s *session) ensureVolume(ctx context.Context, ident, product, role, vol, p
 		return err
 	}
 	return s.persist()
+}
+
+// checkLaunchable proves the launch can be ASSEMBLED before anything is torn down.
+//
+// THE REFERENCE BUILDS THE LAUNCH SPEC BEFORE IT STOPS OR REMOVES THE EXISTING CONTAINER, and the
+// ordering is the point: a bind the policy index does not make bindable, a bind inside the family
+// home, two overlapping writable binds, or a host port mythical.conf cannot be read for are all
+// refusals — and a refusal AFTER the removal has taken a working installation down for a
+// replacement that could never have been created. In this tree the spec is assembled inside the
+// launch facade, which runs after the removal, so the same assembly is asked for here first and its
+// answer thrown away. It is the sibling of the image gate a few lines up, for the same reason.
+func (s *session) checkLaunchable(pc *productContext) error {
+	if _, err := s.rt.MountsFor(pc.Manifest, pc.Policy); err != nil {
+		return err
+	}
+	_, err := hostPorts(s.d.Home, pc.Product, pc.Manifest)
+	return err
 }
 
 // replaceContainer removes the container standing under this name, if any, so bring-up can create

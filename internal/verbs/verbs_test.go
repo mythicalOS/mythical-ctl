@@ -526,6 +526,31 @@ func TestRecreateEnsuresTheImageBeforeRemoving(t *testing.T) {
 	}
 }
 
+// TestRecreateRefusesAnUnassemblableLaunchWithTheContainerIntact is not a bats port: the shell suite
+// pins this ordering for the IMAGE (which is ported above), and gets it for the launch spec
+// structurally, because the reference builds that spec before it stops anything. In this tree the
+// spec is assembled inside the launch facade, which runs AFTER the removal — so the ordering the
+// reference has for free has to be asserted here, or a recreate that could never have succeeded
+// takes a working installation down on its way to finding out.
+func TestRecreateRefusesAnUnassemblableLaunchWithTheContainerIntact(t *testing.T) {
+	r := newRig(t)
+	r.writeProduct("p1")
+	r.mintIdentity()
+	r.mustInstall("p1")
+	c := r.container("p1")
+
+	// The operator points a bindable role at a path that is not there. The launch cannot be
+	// assembled from it, and finding that out must not cost them the running container.
+	r.writeFile("mythical.conf", "MYTHICAL_TELEMETRY_KEY=tk\nMYTHICAL_P1_STATE_BIND=/nonexistent-mythical-ctl-test/state\n")
+
+	if rc := r.recreate("p1"); rc != cliio.ExitFail {
+		t.Fatalf("rc = %d, want 1\n%s", rc, r.said())
+	}
+	if got := r.observed(c); got != state.ObsRunning {
+		t.Fatalf("observed %q — the recreate tore down a container it could never have replaced", got)
+	}
+}
+
 func TestRecreateNormalizesAContextFailure(t *testing.T) {
 	// The product is already installed, so ANY context failure — here the manifest is withdrawn to
 	// not-launched — is an operational failure for a recreate, NOT a clean "not launched yet" (which
