@@ -50,6 +50,9 @@ COMMANDS
                            installation is present
                              --abandon   abandon an in-progress restore, removing the partial
                                          volumes it created under their recorded identity
+  migrate-storage <product> <role> --to-bind PATH
+                           move a product's storage from its named volume to a host directory
+                             --map-foreign-to-operator   map foreign-uid entries to the operator
 
 OPTIONS
   --index PATH             the family index (default: ~/.mythical/.state/index)
@@ -95,6 +98,8 @@ func runEnv(args, env []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runBackup(o, stdin, stdout, stderr)
 	case "restore":
 		return runRestore(o, stdin, stdout, stderr)
+	case "migrate-storage":
+		return migrateStorage(o, stderr)
 	case "-v", "--version":
 		fmt.Fprintf(stdout, "mythical-ctl %s\n", version.Version)
 		return cliio.ExitOK
