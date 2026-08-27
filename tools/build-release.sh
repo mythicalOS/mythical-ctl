@@ -25,7 +25,12 @@
 #                   checkout location and module cache do not travel inside the binary
 #   -buildvcs=false no commit hash, no commit time, no dirty flag — a VCS stamp is a timestamp
 #                   with extra steps, and it makes a build from an exported tree differ from a
-#                   build from a checkout of the same source
+#                   build from a checkout of the same source. MEASURED: removing this flag makes
+#                   all four targets differ between the two builds of the --repro check — but
+#                   only in a checkout whose .git is a real directory. Where .git is a FILE (a
+#                   linked worktree, a submodule) the go command recognises no VCS at all and
+#                   stamps nothing even under -buildvcs=true, so that flavour of checkout cannot
+#                   demonstrate the flag either way. CI clones normally, and does.
 #   -ldflags -s -w  strip the symbol table and DWARF; smaller, and nothing in them is contract
 #   -X ...Version=  the version stamp — see the note on the linker's silence below
 #   GOTOOLCHAIN     pinned: two Go releases do not emit the same bytes, so "same source" is only

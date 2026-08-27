@@ -337,11 +337,14 @@ func checkBuildInfo(path string, t Target) error {
 	if err != nil {
 		return fmt.Errorf("reading build info: %w", err)
 	}
-	if bi.Path != mainPackage {
-		return fmt.Errorf("built from %q, want %q", bi.Path, mainPackage)
-	}
+	// Module before package, deliberately: a binary from a different module also has a
+	// different main-package path, so checking the package first would leave the module check
+	// with no input that can reach it.
 	if bi.Main.Path != modulePath {
 		return fmt.Errorf("main module is %q, want %q", bi.Main.Path, modulePath)
+	}
+	if bi.Path != mainPackage {
+		return fmt.Errorf("built from %q, want %q", bi.Path, mainPackage)
 	}
 	settings := map[string]string{}
 	for _, s := range bi.Settings {

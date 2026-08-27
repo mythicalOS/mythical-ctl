@@ -255,15 +255,21 @@ func TestCheckBuildInfoAcceptsAReleaseBuild(t *testing.T) {
 // The GOOS/GOARCH suffix in the file name is a claim; the build info is the fact. A file that
 // is a copy of another platform's build must not pass under this name.
 func TestCheckArtifactRefusesTheWrongPlatform(t *testing.T) {
-	var other Target
+	// EVERY other target, not just the first one. The matrix contains neighbours that differ
+	// from the host in GOOS alone and in GOARCH alone; checking one of them would leave the
+	// other field's assertion unexercised, which is how a half-checked platform claim survives.
+	checked := 0
 	for _, tg := range targets {
-		if tg != hostTarget {
-			other = tg
-			break
+		if tg == hostTarget {
+			continue
 		}
+		checked++
+		_, err := checkArtifact(hostArtifact, tg, testVersion, forbidNothingReal())
+		mustFail(t, err, "build setting")
 	}
-	_, err := checkArtifact(hostArtifact, other, testVersion, forbidNothingReal())
-	mustFail(t, err, "build setting")
+	if checked == 0 {
+		t.Fatal("no non-host target to check against")
+	}
 }
 
 // --- truncation and permissions ---------------------------------------------------------
@@ -340,10 +346,15 @@ func TestCheckSumsRefusals(t *testing.T) {
 	}
 }
 
+// The refusal must name the MISSING FILE, not fall through to "the file is empty": an absent
+// checksum file and an empty one are different accidents, and reading a missing file as empty
+// is how a checksum step ends up passing on nothing at all.
 func TestCheckSumsRefusesAMissingFile(t *testing.T) {
 	dir := t.TempDir()
 	_, arts := sumsFixture(t, "")
-	mustFail(t, checkSums(filepath.Join(dir, sumsName), arts), sumsName)
+	err := checkSums(filepath.Join(dir, sumsName), arts)
+	mustFail(t, err, sumsName)
+	mustFail(t, err, "no such file")
 }
 
 // --- the directory as a whole ---------------------------------------------------------------
@@ -491,6 +502,13 @@ func TestTargetsSubcommandPrintsTheMatrix(t *testing.T) {
 	}
 }
 
+// os.Stat("") errors too, so an untightened test cannot tell the missing-flag refusal from an
+// accidental one. The message is the contract here: it is what tells a caller what to fix.
+func TestRunVerifyRequiresADirFlag(t *testing.T) {
+	err := run([]string{"verify", "--version", "1.2.3", "--forbid", "/x"}, &bytes.Buffer{})
+	mustFail(t, err, "--dir is required")
+}
+
 func TestRunRejectsUnknownAndMalformedInvocations(t *testing.T) {
 	cases := [][]string{
 		{},
@@ -504,5 +522,138 @@ func TestRunRejectsUnknownAndMalformedInvocations(t *testing.T) {
 		if err := run(args, &bytes.Buffer{}); err == nil {
 			t.Errorf("run(%q) returned nil, want an error", args)
 		}
+	}
+}
+
+// --- build provenance the artifact cannot fake -------------------------------------------
+
+func TestCheckArtifactRefusesANonRegularFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, hostTarget.Artifact())
+	if err := os.Mkdir(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, err := checkArtifact(path, hostTarget, testVersion, forbidNothingReal())
+	mustFail(t, err, "not a regular file")
+}
+
+// A different main package of THIS module: same module path, different program. The artifact
+// name says which platform it is; nothing in the name says which program it is.
+func TestCheckBuildInfoRefusesADifferentMainPackage(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "other-program")
+	cmd := exec.Command("go", "build", "-trimpath", "-buildvcs=false", "-o", out, "./tools/boundary-gate")
+	cmd.Dir = moduleRoot()
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOFLAGS=")
+	if b, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("building a second main package: %v: %s", err, b)
+	}
+	mustFail(t, checkBuildInfo(out, hostTarget), "built from")
+}
+
+func TestCheckBuildInfoRefusesAForeignModule(t *testing.T) {
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	env := append(os.Environ(), "CGO_ENABLED=0", "GOFLAGS=")
+	init := exec.Command("go", "mod", "init", "example.test/elsewhere")
+	init.Dir = src
+	init.Env = env
+	if b, err := init.CombinedOutput(); err != nil {
+		t.Fatalf("go mod init: %v: %s", err, b)
+	}
+	out := filepath.Join(src, "foreign")
+	build := exec.Command("go", "build", "-trimpath", "-buildvcs=false", "-o", out, ".")
+	build.Dir = src
+	build.Env = env
+	if b, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("building a foreign module: %v: %s", err, b)
+	}
+	mustFail(t, checkBuildInfo(out, hostTarget), "main module is")
+}
+
+// CGO_ENABLED=1 needs no C compiler for a package with no cgo in it, but it records itself in
+// the build info all the same — which is what makes the setting checkable from the artifact.
+func TestCheckBuildInfoRefusesACgoBuild(t *testing.T) {
+	out := filepath.Join(t.TempDir(), hostTarget.Artifact())
+	cmd := exec.Command("go", "build", "-trimpath", "-buildvcs=false",
+		"-ldflags", "-s -w -X "+VersionSymbolForTest+"="+testVersion,
+		"-o", out, "./cmd/mythical-ctl")
+	cmd.Dir = moduleRoot()
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=1", "GOFLAGS=")
+	if b, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("a CGO_ENABLED=1 build is not available here: %v: %s", err, b)
+	}
+	mustFail(t, checkBuildInfo(out, hostTarget), "CGO_ENABLED")
+}
+
+// --- the stamp round-trip, both spellings -------------------------------------------------
+
+// fakeCLI writes an executable that answers the version flags however the test wants. No real
+// build can answer one spelling correctly and the other wrongly, so without this the second
+// spelling would be an assertion nothing could ever falsify.
+func fakeCLI(t *testing.T, body string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "fake-cli")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestCheckStampChecksBothFlagSpellings(t *testing.T) {
+	both := fakeCLI(t, `printf 'mythical-ctl 1.2.3\n'`)
+	if err := checkStamp(both, "1.2.3"); err != nil {
+		t.Fatalf("checkStamp on a CLI that answers both spellings: %v", err)
+	}
+	// Correct for --version, wrong for -v.
+	onlyLong := fakeCLI(t, `if [ "$1" = --version ]; then printf 'mythical-ctl 1.2.3\n'; else printf 'mythical-ctl 0.0.0\n'; fi`)
+	mustFail(t, checkStamp(onlyLong, "1.2.3"), "-v printed")
+}
+
+func TestCheckStampRefusesANonZeroExit(t *testing.T) {
+	broken := fakeCLI(t, `printf 'boom\n' >&2; exit 3`)
+	mustFail(t, checkStamp(broken, "1.2.3"), "boom")
+}
+
+// --- the build script's own refusals ------------------------------------------------------
+
+func runBuildScript(t *testing.T, env []string, args ...string) (string, error) {
+	t.Helper()
+	cmd := exec.Command("bash", append([]string{filepath.Join("tools", "build-release.sh")}, args...)...)
+	cmd.Dir = moduleRoot()
+	cmd.Env = append(os.Environ(), env...)
+	b, err := cmd.CombinedOutput()
+	return string(b), err
+}
+
+func TestBuildReleaseScriptRefusesBadInvocations(t *testing.T) {
+	// Every path argument is a temp dir. If one of these guards is ever removed, the script
+	// must not be able to write build output into the working tree while proving it.
+	cases := []struct {
+		name string
+		env  []string
+		args []string
+		want string
+	}{
+		{"no arguments", nil, nil, "usage:"},
+		// The script's OWN wording, not the verifier's. Both refuse an empty version, but the
+		// script refuses it before building anything; a test that accepts either message would
+		// pass while the script had quietly stopped checking and spent four cross-compiles
+		// finding out.
+		{"empty version", nil, []string{"", t.TempDir()}, "the version argument is empty"},
+		{"too many arguments", nil, []string{"1.2.3", t.TempDir(), "extra"}, "too many arguments"},
+		{"drifted toolchain pin", []string{"GOTOOLCHAIN=go1.0.0"}, []string{"1.2.3", t.TempDir()}, "release pin"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := runBuildScript(t, tc.env, tc.args...)
+			if err == nil {
+				t.Fatalf("the script accepted %v; output:\n%s", tc.args, out)
+			}
+			if !strings.Contains(out, tc.want) {
+				t.Fatalf("refusal does not mention %q; output:\n%s", tc.want, out)
+			}
+		})
 	}
 }
