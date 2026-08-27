@@ -118,6 +118,22 @@ func TestOverlayStackPushDoesNotMutateAnEarlierValue(t *testing.T) {
 	if len(base) != 1 {
 		t.Fatalf("the base stack grew: %d", len(base))
 	}
+
+	// The case above only aliases if append happens to have left spare capacity, which is not
+	// something a test may rely on. This is the shape that ALWAYS aliases without the copy.
+	shared := make(overlayStack, 1, 8)
+	shared[0] = stubOverlay{name: "a"}
+	l2 := shared.push(stubOverlay{name: "L"})
+	r2 := shared.push(stubOverlay{name: "R"})
+	if got := l2.top().(stubOverlay).name; got != "L" {
+		t.Fatalf("the second push wrote into the first's backing array: %q", got)
+	}
+	if got := r2.top().(stubOverlay).name; got != "R" {
+		t.Fatalf("right top is %q", got)
+	}
+	if len(shared) != 1 {
+		t.Fatalf("the shared stack grew: %d", len(shared))
+	}
 }
 
 // TestPushPopCmdsCarryTheirMessages — the two Cmds are the seam an actions layer uses.

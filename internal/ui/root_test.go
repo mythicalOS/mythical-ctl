@@ -286,6 +286,49 @@ func TestRootReachesEveryLayerOnResize(t *testing.T) {
 	}
 }
 
+// TestRootResizeReachesALayerThatIsNotOnTop. Delivering a resize to the top alone leaves everything
+// beneath it laid out for the OLD terminal, and it is drawn wrong the moment it comes back — which
+// is exactly what a pop reveals.
+func TestRootResizeReachesALayerThatIsNotOnTop(t *testing.T) {
+	m := NewRoot(func() {})
+	m, _ = step(m, PushOverlayMsg{Overlay: stubOverlay{name: "under"}})
+	m, _ = step(m, PushOverlayMsg{Overlay: stubOverlay{name: "over"}})
+	m, _ = step(m, tea.WindowSizeMsg{Width: 120, Height: 50})
+	if m.Overlays() != 2 {
+		t.Fatalf("depth %d", m.Overlays())
+	}
+	for i, o := range []Overlay{m.overlays[0], m.overlays[1]} {
+		seen := o.(stubOverlay).seen
+		if len(seen) == 0 || seen[len(seen)-1] != "size" {
+			t.Fatalf("overlay %d (%q) missed the resize: %v", i, o.(stubOverlay).name, seen)
+		}
+	}
+	// Pop the top and the revealed one is already sized.
+	m, _ = step(m, PopOverlayMsg{})
+	if got := m.Overlay().(stubOverlay).name; got != "under" {
+		t.Fatalf("revealed %q", got)
+	}
+}
+
+// TestRootDataReachesEveryLayerButKeysDoNot — data is not modal; keys are.
+func TestRootDataReachesEveryLayerButKeysDoNot(t *testing.T) {
+	m := NewRoot(func() {})
+	m, _ = step(m, PushOverlayMsg{Overlay: stubOverlay{name: "under"}})
+	m, _ = step(m, PushOverlayMsg{Overlay: stubOverlay{name: "over"}})
+	m, _ = step(m, ProgressMsg{Event: verbs.ProgressEvent{Stage: "s", Detail: "d"}})
+	m, _ = step(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	under := m.overlays[0].(stubOverlay).seen
+	over := m.overlays[1].(stubOverlay).seen
+	for _, k := range under {
+		if k == "k" {
+			t.Fatalf("the key reached the layer underneath: %v", under)
+		}
+	}
+	if len(over) != 1 || over[0] != "k" {
+		t.Fatalf("the top overlay saw %v, want just the key", over)
+	}
+}
+
 // TestRootNormalisesTypedNilOverlays on every path that stores one: the push, and an overlay's own
 // Update handing one back.
 func TestRootNormalisesTypedNilOverlays(t *testing.T) {
@@ -393,10 +436,13 @@ func TestRootDrawsOnlyTheTopOverlay(t *testing.T) {
 	if got := m.Overlay().(stubOverlay).seen; len(got) != 1 || got[0] != "k" {
 		t.Fatalf("the top overlay did not get the key: %v", got)
 	}
-	// And the one underneath is untouched.
-	under := m.Overlays()
-	if under != 2 {
-		t.Fatalf("depth %d", under)
+	// And the one underneath saw NOTHING — asserting only the depth would pass an implementation
+	// that handed the key to both.
+	if m.Overlays() != 2 {
+		t.Fatalf("depth %d", m.Overlays())
+	}
+	if got := m.overlays[0].(stubOverlay).seen; len(got) != 0 {
+		t.Fatalf("the layer underneath saw %v — a modal consumes the key", got)
 	}
 }
 

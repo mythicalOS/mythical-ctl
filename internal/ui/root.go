@@ -197,10 +197,34 @@ func (m Root) broadcast(msg tea.Msg) (Root, tea.Cmd) {
 	var cmd tea.Cmd
 	m.progress, cmd = m.progress.update(msg)
 	cmds = append(cmds, cmd)
-	if m.overlays.top() != nil {
-		m, cmd = m.routeToTop(msg)
-		cmds = append(cmds, cmd)
+	// EVERY overlay, not just the visible one. The comment above this function used to say "every
+	// layer" while the code delivered to the top alone, and the difference is visible: push two
+	// overlays, resize, pop the top, and the one revealed is laid out for the OLD terminal. Data is
+	// not modal — only KEYS are, and keys never come through here.
+	m, cmd = m.routeToAll(msg)
+	cmds = append(cmds, cmd)
+	return m, tea.Batch(cmds...)
+}
+
+// routeToAll delivers one message to every overlay in the stack, bottom-up, and stores what each
+// hands back. An overlay that dissolves itself is answered and dropped, exactly as it would be at
+// the top; the rest keep their positions.
+func (m Root) routeToAll(msg tea.Msg) (Root, tea.Cmd) {
+	if len(m.overlays) == 0 {
+		return m, nil
 	}
+	next := make(overlayStack, 0, len(m.overlays))
+	var cmds []tea.Cmd
+	for _, o := range m.overlays {
+		upd, cmd := o.Update(msg)
+		cmds = append(cmds, cmd)
+		if isNilSeam(upd) {
+			dismiss(o)
+			continue
+		}
+		next = append(next, upd)
+	}
+	m.overlays = next
 	return m, tea.Batch(cmds...)
 }
 
