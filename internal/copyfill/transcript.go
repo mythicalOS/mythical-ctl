@@ -200,6 +200,25 @@ func linktargetSplit(v string) (path, target string, ok bool) {
 	if pathlen == "" || !allDigits(pathlen) {
 		return "", "", false
 	}
+	// A LEADING ZERO IS MALFORMED, and refusing it closes a silent wrong split rather than
+	// porting one. <pathlen> is a fixed-shape token, so no conforming emitter ever pads it —
+	// and the reference reads it in bash's ARITHMETIC context (`${body:0:pathlen}`), where a
+	// leading zero means OCTAL. MEASURED against the frozen lib/copy.sh:
+	//
+	//	":08"  -> bash ERRORS ("value too great for base") and the split is refused, by accident
+	//	          rather than by rule: its own digit test accepts "08" quite happily.
+	//	":010" -> bash ACCEPTS and splits the body at 8, NOT 10.
+	//
+	// That second one is the dangerous shape: the path/target boundary lands in the wrong place,
+	// so the bytes checked for an escape are not the bytes the copier disclosed as the target —
+	// which is exactly how a target that escapes gets shown as one that does not. Reading the
+	// token as decimal (as Go's parser does) would fix the boundary but diverge from the
+	// reference's refusal of ":08"; refusing any padded length covers BOTH, costs nothing a
+	// conforming copier will ever pay, and keeps the rule the module already states everywhere
+	// else — a length this core cannot read unambiguously is refused, never guessed.
+	if len(pathlen) > 1 && pathlen[0] == '0' {
+		return "", "", false
+	}
 	// The path is at least one byte and cannot be as long as the body it prefixes. Bounded on
 	// LENGTH before the arithmetic so an absurd stated length cannot overflow the conversion.
 	// Strictly less, not at most: a path length EQUAL to the body would leave an EMPTY target —

@@ -370,6 +370,15 @@ func (h *HelperImage) copy(args []string) (int, []byte) {
 	// the mapping on a DEFAULT invocation — one that never received --map-foreign.
 	case "foreign-mapped-unrequested":
 		fmt.Fprintf(&out, "mapped=%s/data/alien:4242\n", src)
+	// A ZERO-PADDED <pathlen>. The reference reads that token in bash arithmetic, where a leading
+	// zero means OCTAL — ":010" splits its body at 8, not 10 — so the escape check runs over the
+	// wrong bytes. Here the true path is 21 bytes ("/src/data/od/evillink") and the length is
+	// written "021": read as octal it is 17, read as decimal it is 21, and only one of those puts
+	// the boundary where the copier said it is. The target escapes, so a reader that lands the
+	// boundary wrong measures a different string and can miss it.
+	case "escape-padded-len":
+		out.WriteString("entry=symlink:/src/data/od/evillink\n")
+		out.WriteString("linktarget=/src/data/od/evillink../../../../etc/passwd:021\n")
 	// A symlink entry whose PATH IS NOT UNDER THE ROOT the escape rule is asked about, with an
 	// innocuous relative target. The question "does this target climb out of /src?" cannot be
 	// answered about a link that does not sit in /src, and a question that could not be asked is

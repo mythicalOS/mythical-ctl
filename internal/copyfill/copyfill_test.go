@@ -537,6 +537,14 @@ func TestLinktargetRefusals(t *testing.T) {
 		// A length field that is not a number: refused, never guessed — an unreadable target
 		// could be concealing an escape.
 		"linktarget-badlen": "could not read",
+		// A ZERO-PADDED length field, refused for the same reason and closing a silent wrong
+		// split rather than porting one. The reference reads that token in bash ARITHMETIC,
+		// where a leading zero means OCTAL: measured against the frozen lib/copy.sh, ":08"
+		// ERRORS out and ":010" splits the body at 8 instead of 10 — putting the path/target
+		// boundary in the wrong place, so the bytes checked for an escape are not the bytes the
+		// copier disclosed as its target. Here the true path is 21 bytes and the length is
+		// written "021": octal 17, decimal 21. Refusing any padded length covers both.
+		"escape-padded-len": "could not read",
 	}
 	for knob, want := range cases {
 		r := newRig(t)
