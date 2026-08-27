@@ -329,6 +329,13 @@ func (r *rig) loadLedger(st ledger.Store) *ledger.Ledger {
 	return l
 }
 
+// ledgerOnDisk reads the ledger WITHOUT taking the family lock — the only way to look while a
+// session under test is still holding it.
+func (r *rig) ledgerOnDisk() *ledger.Ledger {
+	r.t.Helper()
+	return r.loadLedger(ledger.LiveRead(r.home))
+}
+
 // ledgerNow reads the ledger the way an outside observer would.
 func (r *rig) ledgerNow() *ledger.Ledger {
 	r.t.Helper()

@@ -273,6 +273,62 @@ func (s *session) prober(ident string) (*probe.Prober, error) {
 	return p, nil
 }
 
+// sessionProber wraps the probe arm so the session's in-memory ledger cannot fall behind it.
+//
+// THE PROBE ARM WRITES THE LEDGER FILE ITSELF. Its accounting holds the family-lock token rather
+// than a ledger, so it opens a probe intent on DISK before the probe container exists and retires
+// it on disk afterwards — and on a reap it could not settle it deliberately RETAINS that intent,
+// because the container may still be standing and the intent is the only record that would ever
+// authorize removing it.
+//
+// The session, meanwhile, is holding a ledger it read before any of that. Persisting that copy
+// afterwards would write the probe intent straight back out of existence: the probe container
+// stays, nothing accounts for it, and the next verb's unaccounted gate wedges the installation
+// over an object no record points at. So the disk is adopted back INTO THE SESSION'S OWN LEDGER
+// after every probe call — including the failing ones, which are the only ones that leave
+// anything behind.
+//
+// It adopts IN PLACE rather than replacing the pointer: the bring-up sequence is holding that
+// same *ledger.Ledger and goes on editing it after the probe returns, so a fresh pointer here
+// would leave those edits on an object nothing persists.
+type sessionProber struct {
+	p bringup.Prober
+	s *session
+}
+
+func (sp sessionProber) SelfCheck(ctx context.Context, ix *trust.Index, netID string) error {
+	err := sp.p.SelfCheck(ctx, ix, netID)
+	if aerr := sp.s.adoptDisk(); aerr != nil && err == nil {
+		return aerr
+	}
+	return err
+}
+
+func (sp sessionProber) Resolve(ctx context.Context, ix *trust.Index, netID, alias string) (string, error) {
+	addr, err := sp.p.Resolve(ctx, ix, netID, alias)
+	if aerr := sp.s.adoptDisk(); aerr != nil && err == nil {
+		return addr, aerr
+	}
+	return addr, err
+}
+
+// adoptDisk re-reads the ledger from disk INTO the session's existing ledger object.
+//
+// It is reload's in-place sibling, and the difference matters: reload publishes a NEW ledger, so
+// anyone already holding the old one keeps editing a copy nothing will persist. Use this one
+// whenever something wrote the ledger file while a caller downstream is mid-sequence with the
+// session's ledger in hand.
+func (s *session) adoptDisk() error {
+	fresh, err := ledger.Read(s.st)
+	if errors.Is(err, ledger.ErrMissingLedger) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return s.l.Adopt(fresh)
+}
+
 // probeCleanup reconciles leftover probe containers before a verb mutates anything.
 //
 // A cleanup that could not verify or remove a stale probe leaves an UNRESOLVED probe intent, and
@@ -361,7 +417,7 @@ func (s *session) bringupDeps(ix *trust.Index, ident string) (bringup.Deps, erro
 	return bringup.Deps{
 		Objs:     bringupObjects{c: s.d.Engine},
 		Mut:      s.rt,
-		Probe:    p,
+		Probe:    sessionProber{p: p, s: s},
 		State:    state.Engine(s.d.Engine),
 		Index:    ix,
 		NewNonce: intent.NonceNew,

@@ -21,6 +21,7 @@ import (
 	"mythicalos.ai/ctl/internal/prov"
 	"mythicalos.ai/ctl/internal/runtime"
 	"mythicalos.ai/ctl/internal/state"
+	"mythicalos.ai/ctl/internal/trust"
 )
 
 // Inventory — the Task 22 share of tests/unit/verbs.bats and tests/acceptance/lifecycle.bats, as
@@ -1285,6 +1286,91 @@ func TestConfirmAndProgressSeams(t *testing.T) {
 	}
 	if asked != "Remove every named volume?" {
 		t.Fatalf("the seam was asked %q", asked)
+	}
+}
+
+// stubProber stands in for the probe arm. It writes the ledger FILE the way the real one does —
+// the accounting holds the lock token, not a ledger — and then fails, which is the case that
+// deliberately RETAINS what it wrote.
+type stubProber struct {
+	write func()
+	err   error
+}
+
+func (sp stubProber) SelfCheck(context.Context, *trust.Index, string) error {
+	sp.write()
+	return sp.err
+}
+
+func (sp stubProber) Resolve(context.Context, *trust.Index, string, string) (string, error) {
+	sp.write()
+	return "", sp.err
+}
+
+// TestAFailedProbeKeepsItsRetainedIntent is not a bats port — the shell has no in-memory ledger,
+// so it cannot have this bug. It is here because THIS tree does: the probe arm writes the ledger
+// file itself, and on a reap it could not settle it retains the probe intent on purpose, because
+// the container may still be standing and that intent is the only record that would ever authorize
+// removing it. A session that then persisted the copy it read earlier would write that intent
+// straight back out of existence — leaving a possibly-live probe container that nothing accounts
+// for, and an unaccounted gate that wedges every later verb over an object no record points at.
+func TestAFailedProbeKeepsItsRetainedIntent(t *testing.T) {
+	r := newRig(t)
+	r.writeProduct("p1")
+	r.mintIdentity()
+
+	s, err := openSession(r.d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.close()
+
+	acct, aerr := intent.NewProbeAccounting(s.h, time.Now)
+	if aerr != nil {
+		t.Fatal(aerr)
+	}
+	const probeName = "mythical-iprobetest-probe-nprobexxxx"
+	sp := sessionProber{s: s, p: stubProber{
+		write: func() { _ = acct.OpenProbe(probeName, "nprobexxxx") },
+		err:   errors.New("probe: the leftover probe container could not be removed — its intent is preserved"),
+	}}
+
+	if _, perr := sp.Resolve(context.Background(), nil, "netid", "mythical-p1"); perr == nil {
+		t.Fatal("the stub was supposed to fail")
+	}
+	// The session's OWN ledger now carries what the probe arm wrote, so persisting it preserves it.
+	if _, ferr := intent.Find(s.l, prov.ClassProbe, probeName); ferr != nil {
+		t.Fatalf("the session's ledger does not carry the retained probe intent: %v", ferr)
+	}
+	if perr := s.persist(); perr != nil {
+		t.Fatal(perr)
+	}
+	if _, ferr := intent.Find(r.ledgerOnDisk(), prov.ClassProbe, probeName); ferr != nil {
+		t.Fatalf("persisting the session erased the retained probe intent: %v", ferr)
+	}
+	// AND IT ADOPTS IN PLACE. The bring-up sequence holds the very ledger the session handed it and
+	// keeps editing it after the probe returns; a fresh pointer here would strand those edits on an
+	// object nothing persists.
+	held := s.l
+	if _, perr := sp.Resolve(context.Background(), nil, "netid", "mythical-p1"); perr == nil {
+		t.Fatal("the stub was supposed to fail")
+	}
+	if s.l != held {
+		t.Fatal("the session published a NEW ledger — whoever held the old one is now editing a copy nothing persists")
+	}
+	// AND THE WRAPPER IS WHAT THE BRING-UP SEQUENCE ACTUALLY GETS. Everything above is about a type
+	// nothing reaches unless bringupDeps installs it — so that is asserted too, or the fix is one
+	// assignment away from being inert with every test still green.
+	ident, ierr := s.l.IdentGet()
+	if ierr != nil {
+		t.Fatal(ierr)
+	}
+	bd, berr := s.bringupDeps(nil, ident)
+	if berr != nil {
+		t.Fatal(berr)
+	}
+	if _, ok := bd.Probe.(sessionProber); !ok {
+		t.Fatalf("the bring-up sequence is handed a %T — nothing adopts what the probe arm writes", bd.Probe)
 	}
 }
 
