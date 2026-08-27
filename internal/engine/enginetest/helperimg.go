@@ -108,6 +108,15 @@ type HelperImage struct {
 	// — the reference's HELPER_MANIFEST, HELPER_COUNT and HELPER_RESTORE_VERIFY. "" means each
 	// mode's own default, which for Count is `empty` (the freshly created volume a restore
 	// expects) and for the other two is the conforming answer.
+	//
+	// THEIR ACCEPTED VALUES ARE EXACTLY THE FROZEN FIXTURE'S, and no others. This type stands in
+	// for the pinned image's CONTRACT, so a setting invented here is a transcript the real image
+	// can never produce — and a test written against one measures a behaviour nothing will ever
+	// exhibit while reading as though it measured the image. A caller-side defence that needs a
+	// shape outside the contract (a count that is not a number, a problem record with no value)
+	// is exercised against a fake that does not claim to be this image; internal/backup's own
+	// copier fake is that vehicle. Anything unrecognised answers with the contract's own "not
+	// implemented" status (2), exactly as the reference does.
 	Manifest      string
 	Count         string
 	RestoreVerify string
@@ -670,11 +679,6 @@ func (h *HelperImage) countMode(args []string) (int, []byte) {
 	// "there are none" is exactly the fail-open this mode's caller must refuse.
 	case "silent":
 		return 0, nil
-	// `badcount`: a stated count that is not a number. It SAYS something, so the
-	// absent-observation rule does not fire and only the numeric check stands between it and a
-	// comparison against a number nobody has.
-	case "badcount":
-		return 0, []byte("checked=many\ndone=ok\n")
 	}
 	return 2, nil
 }
@@ -708,9 +712,6 @@ func (h *HelperImage) againstStdinMode(args []string, stdin []byte) (int, []byte
 	// A restored file whose MODE was not carried (an ordinary archive copy would not carry it either).
 	case "mode-dropped":
 		return h.fin(1, fmt.Sprintf("mismatch=%s/data/f:mode\nchecked=%d\ndone=ok\n", args[0], n))
-	// An EMPTY problem record: its PRESENCE is the problem, and a value-iterating reader skips it.
-	case "empty-mismatch":
-		return h.fin(1, fmt.Sprintf("mismatch=\nchecked=%d\ndone=ok\n", n))
 	// Completion claimed with NO checked= at all — nothing in the answer says the manifest was
 	// measured against anything.
 	case "nocount":
@@ -719,9 +720,6 @@ func (h *HelperImage) againstStdinMode(args []string, stdin []byte) (int, []byte
 	// than the manifest actually names.
 	case "understate":
 		return 0, []byte("checked=1\ndone=ok\n")
-	// A stated count that is not a number at all.
-	case "badcount":
-		return 0, []byte("checked=many\ndone=ok\n")
 	}
 	return 2, nil
 }
