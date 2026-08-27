@@ -24,9 +24,21 @@ USAGE
   mythical-ctl <command> [products...] [options]
 
 COMMANDS
-  (this build carries no lifecycle verbs yet — they land verb by verb; see --version)
+  backup <output-directory>
+                           write the ledger, the tree, and every named volume's contents plus its
+                           per-entry manifest and its recorded identity — copying the directory alone
+                           is not a backup
+  restore <backup-directory>
+                           restore installer state and named volumes from a backup, staging the
+                           incoming ledger before anything is created; refused while an active
+                           installation is present
+                             --abandon   abandon an in-progress restore, removing the partial
+                                         volumes it created under their recorded identity
 
 OPTIONS
+  --index PATH             the family index (default: ~/.mythical/.state/index)
+  --policy PATH            the family policy index
+  --manifest-dir PATH      where <product>.manifest files are
   -v, --version            print the version and exit
   -h, --help               print this help and exit
 
@@ -38,10 +50,9 @@ Documentation: https://docs.mythicalos.ai   Source: https://github.com/mythicalO
 
 // run holds the whole entrypoint so it can be exercised in-process: it takes the argument list
 // without argv[0] and reads and writes the streams it is handed instead of reaching for the
-// process globals. stdin is threaded now, unused yet — the confirmation-reading verbs need it,
-// and retrofitting the seam later would churn every call site.
+// process globals. stdin is what the confirmation-reading verbs read the operator's reply from,
+// so it is threaded rather than reached for.
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
-	_ = stdin
 	if len(args) == 0 {
 		fmt.Fprint(stdout, usage)
 		return cliio.ExitOK
@@ -51,10 +62,15 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	// known option after a global flag is consumed (and then ignored by that flag), an unknown
 	// option is a usage error, and a value-taking option with no value is a usage error with
 	// nothing attempted — all measured behaviors, all pinned by tests.
-	if _, rc := parseOpts(args[1:], stderr); rc >= 0 {
+	o, rc := parseOpts(args[1:], stderr)
+	if rc >= 0 {
 		return rc
 	}
 	switch verb {
+	case "backup":
+		return runBackup(o, stdin, stdout, stderr)
+	case "restore":
+		return runRestore(o, stdin, stdout, stderr)
 	case "-v", "--version":
 		fmt.Fprintf(stdout, "mythical-ctl %s\n", version.Version)
 		return cliio.ExitOK
