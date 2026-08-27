@@ -6,6 +6,13 @@
 #   bash check.sh packages   # only the "does this lane actually cover anything" guard
 #   bash check.sh go         # packages + gofmt + build + vet + boundary + test
 #   bash check.sh boundary   # only the reference-boundary gates
+#   bash check.sh release    # the RELEASE lane: builds the published platform matrix with the
+#                            # release flags, grades the artifacts, and proves byte
+#                            # reproducibility by building the whole matrix a second time from
+#                            # a different source path with a cold cache. Needs only the go
+#                            # toolchain - it is in CI's go job and in `all`, deliberately, so
+#                            # a broken release script is found on a pull request rather than
+#                            # at a tag.
 #   bash check.sh acceptance # the REAL-DAEMON lane: re-measures the daemon behaviors the
 #                            # hermetic fake asserts, against a live local daemon (needs Docker
 #                            # running, and two small pulls). The behaviors it CANNOT reach are
@@ -31,8 +38,8 @@ cd "$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 # Floors, not exact counts: the tree grows a package per port task, and each task raises these
 # two literals in its commit. Overridable ONLY so a test harness can prove the guard refuses.
-MIN_PACKAGES="${MIN_PACKAGES:-27}"
-MIN_TESTED_PACKAGES="${MIN_TESTED_PACKAGES:-27}"
+MIN_PACKAGES="${MIN_PACKAGES:-28}"
+MIN_TESTED_PACKAGES="${MIN_TESTED_PACKAGES:-28}"
 
 # The reference-boundary rules, one per line: `<guarded-import-path>:<Identifier>=<allowed
 # import path>[,<more allowed>]`. Each rule is
@@ -68,6 +75,14 @@ BOUNDARY_RULES=(
 die() {
   printf 'check.sh: ERROR: %s\n' "$*" >&2
   exit 1
+}
+
+RELEASE_OUTDIR=''
+# shellcheck disable=SC2317  # invoked via trap
+cleanup_release() {
+  if [ -n "${RELEASE_OUTDIR:-}" ]; then
+    rm -rf "$RELEASE_OUTDIR"
+  fi
 }
 step() { printf '\n=== %s ===\n' "$*"; }
 
@@ -113,6 +128,25 @@ check_boundary() {
     return 0
   fi
   go run ./tools/boundary-gate "${BOUNDARY_RULES[@]}"
+}
+
+# THE RELEASE LANE RUNS FROM THIS FILE FOR THE REASON IN THE HEADER. A release gate spelled out
+# in the release workflow instead drifts away from the pull-request lane, and it drifts lax:
+# nobody notices a check that stopped running on a path that runs a few times a year. So the
+# release build is a stage here, called identically by CI and by a person.
+#
+# The synthetic version is deliberately NOT internal/version's default. If the -X symbol path
+# ever stops resolving, a build stamped with the default would still print something plausible
+# and the round-trip would pass; stamping something the source cannot produce on its own makes
+# that failure loud.
+check_release() {
+  step "release (reproducible build)"
+  # NOT `local`: the EXIT trap fires after this function has returned, and a local would be out
+  # of scope by then -- the cleanup would run against an empty path and silently remove nothing,
+  # leaving a multi-megabyte directory behind on every run.
+  RELEASE_OUTDIR="$(mktemp -d "${TMPDIR:-/tmp}/mctl-release-check.XXXXXX")"
+  trap cleanup_release EXIT
+  bash tools/build-release.sh --repro 0.0.0-checksh "$RELEASE_OUTDIR"
 }
 
 check_acceptance() {
@@ -161,12 +195,16 @@ case "${1:-all}" in
   packages) check_packages ;;
   boundary) check_boundary ;;
   go) check_go ;;
+  release) check_release ;;
   acceptance) check_acceptance ;;
   # Reads `go test -json` output on stdin and applies the floor, so a harness can prove the
   # floor refuses; the `go` stage uses the same two functions.
   tested-floor) assert_tested_floor "$(count_ok)" ;;
-  all) check_go ;;
-  *) die "unknown stage: $1 (want one of: all, packages, boundary, go, acceptance, tested-floor)" ;;
+  all)
+    check_go
+    check_release
+    ;;
+  *) die "unknown stage: $1 (want one of: all, packages, boundary, go, release, acceptance, tested-floor)" ;;
 esac
 
 printf '\ncheck.sh: OK\n'
