@@ -907,6 +907,56 @@ func TestPhase5CatchesSilentDetachFailure(t *testing.T) {
 	}
 }
 
+// A FAILED PHASE 3 LEAVES NO PARTIAL LEDGER MUTATION — the finding this closes. The phase edits
+// the ledger as it walks the fleet (a stopped container's deferred alias check is committed
+// there and then), so a fleet whose SECOND container fails verification used to return an error
+// with the marker still at phase 2 while the FIRST container's desired state and owed check had
+// already changed. Every cardinality and agreement question this phase asks is asked before the
+// first mutation is published, so a refusal partway through must leave the caller's ledger
+// exactly as it found it.
+//
+// The whole body is asserted byte-for-byte rather than the absence of one row: a partial commit
+// that happened to add a row this test did not name would otherwise pass.
+func TestPhase3LeavesNoPartialCommitWhenALaterContainerFails(t *testing.T) {
+	ctx := context.Background()
+	r := newRig(t)
+	r.fleet(t, c1, c2)
+	// c1 is STOPPED, so phase 3 defers it — which is the branch that WRITES: it commits the
+	// desired state and the alias check owed on the target. c2 is running and fails its live
+	// verification, after c1 has already been committed.
+	r.st.down(c1)
+	for _, p := range []int{1, 2} {
+		if err := MigRun(ctx, r.l, r.d, src, tgt, p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r.d.Live = fakeLive{err: map[string]error{c2: errors.New("does not resolve on the target")}, objs: r.objs, pr: r.pr}
+
+	before := strings.Join(r.l.Lines(), "\n")
+	err := MigRun(ctx, r.l, r.d, src, tgt, 3)
+	if err == nil || !strings.Contains(err.Error(), "phase 3 verification failed for "+strconv.Quote(c2)) {
+		t.Fatalf("phase 3 did not fail on the second container: %v", err)
+	}
+	if after := strings.Join(r.l.Lines(), "\n"); after != before {
+		t.Fatalf("a failed phase 3 left the ledger changed.\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+	// And the property the byte comparison exists to protect, named: the first container's
+	// deferred check was NOT recorded, so nothing owes a verification for a migration that
+	// stopped.
+	out, oerr := state.Outstanding(r.l, c1)
+	if oerr != nil {
+		t.Fatal(oerr)
+	}
+	for _, ch := range out {
+		if ch.Param == tgt {
+			t.Fatalf("a failed phase 3 recorded %q's check on the target: %+v", c1, out)
+		}
+	}
+	if len(r.mut.disconnects) != 0 {
+		t.Fatal("a failed phase 3 detached something")
+	}
+}
+
 func TestPhase4UsesTheRecordedFleet(t *testing.T) {
 	ctx := context.Background()
 	// PHASE 4 DETACHES ONLY THE RECORDED FLEET, never a container that appeared mid-migration and

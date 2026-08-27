@@ -2,6 +2,8 @@ package intent
 
 import (
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	"mythicalos.ai/ctl/internal/famlock"
@@ -85,6 +87,25 @@ func (a *ProbeAccounting) DropProbe(name string) error {
 //
 // A record whose nonce this module refuses to read is REPORTED, not skipped: the prober's reap
 // would otherwise walk past exactly the record that needs a human.
+//
+// THIS IS A SELECTION POINT, AND THE ONE THAT MUTATES THE RUNTIME FROM WHAT IT RETURNS. The rows
+// come out of a listing rather than a keyed lookup, so Find's agreement check never sees them —
+// and what the caller does with each row is REMOVE THE CONTAINER IT NAMES and then drop the record
+// by key. Both questions Find would have asked have to be asked here instead, and they have to be
+// asked over the WHOLE list before any of it is handed back, because the caller acts on row 1
+// before it has looked at row 2:
+//
+//   - AGREEMENT. A row's `key=` is what Drop and Open address it by; its `name=` is what gets
+//     removed. Nothing makes them agree. A row keyed `probe:a` naming `b` had `b` removed and
+//     then `probe:a` dropped — the wrong container gone, and its own record left standing to say
+//     it is still there. (Asked in BOTH directions: a row whose class is `probe` while its key is
+//     not, and a row in the `probe:` key namespace whose class is not, are the same defect seen
+//     from either end, and skipping the second would hide a probe container from every reap.)
+//   - CARDINALITY. Two rows keyed `probe:p1` are two claims about one object. The listing returned
+//     both, the caller reaped the container on the first — and only THEN did the keyed Drop refuse
+//     ErrAmbiguous. The runtime had already been mutated on evidence that contradicted itself, and
+//     the refusal that was supposed to prevent it arrived one step too late. It is the ledger's own
+//     rule (Find and Del refuse a key two rows answer for), applied where a listing bypasses it.
 func (a *ProbeAccounting) ProbeIntents() ([]probe.ProbeIntent, error) {
 	l, err := a.load()
 	if err != nil {
@@ -95,15 +116,35 @@ func (a *ProbeAccounting) ProbeIntents() ([]probe.ProbeIntent, error) {
 		return nil, err
 	}
 	var out []probe.ProbeIntent
+	seen := map[string]bool{}
 	for _, rec := range rows {
 		class, _ := ledger.FieldOf(rec, "class")
-		if class != string(prov.ClassProbe) {
+		k, _ := ledger.FieldOf(rec, "key")
+		isProbe := class == string(prov.ClassProbe)
+		keyedProbe := strings.HasPrefix(k, string(prov.ClassProbe)+":")
+		if !isProbe && !keyedProbe {
 			continue
 		}
 		name, ok := ledger.FieldOf(rec, "name")
 		if !ok || name == "" {
 			return nil, errors.New("intent: a probe intent carries no name — it describes nothing that can be found or removed; preserved and reported. Run 'mythical-ctl state repair'")
 		}
+		// The key this module would MINT for what the row says it is about, against the key the row
+		// actually carries. Same function, so there is no second spelling of the key format to drift.
+		if want := key(prov.ClassProbe, name); !isProbe || k != want {
+			return nil, fmt.Errorf("intent: a probe intent is filed under %q while describing %s %q — it would be\n"+
+				"  addressed as one object and acted on as another: the container named here would be\n"+
+				"  removed and the record under that key dropped, leaving each of them accounted for by\n"+
+				"  the other. Nothing is reaped and nothing is dropped; it is PRESERVED and reported.\n"+
+				"  Run 'mythical-ctl state repair'.", k, class, name)
+		}
+		if seen[k] {
+			return nil, fmt.Errorf("intent: more than one probe intent answers for %q — two claims about one object.\n"+
+				"  Reaping on one of them and discovering the contradiction afterwards would have\n"+
+				"  removed a container on evidence that contradicts itself. Nothing is reaped;\n"+
+				"  everything is PRESERVED and reported. Run 'mythical-ctl state repair': %w", k, ledger.ErrAmbiguous)
+		}
+		seen[k] = true
 		nonce, nerr := nonceOf(rec, name)
 		if nerr != nil {
 			return nil, nerr

@@ -58,6 +58,12 @@ var (
 	// ErrNotFirstUse — a ledger exists, so this machine is not a first install. An ANSWER, not a
 	// refusal: the caller proceeds normally.
 	ErrNotFirstUse = errors.New("prov: an installer state ledger exists — not a first install")
+	// ErrMismatch — a record answered a lookup by its `key=` and then described something else.
+	// A REFUSAL, and it is spelled as a sentinel because ONE caller has to tell it apart from a
+	// read that failed: the unaccounted classifier, whose whole job is to distinguish an ANSWER
+	// ("nothing here accounts for that object") from a question that could not be asked. Everyone
+	// else propagates it, and every one of them refuses on it.
+	ErrMismatch = errors.New("prov: the record does not describe the object it was found under")
 )
 
 // ClassOK closes the vocabulary. Exported because the verbs name a class from operator input.
@@ -194,12 +200,20 @@ func (e engineObjects) Names(ctx context.Context, class Class) ([]string, error)
 // fields and nothing makes them agree. A record keyed `volume:v1` while carrying `class=container`
 // and `name=other` answers the lookup for `volume v1` and then speaks about something else.
 //
-// ONE predicate with THREE call sites — reading a record as permission to delete (Authority),
-// consuming it to build the record that outlives the object (Tombstone), and consuming an intent
-// as the first half of a confirmation (intent.Confirm). The reference had the check at the first
-// and not the second, so a record deletion authority correctly refused was quietly DESTROYED by
-// the tombstone instead. A second copy of a guard is a guard that can be deleted with nothing
-// observable changing, so there is exactly one — EXPORTED rather than duplicated across packages.
+// ONE PREDICATE, APPLIED WHERE THE ROW IS SELECTED — not at each place a row is later consumed.
+//
+// It used to be called at the three places that consumed a record most visibly (deletion
+// authority, the tombstone that outlives the object, and a confirmation's intent), and the rows
+// selected by every OTHER caller went unchecked: a generation was read off a mismatched record and
+// the record then overwritten by Record, an intent belonging to another object was reissued and
+// abandoned, and a tombstone describing something else was replaced. Checking at consumption means
+// remembering, once per consumer, forever; checking at SELECTION means a row that answers a lookup
+// for X and speaks about Y never leaves the lookup at all.
+//
+// So it has THREE call sites, and they are the three selectors: prov.Find, prov.TombstoneFind and
+// intent.Find — which is why it is EXPORTED rather than duplicated. A second copy of a guard is a
+// guard that can be deleted with nothing observable changing; a guard past which no row travels is
+// the only kind worth having.
 func Describes(fields []ledger.Field, class Class, name string) error {
 	rclass, _ := ledger.FieldOf(fields, "class")
 	rname, _ := ledger.FieldOf(fields, "name")
@@ -212,12 +226,19 @@ func Describes(fields []ledger.Field, class Class, name string) error {
 		}
 		return s
 	}
-	return fmt.Errorf("prov: the record found for %s %q does not describe it — it describes %s %q.\n"+
+	return mismatch{fmt.Errorf("prov: the record found for %s %q does not describe it — it describes %s %q.\n"+
 		"  A record that is about something else is not authority over this and is not the record OF\n"+
 		"  this either, so it is PRESERVED and reported rather than acted on.\n"+
 		"  Run 'mythical-ctl state repair'.",
-		string(class), name, shown(rclass, "class"), shown(rname, "name"))
+		string(class), name, shown(rclass, "class"), shown(rname, "name"))}
 }
+
+// mismatch answers errors.Is for ErrMismatch WITHOUT appending the sentinel's text to the
+// operator's message. The sentence above is complete; wrapping the sentinel with %w would print
+// the same fact twice, and the operator-facing text of these refusals is load-bearing.
+type mismatch struct{ error }
+
+func (mismatch) Is(target error) bool { return target == ErrMismatch }
 
 // genOK: A VALUE PARSED OUT OF A FILE IS NOT A NUMBER UNTIL IT HAS BEEN CHECKED.
 //
@@ -242,11 +263,26 @@ func genOK(s string) bool {
 
 // Find returns the object record for class/name. errors.Is(err, ledger.ErrAbsentRecord) is the
 // ANSWER "no record", never a refusal.
+//
+// THE ROW IT RETURNS DESCRIBES WHAT WAS ASKED FOR. `key`, `class` and `name` are three
+// INDEPENDENT fields and nothing in the format makes them agree, so a row keyed `volume:v1` can
+// answer this lookup while speaking about a container called something else. Every caller then
+// consumes it as the record FOR v1 — its generation is read and incremented, its nonce is compared
+// against v1's label, its `id=` becomes the network the fleet attaches to — and the row itself is
+// overwritten by the next keyed put. Refusing here is what makes "any mismatch preserves" true for
+// all of them at once instead of once per caller who remembered.
 func Find(l *ledger.Ledger, class Class, name string) ([]ledger.Field, error) {
 	if err := classCheck(class); err != nil {
 		return nil, err
 	}
-	return l.Find(kindObject, "key", key(class, name))
+	fields, err := l.Find(kindObject, "key", key(class, name))
+	if err != nil {
+		return nil, err
+	}
+	if derr := Describes(fields, class, name); derr != nil {
+		return nil, derr
+	}
+	return fields, nil
 }
 
 // Gen is the generation of the record currently held for class/name, or 0 when there is none.
@@ -279,6 +315,12 @@ func Gen(l *ledger.Ledger, class Class, name string) (uint64, error) {
 // before appending, so reinstalling SUPERSEDES rather than appending beside. An append-only log of
 // three installs otherwise leaves three claims about one object, the oldest as authoritative as
 // the newest. The `gen=` counter is diagnostic; the KEY is class+name.
+//
+// WHAT IT SUPERSEDES IS A RECORD OF THIS OBJECT, and that is the generation read's doing rather
+// than the put's: Gen goes through Find, so a row keyed here while describing something else
+// refuses BEFORE the put that would have overwritten it. Superseding is for a newer claim about
+// the same object; a claim about a DIFFERENT one is conflicting evidence, and this module never
+// resolves that by writing over it.
 func Record(l *ledger.Ledger, class Class, name, nonce string, extra ...ledger.Field) error {
 	if err := classCheck(class); err != nil {
 		return err
@@ -356,11 +398,17 @@ func Tombstone(l *ledger.Ledger, class Class, name string) error {
 	// through was already wrong for an unreadable ledger, and became a way to lose evidence the
 	// moment a lookup could also fail for AMBIGUITY — two object records read as none, then
 	// dropped by a tombstone written with an empty identity.
-	orec, err := l.Find(kindObject, "key", k)
+	//
+	// BOTH LOOKUPS GO THROUGH THIS PACKAGE'S OWN SELECTORS, which is what makes the agreement
+	// question cover the tombstone as well as the object record. Reading the tombstone with a raw
+	// keyed find checked only the row this function ended up CONSUMING: with a good object record
+	// present, a tombstone describing something else was never looked at and was replaced by the
+	// put below — the other object's only surviving account, destroyed by an unrelated removal.
+	orec, err := Find(l, class, name)
 	if err != nil && !errors.Is(err, ledger.ErrAbsentRecord) {
 		return err
 	}
-	otomb, terr := l.Find(kindTomb, "key", k)
+	otomb, terr := TombstoneFind(l, class, name)
 	if terr != nil && !errors.Is(terr, ledger.ErrAbsentRecord) {
 		return terr
 	}
@@ -378,15 +426,12 @@ func Tombstone(l *ledger.Ledger, class Class, name string) error {
 
 	nonce, gen := "", "0"
 	if rec != nil {
-		// THE RECORD MUST DESCRIBE WHAT IS BEING TOMBSTONED — the same door as deletion
-		// authority's, on the other act performed on the same record. Both sources above are
-		// found by `key=` alone; a record whose class and name describe something else was
-		// consumed here anyway, its identity copied into a tombstone for the object that was
-		// ASKED about and the record itself dropped. That is conflicting evidence REPLACED, the
-		// one thing this module may never do.
-		if derr := Describes(rec, class, name); derr != nil {
-			return derr
-		}
+		// THE RECORD DESCRIBES WHAT IS BEING TOMBSTONED — established by the selectors above, on
+		// BOTH sources, before either was read as evidence or dropped. A record whose class and
+		// name describe something else would otherwise be consumed here anyway, its identity
+		// copied into a tombstone for the object that was ASKED about and the record itself
+		// dropped: conflicting evidence REPLACED, the one thing this module may never do.
+		//
 		// A MISSING `nonce=` loses the same way. PRESENCE is the question, not emptiness: a
 		// tombstone written for an object with no record carries `nonce=` with an empty value on
 		// purpose, and a repeat removal must read that back and copy it forward unchanged.
@@ -439,11 +484,24 @@ func TombstoneDrop(l *ledger.Ledger, class Class, name string) error {
 }
 
 // TombstoneFind returns the tombstone for class/name — the surviving record of what was removed.
+//
+// It asks the same agreement question as Find, for the same reason and about the other record set.
+// Once the object record is gone the tombstone IS the account of what was there, so a tombstone
+// keyed for this object while describing another is the only record of that other object — and it
+// was being read as this one's identity, superseded by the next removal, and dropped by the next
+// confirmation.
 func TombstoneFind(l *ledger.Ledger, class Class, name string) ([]ledger.Field, error) {
 	if err := classCheck(class); err != nil {
 		return nil, err
 	}
-	return l.Find(kindTomb, "key", key(class, name))
+	fields, err := l.Find(kindTomb, "key", key(class, name))
+	if err != nil {
+		return nil, err
+	}
+	if derr := Describes(fields, class, name); derr != nil {
+		return nil, derr
+	}
+	return fields, nil
 }
 
 // NormalizeLabel folds the runtime's spellings of ABSENT into one.

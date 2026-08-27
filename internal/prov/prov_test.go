@@ -308,12 +308,18 @@ func TestTombstoneRecordMustDescribe(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	before := strings.Join(l.Lines(), "\n")
 	err := Tombstone(l, ClassVolume, "v1")
 	if err == nil || !strings.Contains(err.Error(), "does not describe it") {
 		t.Fatalf("a record about something else was consumed: %v", err)
 	}
-	if _, ferr := Find(l, ClassVolume, "v1"); ferr != nil {
-		t.Fatalf("the conflicting record was destroyed rather than preserved: %v", ferr)
+	// PRESERVATION IS ASSERTED ON THE LEDGER BODY, not by looking the record up again. Find is
+	// where the agreement question is now asked, so it REFUSES this row — asking it "is the row
+	// still there?" is asking a question it no longer answers, and a test that used it that way
+	// would report the refusal as destruction. The body is the stronger assertion anyway: it
+	// catches a row silently rewritten as well as one dropped.
+	if after := strings.Join(l.Lines(), "\n"); after != before {
+		t.Fatalf("the conflicting record was not preserved byte-for-byte.\nbefore:\n%s\nafter:\n%s", before, after)
 	}
 	// A record with NO nonce loses the same way: an empty tombstone is indistinguishable
 	// afterwards from the honest one written for an object that never had provenance.
@@ -324,11 +330,12 @@ func TestTombstoneRecordMustDescribe(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	before2 := strings.Join(l2.Lines(), "\n")
 	if err := Tombstone(l2, ClassVolume, "v2"); err == nil || !strings.Contains(err.Error(), "carries no nonce") {
 		t.Fatalf("a record with no nonce was consumed: %v", err)
 	}
-	if _, ferr := Find(l2, ClassVolume, "v2"); ferr != nil {
-		t.Fatalf("evidence destroyed: %v", ferr)
+	if after := strings.Join(l2.Lines(), "\n"); after != before2 {
+		t.Fatalf("evidence destroyed.\nbefore:\n%s\nafter:\n%s", before2, after)
 	}
 }
 
@@ -497,12 +504,15 @@ func TestAuthorityRecordMustDescribe(t *testing.T) {
 	}
 	f := newFakeObjs()
 	f.put(ClassVolume, "v1", map[string]string{LabelInstall: id, LabelNonce: "n1"})
+	before := strings.Join(l.Lines(), "\n")
 	err := Authority(ctx, l, f, ClassVolume, "v1")
 	if err == nil || !strings.Contains(err.Error(), "does not describe it") {
 		t.Fatalf("a record about another object granted authority: %v", err)
 	}
-	if _, ferr := Find(l, ClassVolume, "v1"); ferr != nil {
-		t.Fatalf("the conflicting record was not preserved: %v", ferr)
+	// On the ledger body rather than through Find — see TestTombstoneRecordMustDescribe: Find is
+	// the selector that now refuses this row, so it cannot double as a presence probe.
+	if after := strings.Join(l.Lines(), "\n"); after != before {
+		t.Fatalf("the conflicting record was not preserved.\nbefore:\n%s\nafter:\n%s", before, after)
 	}
 	// Ill-formed in a field OTHER than the selector: it matches nothing, so it is never authority,
 	// and an ordinary operation must not destroy it.
@@ -930,5 +940,78 @@ func TestGlobValueComparedLiterally(t *testing.T) {
 	f.obj["volume:v1"][LabelNonce] = "*"
 	if err := Authority(ctx, l, f, ClassVolume, "v1"); err != nil {
 		t.Fatalf("a literal '*' did not match itself: %v", err)
+	}
+}
+
+// --- a row selected by key must describe what was asked for ---------------------------------------
+
+// THE RECORD IS PROVED TO DESCRIBE THE OBJECT AT THE LOOKUP, so no consumer can be the one that
+// forgot. `key`, `class` and `name` are three independent fields; a row keyed `volume:v1` that
+// describes a network called something else answers this lookup and is then read as v1's record —
+// its generation incremented, and the row itself replaced by the keyed put that follows.
+func TestRecordRefusesToOverwriteARecordAboutSomethingElse(t *testing.T) {
+	l := &ledger.Ledger{}
+	// Checksum-valid and well-formed. Nothing about the LINE is wrong — only that it answers for
+	// one object while speaking about another, which is the case a field-level check cannot see.
+	l.ReplaceLines([]string{"object\tkey=volume:v1\tclass=network\tname=other\tnonce=n9\tgen=1"})
+	before := strings.Join(l.Lines(), "\n")
+
+	// The generation read refuses, which is what stops the put: Record's first act is to ask what
+	// generation it is superseding.
+	if _, err := Gen(l, ClassVolume, "v1"); err == nil || !strings.Contains(err.Error(), "does not describe it") {
+		t.Fatalf("a generation was read off a record about something else: %v", err)
+	}
+	err := Record(l, ClassVolume, "v1", "n1")
+	if err == nil || !strings.Contains(err.Error(), "does not describe it") {
+		t.Fatalf("a record about something else was overwritten: %v", err)
+	}
+	if !errors.Is(err, ErrMismatch) {
+		t.Fatalf("the refusal does not carry ErrMismatch, which is how the classifier tells it from an unreadable ledger: %v", err)
+	}
+	if after := strings.Join(l.Lines(), "\n"); after != before {
+		t.Fatalf("the conflicting record was not preserved.\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+	// AND SUPERSEDING STILL WORKS for a record that IS about this object — the guard refuses
+	// conflicting evidence, not a newer claim about the same thing.
+	l2 := &ledger.Ledger{}
+	if err := Record(l2, ClassVolume, "v1", "n1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := Record(l2, ClassVolume, "v1", "n2"); err != nil {
+		t.Fatalf("a legitimate re-record was refused: %v", err)
+	}
+	rows, err := l2.All("object")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("a re-record appended beside instead of superseding: %d rows", len(rows))
+	}
+	if g, _ := ledger.FieldOf(rows[0], "gen"); g != "2" {
+		t.Fatalf("gen = %q, want 2", g)
+	}
+}
+
+// THE TOMBSTONE ROW IS ASKED THE SAME QUESTION AS THE OBJECT ROW. With a good object record
+// present the tombstone is never CONSUMED — so a check on the record this function reads its
+// identity from never looks at it — and the keyed put below replaces it anyway. That row is the
+// only surviving account of whatever it actually described.
+func TestTombstoneRefusesToReplaceATombstoneAboutSomethingElse(t *testing.T) {
+	l := &ledger.Ledger{}
+	l.ReplaceLines([]string{
+		"object\tkey=volume:v1\tclass=volume\tname=v1\tnonce=n1\tgen=1",
+		"tombstone\tkey=volume:v1\tclass=container\tname=other\tnonce=n9\tgen=3",
+	})
+	before := strings.Join(l.Lines(), "\n")
+	err := Tombstone(l, ClassVolume, "v1")
+	if err == nil || !strings.Contains(err.Error(), "does not describe it") {
+		t.Fatalf("a tombstone about something else was replaced: %v", err)
+	}
+	if after := strings.Join(l.Lines(), "\n"); after != before {
+		t.Fatalf("evidence destroyed.\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+	// TombstoneFind refuses it too, and by the same route — it is the selector, not a second copy.
+	if _, ferr := TombstoneFind(l, ClassVolume, "v1"); !errors.Is(ferr, ErrMismatch) {
+		t.Fatalf("the tombstone lookup handed back a record about something else: %v", ferr)
 	}
 }

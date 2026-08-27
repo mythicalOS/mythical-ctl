@@ -64,19 +64,19 @@ func Authority(ctx context.Context, l *ledger.Ledger, objs Objects, class Class,
 		return err
 	}
 
-	// THE RECORD MUST BE ABOUT WHAT WAS ASKED ABOUT — the third door, and the one that stays shut
-	// when the other two are walked around. A record whose key says one object while its class and
-	// name describe another answers the lookup for the first and then hands this function the
-	// SECOND object's nonce, compared against the FIRST object's label — and if they happen to
-	// match, deletion of an object this installer never created is authorized.
+	// THE RECORD IS ABOUT WHAT WAS ASKED ABOUT — the third door, and the one that stays shut when
+	// the other two are walked around. A record whose key says one object while its class and name
+	// describe another answers the lookup for the first and then hands this function the SECOND
+	// object's nonce, compared against the FIRST object's label — and if they happen to match,
+	// deletion of an object this installer never created is authorized.
 	//
-	// Checked here rather than in Find: this is the only function that turns a record into
-	// permission to delete, and a check in Find as well would be a check in neither — the earlier
-	// would shadow the later.
-	if derr := Describes(fields, class, name); derr != nil {
-		return derr
-	}
-
+	// FIND ANSWERS IT, above, and the error is already returned. It used to be asked HERE instead,
+	// on the argument that this is the only function that turns a record into permission to delete
+	// and a check in both places would be a check in neither. That argument was right about the
+	// duplication and wrong about the location: the same row is also read for its generation and
+	// then overwritten, consumed into a tombstone, and read for the id a whole fleet attaches to.
+	// So the check moved to the selector, where no consumer can be forgotten, and this function
+	// stopped restating it — a guard in two places is one nobody can delete a test for.
 	recorded, _ := ledger.FieldOf(fields, "nonce")
 	if recorded == "" {
 		return fmt.Errorf("prov: the record for %q carries no nonce — preserving it and reporting.", name)

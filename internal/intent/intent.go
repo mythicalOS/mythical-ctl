@@ -207,11 +207,29 @@ func Open(l *ledger.Ledger, class prov.Class, name, nonce string, now time.Time,
 }
 
 // Find returns the intent record for class/name. ledger.ErrAbsentRecord is the ANSWER "none".
+//
+// THE ROW IT RETURNS DESCRIBES WHAT WAS ASKED FOR — prov.Describes, the same predicate at the same
+// kind of place, over the third record set selected by a `key=` its `class` and `name` are under
+// no obligation to agree with.
+//
+// What it costs when it is missing is not abstract. Reconcile reads the nonce off whatever
+// answered and REISSUES a volume with it, then confirms — and the confirmation, which does ask,
+// refuses; so the run leaves behind a volume nothing accounts for, and that stops every later
+// operation at the unaccounted gate. Abandonable ages out and Abandon then DROPS the mismatched
+// row, destroying the only record of the object it actually described. state.PlanFor reads it as
+// an unconfirmed intent for a container it is not about. One check, before any of them see a row.
 func Find(l *ledger.Ledger, class prov.Class, name string) ([]ledger.Field, error) {
 	if !prov.ClassOK(class) {
 		return nil, fmt.Errorf("intent: %q is not a provenance class", string(class))
 	}
-	return l.Find(kindIntent, "key", key(class, name))
+	fields, err := l.Find(kindIntent, "key", key(class, name))
+	if err != nil {
+		return nil, err
+	}
+	if derr := prov.Describes(fields, class, name); derr != nil {
+		return nil, derr
+	}
+	return fields, nil
 }
 
 // All lists every recorded intent. COMPLETENESS IS THE CONTRACT: one record it cannot read is a
@@ -239,7 +257,11 @@ func Confirm(l *ledger.Ledger, class prov.Class, name, nonce string, extra ...le
 	}
 	// THERE MUST BE SOMETHING THIS IS THE SECOND HALF OF. Provenance is written for an object this
 	// installer recorded that it was about to create, never on its own.
-	fields, err := l.Find(kindIntent, "key", key(class, name))
+	//
+	// Through THIS package's lookup rather than by naming the record kind here: the lookup is where
+	// the row is proved to describe what was asked for, and a second spelling of "an intent record"
+	// is a second chance for one of them to stop asking.
+	fields, err := Find(l, class, name)
 	if errors.Is(err, ledger.ErrAbsentRecord) {
 		return fmt.Errorf("intent: there is no recorded intent for %s %q, so there is nothing this\n"+
 			"  confirmation is the second half of. Provenance is written for an object this installer\n"+
@@ -248,9 +270,6 @@ func Confirm(l *ledger.Ledger, class prov.Class, name, nonce string, extra ...le
 	}
 	if err != nil {
 		return err
-	}
-	if derr := prov.Describes(fields, class, name); derr != nil {
-		return derr
 	}
 	inonce, nerr := nonceOf(fields, name)
 	if nerr != nil {
@@ -263,12 +282,14 @@ func Confirm(l *ledger.Ledger, class prov.Class, name, nonce string, extra ...le
 			"  by nothing at all. Both are PRESERVED and nothing was written.",
 			string(class), name, inonce, nonce)
 	}
-	// THREE RECORD SETS, THREE CARDINALITY QUESTIONS, ALL ASKED BEFORE ANYTHING IS WRITTEN. The
-	// intent above; the object record, which prov.Record's generation read asks for; and the
-	// TOMBSTONE, which is not covered by either — a confirmation drops it (the object is standing
-	// again, so the record of its removal is no longer the surviving account of it), and a
-	// contradiction among tombstones must refuse BEFORE the object record has been rewritten
-	// rather than after.
+	// THREE RECORD SETS, THREE CARDINALITY QUESTIONS *AND* THREE AGREEMENT QUESTIONS, ALL ASKED
+	// BEFORE ANYTHING IS WRITTEN. The intent above; the object record, which prov.Record's
+	// generation read asks for; and the TOMBSTONE, which is not covered by either — a confirmation
+	// DROPS it (the object is standing again, so the record of its removal is no longer the
+	// surviving account of it), and both a contradiction among tombstones and a tombstone that
+	// describes a different object must refuse BEFORE the object record has been rewritten rather
+	// than after. Dropping the second would delete the only surviving account of whatever it was
+	// actually about, on behalf of an object it has nothing to do with.
 	if _, terr := prov.TombstoneFind(l, class, name); terr != nil && !errors.Is(terr, ledger.ErrAbsentRecord) {
 		return terr
 	}

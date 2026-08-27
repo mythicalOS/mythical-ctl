@@ -196,12 +196,14 @@ func fleetFor(ctx context.Context, l *ledger.Ledger, objs Objects) ([]string, er
 // THE RECORD IS THE PERMISSION, THE NAME IS THE DERIVATION — and the two are separate questions.
 //
 // A container carrying this installation's label that the ledger has no record of stops the
-// migration: migrating a fleet we cannot enumerate is migrating one we cannot verify. That is
-// what the provenance lookup is for, and the record must also DESCRIBE this container — a record
-// keyed for it while describing something else is conflicting evidence, and consuming it here
-// would derive an alias for the OTHER object, which phase 2 would then attach and phase 3 would
-// "verify" against itself. (The reference reads the record's `product` field without asking that
-// question; the same latent blind spot as its root-overlap one, closed here rather than carried.)
+// migration: migrating a fleet we cannot enumerate is migrating one we cannot verify. That is what
+// the provenance lookup is for, and the record must also DESCRIBE this container — a record keyed
+// for it while describing something else is conflicting evidence, and consuming it here would
+// derive an alias for the OTHER object, which phase 2 would then attach and phase 3 would "verify"
+// against itself. prov.Find asks that question now, for every consumer of a keyed record rather
+// than for the ones that remembered; this function does not restate it, only reports it as itself.
+// (The reference reads the record's `product` field without asking at all; the same latent blind
+// spot as its root-overlap one, closed there rather than carried.)
 //
 // The alias itself is derived from the NAME, not from a `product` field — because nothing writes
 // that field for a container. Both this port and the reference record a container's provenance as
@@ -211,17 +213,22 @@ func fleetFor(ctx context.Context, l *ledger.Ledger, objs Objects) ([]string, er
 // `mythical-<identity>-<product>`, the same decomposition internal/state uses for its
 // storage-migration question.
 func aliasFor(l *ledger.Ledger, container string) (string, error) {
-	rec, err := prov.Find(l, prov.ClassContainer, container)
+	_, err := prov.Find(l, prov.ClassContainer, container)
 	if errors.Is(err, ledger.ErrAbsentRecord) {
 		return "", fmt.Errorf("netref: %q carries this installation's label but the ledger has no record of it.\n"+
 			"  Stopping the migration rather than migrating a fleet we cannot enumerate.", container)
 	}
+	// A RECORD THAT DESCRIBES SOMETHING ELSE IS REPORTED AS ITSELF. prov.Find refuses it, and the
+	// refusal names the fact; wrapping it in "could not be read from the ledger" below would tell
+	// the operator the ledger was unreadable when it was read and is contradictory — two different
+	// situations with two different remedies. The refusal is the selector's, not a second copy of
+	// the question.
+	if errors.Is(err, prov.ErrMismatch) {
+		return "", err
+	}
 	if err != nil {
 		return "", fmt.Errorf("netref: whether %q is recorded could not be read from the ledger, so the fleet cannot be\n"+
 			"  enumerated. Stopping: %w", container, err)
-	}
-	if derr := prov.Describes(rec, prov.ClassContainer, container); derr != nil {
-		return "", derr
 	}
 	ident, ierr := l.IdentGet()
 	if ierr != nil {
@@ -488,7 +495,33 @@ func MigRun(ctx context.Context, l *ledger.Ledger, d MigDeps, src, tgt string, p
 }
 
 // migPhase3 is the verification phase, and the one that decides whether phase 4 may ever detach.
+//
+// EVERY EDIT IT MAKES LANDS ON A CLONE, PUBLISHED ONLY WHEN THE WHOLE FLEET HAS PASSED. This
+// phase writes as it walks: a stopped container's deferred alias check is committed at the moment
+// that container is confirmed attached. Committing those into the caller's ledger as it went made
+// a fleet whose SECOND container failed verification return an error with the marker still at
+// phase 2 while the FIRST container's desired state and owed check had ALREADY changed — a
+// half-verified fleet recorded as if the phase had run for part of it, which no later phase can
+// resume from. A refusal must leave the caller's ledger exactly as it found it, and that includes
+// the phase-3 marker itself: the marker and the commits it stands for move together or not at all.
+//
+// THE CLONE IS ALSO WHAT THE VERIFIERS ARE ASKED AGAINST. Both seams take the ledger precisely so
+// they read the one this phase is advancing (see AttachVerifier); handing them `l` while the edits
+// went to a copy would answer from a ledger missing what this phase has already established, which
+// is the same wrong-ledger mismatch the seam exists to make impossible.
 func migPhase3(ctx context.Context, l *ledger.Ledger, d MigDeps, src, tgt string, cs []string) error {
+	cp := l.Clone()
+	if err := migPhase3On(ctx, cp, d, src, tgt, cs); err != nil {
+		return err
+	}
+	return l.Adopt(cp)
+}
+
+// migPhase3On is phase 3 against ONE ledger — the staged clone. It is a separate function rather
+// than an inline block so that every ledger reference in the body IS the staged one: where both
+// were in scope, a single missed substitution would restore the defect silently and nothing about
+// the code would look wrong.
+func migPhase3On(ctx context.Context, l *ledger.Ledger, d MigDeps, src, tgt string, cs []string) error {
 	srcPresent, err := sourcePresence(ctx, d.Objs, src)
 	if err != nil {
 		return err
@@ -674,6 +707,10 @@ func Rebind(ctx context.Context, l *ledger.Ledger, d MigDeps, target string) (st
 			if serr != nil {
 				return "", serr
 			}
+		case errors.Is(perr, prov.ErrMismatch):
+			// The record answers for this name and describes another object: reported as itself
+			// rather than as a ledger that could not be read (see aliasFor).
+			return "", perr
 		case errors.Is(perr, ledger.ErrAbsentRecord):
 			return "", errors.New("netref: there is no reference to migrate FROM and no installer-owned network is\n" +
 				"  recorded, yet containers exist — where the fleet is cannot be established, so\n" +

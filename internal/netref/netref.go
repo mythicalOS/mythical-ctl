@@ -201,15 +201,15 @@ func (e engineObjects) ContainerNets(ctx context.Context, container string) ([]N
 // Recreating it silently would strand every attached container on a network the ledger no longer
 // names, with every product reporting healthy — so every answer other than "the recorded id is
 // answered by itself" refuses.
+//
+// `rec` COMES FROM prov.Find, WHICH HAS ALREADY PROVED IT DESCRIBES `name`. That question used to
+// be asked here, because a record keyed for this name while describing something else supplies
+// THAT object's id — and this function's answer is the network the whole family is then attached
+// to, so the fleet would join a network the ledger never named. It is asked at the lookup now, for
+// every consumer of a keyed record rather than the two that remembered; both call sites below
+// report the refusal as itself. (The reference reads `id` without asking at all; the same latent
+// blind spot as its sibling in the migration alias path.)
 func adoptOwned(ctx context.Context, objs Objects, rec []ledger.Field, name string) (string, error) {
-	// THE RECORD MUST DESCRIBE THE NETWORK IT WAS FOUND UNDER before its `id` is consumed. A
-	// record keyed for this name while describing something else supplies THAT object's id, and
-	// this function's answer is the network the whole family is then attached to — so the fleet
-	// would join a network the ledger never named. (The reference reads `id` without asking; the
-	// same latent blind spot as its sibling in the migration alias path, closed here.)
-	if derr := prov.Describes(rec, prov.ClassNetwork, name); derr != nil {
-		return "", derr
-	}
 	id, ok := ledger.FieldOf(rec, "id")
 	if !ok {
 		return "", errors.New("netref: the recorded family network carries no id. A network is recorded BY its id (§6a\n" +
@@ -256,6 +256,11 @@ func OwnedEnsure(ctx context.Context, l *ledger.Ledger, objs Objects, m Mutator,
 	case ferr == nil:
 		return adoptOwned(ctx, objs, rec, name)
 	case errors.Is(ferr, ledger.ErrAbsentRecord):
+	case errors.Is(ferr, prov.ErrMismatch):
+		// A record that answers for this name and describes another object is reported as itself.
+		// It is not "could not be read": the ledger read fine and holds a contradiction, and a
+		// network is never reissued, so nothing is created either way.
+		return "", ferr
 	default:
 		return "", fmt.Errorf("netref: whether this installation already has a family network could not be read from\n"+
 			"  the ledger. Creating one now would stand a second network beside whatever is\n"+
@@ -270,6 +275,9 @@ func OwnedEnsure(ctx context.Context, l *ledger.Ledger, objs Objects, m Mutator,
 			return "", rerr
 		}
 		rec, ferr = prov.Find(l, prov.ClassNetwork, name)
+		if errors.Is(ferr, prov.ErrMismatch) {
+			return "", ferr
+		}
 		if ferr != nil {
 			return "", fmt.Errorf("netref: the network intent reconciled, but no provenance record can be read for it.\n"+
 				"  Nothing is created over it. Run 'mythical-ctl state repair': %w", ferr)

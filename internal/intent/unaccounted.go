@@ -38,16 +38,31 @@ type Finding struct {
 	Name  string
 }
 
-// accounts answers whether a ledger record accounts for what is ACTUALLY standing there: it must
-// describe this object, and its recorded nonce must be present and equal the live one. An empty
-// recorded nonce accounts for nothing — it is the value that matches everything by looking like
-// nothing.
-func accounts(rec []ledger.Field, class prov.Class, name, live string) bool {
-	if prov.Describes(rec, class, name) != nil {
-		return false
-	}
+// accounts answers whether a ledger record accounts for what is ACTUALLY standing there: its
+// recorded nonce must be present and equal the live one. An empty recorded nonce accounts for
+// nothing — it is the value that matches everything by looking like nothing.
+//
+// It no longer asks whether the record DESCRIBES the object. Both lookups below refuse a row that
+// does not, so no such row reaches here; restating it would be a guard nothing can arrive at. What
+// this classifier owes instead is to treat that refusal as the ANSWER it is — see unaccountedFor.
+func accounts(rec []ledger.Field, live string) bool {
 	recorded, _ := ledger.FieldOf(rec, "nonce")
 	return recorded != "" && live != "" && recorded == live
+}
+
+// unaccountedFor folds the two lookup outcomes that mean "nothing here accounts for this object",
+// and keeps them apart from the one that means the question could not be asked.
+//
+// ABSENT is an answer: there is no record. A MISMATCH is also an answer, and a narrower one —
+// there IS a row under that key and it is about something else, so it accounts for this object
+// exactly as little as no row at all. This is the ONE caller that has to tell that refusal apart
+// from a read that failed: everywhere else a contradictory record stops the operation, but here it
+// decides WHAT THE OPERATOR IS TOLD, and this module's only output is what it tells them. Reported
+// as FindingUnasked it would read as "the installer state could not be read", whose stated remedy
+// is to start the container runtime — advice for a machine that is answering fine and a ledger
+// that needs repair.
+func unaccountedFor(err error) bool {
+	return errors.Is(err, ledger.ErrAbsentRecord) || errors.Is(err, prov.ErrMismatch)
 }
 
 // classify decides what one object is, in the order the evidence becomes available.
@@ -90,20 +105,20 @@ func classify(ctx context.Context, l *ledger.Ledger, objs Objects, class prov.Cl
 	rec, ferr := prov.Find(l, class, name)
 	switch {
 	case ferr == nil:
-		if accounts(rec, class, name, lnonce) {
+		if accounts(rec, lnonce) {
 			return ""
 		}
-	case errors.Is(ferr, ledger.ErrAbsentRecord):
+	case unaccountedFor(ferr):
 	default:
 		return FindingUnasked
 	}
 	irec, ierr := Find(l, class, name)
 	switch {
 	case ierr == nil:
-		if accounts(irec, class, name, lnonce) {
+		if accounts(irec, lnonce) {
 			return ""
 		}
-	case errors.Is(ierr, ledger.ErrAbsentRecord):
+	case unaccountedFor(ierr):
 	default:
 		return FindingUnasked
 	}

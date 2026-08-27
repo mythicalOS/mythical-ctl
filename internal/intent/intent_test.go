@@ -1022,13 +1022,36 @@ func TestGateAccountsRules(t *testing.T) {
 		t.Fatalf("an intent accounted for a different object: %v", err)
 	}
 
-	// A RECORD DESCRIBING SOMETHING ELSE ACCOUNTS FOR NOTHING, EVEN WITH A MATCHING NONCE.
+	// A RECORD DESCRIBING SOMETHING ELSE ACCOUNTS FOR NOTHING, EVEN WITH A MATCHING NONCE — and it
+	// is reported as the ANSWER it is. The lookup refuses such a row now, so the kind reported is
+	// the property this asserts rather than a detail: folded into "could not be asked" it would
+	// still stop the gate, and would tell the operator the installer state was unreadable and to
+	// start their container runtime. It was read, it is contradictory, and it needs repair.
 	l3, id3, f3 := gateFixture(t)
 	l3.ReplaceLines(append(l3.Lines(),
 		"object\tkey=volume:v1\tclass=container\tname=other\tnonce=n1\tgen=1"))
 	f3.put(prov.ClassVolume, "v1", map[string]string{prov.LabelInstall: id3, prov.LabelNonce: "n1"})
-	if err := UnaccountedGate(ctx, l3, f3); !errors.Is(err, ErrUnaccounted) {
-		t.Fatalf("a record about something else accounted for an object: %v", err)
+	err3 := UnaccountedGate(ctx, l3, f3)
+	if !errors.Is(err3, ErrUnaccounted) {
+		t.Fatalf("a record about something else accounted for an object: %v", err3)
+	}
+	if !strings.Contains(err3.Error(), "unrecorded same-identity") {
+		t.Fatalf("a contradictory record was not reported as an unrecorded object: %v", err3)
+	}
+	if strings.Contains(err3.Error(), "could not be asked") {
+		t.Fatalf("a record that WAS read was reported as a question that could not be asked: %v", err3)
+	}
+	// The same for an INTENT describing something else — the other lookup, same fold.
+	l3b, id3b, f3b := gateFixture(t)
+	l3b.ReplaceLines(append(l3b.Lines(),
+		"intent\tkey=volume:v1\tclass=volume\tname=other\tnonce=n1\tcreated=1700000000"))
+	f3b.put(prov.ClassVolume, "v1", map[string]string{prov.LabelInstall: id3b, prov.LabelNonce: "n1"})
+	err3b := UnaccountedGate(ctx, l3b, f3b)
+	if !errors.Is(err3b, ErrUnaccounted) || !strings.Contains(err3b.Error(), "unrecorded same-identity") {
+		t.Fatalf("an intent about something else was not reported as unrecorded: %v", err3b)
+	}
+	if strings.Contains(err3b.Error(), "could not be asked") {
+		t.Fatalf("an intent that WAS read was reported as a question that could not be asked: %v", err3b)
 	}
 
 	// AN EMPTY NONCE ON BOTH SIDES IS NOT A MATCH — a record with no identity accounts for nothing,
