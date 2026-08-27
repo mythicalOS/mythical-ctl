@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"mythicalos.ai/ctl/internal/cliio"
 	"mythicalos.ai/ctl/internal/famlock"
@@ -913,5 +914,136 @@ func TestCopierSeamCarriesNoStateCapability(t *testing.T) {
 				t.Fatalf("Copier.%s returns %s (result %d)", m.Name, what, j)
 			}
 		}
+	}
+}
+
+// TestBackupCapturesATreeUnderASymlinkedHome: a tree walk does NOT follow a symlink handed to
+// it as its ROOT. On an installation whose home is itself a link — an operator who relocated
+// their storage, which is the ordinary reason to make one — a walk rooted at the raw home
+// visits that single entry, descends into nothing, and reports a complete tree having captured
+// NOTHING. A backup that silently contains no tree is the worst shape this module can produce:
+// it looks like a backup and restores an empty installation.
+func TestBackupCapturesATreeUnderASymlinkedHome(t *testing.T) {
+	r := newRig(t)
+	link := filepath.Join(canon(t, t.TempDir()), "home-link")
+	if err := os.Symlink(r.home, link); err != nil {
+		t.Fatal(err)
+	}
+	d := r.deps()
+	d.Home = link // the installation reached through its alias, exactly as an operator's env gives it
+
+	if err := Run(context.Background(), d, r.bk); err != nil {
+		t.Fatalf("Run: %v\n%s", err, r.stderr())
+	}
+	dir := canon(t, r.bk)
+	for _, p := range []string{
+		filepath.Join(dir, "tree", "mythical.conf"),
+		filepath.Join(dir, "tree", "bin", "tool"),
+		filepath.Join(dir, "tree", "bin", "alias"),
+	} {
+		if !exists(p) {
+			t.Fatalf("the tree is missing %s — the walk did not follow the symlinked home", p)
+		}
+	}
+}
+
+// TestExcludedDirectoriesArePruned: returning "skip this entry" on a DIRECTORY visits it and
+// then descends anyway, and the children carry names the exclusion list does not match — so the
+// lock's or the ledger's contents would be copied one level down while the operator was told
+// they were left out. Any of those names can genuinely BE a directory: a failed restore is
+// documented as leaving the ledger path as one.
+func TestExcludedDirectoriesArePruned(t *testing.T) {
+	r := newRig(t)
+	// The ledger must stay a readable file for the backup to run at all, so the directory case
+	// is exercised on the two names that can be directories while a backup still proceeds.
+	for _, name := range []string{"lock.d", "ledger.staging"} {
+		if err := os.MkdirAll(filepath.Join(r.home, ".state", name, "inner"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		write(t, filepath.Join(r.home, ".state", name, "inner", "leaked"), []byte("stale\n"))
+	}
+	if err := Run(context.Background(), r.deps(), r.bk); err != nil {
+		t.Fatalf("Run: %v\n%s", err, r.stderr())
+	}
+	dir := canon(t, r.bk)
+	for _, name := range []string{"lock.d", "ledger.staging"} {
+		if exists(filepath.Join(dir, "tree", ".state", name)) {
+			t.Fatalf(".state/%s was carried into the backup", name)
+		}
+		if exists(filepath.Join(dir, "tree", ".state", name, "inner", "leaked")) {
+			t.Fatalf(".state/%s was not pruned — its contents came along one level down", name)
+		}
+	}
+}
+
+// TestBackupRefusesAnOutputThatContainsTheInstallation: inside the home is fine, the walk skips
+// that subtree — but an output that IS the home, or an ancestor of it, cannot produce a
+// coherent tree, because every file the capture writes lands inside the thing being captured.
+func TestBackupRefusesAnOutputThatContainsTheInstallation(t *testing.T) {
+	r := newRig(t)
+	for _, out := range []string{r.home, filepath.Dir(r.home)} {
+		r.reset()
+		if err := Run(context.Background(), r.deps(), out); err == nil {
+			t.Fatalf("a backup was written to %q, which contains the installation", out)
+		}
+		mustContain(t, r.stderr(), "is the installer home, or contains it", "the refusal")
+		if exists(filepath.Join(out, "volumes")) {
+			t.Fatalf("the refused output directory %q was created anyway", out)
+		}
+	}
+}
+
+// TestPreservedModeKeepsTheBitsThatAreNotPermissions is the platform-independent half: the
+// permission bits alone are what Perm() returns, and a file restored without its setuid,
+// setgid or sticky bit is not the file that was backed up.
+func TestPreservedModeKeepsTheBitsThatAreNotPermissions(t *testing.T) {
+	for _, special := range []os.FileMode{os.ModeSetuid, os.ModeSetgid, os.ModeSticky} {
+		in := os.FileMode(0o750) | special
+		if got := preservedMode(in); got != in {
+			t.Fatalf("preservedMode(%v) = %v — the bit that is not a permission was dropped", in, got)
+		}
+	}
+	// And it carries nothing it should not: a type bit is not metadata to re-apply.
+	if got := preservedMode(os.ModeDir | 0o755); got != 0o755 {
+		t.Fatalf("preservedMode carried a type bit: %v", got)
+	}
+}
+
+// TestTreeCopyPreservesModeAndMtime is the on-disk half. The reference copies the tree with
+// `cp -p`. A tree whose mtimes are all "now" has lost the only evidence of when anything last
+// changed, and this module insists on exactly these facts for VOLUME contents — type, mode,
+// ownership and mtime, per entry — so dropping them on the tree would be the same promise kept
+// in one half and quietly broken in the other.
+func TestTreeCopyPreservesModeAndMtime(t *testing.T) {
+	r := newRig(t)
+	src := filepath.Join(r.home, "special")
+	write(t, src, []byte("payload\n"))
+	// setuid rather than setgid: a filesystem may refuse setgid on a file whose group the
+	// caller does not belong to, and a test that skips proves nothing.
+	_ = os.Chmod(src, os.FileMode(0o751)|os.ModeSetuid)
+	want := time.Unix(1500000000, 0)
+	if err := os.Chtimes(src, want, want); err != nil {
+		t.Fatal(err)
+	}
+	beforeFi, err := os.Stat(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Run(context.Background(), r.deps(), r.bk); err != nil {
+		t.Fatalf("Run: %v\n%s", err, r.stderr())
+	}
+	got, err := os.Stat(filepath.Join(canon(t, r.bk), "tree", "special"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Mode() != beforeFi.Mode() {
+		t.Fatalf("mode %v was captured as %v", beforeFi.Mode(), got.Mode())
+	}
+	if beforeFi.Mode()&os.ModeSetuid != 0 && got.Mode()&os.ModeSetuid == 0 {
+		t.Fatal("the setuid bit was dropped by the capture")
+	}
+	if !got.ModTime().Equal(want) {
+		t.Fatalf("mtime %v was captured as %v", want, got.ModTime())
 	}
 }

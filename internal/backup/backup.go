@@ -45,6 +45,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"mythicalos.ai/ctl/internal/cliio"
 	"mythicalos.ai/ctl/internal/famlock"
@@ -565,6 +566,23 @@ func Run(ctx context.Context, d Deps, rawDir string) error {
 		return err
 	}
 
+	// THE OUTPUT MAY NOT CONTAIN THE INSTALLATION IT IS CAPTURING. Inside the home is fine —
+	// the walk skips that subtree — but an output directory that IS the home, or an ancestor of
+	// it, cannot produce a coherent tree: every file the capture writes lands inside the thing
+	// being captured, and the exclusion has no subtree left to skip. Refused with nothing
+	// created, rather than writing a backup whose tree is a partial copy of its own output.
+	homeCanon, herr := runtime.Canon(d.Home)
+	if herr != nil {
+		d.warn("backup: the installer home (%s) does not resolve: %v", d.Home, herr)
+		return fmt.Errorf("backup: the installer home does not resolve: %w", herr)
+	}
+	if dir == homeCanon || strings.HasPrefix(homeCanon, withSep(dir)) {
+		d.warn("backup: %q is the installer home, or contains it.", dir)
+		d.warn("  A backup written there would capture its own output as part of the tree. Name a")
+		d.warn("  directory outside the installation, or one inside it.")
+		return fmt.Errorf("backup: the output directory contains the installation being captured")
+	}
+
 	lf := livePath(d.Home)
 	if !regularFile(lf) {
 		d.warn("backup: there is no installer state ledger to back up.")
@@ -674,6 +692,22 @@ func (d Deps) captureTree(dir string) error {
 	home := d.Home
 	treeRoot := filepath.Join(dir, "tree")
 
+	// THE WALK STARTS AT THE CANONICAL HOME, and this is not tidiness either. A tree walk does
+	// not follow a symlink handed to it as its ROOT: on an installation whose home is itself a
+	// link — an operator who relocated their storage, the ordinary reason to make one — the
+	// walk would visit that single entry, descend into nothing, and this function would report
+	// a complete tree having captured NOTHING, silently. (The reference has no such hole: its
+	// `find` runs inside a `cd` into the home, and `cd` follows the link.) Resolving first also
+	// makes the output-directory comparison below meaningful, since that path is canonical
+	// already — comparing a canonical path against alias-prefixed walk paths never matches, and
+	// the subtree it is meant to skip would be captured into itself.
+	root, cerr := runtime.Canon(home)
+	if cerr != nil {
+		d.warn("backup: the installer home (%s) does not resolve — refusing rather than capturing", home)
+		d.warn("  a tree from a location this process cannot name: %v", cerr)
+		return fmt.Errorf("backup: the installer home does not resolve: %w", cerr)
+	}
+
 	type entry struct {
 		path string
 		rel  string
@@ -681,15 +715,15 @@ func (d Deps) captureTree(dir string) error {
 	}
 	var entries []entry
 	var walkErr error
-	if werr := filepath.WalkDir(home, func(p string, de os.DirEntry, err error) error {
+	if werr := filepath.WalkDir(root, func(p string, de os.DirEntry, err error) error {
 		if err != nil {
 			walkErr = err
 			return err
 		}
-		if p == home {
+		if p == root {
 			return nil
 		}
-		rel, rerr := filepath.Rel(home, p)
+		rel, rerr := filepath.Rel(root, p)
 		if rerr != nil {
 			walkErr = rerr
 			return rerr
@@ -701,6 +735,15 @@ func (d Deps) captureTree(dir string) error {
 			return filepath.SkipDir
 		}
 		if excludedFromTree(rel) {
+			// PRUNED, NOT MERELY SKIPPED. Returning nil on a DIRECTORY visits it and then
+			// descends anyway, and the children carry names the exclusion list does not
+			// match — so `.state/lock/…` or `.state/ledger/…` would be copied one level
+			// down while the operator was told the lock and the ledger were left out. Any of
+			// these three names can genuinely BE a directory: a failed restore is documented
+			// as leaving the ledger path as one. The reference prunes; so does this.
+			if de.IsDir() {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		info, ierr := de.Info()
@@ -767,18 +810,34 @@ func excludedFromTree(rel string) bool {
 	return strings.HasPrefix(rel, filepath.Join(".state", "lock")+".")
 }
 
-// copyFilePreserving copies one regular file and carries its mode across, as `cp -p` does.
+// preservedMode is what a copy carries across: the permission bits AND the three that are not
+// permissions — setuid, setgid and sticky. The permission bits alone are what `Perm()` returns,
+// and a file restored without its setgid bit is not the file that was backed up; on a directory
+// that bit is what makes a whole subtree's group ownership work.
+func preservedMode(m os.FileMode) os.FileMode {
+	return m & (os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky)
+}
+
+// copyFilePreserving copies one regular file and carries its metadata across, as `cp -p` does:
+// the whole mode, and the access and modification times.
+//
+// OWNERSHIP IS NOT ATTEMPTED, and that is the same thing `cp -p` does here rather than a gap:
+// changing a file's owner requires privilege this process does not have, so the copy lands
+// owned by whoever ran it. The volumes are the half where ownership is load bearing, and there
+// it IS carried — recorded per entry in the backup's own manifest and re-applied by the copier
+// under the product's declared runtime uid.
 func copyFilePreserving(src, dst string) error {
 	fi, err := os.Stat(src)
 	if err != nil {
 		return err
 	}
+	mode := preservedMode(fi.Mode())
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, fi.Mode().Perm())
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
 	if err != nil {
 		return err
 	}
@@ -789,5 +848,11 @@ func copyFilePreserving(src, dst string) error {
 	if err := out.Close(); err != nil {
 		return err
 	}
-	return os.Chmod(dst, fi.Mode().Perm())
+	// AFTER the close: writing through the descriptor is what sets the mtime in the first
+	// place, so stamping it before would be undone by the copy itself. The mode is re-applied
+	// here too, because the open honours the process umask and the bits above it does not.
+	if err := os.Chmod(dst, mode); err != nil {
+		return err
+	}
+	return os.Chtimes(dst, time.Time{}, fi.ModTime())
 }
