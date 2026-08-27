@@ -1,6 +1,7 @@
 package verbs
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -1220,6 +1221,70 @@ func TestImageOverrideRunsWhatItRecords(t *testing.T) {
 	}
 	if _, ferr := r.ledgerNow().Find("forced", "key", "p1:image-override"); !errors.Is(ferr, ledger.ErrAbsentRecord) {
 		t.Fatalf("a plain install left the override record behind: %v", ferr)
+	}
+}
+
+// TestConfirmAndProgressSeams is not a bats port — the shell has one confirmation implementation
+// and no progress seam at all. It is here because these two seams are DEFINED by this task and
+// consumed by later ones: a front-end that runs a verb on a goroutine supplies a Confirm that
+// blocks on an overlay and a Progress that posts messages, and the verb must be unable to tell.
+// So the contract is pinned now, while there is still exactly one implementation of each.
+func TestConfirmAndProgressSeams(t *testing.T) {
+	var out, errb bytes.Buffer
+
+	// DEFAULT Progress: the plain line, on stdout, and nothing else.
+	d := Deps{Stdout: &out, Stderr: &errb}
+	d.say("stage", "%s: installed and running.", "p1")
+	if out.String() != "p1: installed and running.\n" {
+		t.Fatalf("default progress wrote %q", out.String())
+	}
+	if errb.Len() != 0 {
+		t.Fatalf("progress leaked to stderr: %q", errb.String())
+	}
+
+	// SUPPLIED Progress: it receives the event, and stdout is left alone.
+	out.Reset()
+	var got []ProgressEvent
+	d.Progress = func(ev ProgressEvent) { got = append(got, ev) }
+	d.say("install", "%s: installed and running.", "p1")
+	if len(got) != 1 || got[0].Stage != "install" || got[0].Detail != "p1: installed and running." {
+		t.Fatalf("the seam received %+v", got)
+	}
+	if out.Len() != 0 {
+		t.Fatal("a supplied Progress still wrote to stdout — the front-end would see the line twice")
+	}
+
+	// DEFAULT Confirm: the environment decides, and the prompt renders on stderr, not stdout.
+	for _, tc := range []struct {
+		env  []string
+		want bool
+	}{{[]string{"MI_CONFIRM=yes"}, true}, {[]string{"MI_CONFIRM=no"}, false}, {nil, false}} {
+		out.Reset()
+		errb.Reset()
+		c := Deps{Stdout: &out, Stderr: &errb, Env: tc.env}
+		if got := c.ask("Proceed?"); got != tc.want {
+			t.Fatalf("env %v: ask = %v, want %v", tc.env, got, tc.want)
+		}
+		if out.Len() != 0 {
+			t.Fatalf("env %v: the prompt reached stdout: %q", tc.env, out.String())
+		}
+	}
+	// A NIL STDIN IS A CLOSED STDIN, not an empty accept: with no decision in the environment the
+	// read fails, and a failed read refuses. A purge cannot be carried by a pipe that was not there.
+	if (Deps{Stderr: &errb}).ask("Proceed?") {
+		t.Fatal("a nil stdin was read as consent")
+	}
+
+	// SUPPLIED Confirm: it is asked, with the prompt, and its answer is the answer — the seam a
+	// blocking overlay plugs into.
+	asked := ""
+	sc := Deps{Stdout: &out, Stderr: &errb, Env: []string{"MI_CONFIRM=no"},
+		Confirm: func(prompt string) bool { asked = prompt; return true }}
+	if !sc.ask("Remove every named volume?") {
+		t.Fatal("the supplied Confirm was not consulted")
+	}
+	if asked != "Remove every named volume?" {
+		t.Fatalf("the seam was asked %q", asked)
 	}
 }
 
