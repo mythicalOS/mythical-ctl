@@ -333,21 +333,44 @@ func TestForeignOwnedRefused(t *testing.T) {
 	}
 
 	// ...and the product file, on BOTH read and write, which is the other frozen row.
+	//
+	// THE FIXTURE IS WRITTEN BY THE REAL WRITER FIRST, so it carries a valid integrity marker. A
+	// hand-rolled file would be TORN, and a torn file is refused by a different gate entirely — so
+	// both calls below would fail even with the uid check deleted, and this test would pass for a
+	// reason that has nothing to do with what it claims.
+	if err := ProductAdd(h, "brokkr", gidStr(), testSpec, []KV{{"MYTHICAL_BROKKR_PORT", "7480"}}); err != nil {
+		var oe *OwnershipError
+		if !errors.As(err, &oe) {
+			t.Fatalf("seeding a valid product conf: %v", err)
+		}
+	}
 	pf, perr := ProductPath(home, "brokkr")
 	if perr != nil {
 		t.Fatal(perr)
 	}
-	if err := os.WriteFile(pf, []byte("MYTHICAL_BROKKR_PORT=7480\n"), 0o600); err != nil {
-		t.Fatal(err)
+	pbefore, prerr := os.ReadFile(pf)
+	if prerr != nil {
+		t.Fatal(prerr)
+	}
+	// It loads cleanly while it is ours — so the refusals below are the OWNERSHIP change talking.
+	if _, err := LoadProduct(home, "brokkr", testSpec); err != nil {
+		t.Fatalf("the fixture does not load before the chown, so the refusals below prove nothing: %v", err)
 	}
 	if err := os.Chown(pf, 12345, -1); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := LoadProduct(home, "brokkr", testSpec); err == nil {
 		t.Fatal("LoadProduct read a foreign-owned product conf")
+	} else if !strings.Contains(err.Error(), "owned by uid") {
+		t.Fatalf("LoadProduct refused for the wrong reason — the uid gate may be gone and something else refusing: %v", err)
 	}
-	if err := ProductAdd(h, "brokkr", gidStr(), testSpec, []KV{{"MYTHICAL_BROKKR_PORT", "7480"}}); err == nil {
+	if err := ProductAdd(h, "brokkr", gidStr(), testSpec, []KV{{"MYTHICAL_BROKKR_PORT", "7481"}}); err == nil {
 		t.Fatal("ProductAdd wrote into a foreign-owned product conf")
+	} else if !strings.Contains(err.Error(), "owned by uid") {
+		t.Fatalf("ProductAdd refused for the wrong reason: %v", err)
+	}
+	if pafter, aerr := os.ReadFile(pf); aerr != nil || string(pafter) != string(pbefore) {
+		t.Fatalf("the refused product write changed the file: %v / %q", aerr, pafter)
 	}
 }
 
@@ -723,20 +746,43 @@ func TestProductMissingDistinct(t *testing.T) {
 func TestProductSymlinkRefused(t *testing.T) {
 	home := t.TempDir()
 	h := lockFor(t, home)
-	victim := filepath.Join(t.TempDir(), "victim")
-	if err := os.WriteFile(victim, []byte("keep"), 0o600); err != nil {
-		t.Fatal(err)
+
+	// THE VICTIM IS A VALID PRODUCT CONF, WRITTEN BY THE REAL WRITER, and that is what makes this
+	// test able to fail for the reason it claims. An arbitrary file is TORN, and torn is refused by
+	// a different gate entirely — so with the symlink branch deleted both calls below would still
+	// fail, and this test would pass while the guard it names was gone. (Measured: it did.)
+	other := t.TempDir()
+	oh := lockFor(t, other)
+	if err := ProductAdd(oh, "brokkr", gidStr(), testSpec, []KV{{"MYTHICAL_BROKKR_PORT", "7480"}}); err != nil {
+		var oe *OwnershipError
+		if !errors.As(err, &oe) {
+			t.Fatalf("seeding a valid victim: %v", err)
+		}
 	}
+	victim := filepath.Join(other, "brokkr.conf")
+	before, rerr := os.ReadFile(victim)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	// It loads cleanly at its own path, so nothing but the symlink can explain the refusals below.
+	if _, err := LoadProduct(other, "brokkr", testSpec); err != nil {
+		t.Fatalf("the victim does not load on its own, so the refusals below prove nothing: %v", err)
+	}
+
 	if err := os.Symlink(victim, filepath.Join(home, "brokkr.conf")); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := LoadProduct(home, "brokkr", testSpec); err == nil {
 		t.Fatal("read followed a symlink")
+	} else if !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("the read refused for the wrong reason — the symlink gate may be gone: %v", err)
 	}
 	if err := ProductAdd(h, "brokkr", gidStr(), testSpec, nil); err == nil {
 		t.Fatal("write followed a symlink")
+	} else if !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("the write refused for the wrong reason: %v", err)
 	}
-	if b, _ := os.ReadFile(victim); string(b) != "keep" {
+	if b, _ := os.ReadFile(victim); string(b) != string(before) {
 		t.Fatal("symlink target touched")
 	}
 }
@@ -1134,29 +1180,56 @@ func TestProductAddRefusesChownSentinelGid(t *testing.T) {
 // with no guard at all: they could be reordered, or two of them made to say the same thing, and
 // every suite would stay green. So they are asserted where they CAN be: on the error value itself.
 func TestOwnershipErrorNamesEachState(t *testing.T) {
+	// EACH STATE'S FACTS, POSITIVE AND NEGATIVE. "Contains one word" is not a pin: a StateModeFailed
+	// message that blamed the GROUP while still containing "mode" would satisfy it, and that is the
+	// exact wrong answer — it sends the operator to fix something that is already right.
 	seen := map[string]bool{}
 	for _, tc := range []struct {
 		state OwnershipState
-		want  string
+		want  []string
+		never []string
 	}{
-		{StateGroupFailed, "group"},
-		{StateModeFailed, "mode"},
-		{StateBothFailed, "OR mode"},
+		{StateGroupFailed,
+			[]string{"could not set the family group", "0600", "READ-ONLY"},
+			[]string{"0660", "group IS set", "OR mode"}},
+		{StateModeFailed,
+			[]string{"set the family group", "could not set mode 0660", "the group IS set, only the mode is not"},
+			[]string{"READ-ONLY", "OR mode"}},
+		{StateBothFailed,
+			[]string{"could not set the family group", "OR mode 0600", "by hand"},
+			[]string{"0660", "group IS set", "READ-ONLY"}},
 	} {
 		e := &OwnershipError{State: tc.state, Path: "/tmp/x.conf", GID: 20}
 		msg := e.Error()
-		if !strings.Contains(msg, tc.want) {
-			t.Errorf("state %d says %q, which does not name %q", tc.state, msg, tc.want)
+		for _, w := range tc.want {
+			if !strings.Contains(msg, w) {
+				t.Errorf("state %d says %q, which does not carry %q", tc.state, msg, w)
+			}
 		}
-		if !strings.Contains(msg, "/tmp/x.conf") {
-			t.Errorf("state %d does not name the file: %q", tc.state, msg)
+		for _, n := range tc.never {
+			if strings.Contains(msg, n) {
+				t.Errorf("state %d says %q, which claims %q — a fact belonging to a DIFFERENT state", tc.state, msg, n)
+			}
+		}
+		if !strings.Contains(msg, "/tmp/x.conf") || !strings.Contains(msg, "20") {
+			t.Errorf("state %d names neither the file nor the gid: %q", tc.state, msg)
 		}
 		// EACH STATE MUST BE DISTINGUISHABLE. Two states sharing a message is the regression this
-		// test exists for: an operator told "the group could not be set" when the group IS set and
-		// only the mode is wrong will look in the wrong place.
+		// test exists for.
 		if seen[msg] {
 			t.Errorf("state %d repeats another state's message verbatim: %q", tc.state, msg)
 		}
 		seen[msg] = true
+	}
+
+	// AND THE RESULT MAPPING: every one of these is an *OwnershipError, which is what separates
+	// "the bytes are committed and the ownership spec is not fully applied" (the reference's rc 5)
+	// from every plain refusal — where the bytes are NOT committed. A state that stopped being an
+	// OwnershipError would be reported as an ordinary failure and read as "nothing was written".
+	for _, st := range []OwnershipState{StateGroupFailed, StateModeFailed, StateBothFailed} {
+		var oe *OwnershipError
+		if err := error(&OwnershipError{State: st, Path: "/tmp/x.conf", GID: 20}); !errors.As(err, &oe) || oe.State != st {
+			t.Errorf("state %d does not travel as an *OwnershipError", st)
+		}
 	}
 }

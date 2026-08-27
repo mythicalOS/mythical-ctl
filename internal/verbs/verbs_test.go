@@ -1942,8 +1942,34 @@ func TestNoValueFromAProductConfReachesTheLaunch(t *testing.T) {
 			t.Fatalf("a <product>.conf value reached a mount: %+v", m)
 		}
 	}
-	// And nothing carrying it reached the daemon AT ALL — the request log is every call this
-	// install made, so a value that never appears there never had a chance to be acted on.
+	// THE NETWORK ATTACHMENT, ALIASES INCLUDED. An alias is a caller-supplied string that the daemon
+	// records and resolves; it is as much a launch argument as an env entry, and it was the half an
+	// earlier version of this test did not look at.
+	for name, ep := range info.Networks {
+		if strings.Contains(name, hostile) {
+			t.Fatalf("a <product>.conf value reached a network name: %q", name)
+		}
+		for _, a := range ep.Aliases {
+			if strings.Contains(a, hostile) {
+				t.Fatalf("a <product>.conf value reached a network alias: %q", a)
+			}
+		}
+		if strings.Contains(ep.IPAddress, hostile) {
+			t.Fatalf("a <product>.conf value reached an endpoint address: %q", ep.IPAddress)
+		}
+	}
+	// AND THE PUBLISHED PORTS, which decide what of this container is reachable from the host — the
+	// single most consequential thing a hostile value could choose.
+	for _, pb := range info.Ports {
+		for _, f := range []string{pb.ContainerPort, pb.HostIP, pb.HostPort} {
+			if strings.Contains(f, hostile) {
+				t.Fatalf("a <product>.conf value reached a published port: %+v", pb)
+			}
+		}
+	}
+	// The request log is a WEAKER backstop than it looks — the fake records method and URL, not
+	// bodies — so it is here to catch a value smuggled into a PATH or query, not as the main
+	// assertion. The typed inspect above is what actually covers the create body.
 	for _, req := range r.fake.RequestLog() {
 		if strings.Contains(req, hostile) {
 			t.Fatalf("a <product>.conf value reached the daemon in %q", req)

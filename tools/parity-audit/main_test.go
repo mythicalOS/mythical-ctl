@@ -185,21 +185,36 @@ func TestDeferralIsPhraseLevelNotWordLevel(t *testing.T) {
 	}
 }
 
+// TEST NAMES ARE NOT UNIQUE ACROSS PACKAGES — six collide in this tree — so the list is read PER
+// PACKAGE. A global set would let a package's whole share of claims survive the DELETION of the test
+// they name, because a namesake elsewhere keeps supplying it.
 func TestParseGoTestList(t *testing.T) {
 	got := parseGoTestList(lines(
 		`TestOne`,
-		`TestTwo`,
+		`TestShared`,
 		`BenchmarkThing`,
 		`ExampleThing`,
 		`ok  	mythicalos.ai/ctl/internal/x	0.004s`,
-		`?   	mythicalos.ai/ctl/internal/y	[no test files]`,
+		`TestShared`,
 		`TestingNotATest`,
+		`ok  	mythicalos.ai/ctl/internal/y	0.002s`,
+		`?   	mythicalos.ai/ctl/internal/z	[no test files]`,
 	))
-	if !got["TestOne"] || !got["TestTwo"] || !got["TestingNotATest"] {
-		t.Fatalf("missing a name: %v", got)
+	x, y := "mythicalos.ai/ctl/internal/x", "mythicalos.ai/ctl/internal/y"
+	if !got[x]["TestOne"] || !got[x]["TestShared"] {
+		t.Fatalf("package x: %v", got[x])
 	}
-	if got["BenchmarkThing"] || got["ExampleThing"] || len(got) != 3 {
-		t.Fatalf("picked up something that is not a test: %v", got)
+	if got[x]["TestingNotATest"] {
+		t.Fatalf("a later package's name leaked into an earlier one: %v", got[x])
+	}
+	if !got[y]["TestShared"] || !got[y]["TestingNotATest"] || got[y]["TestOne"] {
+		t.Fatalf("package y: %v", got[y])
+	}
+	if got[x]["BenchmarkThing"] || got[x]["ExampleThing"] {
+		t.Fatalf("picked up something that is not a test: %v", got[x])
+	}
+	if len(got["mythicalos.ai/ctl/internal/z"]) != 0 {
+		t.Fatalf("a package with no test files has names: %v", got["mythicalos.ai/ctl/internal/z"])
 	}
 }
 
@@ -331,7 +346,12 @@ var tiny = []batsPair{
 	{"tests/unit/b.bats", "one"}, // the same NAME in another file: the identity is the PAIR
 }
 
-var tinyGoTests = map[string]bool{"TestOne": true, "TestTwo": true, "TestThree": true}
+// The fixtures' claims all live in internal/x/x_test.go, so their targets resolve in package x.
+// TestElsewhere exists ONLY in another package: a claim naming it without saying so must fail.
+var tinyGoTests = map[string]map[string]bool{
+	"mythicalos.ai/ctl/internal/x": {"TestOne": true, "TestTwo": true, "TestThree": true},
+	"mythicalos.ai/ctl/internal/w": {"TestElsewhere": true, "TestOne": true},
+}
 
 // The whole-file N/A pre-declaration is a PARAMETER of the audit, not a global it reads, so these
 // tests can put a file in it and take one out. The real map is asserted separately, below.
@@ -646,7 +666,7 @@ func e2eTree(t *testing.T) (root, goList string) {
 	}
 	write("tests/parity-manifest.tsv", string(renderManifest(pairs)))
 	goList = filepath.Join(root, "golist.txt")
-	if err := os.WriteFile(goList, lines(`TestOne`, `TestThree`, `ok  	pkg	0.1s`), 0o644); err != nil {
+	if err := os.WriteFile(goList, lines(`TestOne`, `TestThree`, "ok  \tmythicalos.ai/ctl/internal/x\t0.1s"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	return root, goList
@@ -897,5 +917,58 @@ func TestAuditCoverageCatchesAClaimSplitAcrossLines(t *testing.T) {
 	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
 	if !hasProblem(r, "which is a real @test in that file") {
 		t.Fatalf("the split claim was not reported: %v", r.Problems)
+	}
+}
+
+// A PORTED target that exists ONLY in another package, with the claim not saying so, must fail.
+//
+// Go test names are not unique across packages — six collide in this tree, TestSchemaRefusals among
+// them. Resolving against a global name set lets a package's whole share of claims stay green after
+// the test they name is DELETED, because a namesake somewhere else keeps supplying the name. That is
+// a parity hole that exits 0, which is the only kind that matters.
+func TestAuditCoverageCatchesAPortedTargetInAnotherPackage(t *testing.T) {
+	c, b, st := claimsFrom(t,
+		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
+		`// PORTED: tests/unit/a.bats: "two" -> TestElsewhere`,
+		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
+	)
+	r := &report{}
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
+	if !hasProblem(r, "namesake") {
+		t.Fatalf("a target that lives only in another package was accepted: %v", r.Problems)
+	}
+}
+
+// ...and a claim that DOES name the other package resolves, because the tree's cross-package claims
+// already say where they point ("owned by internal/docfmt TestDocTypes", "enginetest/fake_test.go").
+func TestAuditCoverageAcceptsACrossPackageTargetThatNamesItsPackage(t *testing.T) {
+	c, b, st := claimsFrom(t,
+		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
+		`// PORTED: tests/unit/a.bats: "two" -> TestElsewhere (owned by internal/w, recorded here for the audit)`,
+		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
+	)
+	r := &report{}
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
+	if len(r.Problems) != 0 {
+		t.Fatalf("a cross-package claim that names its package was rejected: %v", r.Problems)
+	}
+}
+
+// A claim inside a /* */ block, on a CONTINUATION line that opens with nothing at all. This is the
+// shape the round-2 split-claim guard still missed: matching on the line's own first characters
+// cannot see it, so the block depth is tracked instead.
+func TestAuditCoverageCatchesAClaimInABlockCommentContinuation(t *testing.T) {
+	c, b, st := claimsFrom(t,
+		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
+		`// PORTED: tests/unit/a.bats: "two" -> TestTwo`,
+		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
+		`/* PORTED:`,
+		`   tests/unit/a.bats: "two" -> TestTwo, a second claim nothing reads`,
+		`*/`,
+	)
+	r := &report{}
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
+	if !hasProblem(r, "which is a real @test in that file") {
+		t.Fatalf("the block-comment continuation was not reported: %v", r.Problems)
 	}
 }

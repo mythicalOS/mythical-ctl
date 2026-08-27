@@ -41,6 +41,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -387,12 +388,19 @@ func parseInventory(rel string, content []byte) ([]claim, []malformed, []stray, 
 	var claims []claim
 	var bad []malformed
 	var strays []stray
+	inBlock := false
 	sc := bufio.NewScanner(bytes.NewReader(content))
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	line := 0
 	for sc.Scan() {
 		line++
 		text := sc.Text()
+		// Track /* */ depth BEFORE classifying the line, so a line that opens a block counts as a
+		// comment and the line after it does too. Deliberately naive about strings containing the
+		// digraphs: erring toward "this is a comment" only ever widens the stray check, and the
+		// corpus-membership scoping is what keeps that from being noisy.
+		openedInBlock := inBlock
+		inBlock = blockDepthAfter(inBlock, text)
 		if !invAny.MatchString(text) {
 			// Not in claim position. If it nevertheless names a real corpus file in claim syntax,
 			// somebody wrote a claim the audit cannot see — record it and let auditCoverage decide,
@@ -419,7 +427,11 @@ func parseInventory(rel string, content []byte) ([]claim, []malformed, []stray, 
 			if !claimWords && len(quoted) == 0 {
 				continue
 			}
-			inComment := invCommentLine.MatchString(text)
+			// A CONTINUATION LINE INSIDE A /* */ BLOCK opens with nothing at all, so matching on the
+			// line's own first characters missed exactly the shape the split-claim signal exists to
+			// catch. The block depth is tracked instead, and a line is "in a comment" if it opens as
+			// one OR the scanner is inside a block when it arrives.
+			inComment := openedInBlock || inBlock || invCommentLine.MatchString(text)
 			for _, path := range paths {
 				strays = append(strays, stray{rel, line, path, text, claimWords, inComment, quoted})
 			}
@@ -459,6 +471,22 @@ func parseInventory(rel string, content []byte) ([]claim, []malformed, []stray, 
 		return nil, nil, nil, fmt.Errorf("%s: %w", rel, err)
 	}
 	return claims, bad, strays, nil
+}
+
+// blockDepthAfter reports whether the scanner is inside a /* */ block after consuming one line.
+func blockDepthAfter(in bool, line string) bool {
+	for i := 0; i < len(line)-1; i++ {
+		if !in && line[i] == '/' && line[i+1] == '*' {
+			in = true
+			i++
+			continue
+		}
+		if in && line[i] == '*' && line[i+1] == '/' {
+			in = false
+			i++
+		}
+	}
+	return in
 }
 
 // skipDirs are not part of this module's source. third_party is a vendored submodule; dist is
@@ -504,21 +532,75 @@ func collectInventory(root string) ([]claim, []malformed, []stray, int, error) {
 	return claims, bad, strays, scanned, err
 }
 
-// parseGoTestList reads `go test -list '.*' ./...` output. Only bare Test identifiers count: the
-// stream also carries `ok  <pkg>  0.001s`, `?  <pkg> [no test files]`, Benchmark/Fuzz/Example
-// names, and build chatter.
-func parseGoTestList(content []byte) map[string]bool {
-	out := map[string]bool{}
+// parseGoTestList reads `go test -list '.*' ./...` output, KEYED BY PACKAGE. Only bare Test
+// identifiers count: the stream also carries `ok  <pkg>  0.001s`, `?  <pkg> [no test files]`,
+// Benchmark/Fuzz/Example names, and build chatter. The names for a package precede its own
+// terminator line, which is what associates them.
+//
+// PER PACKAGE, NOT A GLOBAL NAME SET, and that is not tidiness. Go test names are not unique across
+// packages — six collide in this tree (TestSchemaRefusals is defined in both internal/manifest and
+// internal/policy) — so a global set lets a package's whole share of claims stay green after its
+// test is DELETED, because a namesake somewhere else keeps supplying the name. That is a parity
+// hole that exits 0, which is the only kind that matters.
+func parseGoTestList(content []byte) map[string]map[string]bool {
+	out := map[string]map[string]bool{}
 	sc := bufio.NewScanner(bytes.NewReader(content))
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	var cur []string
 	for sc.Scan() {
 		t := strings.TrimRight(sc.Text(), "\r")
 		if m := goTestID.FindString(t); m == t && t != "" {
-			out[t] = true
+			cur = append(cur, t)
+			continue
+		}
+		// A package terminator: `ok <pkg> <time>`, `? <pkg> [no test files]`, `FAIL <pkg> ...`.
+		// ONLY a terminator flushes and resets. Benchmark, Fuzz and Example names sit BETWEEN the
+		// test names of one package, so resetting on every non-test line would discard the names
+		// before them — the whole package would arrive empty and every claim on it would report as
+		// dangling, which is loud but about the wrong thing.
+		f := strings.Fields(t)
+		if len(f) >= 2 && (f[0] == "ok" || f[0] == "?" || f[0] == "FAIL" || f[0] == "---") {
+			if out[f[1]] == nil {
+				out[f[1]] = map[string]bool{}
+			}
+			for _, n := range cur {
+				out[f[1]][n] = true
+			}
+			cur = nil
 		}
 	}
 	return out
 }
+
+// candidatePackages is where a PORTED claim's target may legitimately live: the package of the file
+// making the claim, plus any package the claim's own text names. Claims that point across a package
+// boundary already say so in prose ("owned by internal/docfmt TestDocTypes", "enginetest/fake_test.go"),
+// so this reads that prose rather than requiring a new syntax — path segments, with a `_test.go` or
+// `.go` suffix stripped, matched against each package's last segment.
+func candidatePackages(goTests map[string]map[string]bool, goFile, detail string) map[string]bool {
+	bySeg := map[string]string{}
+	for p := range goTests {
+		bySeg[path.Base(p)] = p
+	}
+	out := map[string]bool{}
+	own := path.Dir(filepath.ToSlash(goFile))
+	for p := range goTests {
+		if strings.HasSuffix(p, "/"+own) {
+			out[p] = true
+		}
+	}
+	for _, tok := range pathish.FindAllString(detail, -1) {
+		for _, seg := range strings.Split(tok, "/") {
+			seg = strings.TrimSuffix(strings.TrimSuffix(seg, "_test.go"), ".go")
+			if p, ok := bySeg[seg]; ok {
+				out[p] = true
+			}
+		}
+	}
+	return out
+}
+
+var pathish = regexp.MustCompile(`[A-Za-z0-9_./-]+`)
 
 // ---------------------------------------------------------------------------------------------
 // The audit
@@ -598,7 +680,7 @@ func laneNames() string {
 // auditCoverage is the whole claim under audit: every bats test is accounted for EXACTLY ONCE, no
 // claim names a test that does not exist, every PORTED target is a Go test that really runs, and
 // no file is waved away wholesale except the two that were pre-declared with an argument.
-func auditCoverage(r *report, pairs []batsPair, claims []claim, bad []malformed, strays []stray, goTests map[string]bool, preDeclared map[string]string) {
+func auditCoverage(r *report, pairs []batsPair, claims []claim, bad []malformed, strays []stray, goTests map[string]map[string]bool, preDeclared map[string]string) {
 	for _, b := range bad {
 		r.fail("%s:%d: inventory line does not parse (or its N/A argues nothing): %s", b.GoFile, b.GoLine, strings.TrimSpace(b.Text))
 	}
@@ -708,10 +790,35 @@ func auditCoverage(r *report, pairs []batsPair, claims []claim, bad []malformed,
 		if c.Kind != claimPorted {
 			continue
 		}
+		cands := candidatePackages(goTests, c.GoFile, c.Detail)
 		for _, t := range c.Targets {
-			if !goTests[t] {
+			found := false
+			for p := range cands {
+				if goTests[p][t] {
+					found = true
+					break
+				}
+			}
+			if found {
+				continue
+			}
+			var elsewhere []string
+			for p, names := range goTests {
+				if names[t] {
+					elsewhere = append(elsewhere, p)
+				}
+			}
+			sort.Strings(elsewhere)
+			switch len(elsewhere) {
+			case 0:
 				r.fail("%s:%d: PORTED target %s does not exist — no such test in `go test -list` output (claim: %s: %q)",
 					c.GoFile, c.GoLine, t, c.Pair.File, c.Pair.Name)
+			default:
+				// It exists, but not where this claim can be pointing. Go test names are not unique
+				// across packages, so accepting a namesake would let the intended test be deleted
+				// with every claim on it still green.
+				r.fail("%s:%d: PORTED target %s is not in this file's package and the claim does not name where it is — it exists in %s. Say which package it is in, so deleting it cannot leave this claim satisfied by a namesake (claim: %s: %q)",
+					c.GoFile, c.GoLine, t, strings.Join(elsewhere, ", "), c.Pair.File, c.Pair.Name)
 			}
 		}
 	}
@@ -848,27 +955,36 @@ func run(root, manifestRel string, writeMan bool, goLists []string, maxProblems 
 		return fmt.Errorf("scanned 0 Go files under %s — the inventory scan is pointed at the wrong tree", root)
 	}
 
-	goTests := map[string]bool{}
+	goTests := map[string]map[string]bool{}
+	names := 0
 	for _, p := range goLists {
 		content, err := os.ReadFile(p)
 		if err != nil {
 			return fmt.Errorf("reading go-test list: %w", err)
 		}
-		for t := range parseGoTestList(content) {
-			goTests[t] = true
+		for pkg, ns := range parseGoTestList(content) {
+			if goTests[pkg] == nil {
+				goTests[pkg] = map[string]bool{}
+			}
+			for n := range ns {
+				goTests[pkg][n] = true
+			}
 		}
+	}
+	for _, ns := range goTests {
+		names += len(ns)
 	}
 	// Same liveness argument one level down: an empty set of known tests would make every PORTED
 	// target unresolvable, which is loud — but an empty set arriving because nobody passed a list
 	// would make it loud for the wrong reason, and the fix would be to add the flag rather than to
 	// look at the port. Say so up front.
-	if len(goTests) == 0 {
+	if names == 0 {
 		return fmt.Errorf("no Go test names were loaded (pass --go-list <file> with `go test -list '.*' ./...` output) — PORTED targets cannot be resolved")
 	}
 
 	auditCoverage(r, pairs, claims, bad, strays, goTests, wholeFileNA)
 
-	fmt.Printf("go tree: %d files scanned, %d PORTED, %d N/A, %d Go test names known\n", scanned, r.Ported, r.NA, len(goTests))
+	fmt.Printf("go tree: %d files scanned, %d PORTED, %d N/A, %d Go test names known across %d packages\n", scanned, r.Ported, r.NA, names, len(goTests))
 	fmt.Printf("corpus: %d tests covered by a pre-declared whole-file N/A argument\n", r.WholeFileNA)
 	for _, lane := range lanes {
 		fmt.Printf("corpus: %-20s %4d tests\n", lane.prefix, r.Lanes[lane.prefix])
