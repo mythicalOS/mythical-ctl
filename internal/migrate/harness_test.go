@@ -98,7 +98,9 @@ type fakeObjs struct {
 
 func (f *fakeObjs) ContainerMounts(_ context.Context, c string) ([]engine.MountRecord, error) {
 	if f.err != nil {
-		return nil, f.err
+		// A PARTIAL ANSWER ALONGSIDE THE ERROR — the shape a real client can produce, and the one
+		// a caller that keeps the rows and drops the error would be fooled by.
+		return f.mounts[c], f.err
 	}
 	m, ok := f.mounts[c]
 	if !ok {

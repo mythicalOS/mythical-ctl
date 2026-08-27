@@ -824,4 +824,34 @@ func TestCanonDestResolvesDotDotPhysically(t *testing.T) {
 	if got == filepath.Join(baseCanon, "dest") {
 		t.Fatal("the '..' was collapsed lexically, naming a directory the operator's path does not reach")
 	}
+
+	// A `..` AS THE LEAF ITSELF is carried through literally, the way the reference's printf does,
+	// rather than folded into the parent by a cleaning join. The two name the same directory —
+	// the parent is already physical — but they are different STRINGS, and this one is recorded in
+	// the ledger and written into mythical.conf.
+	leaf, lerr := canonDest(base + "/other/child/..")
+	if lerr != nil {
+		t.Fatal(lerr)
+	}
+	childCanon, _ := runtime.Canon(child)
+	if want := childCanon + "/.."; leaf != want {
+		t.Fatalf("canonDest of a '..' leaf = %q, want the literal %q", leaf, want)
+	}
+}
+
+func TestStagingPathKeepsTheParentLiteral(t *testing.T) {
+	// THE SIBLING MUST STAY IN THE PARENT THE TRUST WALK VERIFIED. A cleaning join collapses a `..`
+	// in the parent, and with a symlink above it that names a DIFFERENT directory — one the walk
+	// never checked, and possibly on another filesystem, which is where the atomic commit stops
+	// being atomic. The reference derives it with a plain printf and no cleaning at all.
+	for _, tc := range []struct{ dest, want string }{
+		{"/safe/link/../dest", "/safe/link/../.mythical-staging-nz"},
+		{"/safe/dest", "/safe/.mythical-staging-nz"},
+		{"/safe/dest/", "/safe/.mythical-staging-nz"},
+		{"/dest", "/.mythical-staging-nz"},
+	} {
+		if got := StagingPath(tc.dest, "nz"); got != tc.want {
+			t.Fatalf("StagingPath(%q) = %q, want %q", tc.dest, got, tc.want)
+		}
+	}
 }

@@ -83,7 +83,23 @@ func splitPath(p string) (dir, base string) {
 
 func StagingPath(dest, nonce string) string {
 	dir, _ := splitPath(dest)
-	return filepath.Join(dir, ".mythical-staging-"+nonce)
+	return joinLiteral(dir, ".mythical-staging-"+nonce)
+}
+
+// joinLiteral appends ONE component the way the reference's printf does — WITHOUT the lexical
+// cleaning filepath.Join performs. Join would collapse a `..` in the parent, which names a
+// different directory whenever a component above it is a symlink, and the sibling this derives is
+// required to be in the SAME parent the trust walk verified and on the SAME filesystem the atomic
+// commit needs. Cleaning it could move it out of both.
+//
+// The one deviation from a literal printf: a parent of "/" yields "/name" rather than "//name".
+// They name the same file on every platform this ships to, and exactly two leading slashes are
+// implementation-defined in POSIX — so the redundant separator is dropped rather than emitted.
+func joinLiteral(dir, name string) string {
+	if dir == "/" {
+		return "/" + name
+	}
+	return dir + "/" + name
 }
 
 // Identity is a path's `device:inode`. rename() PRESERVES both, which is what makes the destination
@@ -605,7 +621,10 @@ func canonDest(dest string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("migrate: the destination's parent directory %q does not resolve. Refusing: %w", pdir, err)
 	}
-	return filepath.Join(pcanon, base), nil
+	// joinLiteral, not filepath.Join, for the same reason StagingPath uses it: pcanon is already
+	// physical, so there is nothing here that WANTS cleaning, and using the cleaning join anyway
+	// would leave the one lexical step this function exists to remove sitting in its own return.
+	return joinLiteral(pcanon, base), nil
 }
 
 // Where names which of the two candidate paths carries the recorded identity.

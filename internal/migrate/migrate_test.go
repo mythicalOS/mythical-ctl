@@ -1847,3 +1847,23 @@ func TestPhase7PreparesTheReplacementBeforeRemovingTheOldOne(t *testing.T) {
 		})
 	}
 }
+
+func TestPrecheckRefusesAPartialMountInspection(t *testing.T) {
+	// POSITIVE INSPECTION MEANS THE INSPECTION SUCCEEDED. An inspection that FAILED carries no
+	// evidence, whatever rows it also returned — and half an answer that happens to contain the
+	// source volume is not an observation that the container mounts it. The reference discards the
+	// output on failure for exactly this reason; keeping the rows and dropping the error is how a
+	// failed question turns into a positive answer, and this gate stands between an operator and a
+	// destructive migration.
+	f := newFx(t)
+	// The rows DO name the source volume — the check would pass on them alone.
+	f.objs.err = errors.New("the container runtime did not finish answering")
+	err := Precheck(ctx(), f.l, f.d, testProduct, testRole, f.dest)
+	mustContain(t, err, "does not mount", f.srcvol)
+
+	// And with the inspection succeeding over the same rows, it passes.
+	f.objs.err = nil
+	if err := Precheck(ctx(), f.l, f.d, testProduct, testRole, f.dest); err != nil {
+		t.Fatalf("a successful inspection naming the source volume was refused: %v", err)
+	}
+}

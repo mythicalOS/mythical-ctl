@@ -476,7 +476,15 @@ func Precheck(ctx context.Context, l *ledger.Ledger, d Deps, product, role, dest
 	if err != nil {
 		return err
 	}
-	mounts, _ := d.Objs.ContainerMounts(ctx, container)
+	// AN INSPECTION THAT FAILED CARRIES NO EVIDENCE, WHATEVER ELSE IT ALSO RETURNED. The reference
+	// discards the output on failure (`… || mounts=""`) precisely so a partial answer cannot
+	// satisfy the check: this is a POSITIVE-inspection gate, and half an answer that happens to
+	// contain the volume is not an observation that the container mounts it. Keeping the rows and
+	// dropping the error is how a failed question becomes a positive answer.
+	mounts, merr := d.Objs.ContainerMounts(ctx, container)
+	if merr != nil {
+		mounts = nil
+	}
 	if !mountsVolume(mounts, srcvol) {
 		return fmt.Errorf("migrate: the container for %q does not mount the volume this migration would read.\n"+
 			"    expected volume: %s\n"+
