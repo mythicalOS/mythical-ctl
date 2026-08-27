@@ -53,6 +53,10 @@ COMMANDS
   migrate-storage <product> <role> --to-bind PATH
                            move a product's storage from its named volume to a host directory
                              --map-foreign-to-operator   map foreign-uid entries to the operator
+  state repair [identity]  rebuild installer state from container-runtime labels
+  state abandon-intent <class> <name>
+                           give up on a write-ahead intent whose object never appeared
+  net rebind               move this installation onto the network MYTHICAL_NET names
 
 OPTIONS
   --index PATH             the family index (default: ~/.mythical/.state/index)
@@ -118,6 +122,10 @@ func runEnv(args, env []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return status(o, env, stdin, stdout, stderr)
 	case "uninstall":
 		return uninstall(o, env, stdin, stdout, stderr)
+	case "state":
+		return stateVerb(o, env, stdin, stdout, stderr)
+	case "net":
+		return netVerb(o, env, stdin, stdout, stderr)
 	}
 	fmt.Fprintf(stderr, "mythical-ctl: unknown command: %s\n\n", verb)
 	fmt.Fprint(stderr, usage)
@@ -272,6 +280,78 @@ func uninstall(o opts, env []string, stdin io.Reader, stdout, stderr io.Writer) 
 		return verbs.UninstallFamily(context.Background(), d, o.purge)
 	}
 	return verbs.Uninstall(context.Background(), d, o.products[0], o.purge)
+}
+
+// stateVerb dispatches `state repair` and `state abandon-intent`.
+//
+// THE ARITY IS THE GATE ON BOTH, and it is checked BEFORE anything is attempted. `state repair`
+// takes at most one further operand (the chosen identity) and `state abandon-intent` exactly two —
+// a surplus operand must not be silently dropped and the command run anyway on "the first words,
+// whatever came after them": both confirm and then perform a state-deleting action, so a malformed
+// invocation is a usage error with NOTHING attempted.
+//
+// `--reinitialize` is deliberately NOT reachable from here. It begins with `-`, so the option loop
+// refuses it as an unknown option before this dispatcher runs — exactly as the frozen reference's
+// own loop does. The library verb accepts it; the CLI does not offer it.
+func stateVerb(o opts, env []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	refuse := func(msg string) int {
+		fmt.Fprintf(stderr, "mythical-ctl: %s\n", msg)
+		return cliio.ExitUsage
+	}
+	sub := ""
+	if len(o.products) > 0 {
+		sub = o.products[0]
+	}
+	switch sub {
+	case "repair":
+		if len(o.products) > 2 {
+			return refuse("state repair takes at most one identity (or --reinitialize)")
+		}
+	case "abandon-intent":
+		if len(o.products) != 3 {
+			return refuse("state abandon-intent needs exactly <class> <name>")
+		}
+	default:
+		return refuse(`state takes "repair" or "abandon-intent"`)
+	}
+	d, err := deps(o, env, stdin, stdout, stderr)
+	if err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return cliio.ExitFail
+	}
+	ctx := context.Background()
+	if sub == "repair" {
+		// The chosen identity is THREADED THROUGH. The reference parsed it and then called the
+		// library verb without it, so the library saw no choice at all and printed its "choose one
+		// explicitly" refusal even though the operator DID choose — the one documented safe recovery
+		// path was unusable from the CLI.
+		return verbs.StateRepair(ctx, d, o.products[1:])
+	}
+	return verbs.AbandonIntent(ctx, d, o.products[1], o.products[2])
+}
+
+// netVerb dispatches `net rebind`.
+//
+// EXACTLY ONE OPERAND, for the same reason: with confirmation granted non-interactively (a script,
+// or an operator who set it), this moves the whole fleet's network attachment, so a malformed
+// invocation does nothing at all.
+func netVerb(o opts, env []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	refuse := func(msg string) int {
+		fmt.Fprintf(stderr, "mythical-ctl: %s\n", msg)
+		return cliio.ExitUsage
+	}
+	if len(o.products) == 0 || o.products[0] != "rebind" {
+		return refuse(`net takes "rebind"`)
+	}
+	if len(o.products) != 1 {
+		return refuse("net rebind takes no further operands")
+	}
+	d, err := deps(o, env, stdin, stdout, stderr)
+	if err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return cliio.ExitFail
+	}
+	return verbs.NetRebind(context.Background(), d)
 }
 
 // deps assembles the verb layer's dependencies: the daemon connection, the family home, the
