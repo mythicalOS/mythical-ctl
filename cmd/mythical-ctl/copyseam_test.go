@@ -136,3 +136,52 @@ func TestCopierIdentAnswersFromTheLedgerOrStandsIn(t *testing.T) {
 		}
 	})
 }
+
+// TestNeitherVerbOptsIntoForeignUidMapping pins the adapter's zero Options as a DECISION rather
+// than a default that happens to be safe.
+//
+// FOLDING A FOREIGN UID INTO THE OPERATOR'S IS THE OPERATOR'S CALL, and neither of these verbs
+// offers the option — the dispatcher refuses --map-foreign-to-operator on both. So a copier that
+// reports a mapping on one of their copies is reporting one nobody asked for, and it is REFUSED
+// rather than logged. Both directions are pinned: the backup's read out of a volume and the
+// restore's fill back into one are separate call sites, and a mutation of either alone would
+// otherwise survive.
+func TestNeitherVerbOptsIntoForeignUidMapping(t *testing.T) {
+	t.Run("backup", func(t *testing.T) {
+		r, img := bkRig(t)
+		r.writeProduct("p1")
+		if rc := r.run(append([]string{"install", "p1"}, r.docArgs()...)...); rc != cliio.ExitOK {
+			t.Fatalf("install rc = %d\n%s", rc, r.said())
+		}
+		img.Copy = "foreign-mapped-unrequested"
+		bk := filepath.Join(safeBase(t), "backup")
+		if rc := r.run(append([]string{"backup", bk}, r.docArgs()...)...); rc != cliio.ExitFail {
+			t.Fatalf("backup rc = %d, want 1 — an unrequested mapping must refuse\n%s", rc, r.said())
+		}
+		if !strings.Contains(r.said(), "did NOT request it") {
+			t.Fatalf("the refusal is not the unrequested-mapping one:\n%s", r.said())
+		}
+	})
+
+	t.Run("restore", func(t *testing.T) {
+		r, img := bkRig(t)
+		r.writeProduct("p1")
+		if rc := r.run(append([]string{"install", "p1"}, r.docArgs()...)...); rc != cliio.ExitOK {
+			t.Fatalf("install rc = %d\n%s", rc, r.said())
+		}
+		bk := filepath.Join(safeBase(t), "backup")
+		if rc := r.run(append([]string{"backup", bk}, r.docArgs()...)...); rc != cliio.ExitOK {
+			t.Fatalf("backup rc = %d\n%s", rc, r.said())
+		}
+		if err := os.Remove(filepath.Join(r.home, ".state", "ledger")); err != nil {
+			t.Fatal(err)
+		}
+		img.Copy = "foreign-mapped-unrequested"
+		if rc := r.run(append([]string{"restore", bk}, r.docArgs()...)...); rc != cliio.ExitFail {
+			t.Fatalf("restore rc = %d, want 1 — an unrequested mapping must refuse\n%s", rc, r.said())
+		}
+		if !strings.Contains(r.said(), "did NOT request it") {
+			t.Fatalf("the refusal is not the unrequested-mapping one:\n%s", r.said())
+		}
+	})
+}

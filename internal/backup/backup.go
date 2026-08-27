@@ -197,6 +197,25 @@ func (d Deps) warn(format string, a ...any) { cliio.Warnf(d.Err, format, a...) }
 
 func (d Deps) log(format string, a ...any) { fmt.Fprintf(d.Out, format+"\n", a...) }
 
+// reported hands a SEAM's refusal to the operator before returning it.
+//
+// EVERY REFUSAL THIS MODULE MAKES IS REPORTED ON Err IN FULL PROSE and ALSO returned as an
+// error — the prose is the operator's, the error is the caller's control signal, and the caller
+// deliberately does not print it again. A refusal formed on the OTHER side of a seam is a
+// refusal all the same, and the copy module's convention is the opposite of this one: it
+// narrates on its own writers and carries its refusal in the error VALUE. Returning such an
+// error untouched therefore satisfies the caller's control flow and tells the operator nothing
+// at all — a backup that stops with exit 1 and not one word about why, which is precisely the
+// silence this module's own contract forbids. It is a seam-crossing translation, not a second
+// refusal: nothing is decided here.
+func (d Deps) reported(err error) error {
+	if err == nil {
+		return nil
+	}
+	d.warn("%v", err)
+	return err
+}
+
 // check refuses an incomplete Deps before anything is touched. Every field below is load
 // bearing on a destructive path; a zero one is a programming error, and discovering it halfway
 // through a restore is the one time it must not be discovered.
@@ -490,7 +509,7 @@ func ManifestWrite(ctx context.Context, d Deps, ch Chain, vol, out string) error
 		return err
 	}
 	if err := d.Copier.Available(ctx, ix); err != nil {
-		return err
+		return d.reported(err)
 	}
 	t, err := d.Copier.Enumerate(ctx, ix, vol)
 	if err != nil || t.Code != 0 {
@@ -676,10 +695,10 @@ func Run(ctx context.Context, d Deps, rawDir string) error {
 			return ierr
 		}
 		if err := d.Copier.Available(ctx, ix); err != nil {
-			return err
+			return d.reported(err)
 		}
 		if err := d.Copier.Run(ctx, ix, v.name, base+".data", ruid, d.OperatorUID); err != nil {
-			return err
+			return d.reported(err)
 		}
 		d.log("backup: captured volume %s (contents, per-entry manifest, and its nonce).", v.name)
 	}

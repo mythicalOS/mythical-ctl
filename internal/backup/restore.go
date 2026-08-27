@@ -374,10 +374,10 @@ func (d Deps) restoreVolume(ctx context.Context, ch Chain, dir, ident string, v 
 			return ierr
 		}
 		if aerr := d.Copier.Available(ctx, ix); aerr != nil {
-			return aerr
+			return d.reported(aerr)
 		}
 		if ferr := d.Copier.Fill(ctx, ix, datacanon, v.name, ruid, d.OperatorUID); ferr != nil {
-			return ferr
+			return d.reported(ferr)
 		}
 		// Phase 4: against THE MANIFEST'S contract, not bytes alone.
 		if verr := d.verify(ctx, ch, v.name, mancanon); verr != nil {
@@ -606,7 +606,7 @@ func (d Deps) volumeEmpty(ctx context.Context, ch Chain, vol string) (bool, erro
 		return false, ierr
 	}
 	if err := d.Copier.Available(ctx, ix); err != nil {
-		return false, err
+		return false, d.reported(err)
 	}
 	t, err := d.Copier.Count(ctx, ix, vol)
 	if err != nil || t.Code != 0 {
@@ -655,7 +655,7 @@ func (d Deps) verify(ctx context.Context, ch Chain, vol, man string) error {
 		return ierr
 	}
 	if err := d.Copier.Available(ctx, ix); err != nil {
-		return err
+		return d.reported(err)
 	}
 	fi, lerr := os.Lstat(man)
 	if lerr != nil || !fi.Mode().IsRegular() {
