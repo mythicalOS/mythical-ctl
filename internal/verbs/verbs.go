@@ -953,6 +953,20 @@ func (s *session) launchOn(ctx context.Context, l *ledger.Ledger, pc *productCon
 	if berr != nil {
 		return berr
 	}
+	return s.launchWith(ctx, l, bd, pc, cfg, desired)
+}
+
+// launchWith is the launch over dependencies the caller ALREADY BUILT.
+//
+// IT EXISTS FOR THE ONE CALLER THAT CANNOT AFFORD TO BUILD THEM LATE. Assembling the bring-up
+// dependencies is itself fallible — the probe accounting opens the ledger store, the probe arm
+// validates the installation identity and its diagnostics writer — and the storage migration
+// reaches its create only AFTER it has removed the old container, which cannot be undone. Every
+// verb above builds them at the moment of the launch, which is correct for them because nothing
+// irreversible has happened yet; the migration's rebuild seam builds them in its Prepare instead
+// and hands them here, so a failure that has nothing to do with the container itself cannot be
+// what leaves the product with none.
+func (s *session) launchWith(ctx context.Context, l *ledger.Ledger, bd bringup.Deps, pc *productContext, cfg runtime.LaunchConfig, desired bringup.Desired) error {
 	launcher := &productLauncher{rt: s.rt, m: pc.Manifest, p: pc.Policy, cfg: cfg}
 	rerr := bringup.Run(ctx, l, bd, launcher, pc.Container, cfg.NetworkID, pc.Alias, desired)
 	if err := s.persistFn()(l); err != nil {

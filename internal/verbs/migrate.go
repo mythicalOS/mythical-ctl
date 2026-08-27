@@ -300,7 +300,17 @@ func (r *rebuilder) Prepare(ctx context.Context, l *ledger.Ledger, product, cont
 	if err := s.checkLaunchable(pc, cfg); err != nil {
 		return nil, err
 	}
-	return &replacement{s: s, pc: pc, cfg: cfg}, nil
+	// THE BRING-UP DEPENDENCIES ARE BUILT HERE TOO, and this is not tidiness. Assembling them is
+	// fallible in its own right — the probe accounting opens the ledger store, the probe arm
+	// validates the installation identity and its diagnostics writer — and every one of those
+	// failures has nothing whatever to do with the container being replaced. Left to the create,
+	// they would fire AFTER the old container is gone and leave the product with none, for a
+	// reason that was fully knowable while it was still standing. (Codex gate round 3.)
+	bd, berr := s.bringupDeps(pc.Index, cfg.Identity)
+	if berr != nil {
+		return nil, berr
+	}
+	return &replacement{s: s, pc: pc, cfg: cfg, bd: bd}, nil
 }
 
 // image settles WHICH image the replacement runs.
@@ -333,9 +343,11 @@ func (r *rebuilder) image(l *ledger.Ledger, pc *productContext) (string, error) 
 
 // replacement is one prepared container, ready to be created once the old one is actually gone.
 type replacement struct {
-	s         *session
-	pc        *productContext
-	cfg       runtime.LaunchConfig
+	s   *session
+	pc  *productContext
+	cfg runtime.LaunchConfig
+	// bd is the bring-up sequence's dependencies, ASSEMBLED IN Prepare — see the note there.
+	bd        bringup.Deps
 	discarded bool
 }
 
@@ -350,7 +362,7 @@ func (rp *replacement) Create(ctx context.Context, l *ledger.Ledger) error {
 	if rp.discarded {
 		return errors.New("verbs: this replacement has been discarded and cannot be created. Nothing is built.")
 	}
-	return rp.s.launchOn(ctx, l, rp.pc, rp.cfg, bringup.Preserve)
+	return rp.s.launchWith(ctx, l, rp.bd, rp.pc, rp.cfg, bringup.Preserve)
 }
 
 // Discard releases what Prepare rendered.

@@ -475,3 +475,65 @@ func TestThePolicyAcceptanceLeavesTheCallersLedgerAbleToCarryTheFloor(t *testing
 		t.Fatalf("the caller's ledger reverted the policy floor to %q after the policy acceptance", got)
 	}
 }
+
+// TestPrepareBuildsTheBringUpDependenciesBeforeTheRemoval closes the last thing that could still
+// fail on the far side of phase 7's irreversible step.
+//
+// ASSEMBLING THE BRING-UP DEPENDENCIES IS ITSELF FALLIBLE — the probe accounting opens the ledger
+// store, the probe arm validates the installation identity and its diagnostics writer — and none
+// of those failures has anything to do with the container being replaced. Built at the create,
+// they fire AFTER the old container is gone and leave the product with none, for a reason that was
+// fully knowable while it was still standing. So Prepare builds them, and the prepared
+// replacement carries them.
+//
+// It reads the prepared value directly because that is the only place the ordering is visible: on
+// a healthy rig the late construction SUCCEEDS, so no outcome distinguishes the two — which is
+// exactly why "it worked in the test" is not evidence here.
+func TestPrepareBuildsTheBringUpDependenciesBeforeTheRemoval(t *testing.T) {
+	r, s, rb, c1, _ := preparedRig(t)
+	rep, err := rb.Prepare(context.Background(), s.l, "p1", c1, netFor(t, s, rb))
+	if err != nil {
+		t.Fatalf("prepare: %v\n%s", err, r.said())
+	}
+	defer rep.Discard()
+	rp, ok := rep.(*replacement)
+	if !ok {
+		t.Fatalf("Prepare returned a %T", rep)
+	}
+	switch {
+	case rp.bd.Probe == nil:
+		t.Fatal("Prepare left the probe arm to be built after the irreversible removal")
+	case rp.bd.Mut == nil, rp.bd.Objs == nil, rp.bd.State == nil:
+		t.Fatal("Prepare left a runtime seam to be built after the irreversible removal")
+	case rp.bd.Persist == nil:
+		t.Fatal("Prepare left the write-ahead seam to be built after the irreversible removal")
+	case rp.bd.NewNonce == nil, rp.bd.Now == nil:
+		t.Fatal("Prepare left the nonce mint or the clock to be built after the irreversible removal")
+	}
+	// AND THE PREPARED SET IS WHAT THE CREATE USES. Building them early and then ignoring them
+	// would satisfy every assertion above while changing nothing, and on a healthy rig a late
+	// rebuild SUCCEEDS — so no outcome distinguishes the two. The prepared set is therefore given
+	// a nonce mint of its own, and the nonce a bring-up mints is stamped on the container it
+	// creates as a provenance label: reading it back says which set was used.
+	rp.bd.NewNonce = func() (string, error) { return "nfixtureprepared", nil }
+	if err := s.rt.ContainerRemove(context.Background(), c1); err != nil {
+		t.Fatal(err)
+	}
+	if cerr := rep.Create(context.Background(), s.l); cerr != nil {
+		t.Fatalf("create: %v\n%s", cerr, r.said())
+	}
+	info, ierr := r.c.ContainerInspect(context.Background(), c1)
+	if ierr != nil {
+		t.Fatalf("the replacement was not created: %v\n%s", ierr, r.said())
+	}
+	found := false
+	for _, v := range info.Labels {
+		if v == "nfixtureprepared" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the replacement was created from dependencies the create built for itself, not from\n"+
+			"  the ones Prepare assembled while the old container was still standing. Labels: %v", info.Labels)
+	}
+}
