@@ -851,6 +851,13 @@ func copyFilePreserving(src, dst string) error {
 	// AFTER the close: writing through the descriptor is what sets the mtime in the first
 	// place, so stamping it before would be undone by the copy itself. The mode is re-applied
 	// here too, because the open honours the process umask and the bits above it does not.
+	//
+	// THE ZERO atime IS A SENTINEL, NOT A TIMESTAMP: os.Chtimes documents "A zero time.Time
+	// value will leave the corresponding file time unchanged", so this stamps the modification
+	// time and lets the access time be whatever creating the copy made it. Spelled out because
+	// it reads like a request for the zero instant, and a reviewer did read it that way;
+	// TestChtimesZeroLeavesTheOtherTimeAlone measures the sentinel so a change in that
+	// behaviour reddens here rather than silently ageing every captured file.
 	if err := os.Chmod(dst, mode); err != nil {
 		return err
 	}

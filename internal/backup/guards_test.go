@@ -1047,3 +1047,35 @@ func TestTreeCopyPreservesModeAndMtime(t *testing.T) {
 		t.Fatalf("mtime %v was captured as %v", want, got.ModTime())
 	}
 }
+
+// TestChtimesZeroLeavesTheOtherTimeAlone pins the one thing copyFilePreserving relies on that
+// is not visible at its call site: in os.Chtimes, "A zero time.Time value will leave the
+// corresponding file time unchanged" (os.Chtimes, Go 1.26). It is a SENTINEL, not a request for
+// the zero instant — a cross-model review read it as the latter and reported the copy as
+// corrupting every file's access time, which this measures to be false.
+//
+// It is asserted through the MTIME slot because that is the time os.FileInfo exposes portably,
+// and both slots go through the same sentinel handling; asserting atime directly would need
+// per-platform stat fields for no extra evidence.
+func TestChtimesZeroLeavesTheOtherTimeAlone(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "f")
+	write(t, p, []byte("x\n"))
+	want := time.Unix(1400000000, 0)
+	if err := os.Chtimes(p, want, want); err != nil {
+		t.Fatal(err)
+	}
+	// Set only the ACCESS time; the modification time must be left exactly as it was.
+	if err := os.Chtimes(p, time.Unix(1600000000, 0), time.Time{}); err != nil {
+		t.Fatalf("a zero time was rejected by this filesystem: %v", err)
+	}
+	fi, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fi.ModTime().Equal(want) {
+		t.Fatalf("a zero time.Time did not leave the other file time unchanged: mtime is now %v, was %v.\n"+
+			"copyFilePreserving passes a zero atime for exactly this reason; if this ever stops being "+
+			"a sentinel, that copy starts stamping an ancient access time on every captured file.",
+			fi.ModTime(), want)
+	}
+}
