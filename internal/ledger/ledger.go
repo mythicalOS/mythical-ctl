@@ -145,7 +145,23 @@ func readPath(path string) (*Ledger, error) {
 	if err != nil {
 		return nil, fmt.Errorf("ledger: cannot read — refusing (fail closed): %w", err)
 	}
-	// From here every refusal is POSITIVE evidence about these bytes: ErrCorrupt.
+	return ReadBytes(data)
+}
+
+// ReadBytes validates a ledger that is already in hand as BYTES — no path, no store, no write
+// capability. Every refusal it makes is POSITIVE evidence about those bytes, so its errors are
+// exactly readPath's: ErrCorrupt or ErrNewerSchema.
+//
+// IT EXISTS SO A LEDGER THAT ARRIVES FROM SOMEWHERE ELSE CAN BE JUDGED BEFORE IT IS INSTALLED.
+// A restore carries a ledger in from a backup and must add its own record to it; staging the
+// incoming file first and editing it afterwards leaves a window in which the well-known
+// staging name holds a valid ledger that does NOT yet carry that record — a state recovery
+// cannot tell from a finished one. Parsing in memory lets the caller build the whole thing and
+// install it in ONE atomic write.
+//
+// It grants nothing: a *Ledger is a value, and writing one still requires the family lock and
+// a Store only the sanctioned constructors mint.
+func ReadBytes(data []byte) (*Ledger, error) {
 	if len(data) == 0 || data[len(data)-1] != '\n' {
 		return nil, fmt.Errorf("ledger is not newline-terminated (truncated?): %w", ErrCorrupt)
 	}

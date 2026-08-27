@@ -34,6 +34,16 @@ COMMANDS
   stop <product>...        stop; sets desired state to stopped
   restart <product>...     restart; refused on a product you have stopped
   recreate <product>...    replace the container, preserving desired state
+  backup <output-directory>
+                           write the ledger, the tree, and every named volume's contents plus its
+                           per-entry manifest and its recorded identity — copying the directory alone
+                           is not a backup
+  restore <backup-directory>
+                           restore installer state and named volumes from a backup, staging the
+                           incoming ledger before anything is created; refused while an active
+                           installation is present
+                             --abandon   abandon an in-progress restore, removing the partial
+                                         volumes it created under their recorded identity
 
 OPTIONS
   --index PATH             the family index (default: ~/.mythical/.state/index)
@@ -52,8 +62,10 @@ Documentation: https://docs.mythicalos.ai   Source: https://github.com/mythicalO
 
 // run holds the whole entrypoint so it can be exercised in-process: it takes the argument list
 // without argv[0] and reads and writes the streams it is handed instead of reaching for the
-// process globals. It reads the real process environment; runEnv is the same entrypoint with the
-// environment supplied, which is what an in-process test drives.
+// process globals. stdin is what the confirmation-reading verbs read the operator's reply from,
+// so it is threaded rather than reached for; the environment is threaded for the same reason.
+// run reads the real process environment; runEnv is the same entrypoint with the environment
+// supplied, which is what an in-process test drives.
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	return runEnv(args, os.Environ(), stdin, stdout, stderr)
 }
@@ -73,6 +85,10 @@ func runEnv(args, env []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return rc
 	}
 	switch verb {
+	case "backup":
+		return runBackup(o, stdin, stdout, stderr)
+	case "restore":
+		return runRestore(o, stdin, stdout, stderr)
 	case "-v", "--version":
 		fmt.Fprintf(stdout, "mythical-ctl %s\n", version.Version)
 		return cliio.ExitOK
