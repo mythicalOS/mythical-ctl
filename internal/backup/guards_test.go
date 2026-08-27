@@ -677,3 +677,43 @@ func TestVolumeWalkRefusesAnUnreadableListing(t *testing.T) {
 		t.Fatal("a backup was written on a partial view of its own volumes")
 	}
 }
+
+// TestBackupIntoTheInstallerHomeDoesNotCopyItself: nothing stops an operator naming an output
+// directory INSIDE the installer home, and the output directory already exists by the time the
+// tree is captured (the ledger was written into it). A LIVE walk would descend into the tree it
+// is itself creating and copy it into itself, again, without bound — a disk-filling loop
+// reachable from an ordinary invocation. The list is taken before the first byte is written and
+// the output subtree is skipped outright.
+func TestBackupIntoTheInstallerHomeDoesNotCopyItself(t *testing.T) {
+	r := newRig(t)
+	inside := filepath.Join(r.home, "backups", "one")
+	// Only the LEAF may be absent — the reference's canonicalizer requires the parent to
+	// resolve, exactly as this one does.
+	if err := os.MkdirAll(filepath.Dir(inside), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := Run(context.Background(), r.deps(), inside); err != nil {
+		t.Fatalf("Run: %v\n%s", err, r.stderr())
+	}
+	dir := canon(t, inside)
+	// The installation's own files are captured...
+	if !exists(filepath.Join(dir, "tree", "mythical.conf")) {
+		t.Fatal("the tree was not captured")
+	}
+	// ...and the backup does not appear inside its own tree copy, at any depth.
+	nested := 0
+	if err := filepath.WalkDir(filepath.Join(dir, "tree"), func(p string, de os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if de.IsDir() && filepath.Base(p) == "one" {
+			nested++
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if nested != 0 {
+		t.Fatalf("the backup copied itself into its own tree %d time(s)", nested)
+	}
+}

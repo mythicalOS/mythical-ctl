@@ -580,11 +580,27 @@ func Run(ctx context.Context, d Deps, rawDir string) error {
 // A WALK THAT COULD NOT FINISH IS NOT AN EMPTY ONE. A directory this process cannot read makes
 // the walk report a partial view, which looks exactly like "walked the whole tree and found
 // nothing else" — so any walk error refuses the backup rather than writing a partial tree.
+//
+// THE WHOLE LIST IS TAKEN BEFORE THE FIRST BYTE IS WRITTEN, and the reason is not tidiness.
+// Nothing stops an operator naming an output directory INSIDE the installer home, and the
+// output directory already exists by the time this runs (the ledger was captured into it). A
+// live walk would then descend into the tree it is itself creating and copy it into itself,
+// again, without bound — a disk-filling loop reachable from an ordinary invocation. Listing
+// first bounds it exactly as the reference's own `find > file` then read-the-file does; the
+// skip below then removes the self-reference entirely, so a backup never contains a partial
+// copy of itself.
 func (d Deps) captureTree(dir string) error {
 	home := d.Home
 	treeRoot := filepath.Join(dir, "tree")
+
+	type entry struct {
+		path string
+		rel  string
+		info os.FileInfo
+	}
+	var entries []entry
 	var walkErr error
-	err := filepath.WalkDir(home, func(p string, de os.DirEntry, err error) error {
+	if werr := filepath.WalkDir(home, func(p string, de os.DirEntry, err error) error {
 		if err != nil {
 			walkErr = err
 			return err
@@ -597,15 +613,34 @@ func (d Deps) captureTree(dir string) error {
 			walkErr = rerr
 			return rerr
 		}
+		// THE BACKUP BEING WRITTEN IS NOT PART OF THE INSTALLATION. Skipping the whole
+		// subtree, not merely its root, is what keeps an output directory named inside the
+		// home from appearing in its own tree copy half-written.
+		if p == dir {
+			return filepath.SkipDir
+		}
 		if excludedFromTree(rel) {
 			return nil
 		}
-		dst := filepath.Join(treeRoot, rel)
 		info, ierr := de.Info()
 		if ierr != nil {
 			d.warn("backup: cannot examine %q: %v", rel, ierr)
+			walkErr = ierr
 			return ierr
 		}
+		entries = append(entries, entry{path: p, rel: rel, info: info})
+		return nil
+	}); werr != nil {
+		if walkErr != nil {
+			d.warn("backup: could not fully walk the installer home (%s) — refusing a partial tree.", home)
+			return fmt.Errorf("backup: could not fully walk the installer home: %w", walkErr)
+		}
+		return fmt.Errorf("backup: capturing the tree failed: %w", werr)
+	}
+
+	for _, e := range entries {
+		p, rel, info := e.path, e.rel, e.info
+		dst := filepath.Join(treeRoot, rel)
 		switch {
 		case info.Mode()&os.ModeSymlink != 0:
 			tgt, lerr := os.Readlink(p)
@@ -635,14 +670,6 @@ func (d Deps) captureTree(dir string) error {
 		default:
 			d.warn("backup: %q is not a regular file, directory or symlink — skipped (not product data).", rel)
 		}
-		return nil
-	})
-	if err != nil {
-		if walkErr != nil {
-			d.warn("backup: could not fully walk the installer home (%s) — refusing a partial tree.", home)
-			return fmt.Errorf("backup: could not fully walk the installer home: %w", walkErr)
-		}
-		return fmt.Errorf("backup: capturing the tree failed: %w", err)
 	}
 	return nil
 }
