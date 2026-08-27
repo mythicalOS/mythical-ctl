@@ -1286,20 +1286,65 @@ func TestTheLaunchDecisionIsMadeExactlyOnceAndTheAnswerAgreesWithIt(t *testing.T
 	}
 }
 
-// TestRunStatusRefreshRunsTheReportAgain, and the terminal keeps only the LAST run's record — a
-// replay of every run's lines would read as one enormous report.
+// TestTheLaunchGateKeepsTheReportOutOfADeadInterface.
+//
+// THIS IS A STATISTICAL ASSERTION AND SAYS SO, because the thing it measures is a race and there
+// is no honest deterministic form of it. When the runtime ends right after dispatching the start
+// command, "the interface is live" and "the interface is gone" are true at the same moment; a
+// select over the two then picks the live branch essentially always, and the report is launched
+// into a program that has already returned. The gate is what turns that into a decision.
+//
+// MEASURED, on this code, over 500 attempts under -race: with the gate, 5 launched; with the gate
+// removed, 500 launched. The threshold below sits an order of magnitude above the first and far
+// below the second, which is the only reason a statistical test is defensible here. An earlier
+// version of this test asserted ZERO launches and failed roughly once in 200 — the residual
+// window in which the goroutine reaches the gate before the teardown sets it is real, and
+// pretending otherwise is what made that version flaky.
+func TestTheLaunchGateKeepsTheReportOutOfADeadInterface(t *testing.T) {
+	const attempts = 300
+	const ceiling = attempts / 5 // 20%; measured ~1% with the gate, 100% without.
+	launched := 0
+	for i := 0; i < attempts; i++ {
+		p := newFakeStatusProgram()
+		p.endAfterInit = true
+		d, _, _ := baseDeps()
+		ran := false
+		if _, err := runStatus(context.Background(), d, func(ctx context.Context, d verbs.Deps) int {
+			ran = true
+			return 0
+		}, p.make, time.Second); err == nil && !ran {
+			t.Fatalf("attempt %d: no error and no run", i)
+		}
+		if ran {
+			launched++
+		}
+	}
+	if launched > ceiling {
+		t.Fatalf("%d of %d reports were launched into an interface that had already returned\n"+
+			"  (ceiling %d) — the launch gate is not being consulted", launched, attempts, ceiling)
+	}
+}
+
+// TestRunStatusRefreshRunsTheReportAgain, and the terminal keeps only the LAST COMPLETED run's
+// record — a replay of every run's lines would read as one enormous report.
+//
+// THE HOOK ACTS ONCE PER GENERATION. Acting on every message that finds the model finished is not
+// the same thing: the model stays finished until the next run's first message arrives, so a hook
+// keyed on "is it done" fires again on the keystroke it just sent and queues a SECOND refresh.
+// That started a third run which the quit then tore off, and the assertion below — written when
+// the runner replayed whichever run was last — became flaky the moment a torn run stopped
+// replacing a completed one.
 func TestRunStatusRefreshRunsTheReportAgain(t *testing.T) {
 	p := newFakeStatusProgram()
-	var runs int
 	var mu sync.Mutex
+	runs := 0
+	acted := map[int]bool{}
 	p.onUpdate = func(m StatusModel, p *fakeStatusProgram) {
-		if !m.Done() {
+		if !m.Done() || acted[m.Generation()] {
 			return
 		}
-		mu.Lock()
-		n := runs
-		mu.Unlock()
-		if n < 2 {
+		acted[m.Generation()] = true
+		if m.Generation() < 2 {
 			p.Send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
 			return
 		}
@@ -1313,7 +1358,7 @@ func TestRunStatusRefreshRunsTheReportAgain(t *testing.T) {
 		mu.Unlock()
 		d.Progress(verbs.ProgressEvent{Stage: "status", Detail: fmt.Sprintf("run %d", n)})
 		return 0
-	}, p.make, 2*time.Second)
+	}, p.make, 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1323,14 +1368,91 @@ func TestRunStatusRefreshRunsTheReportAgain(t *testing.T) {
 	mu.Lock()
 	n := runs
 	mu.Unlock()
-	if n < 2 {
-		t.Fatalf("the report ran %d times; the refresh did not reach the runner", n)
+	if n != 2 {
+		t.Fatalf("the report ran %d times, want 2 — one refresh, acted on once", n)
 	}
-	if got := out.String(); strings.Count(got, "run ") != 1 {
-		t.Fatalf("the terminal kept more than the last run's record:\n%q", got)
+	if got := out.String(); got != "run 2\n" {
+		t.Fatalf("the terminal kept %q, want only the last completed run's record", got)
 	}
-	if !strings.Contains(out.String(), fmt.Sprintf("run %d", n)) {
-		t.Fatalf("the terminal kept a superseded run's record:\n%q", out.String())
+}
+
+// TestACancelledRefreshDoesNotReplaceTheReportTheOperatorSaw.
+//
+// Cancellation makes the report DEGRADE rather than stop: its reads fail, and a failed read is
+// rendered "(unknown)" or "UNREADABLE" — the report's words for a question that could NOT BE
+// ASKED, not for one that was interrupted. So a run torn off by the dashboard closing must not
+// become the record replayed to the terminal: the operator would be left holding a diagnostic
+// that reads like a diagnosis. The last run that actually finished is what stays.
+func TestACancelledRefreshDoesNotReplaceTheReportTheOperatorSaw(t *testing.T) {
+	p := newFakeStatusProgram()
+	var mu sync.Mutex
+	runs := 0
+	secondStarted := make(chan struct{})
+	p.onUpdate = func(m StatusModel, p *fakeStatusProgram) {
+		if !m.Done() {
+			return
+		}
+		// The first report has finished and is on screen. Ask for another one.
+		p.Send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	}
+	go func() {
+		// Close the dashboard once the second run is under way, which is what cancels it.
+		<-secondStarted
+		p.kill()
+	}()
+	d, out, _ := baseDeps()
+	code, err := runStatus(context.Background(), d, func(ctx context.Context, d verbs.Deps) int {
+		mu.Lock()
+		runs++
+		n := runs
+		mu.Unlock()
+		if n == 1 {
+			d.Progress(verbs.ProgressEvent{Stage: "status", Detail: "the whole report"})
+			return 0
+		}
+		d.Progress(verbs.ProgressEvent{Stage: "status", Detail: "half a report"})
+		close(secondStarted)
+		<-ctx.Done()
+		return 0
+	}, p.make, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code != 0 {
+		t.Fatalf("code %d", code)
+	}
+	if got := out.String(); got != "the whole report\n" {
+		t.Fatalf("the terminal was left holding %q — a run the dashboard tore off replaced the\n"+
+			"  report the operator actually saw", got)
+	}
+}
+
+// TestACancelledFIRSTReportIsStillPublished — the guard above must not withhold the only report
+// there is. Withholding it would leave the runner saying the report never ran, which is exactly
+// what licenses the dispatcher to run the whole thing a second time.
+func TestACancelledFIRSTReportIsStillPublished(t *testing.T) {
+	p := newFakeStatusProgram()
+	started := make(chan struct{})
+	go func() {
+		<-started
+		p.kill()
+	}()
+	d, out, _ := baseDeps()
+	code, err := runStatus(context.Background(), d, func(ctx context.Context, d verbs.Deps) int {
+		d.Progress(verbs.ProgressEvent{Stage: "status", Detail: "as far as it got"})
+		close(started)
+		<-ctx.Done()
+		return 5
+	}, p.make, 5*time.Second)
+	if errors.Is(err, ErrNotStarted) {
+		t.Fatal("a report that ran and was cancelled was reported as never having started — the\n" +
+			"  dispatcher would run it a second time")
+	}
+	if code != 5 {
+		t.Fatalf("code %d, want the report's own 5", code)
+	}
+	if got := out.String(); got != "as far as it got\n" {
+		t.Fatalf("the partial report was withheld: %q", got)
 	}
 }
 

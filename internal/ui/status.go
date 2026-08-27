@@ -1032,6 +1032,15 @@ func runStatus(ctx context.Context, base verbs.Deps, fn VerbFunc, mk func(Status
 	var gate sync.Mutex
 	barred := false
 
+	// mayRun asks the launch gate. EVERY generation asks it, not just the first: `barred` is set
+	// BEFORE uiDone is closed, so between those two statements a queued refresh sees neither
+	// channel closed and used to start a run that the very next instruction would cancel.
+	mayRun := func() bool {
+		gate.Lock()
+		defer gate.Unlock()
+		return !barred
+	}
+
 	go func() {
 		// THE REPORT DOES NOT START UNTIL THE INTERFACE IS LIVE, for the same reason Run waits:
 		// a report run into an interface that never came up is a report nobody sees, reported
@@ -1040,13 +1049,10 @@ func runStatus(ctx context.Context, base verbs.Deps, fn VerbFunc, mk func(Status
 		case <-started:
 		case <-uiDone:
 		}
-		gate.Lock()
-		if barred {
-			gate.Unlock()
+		if !mayRun() {
 			done <- outcome{}
 			return
 		}
-		gate.Unlock()
 		var last outcome
 		for gen := 1; ; gen++ {
 			// A FRESH BRIDGE PER RUN. Its record is what the runner replays on the way out, and
@@ -1065,15 +1071,34 @@ func runStatus(ctx context.Context, base verbs.Deps, fn VerbFunc, mk func(Status
 			_ = outW.Close()
 			_ = errW.Close()
 			b.Close()
-			last = outcome{code: code, ran: true, b: b}
+			// A CANCELLED RUN DOES NOT REPLACE A COMPLETED ONE. Cancellation makes the report
+			// DEGRADE rather than stop: its reads fail, and a failed read is rendered "(unknown)"
+			// or "UNREADABLE" — which is the report's word for a question that could not be
+			// asked, not for one that was interrupted. Replaying that over a report that finished
+			// would leave the operator's terminal holding a torn diagnostic that reads like a
+			// diagnosis. The first run is exempt: a partial report is still better than none, and
+			// withholding it would leave `ran` false, which tells the dispatcher the report never
+			// ran and licenses it to run the whole thing again.
+			if vctx.Err() == nil || last.b == nil {
+				last = outcome{code: code, ran: true, b: b}
+			}
 			p.Send(statusRunMsg{Gen: gen, Msg: statusDoneMsg{Code: code}})
 
 			select {
 			case <-refresh:
 				// A refresh can be QUEUED at the moment the interface goes away, and a plain
 				// three-way select would then pick it at random and run the report again with
-				// nothing to show it on. Re-asked here, deterministically.
-				if stopped(vctx, uiDone) {
+				// nothing to show it on. Re-asked here, deterministically — and the launch gate
+				// is asked too, because it is set one instruction before uiDone is closed and
+				// the channels alone cannot see that window.
+				//
+				// STATED RESIDUAL: removing this !mayRun() and leaving stopped() alone is a
+				// mutation no test kills — the window is a few instructions wide and reaching it
+				// requires a run to finish inside it. It is kept because it is correct and free,
+				// and because what it prevents is BRACES over a belt that IS tested: a run that
+				// did start in that window is cancelled at once, and a cancelled run does not
+				// replace the completed report (see the outcome guard below).
+				if stopped(vctx, uiDone) || !mayRun() {
 					done <- last
 					return
 				}
