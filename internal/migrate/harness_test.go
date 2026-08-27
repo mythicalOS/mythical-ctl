@@ -112,10 +112,14 @@ type fakeMut struct {
 	removed  []string
 	stopErr  error
 	rmErr    error
+	onStop   func()
 	onRemove func()
 }
 
 func (f *fakeMut) ContainerStop(_ context.Context, id string) error {
+	if f.onStop != nil {
+		f.onStop()
+	}
 	if f.stopErr != nil {
 		return f.stopErr
 	}
@@ -457,6 +461,54 @@ func (f *fx) seed(r record) {
 		r.Mount = testMount
 	}
 	if err := r.put(f.l, f.d); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+// onDisk reads the ledger as it actually is ON DISK — the only copy a crash leaves behind, and
+// therefore the only one the write-ahead contract is about.
+func (f *fx) onDisk() *ledger.Ledger {
+	f.t.Helper()
+	l, err := ledger.Read(ledger.LiveRead(f.home))
+	if err != nil {
+		f.t.Fatalf("the persisted ledger could not be read: %v", err)
+	}
+	return l
+}
+
+// diskPhase reports the phase the PERSISTED ledger names for this migration, or 0 for none.
+func (f *fx) diskPhase() int {
+	f.t.Helper()
+	p, err := Phase(f.onDisk(), testProduct, testRole)
+	if errors.Is(err, ErrNoMigration) {
+		return 0
+	}
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return p
+}
+
+// seedRaw writes a migration record from RAW fields, so a test can build a record this core's own
+// writer never would — one missing a field, or carrying it empty. That distinction is exactly what
+// the carry-forward rules turn on, and it cannot be expressed through the typed record.
+func (f *fx) seedRaw(fields map[string]string) {
+	f.t.Helper()
+	key := testProduct + ":" + testRole
+	rows := []ledger.Field{
+		{Key: "key", Value: key},
+		{Key: "product", Value: testProduct},
+		{Key: "role", Value: testRole},
+	}
+	for _, k := range []string{"phase", "dest", "srcvol", "staging", "nonce", "confkey", "prior", "attempt", "desired", "mount", "stageid"} {
+		if v, ok := fields[k]; ok {
+			rows = append(rows, ledger.Field{Key: k, Value: v})
+		}
+	}
+	if err := f.l.Put(Kind, "key", key, rows); err != nil {
+		f.t.Fatal(err)
+	}
+	if err := f.d.Persist(f.l); err != nil {
 		f.t.Fatal(err)
 	}
 }

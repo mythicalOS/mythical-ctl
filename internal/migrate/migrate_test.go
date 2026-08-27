@@ -1225,3 +1225,335 @@ func TestVerbRefusesARelativeToBind(t *testing.T) {
 		t.Fatalf("prompted for a malformed destination: %v", f.prompts)
 	}
 }
+
+// --- gate round 1: the guards findings 1-5 added -------------------------------------------------
+
+func TestAPresentButEmptyFieldIsNotAnAbsentOne(t *testing.T) {
+	// THE REFERENCE DEFAULTS ONLY ON ABSENCE. A field that is there and empty is carried verbatim,
+	// so a corrupt or hand-edited record reaches the refusal it should — rather than being silently
+	// upgraded into a well-formed one.
+	t.Run("empty desired refuses at phase 9 and keeps the intent", func(t *testing.T) {
+		f := newFx(t)
+		canon := f.canonDest()
+		if err := os.Mkdir(canon, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		f.seedRaw(map[string]string{
+			"phase": "9", "dest": canon, "nonce": "nz", "staging": StagingPath(canon, "nz"),
+			"attempt": "started", "desired": "", "confkey": f.confkey, "srcvol": f.srcvol,
+			"mount": testMount, "prior": "", "stageid": "",
+		})
+		err := Run(ctx(), f.l, f.d, testProduct, testRole, canon, 9)
+		mustContain(t, err, "neither running nor", "stopped")
+		// AND THE INTENT SURVIVES. The desired state is restored BEFORE the intent is cleared, so a
+		// refusal here must leave the record naming what still has to happen — an intent cleared
+		// first, followed by a failed restore, would leave nothing recording that the container
+		// should still reach its prior state.
+		if p, perr := Phase(f.l, testProduct, testRole); perr != nil || p != 9 {
+			t.Fatalf("the intent is at %d (%v) after a refused phase 9, want 9", p, perr)
+		}
+		if f.diskPhase() != 9 {
+			t.Fatalf("the persisted intent is at %d after a refused phase 9", f.diskPhase())
+		}
+	})
+
+	t.Run("empty attempt refuses at phase 6", func(t *testing.T) {
+		f := newFx(t)
+		canon := f.canonDest()
+		f.seedRaw(map[string]string{
+			"phase": "6", "dest": canon, "nonce": "nz", "staging": StagingPath(canon, "nz"),
+			"attempt": "", "desired": "running", "confkey": f.confkey, "srcvol": f.srcvol,
+			"mount": testMount, "prior": "", "stageid": "",
+		})
+		err := Run(ctx(), f.l, f.d, testProduct, testRole, canon, 6)
+		mustContain(t, err, "is neither 'none' nor", "'started'")
+		if _, cerr := f.confValue(f.confkey); cerr == nil {
+			t.Fatal("mythical.conf was written from an unrecognised attempt state")
+		}
+	})
+
+	t.Run("an ABSENT field still defaults", func(t *testing.T) {
+		// The other half of the same rule: no record at all, and a record that simply does not carry
+		// the field, both default — which is what makes phase 1's own entry and a
+		// pre-this-core record work.
+		f := newFx(t)
+		canon := f.canonDest()
+		if err := os.Mkdir(canon, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		f.seedRaw(map[string]string{
+			"phase": "9", "dest": canon, "nonce": "nz", "staging": StagingPath(canon, "nz"),
+			"confkey": f.confkey, "srcvol": f.srcvol, "mount": testMount,
+		})
+		if err := Run(ctx(), f.l, f.d, testProduct, testRole, canon, 9); err != nil {
+			t.Fatalf("a record carrying no desired field did not default to running: %v", err)
+		}
+		want, err := state.DesiredGet(f.l, f.container)
+		if err != nil || want != state.Running {
+			t.Fatalf("desired state %q (%v)", want, err)
+		}
+	})
+}
+
+func TestAFailedWriteLeavesTheCallersLedgerAlone(t *testing.T) {
+	// THE RECORD IS WRITTEN AHEAD OF THE ACTION, OR NOTHING IS. A phase published into the caller's
+	// ledger before the write succeeded reads as durable and is not — and at phase 9 the same
+	// pattern would leave the intent GONE in memory while disk still carried it, so a same-process
+	// resume would answer "nothing to resume" about a migration that is still recorded.
+	f := newFx(t)
+	before := len(f.l.Lines())
+	f.d.Persist = func(*ledger.Ledger) error { return errors.New("disk is full") }
+	err := MigrateStorage(ctx(), f.l, f.d, testProduct, testRole, Options{ToBind: f.dest})
+	mustContain(t, err, "could not be persisted")
+	if got := len(f.l.Lines()); got != before {
+		t.Fatalf("the caller's ledger grew from %d to %d lines despite the write failing", before, got)
+	}
+	if _, perr := Phase(f.l, testProduct, testRole); !errors.Is(perr, ErrNoMigration) {
+		t.Fatalf("an unpersisted phase is visible in the caller's ledger: %v", perr)
+	}
+
+	// The same at the OTHER end: a phase 9 whose write fails must not leave the intent cleared in
+	// memory while it is still on disk.
+	f2 := newFx(t)
+	canon := f2.canonDest()
+	if err := os.Mkdir(canon, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f2.seed(record{Phase: 9, Dest: canon, Nonce: "nz", Staging: StagingPath(canon, "nz"),
+		Attempt: "started", Desired: "running"})
+	f2.d.Persist = func(*ledger.Ledger) error { return errors.New("disk is full") }
+	if err := Run(ctx(), f2.l, f2.d, testProduct, testRole, canon, 9); err == nil {
+		t.Fatal("a phase 9 whose write failed reported success")
+	}
+	if p, perr := Phase(f2.l, testProduct, testRole); perr != nil || p != 9 {
+		t.Fatalf("the intent was cleared in memory despite the write failing: %d %v", p, perr)
+	}
+}
+
+func TestPhase3NamesTheLeftoverItPreserves(t *testing.T) {
+	// PRESERVED AND REPORTED — and "reported" means NAMED. The record steps back to phase 1 with the
+	// staging path cleared so the next attempt mints a fresh one, but a refusal that does not say
+	// WHICH directory it is preserving leaves the operator with nothing to inspect or reclaim.
+	f := newFx(t)
+	canon := f.canonDest()
+	stage := StagingPath(canon, "nz")
+	if err := os.Mkdir(stage, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f.seed(record{Phase: 3, Dest: canon, Nonce: "nz", Staging: stage, Attempt: "none", Desired: "running"})
+	err := Run(ctx(), f.l, f.d, testProduct, testRole, canon, 3)
+	mustContain(t, err, stage, "already exists")
+	mustNotContain(t, err, `""`)
+	if !exists(stage) {
+		t.Fatal("the leftover was removed")
+	}
+}
+
+func TestASymlinkAtTheStagingNameIsReportedNotSwallowed(t *testing.T) {
+	// "IS THERE A DIRECTORY HERE" FOLLOWS THE SYMLINK, as `[ -d ]` does; the IDENTITY question is
+	// what uses Lstat. Reading a symlink-to-directory as "there is nothing here" would skip the
+	// verification entirely at phase 4, and would make the reclaim return SUCCESS having said
+	// nothing about an object standing where this installer's own staging directory should be.
+	t.Run("phase 4 verifies rather than skipping", func(t *testing.T) {
+		f := newFx(t)
+		canon := f.canonDest()
+		stage := StagingPath(canon, "nz")
+		real := filepath.Join(f.base, "elsewhere")
+		if err := os.Mkdir(real, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(real, stage); err != nil {
+			t.Fatal(err)
+		}
+		f.seed(record{Phase: 4, Dest: canon, Nonce: "nz", Staging: stage, StageID: "1:2",
+			Attempt: "none", Desired: "running"})
+		f.d.Entries.Set(3)
+		err := Run(ctx(), f.l, f.d, testProduct, testRole, canon, 4)
+		mustContain(t, err, "no longer carries the identity")
+		if len(f.cp.ranWith) != 0 {
+			t.Fatal("the copy helper was handed a substituted staging path")
+		}
+	})
+
+	t.Run("reclaim reports the mismatch", func(t *testing.T) {
+		base := safeBase(t)
+		home := filepath.Join(base, "home")
+		if err := os.Mkdir(home, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		stage := StagingPath(filepath.Join(base, "dest"), "nonceX")
+		real := filepath.Join(base, "elsewhere")
+		if err := os.Mkdir(real, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(real, stage); err != nil {
+			t.Fatal(err)
+		}
+		err := StagingReclaim(home, stage, "nonceX", "1:2", "nonceX")
+		mustContain(t, err, "does not match the recorded intent", "preserved")
+		if !exists(stage) {
+			t.Fatal("the substituted object was removed")
+		}
+	})
+}
+
+func TestPhase5PreservesASubstitutedNonDirectoryDestination(t *testing.T) {
+	// rmdir(2), NOT a general remove. A general remove unlinks a NON-directory too, so a symlink
+	// planted at the destination after the precheck would be silently deleted and the staged tree
+	// committed in its place — quietly redefining where the operator's destination points.
+	f := newFx(t)
+	canon := f.canonDest()
+	stage := StagingPath(canon, "nz")
+	if err := os.Mkdir(stage, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stage, "payload"), []byte("ours"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sid, _ := Identity(stage)
+	// Planted after the precheck: a symlink where the destination directory should be.
+	target := filepath.Join(f.base, "somewhere-else")
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, canon); err != nil {
+		t.Fatal(err)
+	}
+	f.seed(record{Phase: 5, Dest: canon, Nonce: "nz", Staging: stage, StageID: sid,
+		Attempt: "none", Desired: "running"})
+	err := Run(ctx(), f.l, f.d, testProduct, testRole, canon, 5)
+	mustContain(t, err, "no longer the empty or absent directory")
+	st, lerr := os.Lstat(canon)
+	if lerr != nil || st.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("the planted symlink was removed; a substitution is preserved, not deleted")
+	}
+	if !exists(filepath.Join(stage, "payload")) {
+		t.Fatal("the copy was moved despite the refusal")
+	}
+	if ents, _ := os.ReadDir(target); len(ents) != 0 {
+		t.Fatalf("the symlink was followed and the copy landed at its target: %v", ents)
+	}
+}
+
+// --- gate round 1: the temporal properties the state-machine tests claimed ------------------------
+
+func TestThePhaseIsDurableBeforeItsActionRuns(t *testing.T) {
+	// THE WRITE-AHEAD CONTRACT, OBSERVED FROM INSIDE THE ACTION. A test that inspects only the
+	// finished ledger cannot tell record-before-action from action-before-record; these read the
+	// PERSISTED ledger at the moment the phase's own side effect is happening, which is the only
+	// copy a crash there would leave behind.
+	f := newFx(t)
+	var atStop, atCopy int
+	var stageIDAtCopy string
+	f.mut.onStop = func() { atStop = f.diskPhase() }
+	f.cp.afterRun = func(string) {
+		atCopy = f.diskPhase()
+		r, err := find(f.onDisk(), testProduct, testRole)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stageIDAtCopy = r.StageID
+	}
+	var confAtRebuild string
+	var diskAtRebuild int
+	f.bld.hook = func() {
+		diskAtRebuild = f.diskPhase()
+		confAtRebuild, _ = f.confValue(f.confkey)
+	}
+	if err := MigrateStorage(ctx(), f.l, f.d, testProduct, testRole, Options{ToBind: f.dest}); err != nil {
+		t.Fatal(err)
+	}
+	if atStop != 2 {
+		t.Fatalf("while the container was being stopped, disk named phase %d, want 2", atStop)
+	}
+	if atCopy != 3 {
+		t.Fatalf("while the copy was running, disk named phase %d, want 3", atCopy)
+	}
+	// The staging identity is recorded in the SAME write that creates the directory, never one
+	// without the other — that is what makes phase 4 and phase 5 able to refuse an unattributable
+	// tree at all.
+	if stageIDAtCopy == "" {
+		t.Fatal("the copy ran with no staging identity persisted alongside the staging path")
+	}
+	if diskAtRebuild != 7 {
+		t.Fatalf("while the container was being replaced, disk named phase %d, want 7", diskAtRebuild)
+	}
+	if confAtRebuild != f.canonDest() {
+		t.Fatalf("at replacement time mythical.conf held %q", confAtRebuild)
+	}
+}
+
+func TestPhases6To9ResumeAtTheirRecordedPhase(t *testing.T) {
+	// THE OTHER HALF OF "each of the nine phases resumes". When the destination VERIFIABLY carries
+	// phase 5's result, phases 6-9 resume WHERE THEY ARE RECORDED — they do not fall back to 5. A
+	// fixture with no recorded identity can only ever exercise the fallback, so it cannot show that
+	// the recorded phase is ever honoured at all.
+	for n := 6; n <= PhaseLast; n++ {
+		t.Run(fmt.Sprintf("phase%d", n), func(t *testing.T) {
+			f := newFx(t)
+			canon := f.canonDest()
+			if err := os.Mkdir(canon, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			sid, err := Identity(canon)
+			if err != nil {
+				t.Fatal(err)
+			}
+			attempt := "none"
+			if n >= 7 {
+				// Phases 7 on follow a completed compare-and-set, so the bind is already recorded.
+				attempt = "started"
+				if err := conf.FamilyAdd(f.lock, f.confkey, canon); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if n >= 8 {
+				// Phase 7 has already replaced the container, so it mounts the bind.
+				f.objs.mounts[f.container] = []engine.MountRecord{
+					{Type: "bind", Source: canon, Destination: testMount, RW: true},
+				}
+			}
+			f.seed(record{Phase: n, Dest: canon, Nonce: "nz", Staging: StagingPath(canon, "nz"),
+				StageID: sid, Attempt: attempt, Desired: "running"})
+			if err := Resume(ctx(), f.l, f.d); err != nil {
+				t.Fatalf("phase %d did not resume: %v", n, err)
+			}
+			if !strings.Contains(f.log.String(), fmt.Sprintf("resuming %s/%s at phase %d.", testProduct, testRole, n)) {
+				t.Fatalf("phase %d was not resumed AT its recorded phase:\n%s", n, f.log.String())
+			}
+			if strings.Contains(f.log.String(), "Re-deriving from observable state") {
+				t.Fatalf("phase %d fell back to phase 5 despite a verifiable destination", n)
+			}
+			if _, err := Phase(f.l, testProduct, testRole); !errors.Is(err, ErrNoMigration) {
+				t.Fatalf("phase %d resumed but did not complete: %v", n, err)
+			}
+		})
+	}
+}
+
+func TestPhase4VerifiesARealStagedTreeOnResume(t *testing.T) {
+	// The nine-phase resume fixtures reach phase 4 with no staging tree, which exercises only its
+	// no-op path. This one resumes at phase 4 over a tree that IS there, so the verification, the
+	// host access check and the identity re-checks actually run.
+	f := newFx(t)
+	canon := f.canonDest()
+	stage := StagingPath(canon, "nz")
+	if err := os.Mkdir(stage, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sid, _ := Identity(stage)
+	f.seed(record{Phase: 4, Dest: canon, Nonce: "nz", Staging: stage, StageID: sid,
+		Attempt: "none", Desired: "running"})
+	f.d.Entries.Set(3)
+	f.cp.verifyErr = errors.New("the copy does not match the source")
+	mustContain(t, Run(ctx(), f.l, f.d, testProduct, testRole, canon, 4), "does not match the source")
+
+	f.cp.verifyErr = nil
+	f.cp.hostErr = errors.New("the staged tree is not readable by the operator")
+	mustContain(t, Run(ctx(), f.l, f.d, testProduct, testRole, canon, 4), "not readable by the operator")
+
+	f.cp.hostErr = nil
+	if err := Run(ctx(), f.l, f.d, testProduct, testRole, canon, 4); err != nil {
+		t.Fatalf("a well-formed phase 4 over a real staged tree was refused: %v", err)
+	}
+}

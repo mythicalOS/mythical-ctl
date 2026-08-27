@@ -385,11 +385,25 @@ func TestReclaimUsesTheInstallersOwnDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	id, _ := Identity(stage)
+
+	hcanon0, _ := runtime.Canon(home)
+	wantParent := filepath.Join(hcanon0, ".state", "reclaim")
+	var landedIn string
+	origRename := renameDir
+	renameDir = func(from, to string) error { landedIn = filepath.Dir(to); return origRename(from, to) }
+	t.Cleanup(func() { renameDir = origRename })
+
 	if err := StagingReclaim(home, stage, "nonceX", id, "nonceX"); err != nil {
 		t.Fatal(err)
 	}
 	if exists(stage) {
 		t.Fatal("the leftover survived a full match")
+	}
+	// THE RENAME ITSELF LANDED IN THE INSTALLER'S OWN DIRECTORY. Asserting only that no sibling
+	// survives cannot tell that apart from a sibling rename followed by a delete — which leaves the
+	// same evidence and closes nothing.
+	if landedIn != wantParent {
+		t.Fatalf("the reclaim renamed into %q, not the installer's own %q", landedIn, wantParent)
 	}
 	siblings, err := os.ReadDir(filepath.Dir(dest))
 	if err != nil {
@@ -619,9 +633,18 @@ func TestReclaimVerifiesTheRenamedDirectory(t *testing.T) {
 	}
 	id, _ := Identity(stage)
 
+	hcanon, _ := runtime.Canon(home)
+	rdir := filepath.Join(hcanon, ".state", "reclaim")
 	var landed string
 	orig := renameDir
 	renameDir = func(from, to string) error {
+		// WHERE IT LANDS IS THE WHOLE POINT (round 1, finding 6). A regression that renamed to
+		// another name in the SAME untrusted parent and then deleted it would leave no sibling
+		// behind and an empty reclaim directory — indistinguishable, from the outside, from doing
+		// it correctly. It does not close the check-then-rm race; it only moves it.
+		if got := filepath.Dir(to); got != rdir {
+			t.Fatalf("the reclaim renamed into %q, not the installer's own %q", got, rdir)
+		}
 		if err := orig(from, to); err != nil {
 			return err
 		}
