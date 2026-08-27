@@ -425,9 +425,16 @@ func (m StatusModel) handleKey(msg tea.KeyMsg) (StatusModel, tea.Cmd) {
 		return m.scroll(m.page()), nil
 	case "home", "g":
 		m.offset = 0
-		return m, nil
+		return m.clamp(), nil
 	case "end", "G":
-		m.offset = m.maxOffset()
+		content := m.render()
+		body := m.body()
+		if body == 0 {
+			return m, nil
+		}
+		// The END of the report can itself be blank — an error whose text ends in a newline
+		// splits into a last, empty line — so the correction looks BACKWARDS from there.
+		m.offset = visibleFrom(content, clampOffset(len(content)-body, len(content), body), body, -1)
 		return m, nil
 	}
 	return m, nil
@@ -440,19 +447,54 @@ func (m StatusModel) page() int {
 	return 1
 }
 
+// scroll moves the viewport.
+//
+// IT MOVES FROM WHAT IS ON SCREEN, not from what is stored. Those were allowed to differ: the
+// correction that keeps a viewport off a blank run was applied when RENDERING and thrown away, so
+// the stored offset lagged behind the drawn one and the first keystroke or two only caught it up —
+// the operator pressed a key and the screen did not move. Correcting here, in the direction of
+// travel, is what makes every keystroke do something.
 func (m StatusModel) scroll(by int) StatusModel {
-	m.offset += by
-	return m.clamp()
+	content := m.render()
+	body := m.body()
+	if body == 0 {
+		// No windowing: there is nothing to scroll.
+		return m
+	}
+	dir := 1
+	if by < 0 {
+		dir = -1
+	}
+	m.offset = clampOffset(m.viewOffset(content, body)+by, len(content), body)
+	m.offset = visibleFrom(content, m.offset, body, dir)
+	return m
 }
 
 func (m StatusModel) clamp() StatusModel {
-	if max := m.maxOffset(); m.offset > max {
-		m.offset = max
-	}
-	if m.offset < 0 {
+	content := m.render()
+	body := m.body()
+	if body == 0 {
 		m.offset = 0
+		return m
 	}
+	m.offset = m.viewOffset(content, body)
 	return m
+}
+
+// viewOffset is the offset actually drawn: the stored one, clamped into range and moved off a
+// window that would show nothing.
+func (m StatusModel) viewOffset(content []string, body int) int {
+	return visibleFrom(content, clampOffset(m.offset, len(content), body), body, 1)
+}
+
+func clampOffset(off, total, body int) int {
+	if max := total - body; off > max {
+		off = max
+	}
+	if off < 0 {
+		return 0
+	}
+	return off
 }
 
 // layout decides the frame: whether there is room for the title line, whether there is room for
@@ -547,18 +589,11 @@ func (m StatusModel) View() string {
 	if body == 0 {
 		return strings.Join(append([]string{m.titleLine()}, content...), "\n")
 	}
-	off := m.offset
-	if max := len(content) - body; off > max {
-		off = max
-	}
-	if off < 0 {
-		off = 0
-	}
 	// THE VIEWPORT IS NEVER ENTIRELY BLANK while there is anything to show. The report is laid
 	// out with blank lines between its sections, and on a one- or two-row terminal a scroll
 	// position can land squarely on one — leaving a dashboard showing nothing at all, which is
 	// the exact thing this view exists not to do.
-	off = firstVisible(content, off, body)
+	off := m.viewOffset(content, body)
 	end := off + body
 	if end > len(content) {
 		end = len(content)
@@ -584,27 +619,46 @@ func btoi(b bool) int {
 	return 0
 }
 
-// firstVisible moves an offset to the nearest position whose window shows at least one line with
-// something on it — forwards first, so scrolling down keeps going down.
-func firstVisible(content []string, off, body int) int {
+// visibleFrom moves an offset whose whole window would be blank to the nearest position that shows
+// something, searching IN THE DIRECTION OF TRAVEL first.
+//
+// The direction matters: correcting always-forwards would make scrolling UP out of a blank run
+// snap straight back down to where it started, so the operator could not get past it.
+func visibleFrom(content []string, off, body, dir int) int {
+	if !windowBlank(content, off, body) {
+		return off
+	}
+	first, second := 1, -1
+	if dir < 0 {
+		first, second = -1, 1
+	}
+	if i := scanVisible(content, off, first); i >= 0 {
+		return i
+	}
+	if i := scanVisible(content, off, second); i >= 0 {
+		return i
+	}
+	return off
+}
+
+func scanVisible(content []string, off, step int) int {
+	for i := off + step; i >= 0 && i < len(content); i += step {
+		if !blank(content[i]) {
+			return i
+		}
+	}
+	return -1
+}
+
+func windowBlank(content []string, off, body int) bool {
 	end := off + body
 	if end > len(content) {
 		end = len(content)
 	}
-	if !allBlank(content[off:end]) {
-		return off
+	if off < 0 || off >= len(content) {
+		return true
 	}
-	for i := off + 1; i < len(content); i++ {
-		if !blank(content[i]) {
-			return i
-		}
-	}
-	for i := off - 1; i >= 0; i-- {
-		if !blank(content[i]) {
-			return i
-		}
-	}
-	return off
+	return allBlank(content[off:end])
 }
 
 func blank(s string) bool { return strings.TrimSpace(ansi.Strip(s)) == "" }
@@ -693,7 +747,13 @@ func (m StatusModel) render() []string {
 		if len(entries) == 0 {
 			continue
 		}
-		out = append(out, "", headingStyle.Render(fit(sec.title, width)))
+		if len(out) > 0 {
+			// A separator BETWEEN sections, never before the first one: a blank first line is a
+			// row of nothing at the top of every viewport, and on a short terminal it is the
+			// whole viewport.
+			out = append(out, "")
+		}
+		out = append(out, headingStyle.Render(fit(sec.title, width)))
 		out = append(out, m.renderSection(sec.title, entries, avail)...)
 	}
 	return out

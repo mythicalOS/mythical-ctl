@@ -561,6 +561,130 @@ func TestNoHeightOverflowsTheTerminalAtAnyScrollPosition(t *testing.T) {
 	}
 }
 
+// TestTheReportDoesNotOpenWithABlankLine. A separator belongs BETWEEN sections; one before the
+// first is a row of nothing at the top of every viewport, and on a short terminal it is the whole
+// viewport. The blank-run correction hides it — which is exactly why it needs its own assertion.
+func TestTheReportDoesNotOpenWithABlankLine(t *testing.T) {
+	for _, m := range []StatusModel{
+		narrowReport(100),
+		func() StatusModel {
+			m := sized(NewStatusModel(nil), 100, 40)
+			m = say(m, "installation: zzident")
+			m, _ = sstep(m, statusDoneMsg{})
+			return m
+		}(),
+	} {
+		lines := m.render()
+		if len(lines) == 0 {
+			t.Fatal("no report")
+		}
+		if blank(lines[0]) {
+			t.Fatalf("the report opens with a blank line:\n%q", lines[:min(4, len(lines))])
+		}
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// TestTheStoredOffsetAlwaysShowsSomething. The offset the MODEL holds — not merely the one the
+// renderer corrects to — must be a position that shows something. Letting the two differ is what
+// made keystrokes inert, and a correction that lives only in the renderer hides every mutation to
+// the ones that move the stored offset.
+func TestTheStoredOffsetAlwaysShowsSomething(t *testing.T) {
+	check := func(t *testing.T, m StatusModel, what string) {
+		t.Helper()
+		body := m.body()
+		if body == 0 {
+			return
+		}
+		if windowBlank(m.render(), m.Offset(), body) {
+			t.Fatalf("%s: the stored offset %d shows nothing", what, m.Offset())
+		}
+	}
+	for _, h := range []int{1, 2, 3, 7} {
+		// A report whose LAST line is blank, so the end of it is the awkward case.
+		m := sized(NewStatusModel(nil), 100, h)
+		m = say(m, "installation: zzident")
+		m = say(m, "unattributed container: zzthing")
+		m = say(m, "")
+		m = say(m, "")
+		m, _ = sstep(m, statusDoneMsg{})
+		check(t, m, fmt.Sprintf("height %d, opening", h))
+		m, _ = sstep(m, tea.KeyMsg{Type: tea.KeyEnd})
+		check(t, m, fmt.Sprintf("height %d, after End", h))
+		m, _ = sstep(m, tea.KeyMsg{Type: tea.KeyHome})
+		check(t, m, fmt.Sprintf("height %d, after Home", h))
+		for i := 0; i < 30; i++ {
+			m, _ = sstep(m, tea.KeyMsg{Type: tea.KeyDown})
+			check(t, m, fmt.Sprintf("height %d, down %d", h, i+1))
+		}
+		for i := 0; i < 30; i++ {
+			m, _ = sstep(m, tea.KeyMsg{Type: tea.KeyUp})
+			check(t, m, fmt.Sprintf("height %d, up %d", h, i+1))
+		}
+		// A RESIZE can strand it too, and that is the path the keys do not cover: an offset whose
+		// window shows plenty at seven rows can show one blank line at one row, and the terminal
+		// changes size without the operator pressing anything.
+		for k := range m.render() {
+			shrunk := m
+			shrunk.offset = k
+			check(t, sized(shrunk, 100, 1), fmt.Sprintf("height %d, offset %d resized to one row", h, k))
+			check(t, sized(shrunk, 40, 3), fmt.Sprintf("height %d, offset %d resized to three rows", h, k))
+		}
+	}
+}
+
+// TestNoScrollKeystrokeIsInert. A key the operator presses must move the report, every time,
+// until there is no more report to move. The failure this pins is subtle and reads as a frozen
+// dashboard: the correction that keeps a viewport off a blank run used to be applied when
+// RENDERING and thrown away, so the stored offset lagged behind the drawn one and the first press
+// or two only caught it up while the screen sat still.
+func TestNoScrollKeystrokeIsInert(t *testing.T) {
+	for _, h := range []int{1, 2, 3, 5, 9} {
+		m := narrowReport(100)
+		m = sized(m, 100, h)
+		m, _ = sstep(m, tea.KeyMsg{Type: tea.KeyHome})
+		seen := plain(m)
+		for press := 0; press < 200; press++ {
+			at := m.Offset()
+			if at >= m.maxOffset() {
+				break
+			}
+			next, _ := sstep(m, tea.KeyMsg{Type: tea.KeyDown})
+			if v := plain(next); v == seen {
+				t.Fatalf("height %d, press %d at offset %d: the screen did not move", h, press+1, at)
+			} else {
+				seen = v
+			}
+			if next.Offset() <= at {
+				t.Fatalf("height %d, press %d: the offset went from %d to %d", h, press+1, at, next.Offset())
+			}
+			m = next
+		}
+		// And back up again, the same way.
+		for press := 0; press < 200; press++ {
+			at := m.Offset()
+			if at == 0 {
+				break
+			}
+			next, _ := sstep(m, tea.KeyMsg{Type: tea.KeyUp})
+			if next.Offset() >= at {
+				t.Fatalf("height %d: scrolling up from offset %d went to %d — a blank run it cannot\n"+
+					"  get past", h, at, next.Offset())
+			}
+			m = next
+		}
+		if m.Offset() != 0 {
+			t.Fatalf("height %d: scrolling up stopped at offset %d", h, m.Offset())
+		}
+	}
+}
+
 // TestAReportEndingInBlankLinesStillShowsSomething. A report line CAN be empty — an error whose
 // text ends in a newline is split into a last, empty line — so the end of the laid-out report can
 // be blank. Scrolled to the bottom of one on a one-row terminal, the viewport lands on the blank
@@ -589,14 +713,12 @@ func TestAOneRowTerminalSpendsItsRowOnTheReport(t *testing.T) {
 	if v := plain(m); strings.Contains(v, "mythical-ctl status") {
 		t.Fatalf("the one row went to the view's own title:\n%q", v)
 	}
-	// And the report is reachable from there.
-	found := false
-	for i := 0; i < 8 && !found; i++ {
-		m, _ = sstep(m, tea.KeyMsg{Type: tea.KeyDown})
-		found = strings.Contains(plain(m), "zzident")
-	}
-	if !found {
-		t.Fatal("the report line cannot be scrolled to on a one-row terminal")
+	// And the report line is ONE keystroke away — the opening row is its section's heading, and
+	// the line sits directly under it. "Reachable in a few presses" is what an inert keystroke
+	// looks like from the outside, so the count is the assertion.
+	m, _ = sstep(m, tea.KeyMsg{Type: tea.KeyDown})
+	if v := plain(m); !strings.Contains(v, "zzident") {
+		t.Fatalf("one press down and the report line is still not on screen: %q", v)
 	}
 	// At two rows the footer earns its place back; at three, the title.
 	if v := plain(sized(m, 100, 2)); !strings.Contains(v, "closes") || strings.Contains(v, "mythical-ctl status") {
