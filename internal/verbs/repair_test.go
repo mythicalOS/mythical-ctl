@@ -978,17 +978,23 @@ func TestDifferentNetworkEntersTheMigration(t *testing.T) {
 }
 
 func TestBothNetworksIsDetectedAsMidMigration(t *testing.T) {
-	// opnet (the configured target) is joined FIRST, so it is emitted first in the attachment
-	// listing — exactly the ambiguity a real daemon's unspecified iteration order can also produce.
-	// Taking only the first attachment made every container's "one" network the target, the observed
-	// network came out equal to the resolved one, and a CLEAN reference was recorded with NO
-	// migration intent — silently dropping all record of the still-live old attachment.
+	// A container interrupted between migration phases 2 and 4 is attached to BOTH the old network
+	// and the configured target. Taking only the FIRST attachment made its "one" network whichever
+	// came first: with the target first, the observed network came out equal to the resolved one and
+	// a CLEAN reference was recorded with NO migration intent — silently dropping all record of the
+	// still-live old attachment, so nothing would ever detach it.
+	//
+	// THE NAMES ARE CHOSEN SO THE TARGET IS EMITTED FIRST. The attachment reader sorts by network
+	// NAME, so "atarget" precedes "zsource" deterministically — the shell suite arranged the same
+	// ordering through its fake's join order, which a sorted reader does not have. Named the other
+	// way round this test passes with the defect in place, because the first attachment would then
+	// be the source and "take the first" would happen to get the right answer.
 	r := newRepairRig(t)
-	tgt := r.operatorNetwork("opnet")
-	src := r.operatorNetwork("oldnet")
+	tgt := r.operatorNetwork("atarget")
+	src := r.operatorNetwork("zsource")
 	r.productContainer("c1", tgt, "p1", "insta", "nc1")
 	r.connect(src, "c1", "mythical-p1")
-	r.familyConf("MYTHICAL_NET=opnet\n")
+	r.familyConf("MYTHICAL_NET=atarget\n")
 
 	if rc := r.repair("insta"); rc != cliio.ExitOK {
 		t.Fatalf("rc = %d, want 0\n%s", rc, r.said())
@@ -1267,10 +1273,21 @@ func TestLateObjectAfterReinitializingRepairIsUnattributed(t *testing.T) {
 func TestAbandonIntentRespectsTheGracePeriod(t *testing.T) {
 	r := newRepairRig(t)
 	r.openNetworkIntent("net1")
+	// THE REFUSAL COMES BEFORE THE PROMPT. Asking "abandon this intent?" and announcing "abandoning
+	// the intent for network net1" for something that cannot be abandoned yet teaches the operator
+	// to answer yes to a question the tool was never going to honour — and it is what an
+	// unconditional confirm-then-try structure looks like from the outside even when the deeper
+	// writer happens to refuse too.
+	asked := 0
+	r.d.Confirm = func(string) bool { asked++; return true }
 
 	if rc := AbandonIntent(context.Background(), r.d, "network", "net1"); rc == cliio.ExitOK {
 		t.Fatalf("an intent was abandoned inside its grace period\n%s", r.said())
 	}
+	if asked != 0 {
+		t.Fatalf("the operator was asked to confirm an abandonment the grace period already refused\n%s", r.said())
+	}
+	r.mustNotSay("abandoning the intent for")
 	if _, err := intent.Find(r.ledgerNow(), prov.ClassNetwork, "net1"); err != nil {
 		t.Fatalf("the intent was dropped by a refused abandonment: %v", err)
 	}
@@ -1832,4 +1849,71 @@ func TestUnreadableLedgerPermissionsAreNeverReadAsCorruption(t *testing.T) {
 	if after := readFile(t, r.ledgerPath()); after != before {
 		t.Fatalf("the ledger was rewritten:\nbefore: %s\nafter:  %s", before, after)
 	}
+}
+
+func TestFailedLiveVerificationLeavesTheCheckOutstanding(t *testing.T) {
+	// The alias RESOLVES — to something other than this container's own endpoint on this network.
+	// The container is left running and the check stays owed: clearing it would tell every sibling
+	// product this one is reachable when the name points somewhere else.
+	r := newRepairRig(t)
+	net := r.labelledNetwork("netA", "nA", "insta")
+	r.productContainer("c1", net, "p1", "insta", "nc1")
+	r.startNamed("c1")
+	r.resolveAddr = "10.9.9.9"
+
+	r.mustRepair("insta")
+	r.mustSay("did not verify")
+	if checks := r.outstanding("c1"); len(checks) != 1 {
+		t.Fatalf("outstanding = %v, want the alias check still owed after a failed verification", checks)
+	}
+}
+
+func TestUnusableTrustAnchorIsDropped(t *testing.T) {
+	// ONE anchor row whose digest is not a usable one. The whole-ledger checksum proves the bytes
+	// were not altered after they were written — not that this record is one the installer's own
+	// writer ever produced. Preserving it wedges the next command that reads it.
+	r := newRig(t)
+	r.setEnv("MI_CONFIRM", "yes")
+	r.mintIdentity()
+	r.appendRows("trust-anchor\tdigest=not-a-digest")
+
+	if rc := r.repair(reinitialize); rc != cliio.ExitOK {
+		t.Fatalf("rc = %d, want 0\n%s", rc, r.said())
+	}
+	r.mustSay("not a usable digest")
+	r.mustSay("GUARANTEE LOST")
+	var got error
+	r.withLock(func(_ famlock.Held, st ledger.Store) { _, got = trust.AnchorGet(st) })
+	if !errors.Is(got, ledger.ErrAbsentRecord) {
+		t.Fatalf("the unusable anchor survived the repair: %v", got)
+	}
+}
+
+func TestReconstructionRefusesAnUnreadableConfig(t *testing.T) {
+	// mythical.conf that could not be READ is not MYTHICAL_NET being unset. Taking the
+	// installer's-own-network branch on it would silently decide which network this family joins
+	// from a file nobody could read.
+	r := newRepairRig(t)
+	r.labelledVolume("v1", "n1", "insta")
+	r.familyConf("MYTHICAL_NET=has\ta\tcontrol\tbyte\n")
+
+	if rc := r.repair("insta"); rc == cliio.ExitOK {
+		t.Fatalf("the reference was reconstructed from a config that could not be read\n%s", r.said())
+	}
+	r.mustSay("mythical.conf could not be read")
+	if _, err := netref.RefGet(r.ledgerNow()); !errors.Is(err, netref.ErrNoReference) {
+		t.Fatalf("a reference was recorded anyway: %v", err)
+	}
+}
+
+func TestNetRebindRefusesAnUnreadableConfig(t *testing.T) {
+	r := newRepairRig(t)
+	r.mintIdentity()
+	r.familyConf("MYTHICAL_NET=has\ta\tcontrol\tbyte\n")
+
+	if rc := NetRebind(context.Background(), r.d); rc == cliio.ExitOK {
+		t.Fatalf("a rebind started from a config that could not be read\n%s", r.said())
+	}
+	r.mustSay("cannot be")
+	r.mustNotSay("MYTHICAL_NET is not set")
 }

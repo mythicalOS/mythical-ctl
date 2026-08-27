@@ -1392,11 +1392,10 @@ func AbandonIntent(ctx context.Context, d Deps, class, name string) int {
 	}
 	defer s.close()
 
+	// THE CLASS IS NOT VALIDATED HERE. intent.Abandonable refuses an unknown one itself, and the
+	// reference delegates it the same way — refusing here as a USAGE error instead would answer the
+	// same malformed invocation with a different exit code than the reference gives it.
 	c := prov.Class(class)
-	if !prov.ClassOK(c) {
-		d.warn("verbs: %q is not an object class this installer records intents for", class)
-		return cliio.ExitUsage
-	}
 	if err := intent.Abandonable(ctx, s.l, s.objs, c, name, timeNow(), grace); err != nil {
 		d.warnErr(err)
 		return cliio.ExitFail
