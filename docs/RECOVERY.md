@@ -361,8 +361,15 @@ confirmation:
 - **Reset — a real rollback window:** every trust floor. Floors are a record of history, not something
   the runtime carries, so repair cannot reconstruct them; a withdrawn manifest version could be replayed
   and accepted again until new floors are established by normal use. (The trust *anchor* — which family
-  index this installation has authenticated — is not part of this: it is preserved, so repair does not
-  force you back online to re-establish it.)
+  index this installation has authenticated — is not part of this: a **usable** anchor is preserved, so
+  repair does not force you back online to re-establish it. An anchor repair cannot use is dropped
+  instead, and the loss is stated in the report before you confirm: a ledger recording more than one
+  anchor is ambiguous, and one whose digest is empty or malformed is not a digest. The whole-ledger
+  checksum proves those bytes were not altered after they were written; it does not prove the record is
+  one this installer's own writer produced. Preserving such a record would report a successful repair
+  and then have the very next command that reads trust refuse it — an installation wedged by the repair
+  that claimed to fix it. When that happens you need to be online once to re-establish the anchor, the
+  same requirement a first install has.)
 - **Inferred, not recovered:** desired state, from what each container is observed to be doing right now.
   A stopped container stays recorded as stopped; repair cannot know whether that was deliberate.
 - **Never rebuilt, never enumerated:** image provenance. Images carry no installation label at all

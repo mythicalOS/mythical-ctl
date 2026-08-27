@@ -12,6 +12,7 @@ import (
 	"mythicalos.ai/ctl/internal/intent"
 	"mythicalos.ai/ctl/internal/ledger"
 	"mythicalos.ai/ctl/internal/prov"
+	"mythicalos.ai/ctl/internal/state"
 )
 
 // Inventory — the STATUS half of Task 23's share of tests/unit/verbs.bats, as
@@ -716,4 +717,59 @@ func TestStatusReportsOpenIntentsAndAnUnreadableIntentList(t *testing.T) {
 	}
 	r.mustSay("PENDING:      UNREADABLE")
 	r.mustSay("state repair")
+}
+
+// TestOutstandingRenderingIsJoinedWithoutATrailingComma pins the one COSMETIC divergence in this
+// report, which is otherwise the kind of difference nothing would notice until a script did.
+//
+// The reference built this field by piping the check kinds through `tr '\n' ','`, which turns every
+// separator AND the final newline into a comma — so its output always ended in one ("alias," for a
+// single check). That trailing comma is an artifact of the pipeline, not information: joining says
+// the same thing. Pinned rather than left implicit because a diagnostic field's shape is the part a
+// wrapper parses, and "it used to have a trailing comma" is exactly the detail a later reader would
+// re-add on the theory that the reference meant it.
+func TestOutstandingRenderingIsJoinedWithoutATrailingComma(t *testing.T) {
+	r := newRig(t)
+	r.writeProduct("p1")
+	r.mintIdentity()
+	r.mustInstall("p1")
+	c := r.container("p1")
+
+	r.withLock(func(h famlock.Held, st ledger.Store) {
+		l := r.loadLedger(st)
+		if err := state.Commit(l, c, state.Running, []state.Check{
+			{Kind: state.CheckAlias, Param: "net-a"},
+			{Kind: state.CheckAlias, Param: "net-b"},
+		}, false); err != nil {
+			t.Fatal(err)
+		}
+		if err := ledger.Write(h, st, l); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	l := r.ledgerOnDisk()
+	got := outstandingOf(l, c)
+	if got != "alias,alias" {
+		t.Fatalf("outstandingOf = %q, want %q — two checks, one separator, no trailing comma", got, "alias,alias")
+	}
+	if strings.HasSuffix(got, ",") {
+		t.Fatalf("outstandingOf = %q — the reference's `tr` artifact was re-added", got)
+	}
+	// And the empty case is a WORD, not an empty field: a blank there reads as a rendering bug —
+	// and it is the value "UNREADABLE" has to stay distinguishable from.
+	r.withLock(func(h famlock.Held, st ledger.Store) {
+		l := r.loadLedger(st)
+		for _, p := range []string{"net-a", "net-b"} {
+			if err := state.OutstandingClear(l, c, state.CheckAlias, p); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := ledger.Write(h, st, l); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if got := outstandingOf(r.ledgerOnDisk(), c); got != "none" {
+		t.Fatalf("with nothing outstanding: %q, want %q", got, "none")
+	}
 }
