@@ -59,6 +59,7 @@ COMMANDS
   net rebind               move this installation onto the network MYTHICAL_NET names
 
 OPTIONS
+  --plain                  status only: print the report instead of the terminal dashboard
   --index PATH             the family index (default: ~/.mythical/.state/index)
   --policy PATH            the family policy index
   --manifest-dir PATH      where <product>.manifest files are
@@ -96,6 +97,15 @@ func runEnv(args, env []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	o, rc := parseOpts(args[1:], stderr)
 	if rc >= 0 {
 		return rc
+	}
+	// --plain selects status's plain report over its terminal dashboard, and belongs to `status`
+	// alone. REFUSED HERE, ONCE, rather than accepted and ignored elsewhere: an option a verb
+	// takes without honouring is an option whose next reader assumes it worked. It is refused
+	// centrally because every other verb's option matrix is a port of the frozen dispatcher's,
+	// and this flag has no counterpart there to port.
+	if o.plain && verb != "status" {
+		fmt.Fprintln(stderr, "mythical-ctl: --plain applies to status only")
+		return cliio.ExitUsage
 	}
 	switch verb {
 	case "backup":
@@ -213,7 +223,12 @@ func status(o opts, env []string, stdin io.Reader, stdout, stderr io.Writer) int
 		fmt.Fprintln(stderr, err.Error())
 		return cliio.ExitFail
 	}
-	return verbs.Status(context.Background(), d, o.products)
+	// At a terminal the report is DRAWN; everywhere else, and under --plain, it is printed
+	// exactly as it always was. Same verb, same lines, one producer — see driveStatus.
+	return driveStatus(context.Background(), d, o.plain, stdin, stdout,
+		func(ctx context.Context, d verbs.Deps) int {
+			return verbs.Status(ctx, d, o.products)
+		})
 }
 
 // statusDeps assembles the report's dependencies WITHOUT letting a runtime that cannot be LOCATED
@@ -408,7 +423,10 @@ func or(v, fallback string) string {
 type opts struct {
 	index, policy, manifestDir, image, toBind  string
 	purge, family, forced, mapForeign, abandon bool
-	products                                   []string
+	// plain selects status's plain report over the terminal dashboard. It is refused for every
+	// other verb (see runEnv) rather than accepted and ignored.
+	plain    bool
+	products []string
 }
 
 // parseOpts ports the frozen dispatcher's while-loop verbatim: known value-taking options
@@ -470,6 +488,8 @@ func parseOpts(args []string, stderr io.Writer) (opts, int) {
 			o.mapForeign = true
 		case "--abandon":
 			o.abandon = true
+		case "--plain":
+			o.plain = true
 		default:
 			if strings.HasPrefix(a, "-") {
 				fmt.Fprintf(stderr, "mythical-ctl: unknown option: %s\n", a)

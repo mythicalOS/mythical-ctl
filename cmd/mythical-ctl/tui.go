@@ -19,8 +19,9 @@ import (
 // interface's bridge. The refusal semantics are cliio.Confirm's in both, so a destructive verb is
 // exactly as hard to confirm at a terminal as it is in a script.
 //
-// Read-only and non-lifecycle verbs are deliberately NOT routed through here yet: status has its own
-// live view still to come, and backup/restore print reports a capture is entitled to see unchanged.
+// Read-only and non-lifecycle verbs are deliberately NOT routed through here: status has its own
+// live view (driveStatus, which reaches driveWith below with ui.RunStatus), and backup/restore
+// print reports a capture is entitled to see unchanged.
 func drive(ctx context.Context, d verbs.Deps, stdin io.Reader, stdout io.Writer, fn ui.VerbFunc) int {
 	return driveWith(ctx, d, fn, ui.Interactive(d.Env, stdin, stdout), ui.Run)
 }
