@@ -783,6 +783,71 @@ func TestProgressRecordMatchesThePlainPathByte(t *testing.T) {
 	}
 }
 
+// senderFunc adapts a function to Sender.
+type senderFunc func(tea.Msg)
+
+func (f senderFunc) Send(m tea.Msg) { f(m) }
+
+// TestRecordAndScreenAgreeOnOrderAcrossStreams. The ordering lock has to span the whole bridge, not
+// each writer: stdout can record its line and then pause inside the post while stderr records AND
+// posts its own, and then the replayed record says stdout-first while the screen said stderr-first.
+// One of the two is then lying about what happened when.
+//
+// The interleaving is PINNED rather than raced: the first post blocks until this test releases it,
+// which is exactly the pause a per-writer lock leaves open.
+func TestRecordAndScreenAgreeOnOrderAcrossStreams(t *testing.T) {
+	var mu sync.Mutex
+	var drawn []string
+	firstPost := make(chan struct{})
+	release := make(chan struct{})
+	// A CAS rather than sync.Once: Once BLOCKS every concurrent caller until the first Do returns,
+	// which would serialise the second writer inside the sender and hide the very interleaving this
+	// test exists to produce. The first caller parks; every later one walks straight through.
+	var parked int32
+
+	b := NewBridge(context.Background(), senderFunc(func(m tea.Msg) {
+		if atomic.CompareAndSwapInt32(&parked, 0, 1) {
+			close(firstPost)
+			<-release
+		}
+		if om, ok := m.(OutputMsg); ok {
+			mu.Lock()
+			drawn = append(drawn, om.Line)
+			mu.Unlock()
+		}
+	}))
+
+	out, errw := b.Writer(false), b.Writer(true)
+	done := make(chan struct{}, 2)
+	go func() { fmt.Fprint(out, "A\n"); done <- struct{}{} }()
+	// Wait until the first writer is INSIDE the post and stuck there.
+	<-firstPost
+	go func() { fmt.Fprint(errw, "B\n"); done <- struct{}{} }()
+	// Give the second writer every chance to overtake: with a per-writer lock it records and draws
+	// B while A is still parked in its post.
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+	<-done
+	<-done
+
+	var recorded []string
+	for _, c := range b.Record() {
+		recorded = append(recorded, strings.TrimSuffix(c.text, "\n"))
+	}
+	mu.Lock()
+	got := append([]string(nil), drawn...)
+	mu.Unlock()
+	if len(recorded) != 2 || len(got) != 2 {
+		t.Fatalf("recorded %q drawn %q", recorded, got)
+	}
+	if recorded[0] != got[0] || recorded[1] != got[1] {
+		t.Fatalf("the record says %q and the screen says %q — one of them is lying about the order", recorded, got)
+	}
+	if recorded[0] != "A" {
+		t.Fatalf("the writer that got there first is %q", recorded[0])
+	}
+}
+
 // TestBridgeIsRaceFreeUnderConcurrentUse. A goroutine-per-verb design plus a message loop is exactly
 // where races live; this is the shape `go test -race` needs to see.
 func TestBridgeIsRaceFreeUnderConcurrentUse(t *testing.T) {

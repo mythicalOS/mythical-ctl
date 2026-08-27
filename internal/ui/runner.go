@@ -67,6 +67,17 @@ type Bridge struct {
 	closed chan struct{}
 	once   sync.Once
 
+	// order serialises the RECORD-THEN-POST pair across EVERY producer — both stream writers and
+	// the narration. A per-writer lock is not enough: stdout can record A and pause before posting
+	// while stderr records and posts B, and then the replayed record says A-then-B while the screen
+	// said B-then-A. The two must not be able to disagree about what happened first.
+	//
+	// It is held across the post, which can block until the message loop takes it. That is bounded
+	// by the program's lifetime, and nothing the message loop runs writes back through a Bridge, so
+	// there is no cycle. Lock order is ALWAYS order -> StreamWriter.mu -> mu, and nothing takes them
+	// in any other order.
+	order sync.Mutex
+
 	mu     sync.Mutex
 	record []recordChunk
 }
@@ -140,6 +151,8 @@ func (b *Bridge) Confirm(prompt string) bool {
 // interface comes down, so a step that happens during a teardown is still reported rather than lost
 // with the frame it was drawn in.
 func (b *Bridge) Progress(ev verbs.ProgressEvent) {
+	b.order.Lock()
+	defer b.order.Unlock()
 	// EXACTLY what the plain path writes for the same event: fmt.Fprintln(d.out(), ev.Detail).
 	b.appendRecord(false, ev.Detail+"\n")
 	if b.gone() {
@@ -152,6 +165,10 @@ func (b *Bridge) Progress(ev verbs.ProgressEvent) {
 // recorded: a pull emits a record per layer per tick, and replaying thousands of transient status
 // lines into the terminal afterwards would bury the operation's actual narration.
 func (b *Bridge) PullProgress(status string) {
+	// Not recorded, but still ordered: a pull line drawn out of sequence with the step it belongs to
+	// would tell the operator the wrong story about where the operation is.
+	b.order.Lock()
+	defer b.order.Unlock()
 	if b.gone() {
 		return
 	}
@@ -224,11 +241,10 @@ func (w *StreamWriter) Write(p []byte) (int, error) {
 	// RECORDED FIRST, RAW, AND IN THE SAME CRITICAL SECTION as the line splitting: the record's
 	// order is the order the verb wrote in, and a chunk appended after another goroutine's would
 	// replay out of sequence.
-	// RECORDED AND DRAWN UNDER ONE LOCK, so the two agree on order. Releasing between them let two
-	// concurrent writers record A-then-B and draw B-then-A: the replay and the screen would then
-	// disagree about what happened first. The lock is held across the post to the message loop;
-	// that post is the only thing here that can block, it is bounded by the program's lifetime, and
-	// nothing the message loop runs writes back to a StreamWriter, so there is no cycle to close.
+	// RECORDED AND DRAWN UNDER THE BRIDGE'S ORDERING LOCK, so the replay and the screen agree —
+	// across streams, not merely within one. See Bridge.order.
+	w.b.order.Lock()
+	defer w.b.order.Unlock()
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.b.appendRecord(w.stderr, string(p))
@@ -248,6 +264,8 @@ func (w *StreamWriter) Write(p []byte) (int, error) {
 // Close draws a trailing partial line. It adds NOTHING to the record — the bytes are already there,
 // exactly as they were written.
 func (w *StreamWriter) Close() error {
+	w.b.order.Lock()
+	defer w.b.order.Unlock()
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	rest := string(w.buf)
