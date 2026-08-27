@@ -435,6 +435,63 @@ type blackHole struct{}
 
 func (blackHole) Send(tea.Msg) {}
 
+// recordingSender counts what was posted, so a message that must NEVER be posted can be asserted
+// on rather than reasoned about.
+type recordingSender struct {
+	mu   sync.Mutex
+	msgs []tea.Msg
+}
+
+func (r *recordingSender) Send(m tea.Msg) {
+	r.mu.Lock()
+	r.msgs = append(r.msgs, m)
+	r.mu.Unlock()
+}
+
+func (r *recordingSender) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.msgs)
+}
+
+// TestBridgePostsNothingToADeadInterface — a question asked after the interface is gone must refuse
+// WITHOUT being posted. Posting it would race a torn-down program and, on a program that has not
+// started, would block the verb inside Send with nothing able to take the message.
+func TestBridgePostsNothingToADeadInterface(t *testing.T) {
+	rec := &recordingSender{}
+	b := NewBridge(context.Background(), rec)
+	b.Close()
+	if b.Confirm("?") {
+		t.Fatal("a closed bridge accepted")
+	}
+	if got := rec.count(); got != 0 {
+		t.Fatalf("%d message(s) were posted to a dead interface", got)
+	}
+	b.Progress(verbs.ProgressEvent{Stage: "s", Detail: "d"})
+	b.PullProgress("layer")
+	w := b.Writer(false)
+	fmt.Fprintln(w, "a line")
+	_ = w.Close()
+	if got := rec.count(); got != 0 {
+		t.Fatalf("%d message(s) were posted to a dead interface", got)
+	}
+	// The narration is still RECORDED, so nothing the verb said is lost.
+	if got := len(b.Record()); got != 2 {
+		t.Fatalf("record holds %d lines, want the progress step and the stream line", got)
+	}
+
+	// And on a live bridge, the same calls do post.
+	rec2 := &recordingSender{}
+	b2 := NewBridge(context.Background(), rec2)
+	b2.Progress(verbs.ProgressEvent{Stage: "s", Detail: "d"})
+	b2.PullProgress("layer")
+	w2 := b2.Writer(false)
+	fmt.Fprintln(w2, "a line")
+	if got := rec2.count(); got != 3 {
+		t.Fatalf("a live bridge posted %d messages, want 3", got)
+	}
+}
+
 // TestBridgeConfirmRefusesWhenClosed covers both orderings: closed before the question, and closed
 // while it is outstanding.
 func TestBridgeConfirmRefusesWhenClosed(t *testing.T) {
