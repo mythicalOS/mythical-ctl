@@ -471,7 +471,7 @@ func (r *rig) mustInstall(product string) {
 // the Go spelling of grepping the reference harness's call log.
 func (r *rig) requests(match func(string) bool) int {
 	n := 0
-	for _, req := range r.fake.Requests {
+	for _, req := range r.fake.RequestLog() {
 		if match(req) {
 			n++
 		}

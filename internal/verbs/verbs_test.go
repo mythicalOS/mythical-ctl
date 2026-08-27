@@ -184,14 +184,14 @@ func TestInstallLibraryRefusesValuelessImage(t *testing.T) {
 	r := newRig(t)
 	r.writeProduct("p1")
 	r.mintIdentity()
-	before := len(r.fake.Requests)
+	before := len(r.fake.RequestLog())
 
 	rc := r.install("p1", withImage(""))
 	if rc != cliio.ExitUsage {
 		t.Fatalf("rc = %d, want 2 (usage)\n%s", rc, r.said())
 	}
 	r.mustSay("requires a value")
-	if got := len(r.fake.Requests); got != before {
+	if got := len(r.fake.RequestLog()); got != before {
 		t.Fatalf("a usage error attempted %d daemon request(s)", got-before)
 	}
 }
@@ -342,12 +342,12 @@ func TestInstallDoesNotPullOnAnUnaskablePresenceCheck(t *testing.T) {
 // DownFrom knob matches on, so the fixture cannot drift from the client's own URL shape.
 func imageInspectKey(t *testing.T, r *rig, ref string) string {
 	t.Helper()
-	before := len(r.fake.Requests)
+	before := len(r.fake.RequestLog())
 	_, _ = r.c.ImageInspect(context.Background(), ref)
-	if len(r.fake.Requests) == before {
+	if len(r.fake.RequestLog()) == before {
 		t.Fatal("the image inspect made no request")
 	}
-	req := r.fake.Requests[len(r.fake.Requests)-1]
+	req := r.fake.RequestLog()[len(r.fake.RequestLog())-1]
 	method, path, ok := strings.Cut(req, " ")
 	if !ok {
 		t.Fatalf("unexpected request record %q", req)

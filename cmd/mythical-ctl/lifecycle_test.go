@@ -172,8 +172,8 @@ func TestCLIUnknownVerbExitsTwo(t *testing.T) {
 	if rc := r.run("frobnicate"); rc != cliio.ExitUsage {
 		t.Fatalf("rc = %d, want 2\n%s", rc, r.said())
 	}
-	if len(r.fake.Requests) != 0 {
-		t.Fatalf("an unknown verb reached the daemon: %v", r.fake.Requests)
+	if len(r.fake.RequestLog()) != 0 {
+		t.Fatalf("an unknown verb reached the daemon: %v", r.fake.RequestLog())
 	}
 }
 
@@ -206,7 +206,7 @@ func TestCLIValuelessOptionIsAUsageError(t *testing.T) {
 	r.writeProduct("p1")
 	for _, opt := range []string{"--index", "--policy", "--manifest-dir", "--image"} {
 		before := r.fake.Snapshot()
-		reqs := len(r.fake.Requests)
+		reqs := len(r.fake.RequestLog())
 		if rc := r.run("install", "p1", opt); rc != cliio.ExitUsage {
 			t.Fatalf("install p1 %s: rc = %d, want 2\n%s", opt, rc, r.said())
 		}
@@ -215,8 +215,8 @@ func TestCLIValuelessOptionIsAUsageError(t *testing.T) {
 		}
 		// AND NOTHING WAS ATTEMPTED, which is the half of "usage error" the exit code alone does
 		// not carry: the daemon was never spoken to and the world is unchanged.
-		if len(r.fake.Requests) != reqs {
-			t.Fatalf("install p1 %s: reached the daemon: %v", opt, r.fake.Requests[reqs:])
+		if len(r.fake.RequestLog()) != reqs {
+			t.Fatalf("install p1 %s: reached the daemon: %v", opt, r.fake.RequestLog()[reqs:])
 		}
 		if after := r.fake.Snapshot(); after != before {
 			t.Fatalf("install p1 %s: the runtime changed:\n%s\n---\n%s", opt, before, after)
@@ -242,8 +242,8 @@ func TestCLIInstallRejectsPurge(t *testing.T) {
 	if r.isMember("p1") {
 		t.Fatal("the stray option was accepted and the install ran anyway")
 	}
-	if len(r.fake.Requests) != 0 {
-		t.Fatalf("the refusal reached the daemon: %v", r.fake.Requests)
+	if len(r.fake.RequestLog()) != 0 {
+		t.Fatalf("the refusal reached the daemon: %v", r.fake.RequestLog())
 	}
 }
 
