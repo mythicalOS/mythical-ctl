@@ -79,13 +79,17 @@ type ConfirmRequestMsg struct {
 // Esc refuses. So does ^D, which is the operator saying there is no more input. So does the
 // interface going away without an answer — see Bridge.
 //
-// BRACKETED PASTE IS DISABLED AT THE PROGRAM (see programOptions), which closes the two holes a
-// model cannot close for itself: the decoder silently drops runes decoding to U+FFFD inside a
-// paste, and a clipboard containing the paste terminator ends the paste early so its tail is
-// decoded as ordinary input — both of which can deliver a clean "y" for bytes a pipe would refuse.
-// With it off, pasted bytes arrive as the key events they describe and take the same paths as
-// typing. The paste branch below is kept anyway: this overlay must answer correctly for whatever
-// it is handed, whoever configured the program.
+// A PASTE IS NOT AN ANSWER — see the msg.Paste branch in handleKey for why, and for the one place
+// this overlay is deliberately stricter than the pipe. The program also declines to turn bracketed
+// paste ON (see programOptions), which is defence in depth rather than the fix: that option only
+// skips ENABLING the terminal mode, and Bubble Tea's decoder runs regardless.
+//
+// STATED RESIDUAL, and it is a property of the transport rather than of this code: with bracketing
+// off, a terminal gives no signal that distinguishes pasted bytes from typed ones. A CR among them
+// is then the Enter key, because that is what a terminal means by CR — so pasting "y\r\n" without
+// bracketing answers as typing y and pressing Enter does. The pipe, which has no Enter key, reads
+// the same bytes as the line "y\r" and refuses. Nothing in a model can tell the two apart when the
+// terminal does not.
 //
 // Signature note (a deliberate, documented widening of the plan's `Confirm(prompt string)
 // Overlay`): the constructor takes the Reply as well. An overlay with nowhere to send its answer
@@ -181,6 +185,21 @@ func (o ConfirmOverlay) handleKey(msg tea.KeyMsg) (Overlay, tea.Cmd) {
 	// An ALT MODIFIER is not typed text on any key — a terminal sends it as an ESC prefix, which no
 	// accepted reply contains. It marks the line whatever key carries it.
 	if msg.Alt {
+		o.marked = true
+	}
+	// A PASTE IS NOT TYPED TEXT EITHER, and this is the one place the two worlds are deliberately
+	// asymmetric. Bubble Tea's paste decoder is LOSSY: it silently drops every rune that decodes to
+	// U+FFFD, so the runes handed over are not the bytes that were pasted, and a clipboard
+	// containing the paste terminator ends the paste early so its tail is decoded separately.
+	// Judging an accept on a lossy transform of the input is unsound whichever way it falls, and the
+	// decoder runs whether or not the program enabled bracketed paste in the terminal
+	// (WithoutBracketedPaste only skips ENABLING it — measured against v1.3.10). So a paste is
+	// marked, and the reply must be typed.
+	//
+	// This is the direction that makes the confirmation HARDER than the pipe's, knowingly: pasting
+	// "yes" no longer answers it. That is the safe half of the asymmetry, it is recoverable in one
+	// keystroke (^U clears the line and the mark), and the prompt says so in its own footer.
+	if msg.Paste {
 		o.marked = true
 	}
 	switch msg.Type {

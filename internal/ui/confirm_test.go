@@ -208,11 +208,47 @@ func TestConfirmKeepsControlBytesInTheBuffer(t *testing.T) {
 	}
 }
 
-// TestConfirmPastedNewlineSubmits — the plain path's reader stops at the first newline, so a pasted
-// "y\n…" is an accepted answer there. Buffering the newline instead would refuse it here.
-func TestConfirmPastedNewlineSubmits(t *testing.T) {
+// TestConfirmRefusesEveryPaste. Bubble Tea's paste decoder is LOSSY — it drops every rune that
+// decodes to U+FFFD — and it runs whether or not the program enabled bracketed paste in the
+// terminal, so an accept decided on its output would be decided on a transform of the input rather
+// than the input. A clipboard carrying the paste TERMINATOR ends the paste early, which delivered a
+// clean "y" for bytes a pipe refuses. Marking is the sound answer, and it is the one place this
+// overlay is knowingly stricter than the pipe.
+func TestConfirmRefusesEveryPaste(t *testing.T) {
+	for _, paste := range []string{"y", "yes", "Y", "y\n", "yes\nrm -rf /\n", "y\r", "y\x1b[201~\n"} {
+		r := NewReply()
+		var o Overlay = Confirm("Really?", r)
+		o, _ = o.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(paste), Paste: true})
+		if o != nil {
+			// No embedded newline: it is still open, and marked.
+			if !o.(ConfirmOverlay).Marked() {
+				t.Fatalf("paste %q did not mark the line", paste)
+			}
+			o = press(t, o, tea.KeyEnter)
+		}
+		if ok := <-r.C(); ok {
+			t.Fatalf("paste %q was ACCEPTED", paste)
+		}
+	}
+
+	// ^U recovers: the line and the mark go together, and a TYPED reply is then accepted.
+	r := NewReply()
+	var o Overlay = Confirm("Really?", r)
+	o, _ = o.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("yes"), Paste: true})
+	o = press(t, o, tea.KeyCtrlU)
+	o = typeRunes(t, o, "yes")
+	o = press(t, o, tea.KeyEnter)
+	if ok := <-r.C(); !ok {
+		t.Fatal("a reply typed after ^U cleared a paste was refused")
+	}
+}
+
+// TestConfirmNewlineInRunesStillSubmits — the embedded-newline branch is not paste-only. A KeyRunes
+// carrying a newline submits what precedes it, exactly as the plain path's reader stops at the
+// first newline; whether the result is ACCEPTED is then the mark's business.
+func TestConfirmNewlineInRunesStillSubmits(t *testing.T) {
 	for _, tc := range []struct {
-		paste string
+		runes string
 		want  bool
 	}{
 		{"y\n", true},
@@ -222,18 +258,16 @@ func TestConfirmPastedNewlineSubmits(t *testing.T) {
 	} {
 		r := NewReply()
 		var o Overlay = Confirm("Really?", r)
-		o, _ = o.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(tc.paste), Paste: true})
+		o, _ = o.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(tc.runes)})
 		if o != nil {
-			t.Fatalf("paste %q left the overlay open — the newline must submit", tc.paste)
+			t.Fatalf("%q left the overlay open — the newline must submit", tc.runes)
 		}
-		got := <-r.C()
-		if got != tc.want {
-			t.Errorf("paste %q: %v, want %v", tc.paste, got, tc.want)
+		if got := <-r.C(); got != tc.want {
+			t.Errorf("%q: %v, want %v", tc.runes, got, tc.want)
 		}
-		// And the plain path agrees, byte for byte, on the same input.
-		plain := cliio.Confirm(nil, strings.NewReader(tc.paste), io.Discard, "Proceed?")
-		if plain != tc.want {
-			t.Errorf("paste %q: plain path %v, want %v", tc.paste, plain, tc.want)
+		// The plain path agrees, byte for byte, on the same input.
+		if plain := cliio.Confirm(nil, strings.NewReader(tc.runes), io.Discard, "Proceed?"); plain != tc.want {
+			t.Errorf("%q: plain path %v, want %v", tc.runes, plain, tc.want)
 		}
 	}
 }
@@ -472,23 +506,18 @@ func TestConfirmCtrlDRefuses(t *testing.T) {
 	}
 }
 
-// TestConfirmCarriageReturnDependsOnHowItArrives, and both arrivals agree with the plain path.
-//
-// A bare CR is the one byte that is NOT the same input in the two worlds, and saying so is more
-// useful than pretending it is. A pipe carrying "Y\r\n" gives the plain path the line "Y\r", which
-// refuses. A TERMINAL never delivers a bare CR as data: the Enter key is the line terminator (the
-// line discipline turns CR into NL), which is what KeyEnter means here — so pressing Y then Enter is
-// the line "Y" and accepts, in both worlds. The only way a literal CR reaches the buffer is a PASTE,
-// and there it stays in the line and refuses, exactly as the pipe does.
-func TestConfirmCarriageReturnDependsOnHowItArrives(t *testing.T) {
-	// Pasted: the CR is data, and the line refuses — as it does on the plain path.
+// TestConfirmCarriageReturn. A bare CR is the one byte that is not the same input in both worlds,
+// and it is stated rather than papered over. A PASTED CR refuses, because every paste is marked. A
+// PRESSED Enter is the line terminator — that is what a terminal means by CR — so `Y` then Enter is
+// the line "Y" and accepts, exactly as the pipe's line "Y" does. With bracketing off a terminal
+// gives no signal that separates the two; that residual is stated in the type comment.
+func TestConfirmCarriageReturn(t *testing.T) {
 	for _, paste := range []string{"Y\r", "yes\r", "\ry"} {
 		r := NewReply()
 		var o Overlay = Confirm("Really?", r)
 		o, _ = o.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(paste), Paste: true})
-		o = press(t, o, tea.KeyEnter)
 		if o != nil {
-			t.Fatalf("paste %q left the overlay open", paste)
+			o = press(t, o, tea.KeyEnter)
 		}
 		if ok := <-r.C(); ok {
 			t.Fatalf("paste %q was accepted", paste)
@@ -497,7 +526,6 @@ func TestConfirmCarriageReturnDependsOnHowItArrives(t *testing.T) {
 			t.Fatalf("paste %q: the plain path accepted it", paste)
 		}
 	}
-	// Pressed: Enter is the terminator, so the line is what was typed before it.
 	if !answerThroughOverlay(t, "Y") {
 		t.Fatal("Y followed by Enter was refused")
 	}

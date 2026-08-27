@@ -33,6 +33,11 @@ func (s stubOverlay) Update(msg tea.Msg) (Overlay, tea.Cmd) {
 		s.seen = append(append([]string(nil), s.seen...), m.String())
 	case tea.WindowSizeMsg:
 		s.seen = append(append([]string(nil), s.seen...), "size")
+	case ProgressMsg:
+		// Recorded so a test can tell "the data reached me" from "nothing happened". Without this
+		// the broadcast assertions are vacuous: an implementation that routed data nowhere at all
+		// would satisfy them.
+		s.seen = append(append([]string(nil), s.seen...), "data:"+m.Event.Detail)
 	}
 	return s, nil
 }

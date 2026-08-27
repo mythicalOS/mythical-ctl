@@ -319,13 +319,13 @@ func TestRootDataReachesEveryLayerButKeysDoNot(t *testing.T) {
 	m, _ = step(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
 	under := m.overlays[0].(stubOverlay).seen
 	over := m.overlays[1].(stubOverlay).seen
-	for _, k := range under {
-		if k == "k" {
-			t.Fatalf("the key reached the layer underneath: %v", under)
-		}
+	// The data reached BOTH — asserted positively, or an implementation that routed it nowhere
+	// would satisfy a test that only checks the key did not arrive.
+	if len(under) != 1 || under[0] != "data:d" {
+		t.Fatalf("the layer underneath saw %v, want just the data", under)
 	}
-	if len(over) != 1 || over[0] != "k" {
-		t.Fatalf("the top overlay saw %v, want just the key", over)
+	if len(over) != 2 || over[0] != "data:d" || over[1] != "k" {
+		t.Fatalf("the top overlay saw %v, want the data then the key", over)
 	}
 }
 

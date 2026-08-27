@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -596,12 +597,46 @@ func TestProgramOptionsDisableBracketedPaste(t *testing.T) {
 				tc.name, len(got), tc.want)
 		}
 	}
-	// It is applied to a real program without panicking, which is the only other thing that can be
-	// checked about an opaque option.
 	p := tea.NewProgram(NewRoot(nil), programOptions(verbs.Deps{Stdin: &in, Stdout: &out})...)
 	if p == nil {
 		t.Fatal("NewProgram returned nil")
 	}
+
+	// AND THE OPTION IS ACTUALLY THE ONE CLAIMED. A count alone passes for any other non-panicking
+	// option — exactly the substitution that would leave bracketed paste on — and a ProgramOption's
+	// code pointer is not a usable identity (measured: two calls to the same constructor return
+	// different pointers). What IS observable is the bit the option sets on the program, so the
+	// mask is DERIVED by applying the option alone and then required to be present in ours.
+	mask := startupBits(t, tea.WithoutBracketedPaste())
+	if mask == 0 {
+		t.Skip("this bubbletea build does not expose the startup flags this assertion reads")
+	}
+	// The premise: a different option sets a different bit, so the mask means something.
+	if other := startupBits(t, tea.WithAltScreen()); other == mask {
+		t.Fatal("two different options set the same bit — the mask proves nothing")
+	}
+	if got := startupBits(t, programOptions(verbs.Deps{Stdin: &in, Stdout: &out})...); got&mask == 0 {
+		t.Fatalf("startup flags %b lack the no-bracketed-paste bit %b", got, mask)
+	}
+}
+
+// startupBits applies options to a program and reads the startup flags they set. The field is
+// unexported, which reflection may READ (only Interface and the setters are barred); a build that
+// renames it yields an invalid Value and the caller skips rather than asserting nothing.
+func startupBits(t *testing.T, opts ...tea.ProgramOption) int64 {
+	t.Helper()
+	p := tea.NewProgram(NewRoot(nil), opts...)
+	f := reflect.ValueOf(p).Elem().FieldByName("startupOptions")
+	if !f.IsValid() {
+		return 0
+	}
+	switch f.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return f.Int()
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return int64(f.Uint())
+	}
+	return 0
 }
 
 // TestRunSuppliesBothSeams — a nil Confirm or Progress would silently fall back to the plain-CLI
