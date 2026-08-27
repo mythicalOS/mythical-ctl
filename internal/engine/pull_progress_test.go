@@ -7,8 +7,15 @@ package engine_test
 
 import (
 	"context"
+	"encoding/json"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"mythicalos.ai/ctl/internal/engine"
 )
 
 // TestImagePullReportsProgressWhenAskedTo — the callback is the only way a front-end can show
@@ -72,4 +79,66 @@ func TestImagePullReportsTheFailureRatherThanTheProgress(t *testing.T) {
 	if len(got) != 0 {
 		t.Fatalf("a refused pull narrated %q", got)
 	}
+}
+
+// TestImagePullOneRecordCarryingBoth is the case the sentence above actually claims and the shared
+// fake cannot produce: ONE record with a status AND an error. Two separate records — a status, then
+// an error — pass whichever order the two checks are in, so a regression that narrated first would
+// have gone unnoticed. Served here from a socket this test owns, so the shared fake is untouched.
+func TestImagePullOneRecordCarryingBoth(t *testing.T) {
+	stream := []map[string]string{
+		{"status": "Pulling from reg.example/img", "id": "abc"},
+		{"status": "Downloading", "progress": "1/2", "error": "denied: requested access is denied"},
+		{"status": "Downloaded newer image"},
+	}
+	c := pullServer(t, stream)
+	m, _ := newMutator(t, c)
+	var got []string
+	m.PullProgress = func(s string) { got = append(got, s) }
+
+	err := m.ImagePull(context.Background(), "reg.example/img:v1")
+	if err == nil || !strings.Contains(err.Error(), "denied: requested access is denied") {
+		t.Fatalf("err %v — the registry's own words must ride the error", err)
+	}
+	// The status on the FAILING record is not a step: narrating it would put a reassuring line on
+	// screen for the moment the pull failed. And nothing after the failure is read at all.
+	if len(got) != 1 {
+		t.Fatalf("narrated %q, want only the records before the failure", got)
+	}
+	if !strings.Contains(got[0], "abc: Pulling from reg.example/img") {
+		t.Fatalf("first line %q", got[0])
+	}
+}
+
+// pullServer serves one canned image-create stream over a unix socket and returns a client for it.
+func pullServer(t *testing.T, records []map[string]string) *engine.Client {
+	t.Helper()
+	// os.MkdirTemp rather than t.TempDir: a unix socket path has a hard length limit (~104 bytes
+	// on darwin) and t.TempDir bakes the test's name into the path, which overruns it.
+	dir, err := os.MkdirTemp("", "pullprog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sock := filepath.Join(dir, "d.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/images/create") {
+			http.Error(w, "unexpected path "+r.URL.Path, http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		enc := json.NewEncoder(w)
+		for _, rec := range records {
+			_ = enc.Encode(rec)
+		}
+	})}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() {
+		_ = srv.Close()
+		_ = os.RemoveAll(dir)
+	})
+	return engine.Dial(sock)
 }

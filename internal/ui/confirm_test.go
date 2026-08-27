@@ -86,9 +86,8 @@ func TestOverlayAndPlainPathAgreeOnEveryReply(t *testing.T) {
 		"", " ", "  y", "y ", " y ", "yess", "yy", "ye", "YEs", "yEs", "yes!",
 		"ok", "1", "true",
 		"Y\u202e", "y\x00", "\u200by",
-		// The keys Bubble Tea reports as something other than a rune. A terminal reading a line
-		// puts every one of these bytes INTO the line, so each of them refuses on the plain path
-		// and must refuse here.
+		// The keys Bubble Tea reports as something other than a rune. Each of these bytes refuses
+		// on the plain path — none appears in an accepted reply — and each must refuse here.
 		"y\t", "\ty", "y\x01", "y\x1b", "\x1by", "y\x0b", "y\x1f", "y\x7f\x7f",
 	}
 	for _, line := range lines {
@@ -239,65 +238,125 @@ func TestConfirmPastedNewlineSubmits(t *testing.T) {
 	}
 }
 
-// TestConfirmUnclaimedKeysEnterTheLine. A terminal reading a line puts an unclaimed key's bytes
-// into it, so the buffer must carry them too — dropping them is what made `y<Tab><Enter>` accept
-// here and refuse on the plain path. The keys still reach nothing underneath the modal.
-func TestConfirmUnclaimedKeysEnterTheLine(t *testing.T) {
-	// A control key's KeyType IS its ASCII code, so it reconstructs exactly.
-	for _, tc := range []struct {
-		key  tea.KeyType
-		want string
-	}{
-		{tea.KeyTab, "y\t"},
-		{tea.KeyCtrlA, "y\x01"},
-		{tea.KeyNull, "y\x00"},
-		{tea.KeyCtrlV, "y\x16"},
-	} {
+// TestConfirmUnclaimedKeysVetoTheReply. Dropping an unclaimed key was a real divergence and it fell
+// the DANGEROUS way: `y<Tab><Enter>` submitted "y" and ACCEPTED here while the byte reader refuses
+// "y\t". The rule is now structural — anything that is not typed text marks the line, and a marked
+// line cannot be accepted however it reads.
+func TestConfirmUnclaimedKeysVetoTheReply(t *testing.T) {
+	unclaimed := []tea.KeyType{
+		tea.KeyTab, tea.KeyCtrlA, tea.KeyNull, tea.KeyCtrlV, tea.KeyCtrlW, tea.KeyCtrlK,
+		tea.KeyUp, tea.KeyDown, tea.KeyLeft, tea.KeyRight, tea.KeyF1, tea.KeyHome, tea.KeyEnd,
+		tea.KeyPgUp, tea.KeyShiftTab, tea.KeyDelete, tea.KeyInsert,
+	}
+	for _, k := range unclaimed {
 		r := NewReply()
 		var o Overlay = Confirm("Really?", r)
 		o = typeRunes(t, o, "y")
-		o = press(t, o, tc.key)
-		if o == nil {
-			t.Fatalf("key %v dismissed the overlay", tc.key)
-		}
-		if got := o.(ConfirmOverlay).Input(); got != tc.want {
-			t.Fatalf("key %v: buffer %q, want %q", tc.key, got, tc.want)
-		}
-		o = press(t, o, tea.KeyEnter)
-		if ok := <-r.C(); ok {
-			t.Fatalf("key %v: `y` plus an unclaimed key was ACCEPTED", tc.key)
-		}
-	}
-
-	// A navigation key arrives at a line-reading terminal as an escape sequence; the introducer is
-	// enough to make the line refuse for the same reason the whole sequence would.
-	for _, k := range []tea.KeyType{tea.KeyUp, tea.KeyDown, tea.KeyF1, tea.KeyHome, tea.KeyPgUp, tea.KeyShiftTab} {
-		r := NewReply()
-		var o Overlay = Confirm("Really?", r)
-		o = typeRunes(t, o, "yes")
 		o = press(t, o, k)
 		if o == nil {
 			t.Fatalf("key %v dismissed the overlay", k)
 		}
-		if got := o.(ConfirmOverlay).Input(); got != "yes\x1b" {
-			t.Fatalf("key %v: buffer %q", k, got)
+		c := o.(ConfirmOverlay)
+		if !c.Marked() {
+			t.Fatalf("key %v did not mark the line", k)
+		}
+		// It reaches neither the buffer nor anything underneath the modal.
+		if got := c.Input(); got != "y" {
+			t.Fatalf("key %v wrote %q into the buffer", k, got)
 		}
 		o = press(t, o, tea.KeyEnter)
 		if ok := <-r.C(); ok {
-			t.Fatalf("key %v: `yes` plus a navigation key was ACCEPTED", k)
+			t.Fatalf("key %v: `y` plus an unclaimed key was ACCEPTED", k)
 		}
 	}
 
-	// An alt-modified key is ESC-prefixed by the terminal, so the line carries the ESC.
+	// The mark is STICKY: erasing back to a clean-looking line does not restore acceptance. This is
+	// the interleaving that a per-key reconstructed BYTE would have got wrong — backspace would have
+	// removed the byte and left an accepting "y".
 	r := NewReply()
 	var o Overlay = Confirm("Really?", r)
-	o, _ = o.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}, Alt: true})
-	if got := o.(ConfirmOverlay).Input(); got != "\x1by" {
-		t.Fatalf("alt+y: buffer %q", got)
+	o = typeRunes(t, o, "y")
+	o = press(t, o, tea.KeyCtrlW)
+	o = press(t, o, tea.KeyBackspace)
+	o = typeRunes(t, o, "y")
+	if got := o.(ConfirmOverlay).Input(); got != "y" {
+		t.Fatalf("buffer %q", got)
 	}
 	o = press(t, o, tea.KeyEnter)
 	if ok := <-r.C(); ok {
-		t.Fatal("alt+y was ACCEPTED")
+		t.Fatal("erasing around an unclaimed key restored acceptance")
+	}
+
+	// An ALT modifier marks the line on ANY key, submit keys included: a terminal sends alt as an
+	// ESC prefix, and no accepted reply contains one.
+	for _, msg := range []tea.KeyMsg{
+		{Type: tea.KeyRunes, Runes: []rune{'x'}, Alt: true},
+		{Type: tea.KeyEnter, Alt: true},
+		{Type: tea.KeySpace, Runes: []rune{' '}, Alt: true},
+	} {
+		r := NewReply()
+		var o Overlay = Confirm("Really?", r)
+		o = typeRunes(t, o, "y")
+		o, _ = o.Update(msg)
+		if o == nil {
+			// alt+enter submits; it must have refused.
+			if ok := <-r.C(); ok {
+				t.Fatalf("%v was ACCEPTED", msg)
+			}
+			continue
+		}
+		if !o.(ConfirmOverlay).Marked() {
+			t.Fatalf("%v did not mark the line", msg)
+		}
+		o = press(t, o, tea.KeyEnter)
+		if ok := <-r.C(); ok {
+			t.Fatalf("%v was ACCEPTED", msg)
+		}
+	}
+}
+
+// TestConfirmKillClearsTheMark. ^U discards everything typed so far — that is the line discipline's
+// own semantics, and it is the operator's way back from a stray keystroke without abandoning the
+// operation. It cannot widen the accept-set: the reply must be typed again from nothing.
+func TestConfirmKillClearsTheMark(t *testing.T) {
+	r := NewReply()
+	var o Overlay = Confirm("Really?", r)
+	o = typeRunes(t, o, "y")
+	o = press(t, o, tea.KeyTab)
+	if !o.(ConfirmOverlay).Marked() {
+		t.Fatal("the tab did not mark the line")
+	}
+	o = press(t, o, tea.KeyCtrlU)
+	c := o.(ConfirmOverlay)
+	if c.Marked() || c.Input() != "" {
+		t.Fatalf("^U left marked=%v input=%q", c.Marked(), c.Input())
+	}
+	o = typeRunes(t, o, "yes")
+	o = press(t, o, tea.KeyEnter)
+	if ok := <-r.C(); !ok {
+		t.Fatal("a line retyped after ^U was refused")
+	}
+
+	// And ^U alone does not make an empty line acceptable.
+	r2 := NewReply()
+	var o2 Overlay = Confirm("Really?", r2)
+	o2 = press(t, o2, tea.KeyCtrlU)
+	o2 = press(t, o2, tea.KeyEnter)
+	if ok := <-r2.C(); ok {
+		t.Fatal("an empty line after ^U was accepted")
+	}
+}
+
+// TestConfirmMarkIsVisible — an operator whose reply cannot be accepted must be told why, or the
+// prompt looks broken.
+func TestConfirmMarkIsVisible(t *testing.T) {
+	var o Overlay = Confirm("Really?", NewReply())
+	if strings.Contains(o.View(), "only typed text") {
+		t.Fatal("a clean prompt says the line is marked")
+	}
+	o = press(t, o, tea.KeyTab)
+	if !strings.Contains(o.View(), "only typed text") {
+		t.Fatalf("a marked prompt does not say so:\n%s", o.View())
 	}
 }
 
@@ -322,14 +381,18 @@ func TestConfirmCtrlDRefuses(t *testing.T) {
 		default:
 			t.Fatalf("typed %q: ^D gave no answer — the asker would block", typed)
 		}
-		// And the plain path refuses the same input: the reply never gets its newline.
+		// The plain path answers the same, by both of its readings of "no more input": a stdin
+		// that ends without a terminator, and the byte 0x04 sitting in a line.
 		if cliio.Confirm(nil, strings.NewReader(typed), io.Discard, "Proceed?") {
 			t.Fatalf("typed %q: the plain path accepted an unterminated line", typed)
+		}
+		if cliio.Confirm(nil, strings.NewReader(typed+"\x04\n"), io.Discard, "Proceed?") {
+			t.Fatalf("typed %q: the plain path accepted a line containing 0x04", typed)
 		}
 	}
 }
 
-// TestConfirmCarriageReturnDependsOnHowItArRives, and both arrivals agree with the plain path.
+// TestConfirmCarriageReturnDependsOnHowItArrives, and both arrivals agree with the plain path.
 //
 // A bare CR is the one byte that is NOT the same input in the two worlds, and saying so is more
 // useful than pretending it is. A pipe carrying "Y\r\n" gives the plain path the line "Y\r", which

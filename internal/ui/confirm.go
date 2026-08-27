@@ -57,7 +57,34 @@ type ConfirmRequestMsg struct {
 // cliio.AcceptedReply: the accept-set lives in exactly one function, so `yess`, ` y`, `y\r` and an
 // empty line refuse in both worlds for the same reason.
 //
-// Esc refuses. So does the interface going away without an answer — see Bridge.
+// THE PARITY CLAIM, EXACTLY. The other world is NOT a terminal: the wiring rule sends every
+// invocation whose stdin is a tty here, so cliio.Confirm always reads a pipe or a file — bytes up to
+// a newline, no line discipline, no ERASE, no VEOF. Emulating a canonical terminal would therefore
+// be emulating something nothing runs, and the attempt is a rabbit hole with a dangerous floor: the
+// first version of this overlay SWALLOWED unclaimed keys, and `y<Tab><Enter>` accepted here while
+// the byte reader refuses "y\t".
+//
+// So the rule is structural rather than imitative. The line is built ONLY from printable text the
+// operator typed, edited with the two operations a line discipline offers (ERASE and KILL). ANY
+// other input — a tab, a navigation key, an unclaimed control key, an alt modifier — marks the line
+// as not-plainly-typed, and a marked line CANNOT be accepted no matter what it now reads as. The
+// accept-set is then exactly the five strings, reachable only by typing them, which is a strict
+// subset of what a pipe can express: this overlay can never be the EASIER of the two.
+//
+// KILL (^U) clears the mark along with the line. That is the line discipline's own semantics — ^U
+// discards everything typed so far — and it is the operator's way back from a stray keystroke
+// without abandoning the operation. It cannot widen the accept-set: after ^U the reply must be
+// typed again from nothing.
+//
+// Esc refuses. So does ^D, which is the operator saying there is no more input. So does the
+// interface going away without an answer — see Bridge.
+//
+// STATED RESIDUAL, not reachable by anything but the operator's own hands: Bubble Tea's input
+// decoder DISCARDS bytes that are not valid UTF-8 (including a typed or pasted U+FFFD) before any
+// model sees them, so a paste of "y" followed by such a byte arrives here as plain "y" and is
+// accepted, where the same bytes down a pipe would refuse. Nothing in a model can restore an event
+// it is never given. The exposure is nil in the sense that matters: a confirmation exists to
+// establish that the person at the keyboard deliberately said yes, and the person pasted a "y".
 //
 // Signature note (a deliberate, documented widening of the plan's `Confirm(prompt string)
 // Overlay`): the constructor takes the Reply as well. An overlay with nowhere to send its answer
@@ -67,6 +94,10 @@ type ConfirmOverlay struct {
 	prompt string
 	input  []rune
 	reply  *Reply
+	// marked records that something other than plainly typed text has reached this prompt. It is
+	// STICKY (except through KILL, which discards the line) and it VETOES acceptance: the reply is
+	// then refused whatever the buffer happens to read as.
+	marked bool
 	// answered records that this overlay has already resolved. Reply.Resolve is idempotent on its
 	// own; this field is what keeps the VIEW and the key handling honest about it.
 	answered bool
@@ -94,6 +125,16 @@ func (o ConfirmOverlay) Input() string { return string(o.input) }
 // Answered reports whether this overlay has resolved its question.
 func (o ConfirmOverlay) Answered() bool { return o.answered }
 
+// Marked reports that something other than plainly typed text has reached this prompt, so the reply
+// cannot be accepted until the line is discarded with ^U and typed again.
+func (o ConfirmOverlay) Marked() bool { return o.marked }
+
+// accepted is the ONE place the answer is decided: the mark vetoes, and the line is judged by the
+// same function the plain path uses.
+func (o ConfirmOverlay) accepted() bool {
+	return !o.marked && cliio.AcceptedReply(string(o.input))
+}
+
 // Init has nothing to start.
 func (o ConfirmOverlay) Init() tea.Cmd { return nil }
 
@@ -118,32 +159,35 @@ func (o ConfirmOverlay) Update(msg tea.Msg) (Overlay, tea.Cmd) {
 // block (Reply is buffered, cap one, and answered at most once), so nothing about the message loop
 // depends on the asker being ready to receive.
 func (o ConfirmOverlay) handleKey(msg tea.KeyMsg) (Overlay, tea.Cmd) {
+	// An ALT MODIFIER is not typed text on any key — a terminal sends it as an ESC prefix, which no
+	// accepted reply contains. It marks the line whatever key carries it.
+	if msg.Alt {
+		o.marked = true
+	}
 	switch msg.Type {
 	case tea.KeyEsc:
 		// Cancel is a REFUSAL, not a dismissal: the verb asked and must be told.
 		return o.resolve(false)
 	case tea.KeyCtrlD:
-		// ^D is END OF TRANSMISSION. On the plain path it makes the read FAIL — end of input on an
-		// empty line, and a line delivered without its terminator otherwise — and mi_confirm
-		// refuses on a failed read either way. Swallowing it here would leave the question open on
-		// a keystroke that means "no more input", which is the one divergence that makes the modal
-		// impossible to get out of by the means the other world offers.
+		// ^D is the operator saying there is no more input. On the plain path the equivalent — a
+		// stdin that ends without an answer — REFUSES, and so does the byte 0x04 sitting in a line.
+		// Swallowing it would leave the question open on the one keystroke that means "no".
 		return o.resolve(false)
-	case tea.KeyCtrlJ:
-		// ^J IS the line terminator a terminal delivers (NL); the Enter key delivers CR, which the
-		// line discipline turns into the same thing. Both submit.
-		return o.resolve(cliio.AcceptedReply(string(o.input)))
-	case tea.KeyEnter:
-		// The buffer is submitted AS TYPED. Trimming here would accept " y" in this world and
-		// refuse it in the plain one.
-		return o.resolve(cliio.AcceptedReply(string(o.input)))
+	case tea.KeyEnter, tea.KeyCtrlJ:
+		// Both submit: a terminal's Enter delivers CR, ^J delivers NL, and the line discipline makes
+		// them the same terminator.
+		return o.resolve(o.accepted())
 	case tea.KeyBackspace:
+		// ERASE. It removes a character; it cannot remove an event that put no character there, so
+		// it does not clear the mark.
 		if n := len(o.input); n > 0 {
 			o.input = append([]rune(nil), o.input[:n-1]...)
 		}
 		return o, nil
 	case tea.KeyCtrlU:
+		// KILL discards everything typed so far — the mark with it. See the type comment.
 		o.input = nil
+		o.marked = false
 		return o, nil
 	case tea.KeyRunes, tea.KeySpace:
 		// A NEWLINE INSIDE THE INPUT SUBMITS WHAT PRECEDES IT, and everything after it is
@@ -153,42 +197,19 @@ func (o ConfirmOverlay) handleKey(msg tea.KeyMsg) (Overlay, tea.Cmd) {
 		// accept in the other, for the same keystrokes.
 		if i := indexRune(msg.Runes, '\n'); i >= 0 {
 			o = o.appendRunes(msg.Runes[:i])
-			return o.resolve(cliio.AcceptedReply(string(o.input)))
+			return o.resolve(o.accepted())
 		}
 		return o.insert(msg), nil
 	}
-	// EVERY OTHER KEY CONTRIBUTES TO THE LINE, exactly as it would on the plain path.
-	//
-	// Swallowing them was a real divergence, and it fell the DANGEROUS way: a terminal reading a
-	// line puts the tab byte into it, so `y<Tab><Enter>` gives the plain path "y\t" and REFUSES —
-	// while an editor that dropped the tab would submit "y" and ACCEPT. The same for every
-	// unclaimed control key and for an escape sequence from an arrow or function key. Reconstructing
-	// the byte keeps the buffer equal to the line the other world would have read, which is the only
-	// way the two can be held to one accept-set.
+	// EVERY OTHER KEY MARKS THE LINE: a tab, an arrow, a function key, ^W, ^K, anything this editor
+	// does not claim. None of them is text the operator typed, none of them appears in an accepted
+	// reply, and the first version of this overlay simply dropped them — which let `y<Tab><Enter>`
+	// submit "y" and ACCEPT while the byte reader refuses "y\t". Marking is the fail-closed reading
+	// and it needs no claim about what byte a terminal would have produced.
 	//
 	// Nothing reaches what is underneath the modal either way; that property is unchanged.
-	return o.appendUnclaimed(msg), nil
-}
-
-// appendUnclaimed adds the bytes an unclaimed key would have put into a line.
-//
-// Bubble Tea's control-key KeyTypes ARE their ASCII codes (KeyTab == 9, KeyCtrlA == 1, KeyNull == 0,
-// and so on up to DEL), so a control key reconstructs exactly. The navigation keys — arrows,
-// function keys, page and home — have negative KeyTypes and arrive at a line-reading terminal as an
-// ESCAPE SEQUENCE; the introducer alone is appended, which is enough to make the line refuse for the
-// same reason the full sequence would, and is not a claim to reproduce the sequence byte for byte.
-// An alt-modified key is ESC-prefixed, which is how a terminal sends it.
-func (o ConfirmOverlay) appendUnclaimed(msg tea.KeyMsg) ConfirmOverlay {
-	var rs []rune
-	if msg.Alt {
-		rs = append(rs, '\x1b')
-	}
-	if t := int(msg.Type); t >= 0 && t <= 127 {
-		rs = append(rs, rune(t))
-	} else {
-		rs = append(rs, '\x1b')
-	}
-	return o.appendRunes(rs)
+	o.marked = true
+	return o, nil
 }
 
 // insert appends the message's runes to the buffer.
@@ -202,17 +223,10 @@ func (o ConfirmOverlay) insert(msg tea.KeyMsg) ConfirmOverlay {
 	if msg.Type == tea.KeySpace && len(msg.Runes) == 0 {
 		// Bubble Tea reports the space bar as KeySpace with the rune in Runes; a build that ever
 		// reports it empty must still insert a space rather than nothing.
-		if msg.Alt {
-			return o.appendRunes([]rune{'\x1b', ' '})
-		}
 		return o.appendRunes([]rune{' '})
 	}
 	if len(msg.Runes) == 0 {
 		return o
-	}
-	if msg.Alt {
-		// A terminal sends alt+x as ESC then x, so the line the plain path reads carries the ESC.
-		return o.appendRunes(append([]rune{'\x1b'}, msg.Runes...))
 	}
 	return o.appendRunes(msg.Runes)
 }
@@ -265,6 +279,9 @@ func (o ConfirmOverlay) View() string {
 	b.WriteString("> ")
 	b.WriteString(sanitize(string(o.input)))
 	b.WriteString("\n")
+	if o.marked {
+		b.WriteString("only typed text is accepted here — ctrl+u clears the line\n")
+	}
 	b.WriteString("enter submits · esc refuses")
 	return b.String()
 }
