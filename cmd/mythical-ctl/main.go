@@ -175,12 +175,51 @@ func status(o opts, env []string, stdin io.Reader, stdout, stderr io.Writer) int
 		fmt.Fprintln(stderr, "mythical-ctl: status takes no options other than --index")
 		return cliio.ExitUsage
 	}
-	d, err := deps(o, env, stdin, stdout, stderr)
+	d, err := statusDeps(o, env, stdin, stdout, stderr)
 	if err != nil {
 		fmt.Fprintln(stderr, err.Error())
 		return cliio.ExitFail
 	}
 	return verbs.Status(context.Background(), d, o.products)
+}
+
+// statusDeps assembles the report's dependencies WITHOUT letting a runtime that cannot be LOCATED
+// gate the report.
+//
+// Endpoint resolution is fail-closed on purpose — a remote DOCKER_HOST, a Windows named pipe and an
+// unreadable docker context all refuse rather than fall back to a default socket — and every
+// MUTATING verb must inherit that refusal. status must not: it is the command an operator runs to
+// find out why the others are refusing, and the frozen dispatcher resolves no endpoint for it at
+// all (each runtime call resolves its own and fails on its own), so there a misconfigured context
+// still produced the ledger half of the report and exit 0. Here the refusal is REPORTED and the
+// verb is handed no runtime, which it already renders as "unobservable" rather than inventing.
+//
+// The family HOME is the one thing the report cannot do without — there is no ledger to read
+// without it — so that failure still refuses. STATED DIVERGENCE: the reference returned 0 there
+// too, printing "installation: UNREADABLE"; claiming an identity is recorded on a machine whose
+// home could not even be located is a worse answer than saying why.
+func statusDeps(o opts, env []string, stdin io.Reader, stdout, stderr io.Writer) (verbs.Deps, error) {
+	d, err := deps(o, env, stdin, stdout, stderr)
+	if err == nil {
+		return d, nil
+	}
+	home, herr := layout.Home(env)
+	if herr != nil {
+		return verbs.Deps{}, herr
+	}
+	fmt.Fprintln(stderr, err.Error())
+	fmt.Fprintln(stderr, "mythical-ctl: the container runtime could not be located, so nothing below is observed live.")
+	stateDir := filepath.Join(home, ".state")
+	return verbs.Deps{
+		Home:        home,
+		Stdin:       stdin,
+		Stdout:      stdout,
+		Stderr:      stderr,
+		Env:         env,
+		IndexPath:   or(o.index, filepath.Join(stateDir, "index")),
+		PolicyPath:  or(o.policy, filepath.Join(stateDir, "policy")),
+		ManifestDir: or(o.manifestDir, stateDir),
+	}, nil
 }
 
 // uninstall dispatches the two scopes.

@@ -193,3 +193,43 @@ func TestCLIUninstallDrivesTheProductScope(t *testing.T) {
 		t.Fatal("a product uninstall dropped membership")
 	}
 }
+
+func TestCLIStatusReportsWhenTheRuntimeCannotEvenBeLocated(t *testing.T) {
+	// Endpoint resolution is fail-closed on purpose, and every MUTATING verb must inherit that
+	// refusal. status must not: it is the command an operator runs to find out why the others are
+	// refusing, and routing it through the same door made the one diagnostic a broken installation
+	// reaches for the one command a broken installation cannot run.
+	r := newCLIRig(t)
+	r.writeProduct("p1")
+	args := append([]string{"install", "p1"}, r.docArgs()...)
+	if rc := r.run(args...); rc != cliio.ExitOK {
+		t.Fatalf("install rc = %d\n%s", rc, r.said())
+	}
+
+	// A remote DOCKER_HOST: local-only by contract, so resolution REFUSES rather than falling back.
+	var env []string
+	for _, kv := range r.env {
+		if strings.HasPrefix(kv, "DOCKER_HOST=") {
+			continue
+		}
+		env = append(env, kv)
+	}
+	r.env = append(env, "DOCKER_HOST=tcp://example.invalid:2375")
+
+	if rc := r.run("status"); rc != cliio.ExitOK {
+		t.Fatalf("rc = %d, want 0 — status is never gated by its own findings\n%s", rc, r.said())
+	}
+	// The refusal is REPORTED, and the ledger half of the report is still produced.
+	if !strings.Contains(r.said(), "could not be located") {
+		t.Fatalf("the runtime refusal was swallowed:\n%s", r.said())
+	}
+	if !strings.Contains(r.said(), "installation: ") {
+		t.Fatalf("the ledger half of the report is missing:\n%s", r.said())
+	}
+	if !strings.Contains(r.said(), "runtime:      UNAVAILABLE") {
+		t.Fatalf("the report did not name the live half as unobservable:\n%s", r.said())
+	}
+	if !strings.Contains(r.said(), "volume mythical-") {
+		t.Fatalf("the recorded volumes were not reported:\n%s", r.said())
+	}
+}

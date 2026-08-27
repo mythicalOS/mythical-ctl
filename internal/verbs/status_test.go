@@ -67,20 +67,29 @@ func (r *rig) confirm(answer string) {
 	r.d.Env = append(append([]string(nil), r.env...), "MI_CONFIRM="+answer)
 }
 
-// rewriteRows rebuilds the ledger body through fn — the Go spelling of the reference tests'
+// replaceRow swaps ONE ledger row for another, IN PLACE — the Go spelling of the reference tests'
 // `mi_ledger_read | grep -av … | mi_ledger_write`, which is how a record is REPLACED by a damaged
 // one rather than merely accompanied by it.
-func (r *rig) rewriteRows(keep func(line string) bool) {
+//
+// THE POSITION IS PRESERVED, and that is not cosmetic: the removal loops walk the object records in
+// ledger order, so a fixture that dropped a row and appended its replacement would silently reorder
+// the very sequence a test about "it stopped HERE" depends on. (Measured: it did.)
+func (r *rig) replaceRow(match, replacement string) {
 	r.t.Helper()
+	n := 0
 	r.editLedger(func(l *ledger.Ledger) {
-		var out []string
-		for _, line := range l.Lines() {
-			if keep(line) {
-				out = append(out, line)
+		lines := l.Lines()
+		for i, line := range lines {
+			if strings.Contains(line, match) {
+				lines[i] = replacement
+				n++
 			}
 		}
-		l.ReplaceLines(out)
+		l.ReplaceLines(lines)
 	})
+	if n != 1 {
+		r.t.Fatalf("replaceRow: %q matched %d rows, want exactly 1", match, n)
+	}
 }
 
 func (r *rig) networkExists(ref string) bool {
@@ -143,13 +152,16 @@ func TestStatusReportsVolumes(t *testing.T) {
 	if rc := r.status(); rc != cliio.ExitOK {
 		t.Fatalf("rc = %d, want 0\n%s", rc, r.said())
 	}
-	r.mustSay("volume mythical-" + ident + "-p1-state: role=state")
-	r.mustSay("volume mythical-" + ident + "-p1-secrets: role=secrets")
-	r.mustSay("created by this installation")
-	// AND NO SIZE. The host cannot read a named volume's contents and the runtime reports none, so
-	// any number here would have to be invented or obtained by starting a container — and status
-	// starts nothing. The assertion is on the vocabulary a size would have to arrive in.
-	for _, banned := range []string{"size=", " bytes", "MiB", "GiB"} {
+	// THE WHOLE LINE, not a fragment — which is also how "no size" is asserted. The host cannot
+	// read a named volume's contents and the runtime reports none, so any number here would have to
+	// be invented or obtained by starting a container, and status starts nothing. A fragment match
+	// would tolerate a size spliced in anywhere; an exact line leaves nowhere to splice one.
+	for _, role := range []string{"state", "secrets"} {
+		r.mustSay("volume mythical-" + ident + "-p1-" + role + ": role=" + role +
+			" data=regenerable product=p1 — present, created by this installation\n")
+	}
+	// And the vocabulary a size would have to arrive in appears nowhere in the report either.
+	for _, banned := range []string{"size", " bytes", "MiB", "GiB"} {
 		r.mustNotSay(banned)
 	}
 }
@@ -242,9 +254,8 @@ func TestVolumeWithNoPreciousFieldReadsUnregenerable(t *testing.T) {
 	vol := "mythical-" + ident + "-p1-state"
 	nonce := r.volumeRecordNonce(vol)
 
-	r.rewriteRows(func(line string) bool { return !strings.Contains(line, "name="+vol) })
-	r.appendRows("object\tkey=volume:" + vol + "\tclass=volume\tname=" + vol +
-		"\tnonce=" + nonce + "\tgen=1\tproduct=p1\trole=state")
+	r.replaceRow("name="+vol, "object\tkey=volume:"+vol+"\tclass=volume\tname="+vol+
+		"\tnonce="+nonce+"\tgen=1\tproduct=p1\trole=state")
 
 	if rc := r.status(); rc != cliio.ExitOK {
 		t.Fatalf("rc = %d, want 0\n%s", rc, r.said())
@@ -289,10 +300,11 @@ func TestStatusListsUnattributedObjects(t *testing.T) {
 	r.mustSay("another user")
 	// AND IT PROPOSES REMOVING NOTHING. Another user's objects are not this installation's
 	// business, and a diagnostic that suggested deleting one would be suggesting exactly the
-	// misidentification the provenance layer exists to prevent.
-	for _, banned := range []string{"remove it", "docker volume rm someone-elses", "--purge"} {
-		r.mustNotSay(banned)
-	}
+	// misidentification the provenance layer exists to prevent. The assertion names the object,
+	// so it cannot be satisfied by the report simply having gone quiet.
+	r.mustSay("Diagnostic only.")
+	r.mustNotSay("docker volume rm someone-elses")
+	r.mustNotSay("remove someone-elses")
 }
 
 // --- the install-time annotations ------------------------------------------------------------------

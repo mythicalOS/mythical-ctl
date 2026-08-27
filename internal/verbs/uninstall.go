@@ -89,11 +89,18 @@ func (s *session) uninstall(ctx context.Context, product string, purge bool) int
 		d.warnErr(cerr)
 		return cliio.ExitFail
 	}
-	if !s.removeProductContainer(ctx, product, c) {
+	ok, stop := s.removeProductContainer(ctx, product, c)
+	if !ok {
 		rc = cliio.ExitFail
 	}
-	if !s.productVolumes(ctx, product, objs, purge) {
+	if stop != nil {
+		return s.stopAfterPartialRemoval(stop)
+	}
+	if ok, stop = s.productVolumes(ctx, product, objs, purge); !ok {
 		rc = cliio.ExitFail
+	}
+	if stop != nil {
+		return s.stopAfterPartialRemoval(stop)
 	}
 	if purge {
 		s.offerImages(product, imgs)
@@ -109,6 +116,28 @@ func (s *session) uninstall(ctx context.Context, product string, purge bool) int
 	d.say("uninstall", "%s: uninstalled. Its rollback floor and initialization record are retained, so a", product)
 	d.say("uninstall", "  reinstall cannot replay a withdrawn manifest.")
 	return cliio.ExitOK
+}
+
+// stopAfterPartialRemoval reports a ledger-edit failure, makes DURABLE whatever this verb has
+// already recorded, and stops.
+//
+// EVERY OTHER FAILURE IN A REMOVAL LOOP IS ABOUT ONE OBJECT and leaves the rest of the operation
+// meaningful — the reference reports those and continues. A ledger that will not record what was
+// just removed is not that: from there, every further removal is a removal nothing will record,
+// which is why the reference spells these `|| return 1` in the middle of the loop.
+//
+// The persist restores the other half of that `return 1`. The reference's ledger editors wrote the
+// file themselves, so its earlier tombstones were already durable when it returned; these edit
+// memory, so an object removed from the runtime whose tombstone exists only in memory would be
+// forgotten outright. The failing edit itself mutates nothing — both editors ask every cardinality
+// question before they write anything — so what is persisted here is exactly the work that
+// succeeded.
+func (s *session) stopAfterPartialRemoval(cause error) int {
+	s.d.warnErr(cause)
+	if perr := s.persist(); perr != nil {
+		s.d.warnErr(perr)
+	}
+	return cliio.ExitFail
 }
 
 // confirmProductPurge NAMES what is about to be destroyed and then asks.
@@ -186,9 +215,11 @@ func (s *session) confirmProductPurge(product string, objs [][]ledger.Field) boo
 }
 
 // removeProductContainer removes this product's container, under the provenance authority every
-// removal path in this tree obeys. It reports whether the step succeeded; a failure does not abort
-// the uninstall, which continues with the rest.
-func (s *session) removeProductContainer(ctx context.Context, product, c string) bool {
+// removal path in this tree obeys.
+//
+// It reports (step succeeded, stop the verb). A refusal or a failed removal is reported and the
+// uninstall continues with the rest; only a ledger edit that could not be made stops it.
+func (s *session) removeProductContainer(ctx context.Context, product, c string) (bool, error) {
 	d := s.d
 	aerr := prov.Authority(ctx, s.l, prov.Engine(d.Engine), prov.ClassContainer, c)
 	switch {
@@ -201,24 +232,22 @@ func (s *session) removeProductContainer(ctx context.Context, product, c string)
 			d.warnErr(rerr)
 			d.warn("verbs: could not remove the container for %q. Its record is KEPT so it stays", product)
 			d.warn("  removable later; nothing is tombstoned for a removal that did not happen.")
-			return false
+			return false, nil
 		}
 	case errors.Is(aerr, prov.ErrGone):
 		// Already gone: nothing to remove and nothing to preserve, so the record is retired.
 	default:
 		d.warnErr(aerr)
 		d.warn("verbs: the container for %q is preserved (see above). Continuing with the rest.", product)
-		return false
+		return false, nil
 	}
 	if err := prov.Tombstone(s.l, prov.ClassContainer, c); err != nil {
-		d.warnErr(err)
-		return false
+		return false, err
 	}
 	if err := state.Forget(s.l, c); err != nil {
-		d.warnErr(err)
-		return false
+		return false, err
 	}
-	return true
+	return true, nil
 }
 
 // productVolumes keeps or purges this product's named volumes, saying which per volume.
@@ -226,7 +255,7 @@ func (s *session) removeProductContainer(ctx context.Context, product, c string)
 // THE PER-VOLUME STATEMENT IS THE POINT of a plain uninstall, not a summary line: an operator who
 // is told "your data is kept" learns nothing they can check, while a line per volume names exactly
 // what survived and how to remove it if they meant to.
-func (s *session) productVolumes(ctx context.Context, product string, objs [][]ledger.Field, purge bool) bool {
+func (s *session) productVolumes(ctx context.Context, product string, objs [][]ledger.Field, purge bool) (bool, error) {
 	d := s.d
 	okAll := true
 	for _, rec := range objs {
@@ -252,14 +281,18 @@ func (s *session) productVolumes(ctx context.Context, product string, objs [][]l
 			d.say("uninstall", "  keeping volume %s (role %s, %s) — your data. 'uninstall --purge' removes it.", name, role, class)
 			continue
 		}
-		if !s.purgeVolume(ctx, name, role, class) {
+		ok, stop := s.purgeVolume(ctx, name, role, class)
+		if !ok {
 			okAll = false
 		}
+		if stop != nil {
+			return okAll, stop
+		}
 	}
-	return okAll
+	return okAll, nil
 }
 
-func (s *session) purgeVolume(ctx context.Context, name, role, class string) bool {
+func (s *session) purgeVolume(ctx context.Context, name, role, class string) (bool, error) {
 	d := s.d
 	aerr := prov.Authority(ctx, s.l, prov.Engine(d.Engine), prov.ClassVolume, name)
 	switch {
@@ -267,28 +300,26 @@ func (s *session) purgeVolume(ctx context.Context, name, role, class string) boo
 		if rerr := s.rt.VolumeRemove(ctx, name); rerr != nil {
 			d.warnErr(rerr)
 			d.warn("  could NOT remove volume %s — its record is kept, so it stays removable later.", name)
-			return false
+			return false, nil
 		}
 		if err := prov.Tombstone(s.l, prov.ClassVolume, name); err != nil {
-			d.warnErr(err)
-			return false
+			return false, err
 		}
 		d.say("uninstall", "  removed volume %s (role %s, %s).", name, role, class)
-		return true
+		return true, nil
 	case errors.Is(aerr, prov.ErrGone):
 		// ALREADY GONE is not a refusal: nothing to remove and nothing to preserve, so the record
 		// is tombstoned. Only a real refusal — no record, or a nonce that does not match —
 		// preserves.
 		if err := prov.Tombstone(s.l, prov.ClassVolume, name); err != nil {
-			d.warnErr(err)
-			return false
+			return false, err
 		}
 		d.say("uninstall", "  volume %s was already gone; its record is tombstoned.", name)
-		return true
+		return true, nil
 	default:
 		d.warnErr(aerr)
 		d.say("uninstall", "  PRESERVED volume %s — see the reason above.", name)
-		return false
+		return false, nil
 	}
 }
 
@@ -388,7 +419,10 @@ func (s *session) uninstallFamily(ctx context.Context, purge bool) int {
 	// ledger while an object it describes is still there would strip that object's provenance,
 	// making it permanently unauthorized for deletion AND an unrecorded same-identity object that
 	// stops every later operation.
-	preserved := s.familyContainers(ctx, objs)
+	preserved, stop := s.familyContainers(ctx, objs)
+	if stop != nil {
+		return s.stopAfterPartialRemoval(stop)
+	}
 	if s.familyVolumes(ctx, objs, purge) {
 		preserved = true
 	}
@@ -474,8 +508,10 @@ func (s *session) familyPurgeWarning(objs [][]ledger.Field, purge bool) {
 	}
 }
 
-// familyContainers removes every recorded container. It returns whether anything was PRESERVED.
-func (s *session) familyContainers(ctx context.Context, objs [][]ledger.Field) bool {
+// familyContainers removes every recorded container. It returns (anything PRESERVED, stop the
+// verb) — see stopAfterPartialRemoval for why a ledger edit that could not be made is the one
+// failure here that is not survivable.
+func (s *session) familyContainers(ctx context.Context, objs [][]ledger.Field) (bool, error) {
 	d := s.d
 	preserved := false
 	for _, rec := range objs {
@@ -510,11 +546,10 @@ func (s *session) familyContainers(ctx context.Context, objs [][]ledger.Field) b
 		// A REMOVAL THAT FAILED IS NEVER FOLLOWED BY FORGETTING ITS STATE — that would leave the
 		// container running with nothing recording it. Only the two branches above reach here.
 		if ferr := state.Forget(s.l, name); ferr != nil {
-			d.warnErr(ferr)
-			preserved = true
+			return preserved, ferr
 		}
 	}
-	return preserved
+	return preserved, nil
 }
 
 // familyVolumes keeps or purges every recorded volume. It returns whether anything was PRESERVED.

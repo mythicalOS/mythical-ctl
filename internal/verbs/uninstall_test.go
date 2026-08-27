@@ -951,3 +951,46 @@ func TestPurgeRefusesAProductVolumeRecordWithNoName(t *testing.T) {
 	// And the warning named it too, so the operator saw it before answering.
 	r.mustSay("(a volume whose record carries no readable name)")
 }
+
+func TestPurgeStopsWhenTheLedgerWillNotRecordWhatItRemoved(t *testing.T) {
+	// EVERY OTHER FAILURE IN THE REMOVAL LOOP IS ABOUT ONE OBJECT and leaves the rest of the
+	// operation meaningful. A ledger that will not record what was just removed is not that: from
+	// there, every further removal is a removal nothing will record, which is why the reference
+	// spells this one `|| return 1` in the middle of the loop.
+	//
+	// The fixture damages the FIRST volume's generation counter. Authority still passes (it reads
+	// the nonce and the object's own labels, not the generation), the volume is really removed, and
+	// the tombstone that must outlive it then refuses — the one window where the runtime has
+	// already changed and the ledger will not follow.
+	r := newRig(t)
+	r.writeProduct("p1")
+	r.mintIdentity()
+	r.mustInstall("p1")
+	ident := r.ident()
+	first := "mythical-" + ident + "-p1-state"
+	second := "mythical-" + ident + "-p1-secrets"
+	nonce := r.volumeRecordNonce(first)
+	r.replaceRow("name="+first, "object\tkey=volume:"+first+"\tclass=volume\tname="+first+
+		"\tnonce="+nonce+"\tgen=notanumber\tproduct=p1\trole=state")
+	r.reset()
+	r.confirm("yes")
+
+	if rc := r.uninstall("p1", true); rc != cliio.ExitFail {
+		t.Fatalf("rc = %d, want 1\n%s", rc, r.said())
+	}
+	r.mustSay("generation that is not a number")
+	if r.volumeExists(first) {
+		t.Fatal("the fixture did not reach the tombstone — the volume was never removed")
+	}
+	// AND IT STOPPED: the sibling volume is untouched, because nothing would have recorded its
+	// removal either. (The removal loop walks the object records in ledger order, and the state
+	// volume is recorded before the secrets volume; if that ever changes this assertion says so.)
+	if !r.volumeExists(second) {
+		t.Fatal("the purge went on removing volumes after the ledger refused to record one")
+	}
+	// The container's removal, which happened BEFORE the failure, is durable — the reference's
+	// `return 1` left its earlier writes on disk, and so must this one.
+	if !r.tombstoned(prov.ClassContainer, r.container("p1")) {
+		t.Fatal("the work that succeeded before the stop was not made durable")
+	}
+}
