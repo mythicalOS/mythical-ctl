@@ -263,7 +263,14 @@ type claim struct {
 // beside the test it describes) but the comment marker must open the line: a `// PORTED:` inside a
 // Go string literal is not a claim, and anchoring here is what keeps it from being read as one.
 var (
-	invAny    = regexp.MustCompile(`^[ \t]*//[ \t]*(PORTED|N/A):`)
+	invAny = regexp.MustCompile(`^[ \t]*//[ \t]*(PORTED|N/A):`)
+	// A claim written where the parser does not look. Found once for real: a PORTED: line wrapped
+	// into the middle of a paragraph, naming rows that another file had meanwhile marked N/A — two
+	// statements about the same row, one of them invisible to every gate. Deliberately narrow: it
+	// fires only when the mention names a bats file the CORPUS actually holds, so this program's
+	// own documentation and fixtures (which name tests/unit/<file>.bats and tests/unit/a.bats) are
+	// not swept up, and neither is prose about the convention.
+	invStray  = regexp.MustCompile(`(PORTED|N/A):[ \t]+(tests/[A-Za-z0-9_./-]+\.bats)`)
 	invPorted = regexp.MustCompile(`^[ \t]*// PORTED:[ \t]+(\S+):[ \t]+"(.+)"[ \t]+->[ \t]+(.*\S)[ \t]*$`)
 	invNA     = regexp.MustCompile(`^[ \t]*// N/A:[ \t]+(\S+):[ \t]+"(.+)"[ \t]+--[ \t]+(.*\S)[ \t]*$`)
 	goTestID  = regexp.MustCompile(`\bTest[A-Za-z0-9_]*`)
@@ -275,18 +282,70 @@ var (
 // program can make it.
 const minNAReason = 16
 
+// AN N/A THAT DEFERS TO A FUTURE EVENT IS A TODO, NOT AN ARGUMENT — and it is the one thing about a
+// rationale a program CAN check. Measured on this tree: four N/A rows rested on "the verb it names
+// is not wired in this build" and "re-claim once that verb lands". Every one of those premises had
+// expired — the verbs landed a wave earlier — and nothing noticed, because the audit was checking
+// that each row was CLAIMED, never that its claim still held. A deferral is a promise with no
+// expiry date attached; refusing the phrasing forces the promise to be an argument that is true
+// now, or an unclaimed row that fails loudly the moment the reason stops being true.
+//
+// Deliberately phrase-level, not word-level: "later" appears innocently inside real arguments
+// ("every later step consumes that byte slice"), and a check that fires on prose nobody can rewrite
+// is a check somebody turns off.
+var naDeferrals = []string{
+	"re-claim",
+	"reclaim once",
+	"not wired",
+	"once that verb lands",
+	"once the verb lands",
+	"once it lands",
+	"once that lands",
+	"when that lands",
+	"lands with",
+	"not yet wired",
+	"not yet landed",
+	"does not exist yet",
+	"not available yet",
+	"in a later wave",
+	"a future wave",
+	"a future task",
+	"todo",
+	"tbd",
+}
+
+// deferral reports the first future-tense promise in an N/A argument, or "".
+func deferral(reason string) string {
+	low := strings.ToLower(reason)
+	for _, p := range naDeferrals {
+		if strings.Contains(low, p) {
+			return p
+		}
+	}
+	return ""
+}
+
 type malformed struct {
 	GoFile string
 	GoLine int
 	Text   string
 }
 
+// stray is a claim-shaped mention the parser cannot read because of where it sits.
+type stray struct {
+	GoFile   string
+	GoLine   int
+	BatsFile string
+	Text     string
+}
+
 // parseInventory reads one Go file's claims. Anything that opens like an inventory line but does
 // not parse is returned as malformed rather than skipped — a claim the audit cannot read is a
 // claim nobody is checking, which is the same as no claim at all but looks like coverage.
-func parseInventory(rel string, content []byte) ([]claim, []malformed, error) {
+func parseInventory(rel string, content []byte) ([]claim, []malformed, []stray, error) {
 	var claims []claim
 	var bad []malformed
+	var strays []stray
 	sc := bufio.NewScanner(bytes.NewReader(content))
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	line := 0
@@ -294,6 +353,14 @@ func parseInventory(rel string, content []byte) ([]claim, []malformed, error) {
 		line++
 		text := sc.Text()
 		if !invAny.MatchString(text) {
+			// Not in claim position. If it nevertheless names a real corpus file in claim syntax,
+			// somebody wrote a claim the audit cannot see — record it and let auditCoverage decide,
+			// since only it knows what the corpus holds.
+			if strings.Contains(text, "//") {
+				if m := invStray.FindStringSubmatch(text); m != nil {
+					strays = append(strays, stray{rel, line, m[2], text})
+				}
+			}
 			continue
 		}
 		if m := invPorted.FindStringSubmatch(text); m != nil {
@@ -313,6 +380,11 @@ func parseInventory(rel string, content []byte) ([]claim, []malformed, error) {
 				bad = append(bad, malformed{rel, line, text})
 				continue
 			}
+			if d := deferral(m[3]); d != "" {
+				bad = append(bad, malformed{rel, line,
+					fmt.Sprintf("its argument defers to a future event (%q) — an N/A that waits for something to land is a TODO, not an argument: it expires silently the moment the blocker lands and nothing notices. Port the row, or argue why it can never be ported. || %s", d, text)})
+				continue
+			}
 			claims = append(claims, claim{
 				Kind: claimNA, Pair: batsPair{File: m[1], Name: m[2]},
 				Detail: m[3], GoFile: rel, GoLine: line,
@@ -322,18 +394,19 @@ func parseInventory(rel string, content []byte) ([]claim, []malformed, error) {
 		bad = append(bad, malformed{rel, line, text})
 	}
 	if err := sc.Err(); err != nil {
-		return nil, nil, fmt.Errorf("%s: %w", rel, err)
+		return nil, nil, nil, fmt.Errorf("%s: %w", rel, err)
 	}
-	return claims, bad, nil
+	return claims, bad, strays, nil
 }
 
 // skipDirs are not part of this module's source. third_party is a vendored submodule; dist is
 // build output. Neither can carry a claim, and walking them only creates ways to be wrong.
 var skipDirs = map[string]bool{".git": true, "third_party": true, "dist": true, "node_modules": true}
 
-func collectInventory(root string) ([]claim, []malformed, int, error) {
+func collectInventory(root string) ([]claim, []malformed, []stray, int, error) {
 	var claims []claim
 	var bad []malformed
+	var strays []stray
 	scanned := 0
 	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -357,15 +430,16 @@ func collectInventory(root string) ([]claim, []malformed, int, error) {
 			return rerr
 		}
 		scanned++
-		c, b, perr := parseInventory(filepath.ToSlash(rel), content)
+		c, b, st, perr := parseInventory(filepath.ToSlash(rel), content)
 		if perr != nil {
 			return perr
 		}
 		claims = append(claims, c...)
 		bad = append(bad, b...)
+		strays = append(strays, st...)
 		return nil
 	})
-	return claims, bad, scanned, err
+	return claims, bad, strays, scanned, err
 }
 
 // parseGoTestList reads `go test -list '.*' ./...` output. Only bare Test identifiers count: the
@@ -462,7 +536,7 @@ func laneNames() string {
 // auditCoverage is the whole claim under audit: every bats test is accounted for EXACTLY ONCE, no
 // claim names a test that does not exist, every PORTED target is a Go test that really runs, and
 // no file is waved away wholesale except the two that were pre-declared with an argument.
-func auditCoverage(r *report, pairs []batsPair, claims []claim, bad []malformed, goTests map[string]bool, preDeclared map[string]string) {
+func auditCoverage(r *report, pairs []batsPair, claims []claim, bad []malformed, strays []stray, goTests map[string]bool, preDeclared map[string]string) {
 	for _, b := range bad {
 		r.fail("%s:%d: inventory line does not parse (or its N/A argues nothing): %s", b.GoFile, b.GoLine, strings.TrimSpace(b.Text))
 	}
@@ -472,6 +546,17 @@ func auditCoverage(r *report, pairs []batsPair, claims []claim, bad []malformed,
 	for _, p := range pairs {
 		corpus[p] = true
 		perFile[p.File] = append(perFile[p.File], p)
+	}
+
+	// A claim about a real corpus file, written somewhere the parser does not read. It states
+	// something about a row that some OTHER line is meanwhile claiming, and the two can disagree
+	// forever because only one of them is checked.
+	for _, s := range strays {
+		if len(perFile[s.BatsFile]) == 0 {
+			continue
+		}
+		r.fail("%s:%d: a PORTED:/N/A: claim about %s is written mid-line, where the inventory parser does not read it — put it at the start of its own comment line, or say it in prose that does not use the claim syntax: %s",
+			s.GoFile, s.GoLine, s.BatsFile, strings.TrimSpace(s.Text))
 	}
 
 	byPair := map[batsPair][]claim{}
@@ -658,7 +743,7 @@ func run(root, manifestRel string, writeMan bool, goLists []string, maxProblems 
 		fmt.Printf("corpus: bats trees absent (post-cutover) — auditing against the committed %s\n", manifestRel)
 	}
 
-	claims, bad, scanned, err := collectInventory(root)
+	claims, bad, strays, scanned, err := collectInventory(root)
 	if err != nil {
 		return err
 	}
@@ -686,7 +771,7 @@ func run(root, manifestRel string, writeMan bool, goLists []string, maxProblems 
 		return fmt.Errorf("no Go test names were loaded (pass --go-list <file> with `go test -list '.*' ./...` output) — PORTED targets cannot be resolved")
 	}
 
-	auditCoverage(r, pairs, claims, bad, goTests, wholeFileNA)
+	auditCoverage(r, pairs, claims, bad, strays, goTests, wholeFileNA)
 
 	fmt.Printf("go tree: %d files scanned, %d PORTED, %d N/A, %d Go test names known\n", scanned, r.Ported, r.NA, len(goTests))
 	fmt.Printf("corpus: %d tests covered by a pre-declared whole-file N/A argument\n", r.WholeFileNA)

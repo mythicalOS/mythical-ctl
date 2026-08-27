@@ -229,7 +229,24 @@ const (
 //
 // The rewrite re-verifies the expected value AT the write, per line, and a key deleted between
 // check and rewrite refuses — nothing acts on a fact this call did not re-establish.
-func FamilyCAS(h famlock.Held, key, value, prior string, attempt Attempt, confirm cliio.ConfirmFunc) error {
+//
+// THIS DOOR NARRATES, and that is not decoration — it is one of the three grounds on which the
+// reference accepts that the compare-and-set is NOT atomic against a human editor. The operation
+// lock serializes mythical-ctl processes; it has no authority over a text editor, so an operator
+// who saves mythical.conf inside the read-to-rename window loses that edit. The reference accepts
+// that window because it is milliseconds long, because the operator invoked the command that
+// touches this key, and because "the command REPORTS the value it wrote, so a lost edit is visible
+// immediately". A silent version of this function keeps the window and drops the mitigation the
+// design leaned on — and drops it hardest when it matters most: if the migration fails at a later
+// phase, its own success narrative never runs, and the operator sees an error with no statement
+// anywhere that mythical.conf was already rewritten. So `note` carries the three lines the
+// reference printed. A nil note is allowed (a caller with nowhere to write), never assumed.
+func FamilyCAS(h famlock.Held, key, value, prior string, attempt Attempt, confirm cliio.ConfirmFunc, note func(string)) error {
+	say := func(format string, a ...any) {
+		if note != nil {
+			note(fmt.Sprintf(format, a...))
+		}
+	}
 	if err := famlock.Assert(h, "compare-and-set a value in mythical.conf"); err != nil {
 		return err
 	}
@@ -268,9 +285,27 @@ func FamilyCAS(h famlock.Held, key, value, prior string, attempt Attempt, confir
 		}
 	case AttemptStarted:
 		if haveCur && cur == value {
-			return nil // already holds the migrated destination; advance without rewriting
+			say("config: %s already holds the migrated destination; advancing without rewriting.", key)
+			return nil
 		}
-		if confirm == nil || !confirm(fmt.Sprintf("config: write %s=%s, discarding what is there?", key, value)) {
+		// THE EXPLANATION GOES IN THE PROMPT, not only in the refusal. It used to be in the error
+		// returned when the operator DECLINED — which reaches nobody who says yes, and the person
+		// who says yes is the one about to discard something. What they may be discarding is their
+		// own hand edit, and nothing else on this path would have told them so.
+		found := cur
+		if !haveCur {
+			found = "<nothing>"
+		}
+		prompt := fmt.Sprintf(
+			"config: a write of %s was recorded as IN PROGRESS, and the key now holds\n"+
+				"    %s\n"+
+				"  rather than the value this write was in the middle of landing. The write may have\n"+
+				"  crashed before it landed, or you may have deleted or changed the line by hand — the\n"+
+				"  two are equally possible from the file alone, and guessing which one happened would\n"+
+				"  overwrite exactly the edit this file's additive-only rule promises to keep.\n"+
+				"  Stopping. Confirm explicitly to write %q anyway.\n"+
+				"config: write %s=%s, discarding what is there?", key, found, value, key, value)
+		if confirm == nil || !confirm(prompt) {
 			return fmt.Errorf("config: a write of %s was recorded as IN PROGRESS and the key now holds %q — a crash and a hand edit are indistinguishable from the file alone; refusing without explicit confirmation", key, cur)
 		}
 	default:
@@ -320,5 +355,9 @@ func FamilyCAS(h famlock.Held, key, value, prior string, attempt Attempt, confir
 	if err := identityOK(f); err != nil {
 		return err
 	}
-	return atomicReplace(f, []byte(out.String()))
+	if err := atomicReplace(f, []byte(out.String())); err != nil {
+		return err
+	}
+	say("config: set %s=%s in %s (this is the one setting migrate-storage may change).", key, value, f)
+	return nil
 }

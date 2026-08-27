@@ -4,10 +4,12 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"mythicalos.ai/ctl/internal/cliio"
 	"mythicalos.ai/ctl/internal/engine"
 	"mythicalos.ai/ctl/internal/famlock"
+	"mythicalos.ai/ctl/internal/intent"
 	"mythicalos.ai/ctl/internal/ledger"
 	"mythicalos.ai/ctl/internal/prov"
 )
@@ -676,4 +678,42 @@ func TestStatusShowsAnUnattributableVolumeEvenUnderAFilter(t *testing.T) {
 		t.Fatalf("rc = %d, want 0\n%s", rc, r.said())
 	}
 	r.mustSay("volume orphan: role=? data=UNREGENERABLE (unclassified) product=?")
+}
+
+// TestStatusReportsOpenIntentsAndAnUnreadableIntentList pins the PENDING half of the report.
+//
+// IT IS THE ONE PLACE A WEDGE IS VISIBLE. An intent is opened before the object is created and
+// closed after it is confirmed; one left open means a crash landed between those two points, and
+// status is where an operator finds out. Both branches matter, and the UNREADABLE branch matters
+// more: intent records that cannot be read must not render as "nothing pending", which is the
+// reassuring direction and reads exactly like a healthy machine.
+func TestStatusReportsOpenIntentsAndAnUnreadableIntentList(t *testing.T) {
+	r := newRig(t)
+	r.writeProduct("p1")
+	r.mintIdentity()
+	r.mustInstall("p1")
+
+	// An OPEN intent is named, with its class and its object.
+	r.withLock(func(h famlock.Held, st ledger.Store) {
+		l := r.loadLedger(st)
+		if err := intent.Open(l, prov.ClassVolume, "v-stuck", "n1", time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		if err := ledger.Write(h, st, l); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if rc := r.status(); rc != cliio.ExitOK {
+		t.Fatalf("rc = %d, want 0\n%s", rc, r.said())
+	}
+	r.mustSay("PENDING: volume v-stuck — created and not yet confirmed")
+
+	// An intent list that cannot be READ says so. Reporting no pending work off records nobody
+	// could parse is the one direction a diagnostic may never fail in.
+	r.appendRows("intent\tmalformed-no-equals")
+	if rc := r.status(); rc != cliio.ExitOK {
+		t.Fatalf("rc = %d, want 0\n%s", rc, r.said())
+	}
+	r.mustSay("PENDING:      UNREADABLE")
+	r.mustSay("state repair")
 }

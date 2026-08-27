@@ -13,12 +13,21 @@ import (
 	"mythicalos.ai/ctl/internal/runtime"
 )
 
-// Inventory — the CLI-level end-to-end migration. tests/acceptance/migrate.bats's three CLI rows
-// are claimed in migrate_test.go (the dispatcher's refusal matrix); the library rows are claimed in
-// internal/migrate. This file claims no bats row: it is the test that the SEAMS the phase machine
-// is written against are actually connected to the copy module and to product bring-up, which is a
-// property of the wiring rather than of either module, and no bats test could have observed it —
-// in the reference there is no seam to be unwired.
+// Inventory — the CLI-level end-to-end migration. The dispatcher's refusal matrix is claimed in
+// migrate_test.go; the library rows in internal/migrate. Two rows are claimed HERE, and both were
+// N/A until the parity audit, on arguments that had since expired:
+//
+// PORTED: tests/acceptance/migrate.bats: "CLI: migrate-storage end to end, through the real entrypoint, moves the product onto the bind" -> TestMigrateStorageMovesARoleEndToEnd
+// PORTED: tests/unit/migrate.bats: "after the migration, a RECREATE keeps the product on the bind" -> TestRecreateAfterAMigrationKeepsTheBind
+//
+// The first was waived because "the copy and rebuild seams are not wired into the dispatcher"; they
+// are, and this file is where they are proved wired. The second was waived because `recreate` was a
+// verb this build did not carry; Wave 5 landed it. Neither row needs a live runtime after all — the
+// hermetic fake daemon plus the copy-helper stand-in reach the whole path.
+//
+// Everything else here claims no bats row: it tests that the SEAMS the phase machine is written
+// against are actually connected, which is a property of the wiring rather than of either module,
+// and no bats test could have observed it — in the reference there is no seam to be unwired.
 
 // migRig is a CLI rig placed where the location gate will accept it: migrate-storage judges the
 // ancestor chain of the installer home (its secure scratch location lives inside it) as well as of
@@ -252,4 +261,50 @@ func probeLaunches(r *cliRig) int {
 		}
 	}
 	return n
+}
+
+// TestRecreateAfterAMigrationKeepsTheBind ports migrate.bats' "after the migration, a RECREATE keeps
+// the product on the bind".
+//
+// WHAT IT IS ACTUALLY ABOUT. Mounts are fixed at container creation, so every later rebuild reads
+// its mount set from somewhere — and the only durable record of the migration is the
+// MYTHICAL_<PRODUCT>_<ROLE>_BIND key the migration wrote into mythical.conf. If `recreate` built its
+// spec from anything else (the manifest's default named volume, say, or the ledger's pre-migration
+// record), it would quietly put the product back on the OLD storage while the migrated data sat
+// untouched on the bind: the operator sees a healthy container and an empty application.
+func TestRecreateAfterAMigrationKeepsTheBind(t *testing.T) {
+	r, _, base := migRig(t)
+	r.writeProduct("p1")
+	if rc := r.run(append([]string{"install", "p1"}, r.docArgs()...)...); rc != cliio.ExitOK {
+		t.Fatalf("install rc = %d\n%s", rc, r.said())
+	}
+	ident := identOf(t, r.home)
+	container, cerr := manifest.ContainerName(ident, "p1")
+	if cerr != nil {
+		t.Fatal(cerr)
+	}
+	srcVol, verr := manifest.VolumeName(ident, "p1", "state")
+	if verr != nil {
+		t.Fatal(verr)
+	}
+
+	dest := filepath.Join(base, "p1-state")
+	if rc := r.run(append([]string{"migrate-storage", "p1", "state", "--to-bind", dest}, r.docArgs()...)...); rc != cliio.ExitOK {
+		t.Fatalf("migrate-storage rc = %d\n%s", rc, r.said())
+	}
+	canon, cnerr := runtime.Canon(dest)
+	if cnerr != nil {
+		t.Fatal(cnerr)
+	}
+
+	// THE VERB ITSELF, not a stand-in: recreate destroys and rebuilds the container.
+	if rc := r.run(append([]string{"recreate", "p1"}, r.docArgs()...)...); rc != cliio.ExitOK {
+		t.Fatalf("recreate rc = %d\n%s", rc, r.said())
+	}
+	if !mountsSource(t, r, container, canon) {
+		t.Fatalf("after recreate the container does not mount the bind %s\n%s", canon, r.said())
+	}
+	if mountsSource(t, r, container, srcVol) {
+		t.Fatalf("recreate put the product back on the pre-migration volume %s — the data is on the bind\n%s", srcVol, r.said())
+	}
 }

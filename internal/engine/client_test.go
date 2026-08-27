@@ -516,6 +516,27 @@ func TestConstructorRefusals(t *testing.T) {
 	if _, err := engine.NewContainerSpec("c1", "img", engine.SpecOpts{}); err == nil {
 		t.Error("a spec with no network attachment")
 	}
+	// THE THREE ARGUMENT REFUSALS the reference spells out one per line (lib/runtime.sh:388-390).
+	// They were carried into the constructors and then went unasserted: deleting any of the three
+	// left the whole suite green, which is the state that makes a guard decorative. The rule is the
+	// reference's own — non-empty, no control byte, at most 4096 bytes, under LC_ALL=C so
+	// "control byte" means bytes rather than the operator's locale.
+	//
+	// The control byte is the case that matters: these values become argv/JSON on the way to the
+	// daemon, and a name carrying one is how a field boundary gets moved. Written as an ESCAPE,
+	// never as a literal byte — a literal makes the file binary to every grep in this tree.
+	na0, _ := engine.NewNetworkAttach("net", "a")
+	for _, bad := range []string{"", "c\x01name", strings.Repeat("c", 4097)} {
+		if _, err := engine.NewContainerSpec(bad, "img", engine.SpecOpts{Network: na0}); err == nil {
+			t.Errorf("container name %q accepted", bad)
+		}
+		if _, err := engine.NewContainerSpec("c1", bad, engine.SpecOpts{Network: na0}); err == nil {
+			t.Errorf("image reference %q accepted", bad)
+		}
+		if _, err := engine.NewNetworkAttach("net", bad); err == nil {
+			t.Errorf("network alias %q accepted", bad)
+		}
+	}
 	na, _ := engine.NewNetworkAttach("net", "a")
 	if _, err := engine.NewContainerSpec("c1", "img", engine.SpecOpts{
 		Network: na, Labels: map[string]string{"evil": "x"},

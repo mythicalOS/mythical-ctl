@@ -57,9 +57,11 @@ import (
 // PORTED: tests/unit/bringup.bats: "the live check refuses to clear while the container has gained an EXTRA network" -> TestLiveAsksTheCompleteSet
 // PORTED: tests/unit/bringup.bats: "live verification asks the COMPLETE set, not just the address on the target network" -> TestLiveAsksTheCompleteSet
 // PORTED: tests/unit/bringup.bats: "the generic intent reconciler REFUSES a container intent instead of finishing it" -> TestGenericReconcilerRefusesContainers
-// N/A: tests/unit/bringup.bats: "the secret env file holds ONLY the product's declared keys, is 0600, and outlives the call" -- Wave 3 removed the env FILE: secrets are assembled inside runtime.LaunchProduct (secretsFor) and ride the create body over the local socket, so there is no file to have a mode or a lifetime. The key-set rule it protected is asserted by internal/runtime's own suite.
-// N/A: tests/unit/bringup.bats: "a secret the product is not entitled to is REFUSED, not silently dropped" -- same relocation: runtime.secretsFor owns the policy check, and internal/runtime asserts it.
-// N/A: tests/unit/bringup.bats: "a declared secret that is not set REFUSES and leaves no file behind" -- same relocation; there is no file, and the refusal is runtime.secretsFor's.
+// (bringup.bats' three secret-injection rows are NOT claimed here. Wave 3 moved the behaviour to
+// runtime.LaunchProduct's secretsFor, and the claims moved with it — internal/runtime's
+// TestSecretsInjection owns them. They were marked N/A here on the argument that the port was
+// "elsewhere"; that argument was false. A relocated behaviour is PORTED, not N/A, and saying N/A
+// while another file quietly said PORTED left one row described two contradictory ways.)
 // N/A: tests/unit/bringup.bats: "no value from <product>.conf reaches any launch argument" -- structural in Go: the launch seam takes a container name and a nonce, so this package cannot pass a config value to a launch argument even by mistake.
 
 // --- fakes ---------------------------------------------------------------------------------------
@@ -1312,5 +1314,81 @@ func TestVerifierUsesThePassedLedger(t *testing.T) {
 	// came from the argument.
 	if err := v.VerifyAttach(ctx, &ledger.Ledger{}, c1, net1, al1); err == nil {
 		t.Fatal("the verifier answered from something other than the ledger it was handed")
+	}
+}
+
+// TestReconcilerSaysWhyItDidNothing pins the reconciler's two informational verdicts.
+//
+// BOTH ARE THE RECONCILER DECLINING TO ACT, and that is exactly why they are said out loud: an
+// operator watching a pass do nothing cannot tell "deliberately suspended by a migration" or
+// "deferred until the container starts" from "the reconciler never looked at it". The reference
+// printed both; this port carried the behaviour and left the words in a comment, which makes the
+// replacement quieter than the thing it replaces at the two moments quiet is most easily misread.
+func TestReconcilerSaysWhyItDidNothing(t *testing.T) {
+	ctx := context.Background()
+
+	// Deferred: stopped, with a verification outstanding.
+	l, objs, _, _, st, d := fixture(t)
+	var said []string
+	d.Note = func(s string) { said = append(said, s) }
+	if err := state.Commit(l, c1, state.Stopped, []state.Check{{Kind: state.CheckAlias, Param: net1}}, false); err != nil {
+		t.Fatal(err)
+	}
+	objs.nets[c1] = []Attachment{attach(net1, "", al1)}
+	st.down(c1)
+	if err := Reconcile(ctx, l, d, c1, net1, al1); err != nil {
+		t.Fatal(err)
+	}
+	if j := strings.Join(said, "\n"); !strings.Contains(j, "stopped with a verification outstanding") ||
+		!strings.Contains(j, "performed at its next start") {
+		t.Fatalf("the deferred verdict was silent or incomplete: %q", said)
+	}
+
+	// Suspended: a migration intent governs it.
+	l2, objs2, _, _, st2, d2 := fixture(t)
+	said = nil
+	d2.Note = func(s string) { said = append(said, s) }
+	if err := state.Commit(l2, c1, state.Running, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := intent.Open(l2, prov.ClassContainer, c1, "n9", fixedNow); err != nil {
+		t.Fatal(err)
+	}
+	objs2.nets[c1] = []Attachment{attach(net1, "", al1)}
+	st2.down(c1)
+	if err := Reconcile(ctx, l2, d2, c1, net1, al1); err != nil {
+		t.Fatal(err)
+	}
+	if j := strings.Join(said, "\n"); !strings.Contains(j, "is suspended") ||
+		!strings.Contains(j, "must not restart a container a") {
+		t.Fatalf("the suspended verdict was silent or incomplete: %q", said)
+	}
+
+	// A verdict with NOTHING TO SAY says nothing. These two lines exist because the reconciler
+	// declined to act for a reason; a note on every pass would make them noise and stop being read.
+	l3, objs3, _, _, st3, d3 := fixture(t)
+	said = nil
+	d3.Note = func(s string) { said = append(said, s) }
+	objs3.nets[c1] = []Attachment{attach(net1, "10.0.0.9", al1)}
+	st3.up(c1)
+	if err := state.Commit(l3, c1, state.Running, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := Reconcile(ctx, l3, d3, c1, net1, al1); err != nil {
+		t.Fatal(err)
+	}
+	if len(said) != 0 {
+		t.Fatalf("a reconcile with nothing outstanding printed a did-nothing note: %q", said)
+	}
+
+	// A nil Note is a caller with nowhere to write, not a crash.
+	l4, objs4, _, _, st4, d4 := fixture(t)
+	if err := state.Commit(l4, c1, state.Stopped, []state.Check{{Kind: state.CheckAlias, Param: net1}}, false); err != nil {
+		t.Fatal(err)
+	}
+	objs4.nets[c1] = []Attachment{attach(net1, "", al1)}
+	st4.down(c1)
+	if err := Reconcile(ctx, l4, d4, c1, net1, al1); err != nil {
+		t.Fatal(err)
 	}
 }

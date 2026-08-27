@@ -517,6 +517,10 @@ func (s *session) bringupDeps(ix *trust.Index, ident string) (bringup.Deps, erro
 		NewNonce: intent.NonceNew,
 		Now:      time.Now,
 		Persist:  s.persistFn(),
+		// The reconciler's two did-nothing verdicts go to stderr, as the reference sent them —
+		// they are notes, not output, and a caller parsing this verb's stdout must not receive
+		// them. Wired HERE because a seam nothing drives is a diagnostic nobody reads.
+		Note: func(msg string) { s.d.warn("%s", msg) },
 	}, nil
 }
 

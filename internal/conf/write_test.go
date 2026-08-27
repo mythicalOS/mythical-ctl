@@ -315,7 +315,7 @@ func TestWritesRequireTheLock(t *testing.T) {
 	if err := ProductAdd(nil, "brokkr", "20", Spec{}, nil); err == nil {
 		t.Fatal("nil token authorized a product write")
 	}
-	if err := FamilyCAS(nil, "MYTHICAL_BROKKR_DATA_BIND", "/x", "", AttemptNone, nil); err == nil {
+	if err := FamilyCAS(nil, "MYTHICAL_BROKKR_DATA_BIND", "/x", "", AttemptNone, nil, nil); err == nil {
 		t.Fatal("nil token authorized a CAS")
 	}
 }
@@ -797,7 +797,7 @@ func TestFamilyCASAttemptTable(t *testing.T) {
 
 	// none + absent + prior "" => write.
 	h, home := setup("")
-	if err := FamilyCAS(h, key, "/new", "", AttemptNone, nil); err != nil {
+	if err := FamilyCAS(h, key, "/new", "", AttemptNone, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if b, _ := os.ReadFile(FamilyPath(home)); string(b) != key+"=/new\n" {
@@ -806,7 +806,7 @@ func TestFamilyCASAttemptTable(t *testing.T) {
 
 	// none + holds prior => write, preserving other lines.
 	h, home = setup("# note\n" + key + "=/old\nMYTHICAL_NET=n\n")
-	if err := FamilyCAS(h, key, "/new", "/old", AttemptNone, nil); err != nil {
+	if err := FamilyCAS(h, key, "/new", "/old", AttemptNone, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if b, _ := os.ReadFile(FamilyPath(home)); string(b) != "# note\n"+key+"=/new\nMYTHICAL_NET=n\n" {
@@ -815,7 +815,7 @@ func TestFamilyCASAttemptTable(t *testing.T) {
 
 	// none + holds something else => refuse untouched.
 	h, home = setup(key + "=/theirs\n")
-	if err := FamilyCAS(h, key, "/new", "/old", AttemptNone, nil); err == nil {
+	if err := FamilyCAS(h, key, "/new", "/old", AttemptNone, nil, nil); err == nil {
 		t.Fatal("mismatched prior accepted")
 	}
 	if b, _ := os.ReadFile(FamilyPath(home)); string(b) != key+"=/theirs\n" {
@@ -825,7 +825,7 @@ func TestFamilyCASAttemptTable(t *testing.T) {
 	// started + holds our value => advance without rewriting.
 	h, home = setup(key + "=/new\n")
 	st1, _ := os.Stat(FamilyPath(home))
-	if err := FamilyCAS(h, key, "/new", "/old", AttemptStarted, nil); err != nil {
+	if err := FamilyCAS(h, key, "/new", "/old", AttemptStarted, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	st2, _ := os.Stat(FamilyPath(home))
@@ -835,10 +835,10 @@ func TestFamilyCASAttemptTable(t *testing.T) {
 
 	// started + absent => refuse without confirmation; write only WITH it.
 	h, home = setup("MYTHICAL_NET=n\n")
-	if err := FamilyCAS(h, key, "/new", "/old", AttemptStarted, func(string) bool { return false }); err == nil {
+	if err := FamilyCAS(h, key, "/new", "/old", AttemptStarted, func(string) bool { return false }, nil); err == nil {
 		t.Fatal("started+absent wrote without consent")
 	}
-	if err := FamilyCAS(h, key, "/new", "/old", AttemptStarted, func(string) bool { return true }); err != nil {
+	if err := FamilyCAS(h, key, "/new", "/old", AttemptStarted, func(string) bool { return true }, nil); err != nil {
 		t.Fatal(err)
 	}
 	if b, _ := os.ReadFile(FamilyPath(home)); string(b) != "MYTHICAL_NET=n\n"+key+"=/new\n" {
@@ -847,8 +847,129 @@ func TestFamilyCASAttemptTable(t *testing.T) {
 
 	// The door is bind-shaped only: a core key is refused outright.
 	h, _ = setup("")
-	if err := FamilyCAS(h, "MYTHICAL_NET", "n2", "n1", AttemptNone, nil); err == nil {
+	if err := FamilyCAS(h, "MYTHICAL_NET", "n2", "n1", AttemptNone, nil, nil); err == nil {
 		t.Fatal("CAS accepted a core key")
+	}
+}
+
+// TestFamilyCASNarratesWhatItDid pins the three lines this door says out loud.
+//
+// THEY ARE NOT COSMETIC. This compare-and-set is DELIBERATELY not atomic against a human editor —
+// the operation lock has no authority over a text editor — and the reference accepts that window on
+// three stated grounds, the third being that "the command REPORTS the value it wrote, so a lost
+// edit is visible immediately". A silent version keeps the window and drops the mitigation. It
+// drops it hardest exactly when it matters: a migration that fails at a LATER phase never prints
+// its own success narrative, so without this line the operator sees an error and nothing anywhere
+// saying mythical.conf had already been rewritten.
+//
+// The prompt is pinned for the same reason on the other side of the door: the explanation used to
+// live only in the error returned when the operator DECLINED, which reaches nobody who says yes —
+// and the person who says yes is the one about to discard what may be their own hand edit.
+func TestFamilyCASNarratesWhatItDid(t *testing.T) {
+	const key = "MYTHICAL_BROKKR_STATE_BIND"
+	setup := func(content string) (famlock.Held, string) {
+		t.Helper()
+		home := t.TempDir()
+		h := lockFor(t, home)
+		if content != "" {
+			if err := os.WriteFile(FamilyPath(home), []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return h, home
+	}
+	var notes []string
+	note := func(s string) { notes = append(notes, s) }
+
+	// A write REPORTS the value it wrote, and names the file it wrote it in.
+	h, home := setup("")
+	notes = nil
+	if err := FamilyCAS(h, key, "/new", "", AttemptNone, nil, note); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(notes, "\n")
+	for _, want := range []string{"set " + key + "=/new", FamilyPath(home), "the one setting migrate-storage may change"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("the write said %q, which does not carry %q", joined, want)
+		}
+	}
+
+	// A REFUSED write says nothing: a report of a value that was not written is worse than silence.
+	h, _ = setup(key + "=/theirs\n")
+	notes = nil
+	if err := FamilyCAS(h, key, "/new", "/old", AttemptNone, nil, note); err == nil {
+		t.Fatal("mismatched prior accepted")
+	}
+	if len(notes) != 0 {
+		t.Fatalf("a refused CAS reported a write: %q", notes)
+	}
+
+	// The no-op advance says so, rather than looking like a write that did not happen.
+	h, _ = setup(key + "=/new\n")
+	notes = nil
+	if err := FamilyCAS(h, key, "/new", "/old", AttemptStarted, nil, note); err != nil {
+		t.Fatal(err)
+	}
+	if j := strings.Join(notes, "\n"); !strings.Contains(j, "already holds the migrated destination") {
+		t.Fatalf("the advance said %q", j)
+	}
+
+	// The PROMPT the operator answers carries the whole explanation — including the value actually
+	// found, which is the thing they are being asked to discard.
+	h, _ = setup(key + "=/somebody-elses-edit\n")
+	var asked string
+	if err := FamilyCAS(h, key, "/new", "/old", AttemptStarted, func(p string) bool { asked = p; return false }, note); err == nil {
+		t.Fatal("started+different wrote without consent")
+	}
+	for _, want := range []string{
+		"recorded as IN PROGRESS",
+		"/somebody-elses-edit",
+		"deleted or changed the line by hand",
+		"additive-only rule promises to keep",
+		"write " + key + "=/new, discarding what is there?",
+	} {
+		if !strings.Contains(asked, want) {
+			t.Fatalf("the confirmation prompt does not carry %q — the operator consents uninformed:\n%s", want, asked)
+		}
+	}
+
+	// ...and when the key is ABSENT the prompt says so in words, rather than showing an empty line.
+	h, _ = setup("MYTHICAL_NET=n\n")
+	asked = ""
+	if err := FamilyCAS(h, key, "/new", "/old", AttemptStarted, func(p string) bool { asked = p; return false }, note); err == nil {
+		t.Fatal("started+absent wrote without consent")
+	}
+	if !strings.Contains(asked, "<nothing>") {
+		t.Fatalf("an absent key rendered as blank in the prompt:\n%s", asked)
+	}
+
+	// A WRITE THAT FAILED AT THE LAST STEP MUST NOT REPORT SUCCESS. This is the report's worst
+	// possible lie: the operator is told mythical.conf now names the destination when the rename
+	// never happened, and every later decision — theirs and the migration's — is made against a
+	// file that says something else. The refusal above covers the paths that return early; this
+	// covers the one that gets all the way to the replace and loses.
+	h, home = setup("")
+	if os.Getuid() == 0 {
+		t.Log("running as root: an unwritable directory does not stop the write, so this case is skipped")
+	} else {
+		dir := filepath.Dir(FamilyPath(home))
+		if err := os.Chmod(dir, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+		notes = nil
+		if err := FamilyCAS(h, key, "/new", "", AttemptNone, nil, note); err == nil {
+			t.Fatal("a write into an unwritable directory reported success")
+		}
+		if len(notes) != 0 {
+			t.Fatalf("a write that never landed was reported as done: %q", notes)
+		}
+	}
+
+	// A nil note is a caller with nowhere to write, not a crash.
+	h, _ = setup("")
+	if err := FamilyCAS(h, key, "/new", "", AttemptNone, nil, nil); err != nil {
+		t.Fatal(err)
 	}
 }
 

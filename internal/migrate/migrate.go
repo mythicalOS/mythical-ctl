@@ -1019,7 +1019,7 @@ func runPhase6(l *ledger.Ledger, d Deps, prev, r record) error {
 			"  path rather than this refusal. Run 'mythical-ctl state repair' if it persists.",
 			carriedAttempt, r.Product, r.Role)
 	}
-	return conf.FamilyCAS(d.Lock, r.ConfKey, r.Dest, prev.Prior, attempt, d.Confirm)
+	return conf.FamilyCAS(d.Lock, r.ConfKey, r.Dest, prev.Prior, attempt, d.Confirm, func(s string) { d.logf("%s", s) })
 }
 
 // runPhase7 REPLACES THE CONTAINER, because "switch the mount" is not an operation: mounts are fixed

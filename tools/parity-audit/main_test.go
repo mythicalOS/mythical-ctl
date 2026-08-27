@@ -100,7 +100,7 @@ func TestParseManifestRefusesARowWithNoTab(t *testing.T) {
 // ---------------------------------------------------------------------------------------------
 
 func TestParseInventory(t *testing.T) {
-	claims, bad, err := parseInventory("internal/x/x_test.go", lines(
+	claims, bad, _, err := parseInventory("internal/x/x_test.go", lines(
 		`package x`,
 		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
 		`// N/A:    tests/unit/a.bats: "two" -- structurally impossible in Go: no such seam exists`,
@@ -142,14 +142,45 @@ func TestParseInventoryReportsMalformed(t *testing.T) {
 		{"prose target with no test name", `// PORTED: tests/unit/a.bats: "one" -> (structural, nothing to name)`},
 		{"no reason", `// N/A: tests/unit/a.bats: "one" -- `},
 		{"reason argues nothing", `// N/A: tests/unit/a.bats: "one" -- same`},
+		// A DEFERRAL IS NOT AN ARGUMENT. Measured on this tree: four rows rested on "the verb it
+		// names is not wired in this build" and "re-claim once that verb lands", every premise had
+		// expired a wave earlier, and nothing noticed — the audit checked that a row was CLAIMED,
+		// never that its claim still held.
+		{"defers to a verb landing", `// N/A: tests/unit/a.bats: "one" -- the verb it names is not wired in this build; re-claim once that verb lands`},
+		{"defers with a TODO", `// N/A: tests/unit/a.bats: "one" -- TODO: needs the copy seam, which is not built here`},
 		{"unquoted name", `// PORTED: tests/unit/a.bats: one -> TestOne`},
 	} {
-		claims, bad, err := parseInventory("x_test.go", lines(tc.line))
+		claims, bad, _, err := parseInventory("x_test.go", lines(tc.line))
 		if err != nil {
 			t.Fatalf("%s: %v", tc.name, err)
 		}
 		if len(bad) != 1 || len(claims) != 0 {
 			t.Fatalf("%s: %d malformed, %d claims — want 1 and 0", tc.name, len(bad), len(claims))
+		}
+	}
+}
+
+// The deferral list itself: it must fire on a promise and NOT on prose that merely contains a word
+// from it. A check that reddens on arguments nobody can rewrite is a check somebody turns off.
+func TestDeferralIsPhraseLevelNotWordLevel(t *testing.T) {
+	for _, yes := range []string{
+		"the verb it names is not wired in this build",
+		"re-claim against install once that verb lands",
+		"TODO: port this when the seam exists",
+		"lands with internal/verbs in a later task",
+	} {
+		if deferral(yes) == "" {
+			t.Errorf("a deferral went undetected: %q", yes)
+		}
+	}
+	for _, no := range []string{
+		"structural in Go: each acceptor performs exactly one snapshot and every later step consumes that byte slice",
+		"compile-time arity; there is no set -u to abort under",
+		"the mode is a bool on the typed Bind; an unrecognised third field is unrepresentable",
+		"bash bundle-mode artifact; Go links the surface at compile time",
+	} {
+		if d := deferral(no); d != "" {
+			t.Errorf("a real argument was read as a deferral (%q): %q", d, no)
 		}
 	}
 }
@@ -306,16 +337,16 @@ var tinyGoTests = map[string]bool{"TestOne": true, "TestTwo": true, "TestThree":
 // tests can put a file in it and take one out. The real map is asserted separately, below.
 var (
 	noPreDeclared   = map[string]string{}
-	tinyPreDeclared = map[string]string{"tests/unit/bundle.bats": "the bundler retires with the bash tree"}
+	tinyPreDeclared = map[string]string{"tests/unit/waived.bats": "a fixture stand-in for a pre-declared whole-file N/A"}
 )
 
-func claimsFrom(t *testing.T, l ...string) ([]claim, []malformed) {
+func claimsFrom(t *testing.T, l ...string) ([]claim, []malformed, []stray) {
 	t.Helper()
-	c, b, err := parseInventory("internal/x/x_test.go", lines(l...))
+	c, b, st, err := parseInventory("internal/x/x_test.go", lines(l...))
 	if err != nil {
 		t.Fatal(err)
 	}
-	return c, b
+	return c, b, st
 }
 
 func hasProblem(r *report, substr string) bool {
@@ -328,13 +359,13 @@ func hasProblem(r *report, substr string) bool {
 }
 
 func TestAuditCoverageAcceptsACompleteInventory(t *testing.T) {
-	c, b := claimsFrom(t,
+	c, b, st := claimsFrom(t,
 		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
 		`// N/A: tests/unit/a.bats: "two" -- bash-only: guards a source-time hazard Go does not have`,
 		`// PORTED: tests/unit/b.bats: "one" -> TestTwo`,
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, tinyGoTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
 	if len(r.Problems) != 0 {
 		t.Fatalf("a complete inventory was rejected: %v", r.Problems)
 	}
@@ -344,12 +375,12 @@ func TestAuditCoverageAcceptsACompleteInventory(t *testing.T) {
 }
 
 func TestAuditCoverageCatchesAnUnclaimedTest(t *testing.T) {
-	c, b := claimsFrom(t,
+	c, b, st := claimsFrom(t,
 		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
 		`// PORTED: tests/unit/b.bats: "one" -> TestTwo`,
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, tinyGoTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
 	if !hasProblem(r, `"two" is claimed by NO inventory line`) {
 		t.Fatalf("the unclaimed test was not reported: %v", r.Problems)
 	}
@@ -359,14 +390,14 @@ func TestAuditCoverageCatchesAnUnclaimedTest(t *testing.T) {
 // one is invisible while the right one keeps the row covered — which is how a stale N/A survives
 // the landing of the test that retired it.
 func TestAuditCoverageCatchesADoubleClaim(t *testing.T) {
-	c, b := claimsFrom(t,
+	c, b, st := claimsFrom(t,
 		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
 		`// N/A: tests/unit/a.bats: "one" -- claimed elsewhere, and this line was never removed`,
 		`// PORTED: tests/unit/a.bats: "two" -> TestTwo`,
 		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, tinyGoTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
 	if !hasProblem(r, "is claimed 2 times") {
 		t.Fatalf("the double claim was not reported: %v", r.Problems)
 	}
@@ -375,13 +406,13 @@ func TestAuditCoverageCatchesADoubleClaim(t *testing.T) {
 // A paraphrased or truncated test name is the most common way a claim goes wrong, and the most
 // dangerous: the line reads as coverage while the real row it meant is left unclaimed.
 func TestAuditCoverageCatchesAClaimOnNoSuchTest(t *testing.T) {
-	c, b := claimsFrom(t,
+	c, b, st := claimsFrom(t,
 		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
 		`// PORTED: tests/unit/a.bats: "two, roughly" -> TestTwo`,
 		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, tinyGoTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
 	if !hasProblem(r, "no such test in the corpus") {
 		t.Fatalf("the phantom claim was not reported: %v", r.Problems)
 	}
@@ -393,12 +424,12 @@ func TestAuditCoverageCatchesAClaimOnNoSuchTest(t *testing.T) {
 // The identity is the (file, name) PAIR. Six descriptions recur across different bats files in the
 // real corpus, so a name-keyed inventory would let one line silently satisfy several rows.
 func TestAuditCoverageDoesNotLetOneNameSatisfyTwoFiles(t *testing.T) {
-	c, b := claimsFrom(t,
+	c, b, st := claimsFrom(t,
 		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
 		`// PORTED: tests/unit/a.bats: "two" -> TestTwo`,
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, tinyGoTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
 	if !hasProblem(r, `tests/unit/b.bats: "one" is claimed by NO inventory line`) {
 		t.Fatalf("b.bats' same-named row was treated as covered by a.bats' claim: %v", r.Problems)
 	}
@@ -407,13 +438,13 @@ func TestAuditCoverageDoesNotLetOneNameSatisfyTwoFiles(t *testing.T) {
 // A checklist comment with no live test behind it is the failure the inventory exists to prevent,
 // wearing the inventory's own clothes.
 func TestAuditCoverageCatchesADanglingPortedTarget(t *testing.T) {
-	c, b := claimsFrom(t,
+	c, b, st := claimsFrom(t,
 		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
 		`// PORTED: tests/unit/a.bats: "two" -> TestGoneAway`,
 		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, tinyGoTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
 	if !hasProblem(r, "PORTED target TestGoneAway does not exist") {
 		t.Fatalf("the dangling target was not reported: %v", r.Problems)
 	}
@@ -421,26 +452,26 @@ func TestAuditCoverageCatchesADanglingPortedTarget(t *testing.T) {
 
 // Every named target, not just the first: a claim naming two tests is claiming both.
 func TestAuditCoverageResolvesEverySecondaryTarget(t *testing.T) {
-	c, b := claimsFrom(t,
+	c, b, st := claimsFrom(t,
 		`// PORTED: tests/unit/a.bats: "one" -> TestOne, TestVanished`,
 		`// PORTED: tests/unit/a.bats: "two" -> TestTwo`,
 		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, tinyGoTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
 	if !hasProblem(r, "PORTED target TestVanished does not exist") {
 		t.Fatalf("a secondary target was not resolved: %v", r.Problems)
 	}
 }
 
 func TestAuditCoverageReportsMalformedLines(t *testing.T) {
-	c, b := claimsFrom(t,
+	c, b, st := claimsFrom(t,
 		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
 		`// N/A: tests/unit/a.bats: "two" -- x`,
 		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, tinyGoTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
 	if !hasProblem(r, "inventory line does not parse") {
 		t.Fatalf("the malformed line was not reported: %v", r.Problems)
 	}
@@ -449,13 +480,13 @@ func TestAuditCoverageReportsMalformedLines(t *testing.T) {
 // A file waved away wholesale is the largest hole this inventory can have. Exactly the
 // pre-declared files may be, and their arguments are printed on every run.
 func TestAuditCoverageCatchesAnUndeclaredWholesaleNA(t *testing.T) {
-	c, b := claimsFrom(t,
+	c, b, st := claimsFrom(t,
 		`// N/A: tests/unit/a.bats: "one" -- not portable, and this reason is long enough to pass`,
 		`// N/A: tests/unit/a.bats: "two" -- not portable either, for reasons of comparable length`,
 		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, tinyGoTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
 	if !hasProblem(r, "all 2 tests are N/A") {
 		t.Fatalf("the wholesale-N/A file was not reported: %v", r.Problems)
 	}
@@ -464,16 +495,16 @@ func TestAuditCoverageCatchesAnUndeclaredWholesaleNA(t *testing.T) {
 func TestAuditCoverageAcceptsAPreDeclaredWholeFileNA(t *testing.T) {
 	corpus := append([]batsPair(nil), tiny...)
 	corpus = append(corpus,
-		batsPair{"tests/unit/bundle.bats", "x"},
-		batsPair{"tests/unit/bundle.bats", "y"},
+		batsPair{"tests/unit/waived.bats", "x"},
+		batsPair{"tests/unit/waived.bats", "y"},
 	)
-	c, b := claimsFrom(t,
+	c, b, st := claimsFrom(t,
 		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
 		`// PORTED: tests/unit/a.bats: "two" -> TestTwo`,
 		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
 	)
 	r := &report{}
-	auditCoverage(r, corpus, c, b, tinyGoTests, tinyPreDeclared)
+	auditCoverage(r, corpus, c, b, st, tinyGoTests, tinyPreDeclared)
 	if len(r.Problems) != 0 {
 		t.Fatalf("the pre-declared whole-file N/A was rejected: %v", r.Problems)
 	}
@@ -486,15 +517,15 @@ func TestAuditCoverageAcceptsAPreDeclaredWholeFileNA(t *testing.T) {
 // and one of them is wrong.
 func TestAuditCoverageCatchesAClaimOnAPreDeclaredFile(t *testing.T) {
 	corpus := append([]batsPair(nil), tiny...)
-	corpus = append(corpus, batsPair{"tests/unit/bundle.bats", "x"})
-	c, b := claimsFrom(t,
+	corpus = append(corpus, batsPair{"tests/unit/waived.bats", "x"})
+	c, b, st := claimsFrom(t,
 		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
 		`// PORTED: tests/unit/a.bats: "two" -> TestTwo`,
 		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
-		`// PORTED: tests/unit/bundle.bats: "x" -> TestOne`,
+		`// PORTED: tests/unit/waived.bats: "x" -> TestOne`,
 	)
 	r := &report{}
-	auditCoverage(r, corpus, c, b, tinyGoTests, tinyPreDeclared)
+	auditCoverage(r, corpus, c, b, st, tinyGoTests, tinyPreDeclared)
 	if !hasProblem(r, "pre-declared N/A in tools/parity-audit") {
 		t.Fatalf("the contradiction was not reported: %v", r.Problems)
 	}
@@ -503,13 +534,13 @@ func TestAuditCoverageCatchesAClaimOnAPreDeclaredFile(t *testing.T) {
 // A pre-declaration for a file the corpus does not have is an argument protecting nothing — and
 // after the cutover it is the shape a stale exemption would take.
 func TestAuditCoverageCatchesAPreDeclarationWithNoFile(t *testing.T) {
-	c, b := claimsFrom(t,
+	c, b, st := claimsFrom(t,
 		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
 		`// PORTED: tests/unit/a.bats: "two" -> TestTwo`,
 		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, tinyGoTests, map[string]string{"tests/unit/gone.bats": "a file the corpus does not have"})
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, map[string]string{"tests/unit/gone.bats": "a file the corpus does not have"})
 	if !hasProblem(r, "but the corpus has no such file") {
 		t.Fatalf("the empty pre-declaration was not reported: %v", r.Problems)
 	}
@@ -759,5 +790,42 @@ func TestEndToEndRefusesWhenNoGoSourceIsScanned(t *testing.T) {
 	err := e2eRun(root, goList)
 	if err == nil || !strings.Contains(err.Error(), "scanned 0 Go files") {
 		t.Fatalf("err = %v, want a refusal naming the empty scan", err)
+	}
+}
+
+// The stray-claim check, and the defect that motivated it: a PORTED: line wrapped into the middle
+// of a paragraph, naming rows another file had marked N/A. Two statements about one row, and only
+// the invisible one was right.
+func TestAuditCoverageCatchesAClaimWrittenMidLine(t *testing.T) {
+	c, b, st := claimsFrom(t,
+		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
+		`// PORTED: tests/unit/a.bats: "two" -> TestTwo`,
+		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
+		`// some prose about secrets — PORTED: tests/unit/a.bats: "one" -> TestOne (again, unseen)`,
+	)
+	if len(st) != 1 {
+		t.Fatalf("the mid-line claim was not detected: %+v", st)
+	}
+	r := &report{}
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
+	if !hasProblem(r, "is written mid-line") {
+		t.Fatalf("the mid-line claim was not reported: %v", r.Problems)
+	}
+}
+
+// ...and it stays narrow. A mid-line mention naming a file the corpus does not hold is this
+// program's own documentation, or prose about the convention, and must not fail the audit.
+func TestAuditCoverageIgnoresAMidLineMentionOfANonCorpusFile(t *testing.T) {
+	c, b, st := claimsFrom(t,
+		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
+		`// PORTED: tests/unit/a.bats: "two" -> TestTwo`,
+		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
+		`// the convention is: PORTED: tests/unit/<file>.bats: "<name>" -> TestGoFunc`,
+		`// and a fixture may say PORTED: tests/unit/nowhere.bats: "z" -> TestZ`,
+	)
+	r := &report{}
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
+	if len(r.Problems) != 0 {
+		t.Fatalf("a mention of a non-corpus file was reported: %v", r.Problems)
 	}
 }

@@ -49,7 +49,11 @@ import (
 // N/A: tests/unit/migrate.bats: "compare-and-set: attempt in progress, key ABSENT → STOP and require confirmation" -- same: internal/conf TestFamilyCASAttemptTable ("started + absent => refuse without confirmation; write only WITH it").
 // N/A: tests/unit/migrate.bats: "compare-and-set: attempt in progress, key holds SOMETHING ELSE → STOP" -- same: internal/conf TestFamilyCASAttemptTable, and the migration-level consequence (an operator's edit survives a crashed migration) is TestOperatorEditIsNeverSilentlyOverwritten.
 // PORTED: tests/unit/migrate.bats: "the bind reaches mythical.conf BEFORE the container is replaced" -> TestBindIsWrittenBeforeTheContainerIsReplaced
-// N/A: tests/unit/migrate.bats: "after the migration, a RECREATE keeps the product on the bind" -- `recreate` is a lifecycle verb this package does not carry (internal/verbs, Wave 5 Task 22), and asserting it against a stand-in would assert the stand-in. The migration-side precondition it rests on — the canonical bind is in mythical.conf and SURVIVES to the end of the migration, so anything later built from mythical.conf picks it up — is TestBindIsWrittenBeforeTheContainerIsReplaced. Re-claim against recreate once that verb lands.
+// (migrate.bats' "after the migration, a RECREATE keeps the product on the bind" row was N/A here —
+// "re-claim against recreate once that verb lands". Wave 5 landed it, so the row is claimed in
+// cmd/mythical-ctl/migrate_e2e_test.go by TestRecreateAfterAMigrationKeepsTheBind, where the real
+// verb runs rather than a stand-in. The migration-side precondition it rests on stays
+// TestBindIsWrittenBeforeTheContainerIsReplaced here.)
 // PORTED: tests/unit/migrate.bats: "phase 7 REPLACES the container and tombstones the old one — mounts are immutable" -> TestPhase7ReplacesAndTombstonesInOrder
 // PORTED: tests/unit/migrate.bats: "phase 8 verifies the mount BY INSPECTION and claims nothing about the container-side read" -> TestPhase8VerifiesByInspectionAndClaimsNothingMore
 // PORTED: tests/unit/migrate.bats: "a migration of a desired-STOPPED product leaves it stopped and still verifies phase 8" -> TestDesiredStoppedSurvivesTheMigration
@@ -77,8 +81,16 @@ import (
 // PORTED: tests/acceptance/migrate.bats: "a resume with NO confirmation input is refused, not carried out silently" -> TestResumeWithoutConfirmationDoesNothing
 // (The three CLI arity/option rows of tests/acceptance/migrate.bats are claimed by the file that
 //  carries the dispatcher under test: cmd/mythical-ctl/migrate_test.go.)
-// N/A: tests/acceptance/migrate.bats: "CLI: an unrelated verb rejects --to-bind rather than silently ignoring it" -- the reciprocal refusal lives in the option matrix of the OTHER verb (`install`), which lands with internal/verbs in Wave 5 Task 22; this build's dispatcher carries no such verb, so the assertion would pass off the unknown-command path (also exit 2) and could not catch a regression in the rule it names. The half this task owns — migrate-storage refuses every option it does not own, rather than ignoring it — is cmd/mythical-ctl TestMigrateStorageDispatchRefusals. Re-claim against install once that verb lands.
-// N/A: tests/acceptance/migrate.bats: "CLI: migrate-storage end to end, through the real entrypoint, moves the product onto the bind" -- the end-to-end path needs the copy-helper image and a live container runtime, which the hermetic Go lane does not have (check.sh's acceptance stage is the real-daemon lane and covers internal/engine only). The whole nine-phase run, in process and against the real ledger and the real mythical.conf writer, is TestMigrationCompletesEndToEnd; the dispatcher half is cmd/mythical-ctl TestMigrateStorageDispatchRefusals. Re-claim once the copy and rebuild seams are wired into the dispatcher.
+// (acceptance/migrate.bats' "CLI: an unrelated verb rejects --to-bind" row was N/A here while
+// install was unwired — "re-claim against install once that verb lands". It landed in Wave 5, so the
+// row is claimed in cmd/mythical-ctl/lifecycle_test.go by TestCLIInstallRejectsToBind. The half this
+// package owns — migrate-storage refuses every option it does not own — is still
+// cmd/mythical-ctl TestMigrateStorageDispatchRefusals.)
+// (acceptance/migrate.bats' "CLI: migrate-storage end to end" row was N/A here — "re-claim once the
+// copy and rebuild seams are wired into the dispatcher". They are wired, and the row is claimed in
+// cmd/mythical-ctl/migrate_e2e_test.go by TestMigrateStorageMovesARoleEndToEnd, which runs the verb
+// through the real entrypoint against the fake daemon and the copy-helper stand-in. The in-process
+// nine-phase run stays TestMigrationCompletesEndToEnd here.)
 
 func ctx() context.Context { return context.Background() }
 

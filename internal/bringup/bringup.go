@@ -115,6 +115,16 @@ type Deps struct {
 	// family-lock token, which the caller holds — the same reason this package never holds a
 	// Mutator of its own.
 	Persist func(*ledger.Ledger) error
+	// Note is where the reconciler's two informational verdicts go — the two situations in which it
+	// deliberately does NOTHING and the operator would otherwise see silence. Optional: a nil Note
+	// is a caller with nowhere to write, and the reconciler's behaviour does not depend on it.
+	Note func(string)
+}
+
+func (d Deps) note(format string, a ...any) {
+	if d.Note != nil {
+		d.Note(fmt.Sprintf(format, a...))
+	}
 }
 
 // barrier persists the ledger before a runtime mutation, and REFUSES when it cannot.
@@ -613,11 +623,19 @@ func Reconcile(ctx context.Context, l *ledger.Ledger, d Deps, container, netID, 
 	case state.PlanNone:
 		return nil
 	case state.PlanSuspended:
-		// The reconciler must not restart a container a migration deliberately stopped.
+		// SAID OUT LOUD, not merely done. These two verdicts are the reconciler declining to act,
+		// and an operator watching a reconcile pass do nothing has no way to tell "deliberately
+		// suspended" from "the reconciler did not look". The reference printed both; carrying only
+		// the behaviour and leaving the words in a comment makes the port quieter than the thing it
+		// replaces, at the two moments quiet is most easily misread. (The sibling verdict — a
+		// stopped container with no endpoint address — is already carried as an error string.)
+		d.note("note: reconciliation of %q is suspended — a migration intent is recorded for it and\n"+
+			"  carries the desired state to restore. The reconciler must not restart a container a\n"+
+			"  migration deliberately stopped.", container)
 		return nil
 	case state.PlanDefer:
-		// A stopped container has no address, so there is nothing to resolve; the check is
-		// performed at its next start.
+		d.note("note: %q is stopped with a verification outstanding. A stopped container has no\n"+
+			"  address, so there is nothing to resolve; the check is performed at its next start.", container)
 		return nil
 	case state.PlanExited:
 		return fmt.Errorf("bringup: %q should be running and is not, and this installer has ALREADY resumed it\n"+
