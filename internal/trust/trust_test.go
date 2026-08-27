@@ -16,7 +16,7 @@ import (
 // Inventory — tests/unit/trust.bats:
 // PORTED: tests/unit/trust.bats: "digest verification accepts a match and reports both sides on mismatch" -> TestVerifyDigest
 // PORTED: tests/unit/trust.bats: "digest verification refuses a malformed expectation rather than comparing strings" -> TestVerifyDigest
-// N/A: tests/unit/trust.bats: "a missing file is a verification failure, not a pass" -- VerifyDigestData is bytes-first by design (round-1 plan gate); absence is refused earlier, by Snapshot, asserted in TestAcceptorRefusals
+// PORTED: tests/unit/trust.bats: "a missing file is a verification failure, not a pass" -> TestAcceptorRefusals ("a missing file is a refusal from the snapshot step, never a pass" — VerifyDigestData is bytes-first by design (round-1 plan gate), so absence is refused one step earlier, by Snapshot; the property is the same one and it is asserted)
 // PORTED: tests/unit/trust.bats: "an absent floor is first use, not a rollback" -> TestFloorLifecycle
 // PORTED: tests/unit/trust.bats: "a floor round-trips through the ledger" -> TestFloorLifecycle
 // PORTED: tests/unit/trust.bats: "floors are per document id and do not bleed" -> TestFloorLifecycle

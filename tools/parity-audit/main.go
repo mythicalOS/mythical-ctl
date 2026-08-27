@@ -356,10 +356,16 @@ func parseInventory(rel string, content []byte) ([]claim, []malformed, []stray, 
 			// Not in claim position. If it nevertheless names a real corpus file in claim syntax,
 			// somebody wrote a claim the audit cannot see — record it and let auditCoverage decide,
 			// since only it knows what the corpus holds.
-			if strings.Contains(text, "//") {
-				if m := invStray.FindStringSubmatch(text); m != nil {
-					strays = append(strays, stray{rel, line, m[2], text})
-				}
+			//
+			// NO COMMENT-MARKER PRECONDITION, DELIBERATELY. An earlier version required `//` on the
+			// line, which left a block comment — `/* PORTED: <a real corpus row> -> TestX */` — as a
+			// place a second claim on an already-claimed row could sit permanently invisible, and the
+			// exactly-once guarantee is worth exactly as much as its least-visible hiding place. The
+			// corpus-file scoping below is what keeps this narrow: a mention naming a bats file the
+			// corpus does not hold (this program's own `tests/unit/<file>.bats` documentation, its
+			// fixtures' `tests/unit/a.bats`) is not swept up, whatever syntax surrounds it.
+			if m := invStray.FindStringSubmatch(text); m != nil {
+				strays = append(strays, stray{rel, line, m[2], text})
 			}
 			continue
 		}

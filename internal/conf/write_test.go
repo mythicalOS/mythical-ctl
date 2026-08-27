@@ -40,7 +40,7 @@ import (
 // PORTED: tests/unit/config_family.bats: "a forged lock token does not authorize a write" -> TestWritesRequireTheLock (a nil/foreign Held fails famlock.Assert — the sealed-type port of the token forgery test)
 // N/A: tests/unit/config_family.bats: "mi_lock_assert_held refuses a no-argument call in its own words" -- Go arity is compile-time
 // N/A: tests/unit/config_family.bats: "the ledger's lock refusal is unchanged by the extraction" -- bash source-extraction regression; Go has no extraction seam
-// N/A: tests/unit/config_family.bats: "a foreign-owned mythical.conf is refused" -- creating a foreign-owned file needs root; identityOK's uid branch is the refusal, and TestForeignOwnedRefused pins it under a root run
+// PORTED: tests/unit/config_family.bats: "a foreign-owned mythical.conf is refused" -> TestForeignOwnedRefused (identityOK's uid branch; STATED RESIDUAL — creating a foreign-owned file needs root, so the test skips on an unprivileged run and only a root run exercises it)
 // PORTED: tests/unit/config_family.bats: "a non-regular mythical.conf is refused" -> TestNonRegularRefused
 //
 // Inventory — tests/unit/config_product.bats:
@@ -54,7 +54,7 @@ import (
 // PORTED: tests/unit/config_product.bats: "an oversized product conf is refused, and leaves no snapshot behind" -> TestProductOversizedRefused (Go's snapshot is in-memory; "no snapshot file behind" has no on-disk artifact to leak)
 // PORTED: tests/unit/config_product.bats: "a retry after rc 5 repairs the mode and the group" -> TestProductOwnershipFailure
 // PORTED: tests/unit/config_product.bats: "a no-op merge does not rewrite the file" -> TestProductNoOpKeepsBytesAndInode
-// N/A: tests/unit/config_product.bats: "a chmod failure after the bytes have landed reports rc 5, not rc 1" -- an unprivileged process cannot make chmod fail on a file it owns after a successful chgrp (the bash test shimmed chmod); the committed-bytes-vs-refusal distinction the row exists for is asserted by TestProductOwnershipFailure via StateGroupFailed
+// PORTED: tests/unit/config_product.bats: "a chmod failure after the bytes have landed reports rc 5, not rc 1" -> TestProductOwnershipFailure (the rc-5 semantics the row exists for: the bytes ARE committed and the file is left at the 0600 fallback, reported as OwnershipError rather than a plain failure. STATED RESIDUAL — the TRIGGER differs: an unprivileged process cannot make chmod fail on a file it owns after a successful chgrp (the bash shimmed it), so the Go induces the same state through StateGroupFailed)
 // PORTED: tests/unit/config_product.bats: "a rewrite keeps the same inode — a bind mount must not be detached" -> TestProductRewriteKeepsInode
 // PORTED: tests/unit/config_product.bats: "a value containing a newline is refused and nothing is written" -> TestProductAddRefusals
 // PORTED: tests/unit/config_product.bats: "a key outside the product spec is refused on write, leaving no partial file" -> TestProductAddRefusals
@@ -71,7 +71,7 @@ import (
 // PORTED: tests/unit/config_product.bats: "a symlinked product conf is refused on both read and write" -> TestProductSymlinkRefused
 // PORTED: tests/unit/config_product.bats: "a product conf hardlinked to mythical.conf is refused" -> TestProductHardlinkRefused
 // PORTED: tests/unit/config_product.bats: "a product conf hardlinked to a file under bin/ is refused" -> TestProductHardlinkRefused
-// N/A: tests/unit/config_product.bats: "a product conf owned by another uid is refused on both read and write" -- creating a foreign-owned file needs root; the refusal is identityOK's uid branch, the same code path every identity test exercises, and TestForeignOwnedRefused pins it under a root run
+// PORTED: tests/unit/config_product.bats: "a product conf owned by another uid is refused on both read and write" -> TestForeignOwnedRefused (identityOK's uid branch, the same code path every identity test exercises; same STATED RESIDUAL — it skips off-root)
 // N/A: tests/unit/config_product.bats: "an unreadable owner is refused rather than assumed to be ours" -- the bash parsed `ls` output which could be garbled; os.Lstat's Stat_t either exists or the assertion fails closed (that fail-closed branch is in identityOK and cannot be induced portably)
 // PORTED: tests/unit/config_product.bats: "a matching marker reads silently" -> TestProductLoadRoundTrip
 // PORTED: tests/unit/config_product.bats: "a stale marker over a parseable body is torn, not accepted" -> TestProductTornAndMalformed

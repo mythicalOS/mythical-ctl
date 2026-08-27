@@ -802,9 +802,13 @@ func TestAuditCoverageCatchesAClaimWrittenMidLine(t *testing.T) {
 		`// PORTED: tests/unit/a.bats: "two" -> TestTwo`,
 		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
 		`// some prose about secrets — PORTED: tests/unit/a.bats: "one" -> TestOne (again, unseen)`,
+		// A BLOCK COMMENT IS THE OTHER HIDING PLACE, and it is a better one: nothing on the line
+		// looks like a line comment at all. The exactly-once guarantee is worth exactly as much as
+		// its least-visible hiding place.
+		`/* PORTED: tests/unit/b.bats: "one" -> TestThree */`,
 	)
-	if len(st) != 1 {
-		t.Fatalf("the mid-line claim was not detected: %+v", st)
+	if len(st) != 2 {
+		t.Fatalf("a mid-line claim went undetected: %+v", st)
 	}
 	r := &report{}
 	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
