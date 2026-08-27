@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"path/filepath"
 
 	"mythicalos.ai/ctl/internal/cliio"
 )
@@ -26,6 +27,15 @@ func migrateStorage(o opts, stderr io.Writer) int {
 	// EXACTLY <product> <role>.
 	if len(o.products) != 2 {
 		fmt.Fprintln(stderr, "mythical-ctl: migrate-storage needs exactly <product> <role> --to-bind <path>")
+		return cliio.ExitUsage
+	}
+	// AN ABSOLUTE PATH, judged HERE. Every path comparison the migration makes is on absolute
+	// paths, and a relative operand would be resolved against whatever directory the process
+	// happens to be in — a location the operator did not name. It is a MALFORMED INVOCATION, so it
+	// carries the usage code; reporting it as anything else classifies a malformed call as a
+	// well-formed one that merely could not proceed.
+	if !filepath.IsAbs(o.toBind) {
+		fmt.Fprintln(stderr, "mythical-ctl: --to-bind needs an absolute path")
 		return cliio.ExitUsage
 	}
 	// THE MACHINE IS internal/migrate; WHAT IS NOT HERE YET IS ITS RUNTIME WIRING. MigrateStorage

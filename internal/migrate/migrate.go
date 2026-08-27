@@ -619,10 +619,23 @@ func Run(ctx context.Context, l *ledger.Ledger, d Deps, product, role, dest stri
 	// EVERY PHASE'S CARRIED SET, IN ONE PLACE. next starts as the record this phase will write; each
 	// phase overrides only what it changes. Building it once is what keeps a field from being
 	// dropped on the way through one phase and not another.
+	//
+	// PHASE 7 CARRIES A DIFFERENT DEFAULT FOR `attempt`, and it is not an inconsistency: every
+	// phase before it defaults to "none" because a write of the bind has not been attempted yet,
+	// while phase 7 is only ever REACHED through a completed phase 6, so a record that does not
+	// carry the field at all (a repaired or hand-written one) describes a migration whose write
+	// was already begun. Defaulting it to "none" there would make a later fall-back to phase 5
+	// re-present an already-written bind to the compare-and-set as a FRESH write, which refuses
+	// against the value phase 6 itself put in mythical.conf — a migration wedged by its own
+	// recovery path.
+	attemptDefault := "none"
+	if phase == 7 {
+		attemptDefault = "started"
+	}
 	next := record{
 		Product: product, Role: role, Dest: dest, SrcVol: srcvol, ConfKey: key, Mount: mount,
 		Nonce: prev.Nonce, Prior: prev.Prior, StageID: prev.StageID,
-		Attempt:        carried(prev.Attempt, prev.attemptPresent, "none"),
+		Attempt:        carried(prev.Attempt, prev.attemptPresent, attemptDefault),
 		Desired:        carried(prev.Desired, prev.desiredPresent, string(state.Running)),
 		attemptPresent: true, desiredPresent: true,
 	}
@@ -951,12 +964,23 @@ func runPhase5(l *ledger.Ledger, d Deps, r record) error {
 // compare-and-set completed) it reads "started" from that crashed attempt's own write. That is
 // exactly the distinction the compare-and-set needs to tell a crash from a hand edit.
 func runPhase6(l *ledger.Ledger, d Deps, prev, r record) error {
+	// THE WRITE-AHEAD RECORD LANDS FIRST, EVEN FOR A STATE THIS PHASE IS ABOUT TO REFUSE. The
+	// carried attempt state is judged AFTER the record is durable, exactly as the reference orders
+	// it: the record is rewritten with attempt=started, and only then is the STALE value presented
+	// to the compare-and-set. Judging first and returning early would leave an unrecognised value
+	// in the ledger for ever — every retry would reach the same refusal, where the reference's next
+	// attempt reads back "started" and takes the resumable recovery path.
+	carriedAttempt := r.Attempt
+	r.Phase, r.Attempt = 6, "started"
+	if err := r.put(l, d); err != nil {
+		return err
+	}
 	// THE RECORDED STATE IS MAPPED, NOT COERCED. A value that is neither of the two this core
 	// defines is a corrupt or hand-edited record, and folding it into "none" would present a
 	// migration that may already have written mythical.conf to the compare-and-set as a FRESH
 	// write — the one situation the attempt field exists to tell apart.
 	var attempt conf.Attempt
-	switch r.Attempt {
+	switch carriedAttempt {
 	case "none":
 		attempt = conf.AttemptNone
 	case "started":
@@ -965,11 +989,9 @@ func runPhase6(l *ledger.Ledger, d Deps, prev, r record) error {
 		return fmt.Errorf("migrate: the recorded write-attempt state %q for %s/%s is neither 'none' nor\n"+
 			"  'started'. Refusing to present it to the one door authorized to change a value in\n"+
 			"  mythical.conf — a crash and a hand edit are told apart by this field alone.\n"+
-			"  Run 'mythical-ctl state repair'.", r.Attempt, r.Product, r.Role)
-	}
-	r.Phase, r.Attempt = 6, "started"
-	if err := r.put(l, d); err != nil {
-		return err
+			"  The intent is now recorded as a write IN PROGRESS, so a re-run takes the recovery\n"+
+			"  path rather than this refusal. Run 'mythical-ctl state repair' if it persists.",
+			carriedAttempt, r.Product, r.Role)
 	}
 	return conf.FamilyCAS(d.Lock, r.ConfKey, r.Dest, prev.Prior, attempt, d.Confirm)
 }

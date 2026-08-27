@@ -1455,7 +1455,18 @@ func TestThePhaseIsDurableBeforeItsActionRuns(t *testing.T) {
 		stageIDAtCopy = r.StageID
 	}
 	var confAtRebuild string
-	var diskAtRebuild int
+	var diskAtRebuild, diskAtRemove int
+	// OBSERVED AT THE FIRST DESTRUCTIVE ACT, not merely somewhere inside phase 7. The container
+	// removal is irreversible and comes BEFORE the rebuild, so a marker persisted between the two
+	// would satisfy an observation taken at the rebuild while leaving a crash after the removal
+	// with no write-ahead phase at all.
+	prevOnRemove := f.mut.onRemove
+	f.mut.onRemove = func() {
+		diskAtRemove = f.diskPhase()
+		if prevOnRemove != nil {
+			prevOnRemove()
+		}
+	}
 	f.bld.hook = func() {
 		diskAtRebuild = f.diskPhase()
 		confAtRebuild, _ = f.confValue(f.confkey)
@@ -1474,6 +1485,9 @@ func TestThePhaseIsDurableBeforeItsActionRuns(t *testing.T) {
 	// tree at all.
 	if stageIDAtCopy == "" {
 		t.Fatal("the copy ran with no staging identity persisted alongside the staging path")
+	}
+	if diskAtRemove != 7 {
+		t.Fatalf("while the old container was being REMOVED, disk named phase %d, want 7", diskAtRemove)
 	}
 	if diskAtRebuild != 7 {
 		t.Fatalf("while the container was being replaced, disk named phase %d, want 7", diskAtRebuild)
@@ -1555,5 +1569,115 @@ func TestPhase4VerifiesARealStagedTreeOnResume(t *testing.T) {
 	f.cp.hostErr = nil
 	if err := Run(ctx(), f.l, f.d, testProduct, testRole, canon, 4); err != nil {
 		t.Fatalf("a well-formed phase 4 over a real staged tree was refused: %v", err)
+	}
+}
+
+// --- gate round 2 ---------------------------------------------------------------------------------
+
+func TestPhase9KeepsTheIntentWhenTheRestoreITSELFFails(t *testing.T) {
+	// RESTORE FIRST, CLEAR SECOND — and the ordering only bites when the restore FAILS on a desired
+	// value that is otherwise VALID. A refusal raised while merely validating the value proves
+	// nothing about the order, because an implementation that validated, cleared, and only then
+	// restored would refuse at exactly the same point. Here the desired state is `running` and the
+	// commit itself fails, which is the case the ordering exists for: an intent cleared first,
+	// followed by a failed restore, leaves nothing recording that the container should still reach
+	// its prior state.
+	f := newFx(t)
+	canon := f.canonDest()
+	if err := os.Mkdir(canon, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f.seed(record{Phase: 9, Dest: canon, Nonce: "nz", Staging: StagingPath(canon, "nz"),
+		Attempt: "started", Desired: "running"})
+	// An empty network id makes the owed alias check unrecordable, so state.Commit refuses — a
+	// genuine restore failure over a well-formed desired state.
+	f.bld.netID = ""
+	err := Run(ctx(), f.l, f.d, testProduct, testRole, canon, 9)
+	if err == nil {
+		t.Fatal("a failed desired-state restore reported success")
+	}
+	if p, perr := Phase(f.l, testProduct, testRole); perr != nil || p != 9 {
+		t.Fatalf("the intent is at %d (%v) after a failed restore, want 9 — it must outlive the failure", p, perr)
+	}
+	if f.diskPhase() != 9 {
+		t.Fatalf("the persisted intent is at %d after a failed restore", f.diskPhase())
+	}
+	if len(f.bld.reconciled) != 0 {
+		t.Fatal("the container was reconciled toward a state that was never restored")
+	}
+}
+
+func TestPhase6RecordsTheAttemptBeforeJudgingIt(t *testing.T) {
+	// THE WRITE-AHEAD RECORD LANDS FIRST, EVEN FOR A STATE THIS PHASE IS ABOUT TO REFUSE. The
+	// reference rewrites the record with attempt=started and only then presents the STALE value to
+	// the compare-and-set, so an unrecognised value is refused ONCE and the next attempt takes the
+	// resumable recovery path. Judging first and returning early would leave the unrecognised value
+	// in the ledger for ever — every retry reaching the same refusal, with no way forward.
+	f := newFx(t)
+	canon := f.canonDest()
+	f.seedRaw(map[string]string{
+		"phase": "6", "dest": canon, "nonce": "nz", "staging": StagingPath(canon, "nz"),
+		"attempt": "", "desired": "running", "confkey": f.confkey, "srcvol": f.srcvol,
+		"mount": testMount, "prior": "", "stageid": "",
+	})
+	mustContain(t, Run(ctx(), f.l, f.d, testProduct, testRole, canon, 6), "is neither 'none' nor")
+
+	// The record now describes a write IN PROGRESS, in memory and on disk.
+	for _, l := range []*ledger.Ledger{f.l, f.onDisk()} {
+		r, err := find(l, testProduct, testRole)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r.Phase != 6 || r.Attempt != "started" {
+			t.Fatalf("after the refusal the record is phase=%d attempt=%q, want 6/started", r.Phase, r.Attempt)
+		}
+	}
+	// So the retry proceeds down the recovery path instead of the same refusal.
+	if err := Run(ctx(), f.l, f.d, testProduct, testRole, canon, 6); err != nil {
+		t.Fatalf("the retry did not take the recovery path: %v", err)
+	}
+	if got, _ := f.confValue(f.confkey); got != canon {
+		t.Fatalf("the retry did not write the bind: %q", got)
+	}
+}
+
+func TestPhase7DefaultsAnAbsentAttemptToStarted(t *testing.T) {
+	// PHASE 7 IS ONLY EVER REACHED THROUGH A COMPLETED PHASE 6, so a record that does not carry the
+	// attempt field at all describes a migration whose write was already begun. Defaulting it to
+	// "none" — the default every EARLIER phase uses — makes a later fall-back to phase 5 re-present
+	// an already-written bind to the compare-and-set as a FRESH write, which then refuses against
+	// the very value phase 6 put there: a migration wedged by its own recovery path.
+	f := newFx(t)
+	canon := f.canonDest()
+	if err := os.Mkdir(canon, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sid, _ := Identity(canon)
+	// A repaired record: phase 7, no attempt field, and the bind phase 6 already wrote.
+	if err := conf.FamilyAdd(f.lock, f.confkey, canon); err != nil {
+		t.Fatal(err)
+	}
+	f.seedRaw(map[string]string{
+		"phase": "7", "dest": canon, "nonce": "nz", "staging": StagingPath(canon, "nz"),
+		"desired": "running", "confkey": f.confkey, "srcvol": f.srcvol,
+		"mount": testMount, "prior": "", "stageid": sid,
+	})
+	if err := Run(ctx(), f.l, f.d, testProduct, testRole, canon, 7); err != nil {
+		t.Fatal(err)
+	}
+	r, err := find(f.l, testProduct, testRole)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Attempt != "started" {
+		t.Fatalf("phase 7 recorded attempt=%q, want started", r.Attempt)
+	}
+	// And the recovery path it enables actually works: re-running phase 6 over the already-written
+	// bind advances rather than refusing.
+	if err := Run(ctx(), f.l, f.d, testProduct, testRole, canon, 6); err != nil {
+		t.Fatalf("re-running phase 6 over the bind phase 6 already wrote refused: %v", err)
+	}
+	if got, _ := f.confValue(f.confkey); got != canon {
+		t.Fatalf("mythical.conf holds %q", got)
 	}
 }

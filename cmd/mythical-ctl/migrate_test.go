@@ -111,3 +111,25 @@ func TestMigrateStorageIsInTheHelp(t *testing.T) {
 		}
 	}
 }
+
+// A RELATIVE --to-bind IS A MALFORMED INVOCATION, not a well-formed one that could not proceed.
+// Every path comparison the migration makes is on absolute paths, and a relative operand resolves
+// against whatever directory the process happens to be in — a location the operator did not name.
+func TestMigrateStorageRefusesARelativeToBind(t *testing.T) {
+	for _, rel := range []string{"relative/dest", "./dest", "dest", "../dest"} {
+		home := t.TempDir()
+		t.Setenv("MYTHICAL_HOME", home)
+		var out, errb bytes.Buffer
+		rc := run([]string{"migrate-storage", "p1", "state", "--to-bind", rel},
+			strings.NewReader(""), &out, &errb)
+		if rc != 2 {
+			t.Fatalf("--to-bind %q: rc = %d, want 2 (usage); stderr=%q", rel, rc, errb.String())
+		}
+		if !strings.Contains(errb.String(), "absolute path") {
+			t.Fatalf("--to-bind %q: stderr %q does not name the fault", rel, errb.String())
+		}
+		if ents, _ := os.ReadDir(home); len(ents) != 0 {
+			t.Fatalf("the refusal touched the family home: %v", ents)
+		}
+	}
+}
