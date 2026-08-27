@@ -68,13 +68,18 @@ type Bridge struct {
 	once   sync.Once
 
 	mu     sync.Mutex
-	record []recordLine
+	record []recordChunk
 }
 
-// recordLine is one line of the operation's durable record, tagged with the stream it belongs on.
-// The two streams share ONE ordered slice so the interleaving the plain path would have produced
-// survives the replay.
-type recordLine struct {
+// recordChunk is one WRITE of the operation's durable record — the exact bytes, tagged with the
+// stream they belong on, in the order they were produced.
+//
+// CHUNKS, NOT LINES, and this is load-bearing. A record of lines cannot represent a write with no
+// trailing newline (replaying it adds one the verb never wrote) and cannot preserve order across a
+// partial line: hold "a" back waiting for its newline, narrate a step, then write "b\n", and a
+// line-shaped record replays "p / ab" where the plain path printed "ap / b". The two streams share
+// ONE ordered slice so that interleaving survives too.
+type recordChunk struct {
 	stderr bool
 	text   string
 }
@@ -135,7 +140,8 @@ func (b *Bridge) Confirm(prompt string) bool {
 // interface comes down, so a step that happens during a teardown is still reported rather than lost
 // with the frame it was drawn in.
 func (b *Bridge) Progress(ev verbs.ProgressEvent) {
-	b.appendRecord(false, ev.Detail)
+	// EXACTLY what the plain path writes for the same event: fmt.Fprintln(d.out(), ev.Detail).
+	b.appendRecord(false, ev.Detail+"\n")
 	if b.gone() {
 		return
 	}
@@ -154,24 +160,25 @@ func (b *Bridge) PullProgress(status string) {
 
 func (b *Bridge) appendRecord(stderr bool, text string) {
 	b.mu.Lock()
-	b.record = append(b.record, recordLine{stderr: stderr, text: text})
+	b.record = append(b.record, recordChunk{stderr: stderr, text: text})
 	b.mu.Unlock()
 }
 
 // Record is the operation's durable output, in order. Exposed for tests; the runner replays it
 // through Flush.
-func (b *Bridge) Record() []recordLine {
+func (b *Bridge) Record() []recordChunk {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return append([]recordLine(nil), b.record...)
+	return append([]recordChunk(nil), b.record...)
 }
 
-// Flush writes the record to the real streams, each line on the stream it was written to.
+// Flush writes the record to the real streams, VERBATIM — every chunk, in order, on the stream it
+// was written to, with nothing added.
 //
-// This is what makes the interface's output MATCH THE PLAIN PATH's rather than merely resemble it:
-// every line the verb narrated or wrote is printed, in order, once, after the frame is gone. The
-// confirmation PROMPTS are deliberately not part of it — they were asked and answered on screen,
-// and reprinting a question after it has been answered would read as if it were still open.
+// This is what makes the interface's output MATCH THE PLAIN PATH's rather than merely resemble it.
+// Nothing is appended: a verb that wrote no trailing newline gets no trailing newline here either.
+// The confirmation PROMPTS are deliberately not part of the record — they were asked and answered on
+// screen, and reprinting a question after it has been answered would read as if it were still open.
 func (b *Bridge) Flush(stdout, stderr io.Writer) {
 	if stdout == nil {
 		stdout = io.Discard
@@ -179,12 +186,12 @@ func (b *Bridge) Flush(stdout, stderr io.Writer) {
 	if stderr == nil {
 		stderr = io.Discard
 	}
-	for _, l := range b.Record() {
+	for _, c := range b.Record() {
 		w := stdout
-		if l.stderr {
+		if c.stderr {
 			w = stderr
 		}
-		fmt.Fprintln(w, l.text)
+		_, _ = io.WriteString(w, c.text)
 	}
 }
 
@@ -193,11 +200,13 @@ func (b *Bridge) Flush(stdout, stderr io.Writer) {
 // owns the terminal.
 func (b *Bridge) Writer(stderr bool) *StreamWriter { return &StreamWriter{b: b, stderr: stderr} }
 
-// StreamWriter splits a stream into complete lines and posts each one.
+// StreamWriter records a stream's writes VERBATIM and posts them to the interface as complete lines.
 //
-// PARTIAL LINES ARE HELD, not posted: a Fprintf that writes a prefix and then the rest would
-// otherwise become two lines on screen and two lines in the record. Close flushes whatever is left
-// so a final write without a newline is not swallowed.
+// The two are deliberately different shapes. The RECORD takes the raw bytes of every Write, in
+// order, because it is replayed to the real terminal and must be byte-exact. The INTERFACE is given
+// complete lines only — a Fprintf that writes a prefix and then the rest would otherwise be drawn as
+// two lines — so a partial line is held until its newline arrives, and Close flushes whatever is
+// left so a final write without a newline is still drawn.
 type StreamWriter struct {
 	b      *Bridge
 	stderr bool
@@ -209,7 +218,14 @@ type StreamWriter struct {
 var _ io.WriteCloser = (*StreamWriter)(nil)
 
 func (w *StreamWriter) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	// RECORDED FIRST, RAW, AND IN THE SAME CRITICAL SECTION as the line splitting: the record's
+	// order is the order the verb wrote in, and a chunk appended after another goroutine's would
+	// replay out of sequence.
 	w.mu.Lock()
+	w.b.appendRecord(w.stderr, string(p))
 	w.buf = append(w.buf, p...)
 	var lines []string
 	for {
@@ -227,7 +243,8 @@ func (w *StreamWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// Close flushes a trailing partial line.
+// Close draws a trailing partial line. It adds NOTHING to the record — the bytes are already there,
+// exactly as they were written.
 func (w *StreamWriter) Close() error {
 	w.mu.Lock()
 	rest := string(w.buf)
@@ -239,8 +256,8 @@ func (w *StreamWriter) Close() error {
 	return nil
 }
 
+// emit draws one line. The interface only; the record is written by Write.
 func (w *StreamWriter) emit(line string) {
-	w.b.appendRecord(w.stderr, line)
 	if w.b.gone() {
 		return
 	}

@@ -380,7 +380,8 @@ func TestRunReplaysTheRecordToTheRealStreams(t *testing.T) {
 	if code != 0 || err != nil {
 		t.Fatalf("code %d err %v", code, err)
 	}
-	wantOut := "checking the runtime\nstarted brokkr\na line with no newline\n"
+	// BYTE-EXACT: the verb's last write had no newline, so the replay must not invent one.
+	wantOut := "checking the runtime\nstarted brokkr\na line with no newline"
 	if out.String() != wantOut {
 		t.Fatalf("stdout replay:\n%q\nwant\n%q", out.String(), wantOut)
 	}
@@ -392,6 +393,32 @@ func TestRunReplaysTheRecordToTheRealStreams(t *testing.T) {
 	lines := p.Final().Progress().Lines()
 	if len(lines) != 4 {
 		t.Fatalf("the pane saw %d lines: %q", len(lines), lines)
+	}
+}
+
+// TestRunReplayPreservesOrderAcrossAPartialLine. A partial write is HELD back from the screen until
+// its newline arrives — that is a drawing rule — and it must not become an ordering rule: a record
+// of complete lines would replay the held fragment AFTER the step that was narrated while it waited,
+// printing "p / ab" where the plain path printed "ap / b".
+func TestRunReplayPreservesOrderAcrossAPartialLine(t *testing.T) {
+	p := newFakeProgram()
+	d, out, errb := baseDeps()
+	_, err := run(context.Background(), d, func(ctx context.Context, d verbs.Deps) int {
+		fmt.Fprint(d.Stdout, "a")
+		d.Progress(verbs.ProgressEvent{Stage: "s", Detail: "p"})
+		fmt.Fprint(d.Stdout, "b\n")
+		fmt.Fprint(d.Stderr, "e1")
+		fmt.Fprint(d.Stderr, "e2\n")
+		return 0
+	}, p.make, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := out.String(), "ap\nb\n"; got != want {
+		t.Fatalf("stdout replay %q, want %q — the plain path's order", got, want)
+	}
+	if got, want := errb.String(), "e1e2\n"; got != want {
+		t.Fatalf("stderr replay %q, want %q", got, want)
 	}
 }
 
@@ -588,42 +615,86 @@ func TestBridgePullProgressIsNotRecorded(t *testing.T) {
 	}
 }
 
-// TestStreamWriterEmitsCompleteLinesOnly — a Fprintf that writes a prefix and then the rest must not
-// become two lines, and a final write with no newline must not be swallowed.
-func TestStreamWriterEmitsCompleteLinesOnly(t *testing.T) {
+// TestStreamWriterDrawsCompleteLinesOnly. A Fprintf that writes a prefix and then the rest must not
+// be drawn as two lines; a final write with no newline must still be drawn.
+func TestStreamWriterDrawsCompleteLinesOnly(t *testing.T) {
+	rec := &recordingSender{}
+	b := NewBridge(context.Background(), rec)
+	w := b.Writer(true)
+	fmt.Fprint(w, "mythical-ctl: ")
+	if got := rec.count(); got != 0 {
+		t.Fatalf("a partial line was drawn: %v", rec.msgs)
+	}
+	fmt.Fprint(w, "refused\nand another\ntrailing")
+	if got := rec.count(); got != 2 {
+		t.Fatalf("drew %d lines, want 2", got)
+	}
+	_ = w.Close()
+	if got := rec.count(); got != 3 {
+		t.Fatalf("Close did not draw the trailing partial line: %d", got)
+	}
+	first, ok := rec.msgs[0].(OutputMsg)
+	if !ok || first.Line != "mythical-ctl: refused" || !first.Stderr {
+		t.Fatalf("first drawn line %#v", rec.msgs[0])
+	}
+	// Closing twice must not re-draw.
+	_ = w.Close()
+	if got := rec.count(); got != 3 {
+		t.Fatalf("a second Close re-drew: %d", got)
+	}
+	// Write reports the full length it was given, as io.Writer requires.
+	n, err := w.Write([]byte("abc\n"))
+	if n != 4 || err != nil {
+		t.Fatalf("Write returned %d, %v", n, err)
+	}
+	if n, err := w.Write(nil); n != 0 || err != nil {
+		t.Fatalf("an empty Write returned %d, %v", n, err)
+	}
+}
+
+// TestStreamWriterRecordIsByteExact. The record is replayed to the real terminal, so it must be the
+// bytes the verb wrote — not lines reassembled from them. A line-shaped record adds a newline the
+// verb never wrote, and the added newline is invisible in a test that expects it.
+func TestStreamWriterRecordIsByteExact(t *testing.T) {
 	b := NewBridge(context.Background(), blackHole{})
 	w := b.Writer(true)
 	fmt.Fprint(w, "mythical-ctl: ")
-	if got := len(b.Record()); got != 0 {
-		t.Fatalf("a partial line was emitted: %v", b.Record())
-	}
 	fmt.Fprint(w, "refused\nand another\ntrailing")
-	if got := len(b.Record()); got != 2 {
-		t.Fatalf("record %v", b.Record())
-	}
 	_ = w.Close()
-	rec := b.Record()
-	if len(rec) != 3 {
-		t.Fatalf("Close did not flush the trailing partial line: %v", rec)
-	}
 	var out, errb bytes.Buffer
 	b.Flush(&out, &errb)
-	want := "mythical-ctl: refused\nand another\ntrailing\n"
+	want := "mythical-ctl: refused\nand another\ntrailing"
 	if errb.String() != want {
 		t.Fatalf("stderr %q, want %q", errb.String(), want)
 	}
 	if out.Len() != 0 {
 		t.Fatalf("a stderr write landed on stdout: %q", out.String())
 	}
-	// Closing twice must not re-emit.
+	// Close adds nothing to the record: the bytes were already there.
+	before := len(b.Record())
 	_ = w.Close()
-	if got := len(b.Record()); got != 3 {
-		t.Fatalf("a second Close re-emitted: %v", b.Record())
+	if got := len(b.Record()); got != before {
+		t.Fatalf("Close appended to the record: %d -> %d", before, got)
 	}
-	// Write reports the full length it was given, as io.Writer requires.
-	n, err := w.Write([]byte("abc\n"))
-	if n != 4 || err != nil {
-		t.Fatalf("Write returned %d, %v", n, err)
+}
+
+// TestProgressRecordMatchesThePlainPathByte for byte: the plain default is
+// fmt.Fprintln(d.out(), ev.Detail).
+func TestProgressRecordMatchesThePlainPathByte(t *testing.T) {
+	b := NewBridge(context.Background(), blackHole{})
+	b.Progress(verbs.ProgressEvent{Stage: "s", Detail: "started brokkr"})
+	b.Progress(verbs.ProgressEvent{Stage: "s", Detail: ""})
+	var out, errb bytes.Buffer
+	b.Flush(&out, &errb)
+
+	var plain bytes.Buffer
+	fmt.Fprintln(&plain, "started brokkr")
+	fmt.Fprintln(&plain, "")
+	if out.String() != plain.String() {
+		t.Fatalf("record %q, plain path %q", out.String(), plain.String())
+	}
+	if errb.Len() != 0 {
+		t.Fatalf("narration reached stderr: %q", errb.String())
 	}
 }
 

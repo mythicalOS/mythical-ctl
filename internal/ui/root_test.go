@@ -278,6 +278,72 @@ func TestRootPopOnEmptyStack(t *testing.T) {
 	}
 }
 
+// TestRootPopRefusesAnOpenQuestion is the deadlock the bridge's own release paths cannot reach: a
+// pop while a confirmation is up leaves the program and the context BOTH live, so neither of the
+// bridge's two releases fires and the verb waits forever on a question that is no longer on screen.
+// Every path that removes an overlay must answer it.
+func TestRootPopRefusesAnOpenQuestion(t *testing.T) {
+	m := NewRoot(func() {})
+	r := NewReply()
+	m, _ = step(m, ConfirmRequestMsg{Prompt: "Wipe?", Reply: r})
+	m, _ = step(m, PopOverlayMsg{})
+	if m.Overlays() != 0 {
+		t.Fatal("the overlay survived the pop")
+	}
+	select {
+	case ok := <-r.C():
+		if ok {
+			t.Fatal("popping a confirmation accepted it")
+		}
+	default:
+		t.Fatal("popping a confirmation abandoned the asker — it blocks forever")
+	}
+	// The Cmd form reaches the same message, so a caller that pops through it is covered too.
+	if _, ok := PopOverlay()().(PopOverlayMsg); !ok {
+		t.Fatal("PopOverlay produced the wrong message")
+	}
+}
+
+// TestRootDissolveRefusesAnOpenQuestion — an overlay that hands back a nil Overlay leaves the stack
+// the same way, and must be answered the same way. A ConfirmOverlay that dissolved BECAUSE it was
+// answered is unaffected: the answer is once-only.
+func TestRootDissolveRefusesAnOpenQuestion(t *testing.T) {
+	// A stand-in that dissolves on esc while holding a real Reply, the way a future overlay kind
+	// could.
+	r := NewReply()
+	m := NewRoot(func() {})
+	m, _ = step(m, PushOverlayMsg{Overlay: dissolvingConfirm{ConfirmOverlay: Confirm("?", r)}})
+	m, _ = step(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	if m.Overlays() != 0 {
+		t.Fatal("the overlay did not dissolve")
+	}
+	select {
+	case ok := <-r.C():
+		if ok {
+			t.Fatal("a dissolving overlay accepted")
+		}
+	default:
+		t.Fatal("a dissolving overlay abandoned the asker")
+	}
+
+	// And an ordinary answered confirmation keeps its answer rather than being overwritten by the
+	// refusal on the way out.
+	r2 := NewReply()
+	m2 := NewRoot(func() {})
+	m2, _ = step(m2, ConfirmRequestMsg{Prompt: "?", Reply: r2})
+	m2, _ = step(m2, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m2, _ = step(m2, tea.KeyMsg{Type: tea.KeyEnter})
+	if ok := <-r2.C(); !ok {
+		t.Fatal("the answer was overwritten by the dismissal's refusal")
+	}
+}
+
+// dissolvingConfirm answers nothing and vanishes on any key — the shape that proves the refusal is
+// applied by the ROOT rather than by the overlay being polite on its way out.
+type dissolvingConfirm struct{ ConfirmOverlay }
+
+func (d dissolvingConfirm) Update(tea.Msg) (Overlay, tea.Cmd) { return nil, nil }
+
 // TestRootDrawsOnlyTheTopOverlay — a stack draws its top, and the top has the keyboard.
 func TestRootDrawsOnlyTheTopOverlay(t *testing.T) {
 	m := NewRoot(func() {})

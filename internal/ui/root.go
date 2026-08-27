@@ -132,6 +132,11 @@ func (m Root) update(msg tea.Msg) (Root, tea.Cmd) {
 		return m.push(msg.Overlay)
 
 	case PopOverlayMsg:
+		// AN OVERLAY THAT LEAVES THE STACK IS ANSWERED ON ITS WAY OUT. A pop that merely dropped a
+		// confirmation would leave the verb blocked on a question that is no longer on screen, with
+		// the program and the context both still live — the one deadlock the bridge's release paths
+		// cannot reach, because neither of them has fired.
+		dismiss(m.overlays.top())
 		m.overlays = m.overlays.pop()
 		return m, nil
 
@@ -207,7 +212,11 @@ func (m Root) routeToTop(msg tea.Msg) (Root, tea.Cmd) {
 	}
 	next, cmd := top.Update(msg)
 	if isNilSeam(next) {
-		// An overlay that dissolves itself is the same thing as a pop.
+		// An overlay that dissolves itself is the same thing as a pop, and is answered like one.
+		// A confirmation that dissolved BECAUSE it was answered has already resolved and this is a
+		// no-op (Reply answers at most once); one that dissolved for any other reason is refused
+		// rather than abandoned.
+		dismiss(top)
 		m.overlays = m.overlays.pop()
 		return m, cmd
 	}
@@ -222,12 +231,21 @@ func (m Root) routeToTop(msg tea.Msg) (Root, tea.Cmd) {
 // disagreeing at the moment of the keystroke rather than at the moment of teardown.
 func (m Root) refuseAll() Root {
 	for _, o := range m.overlays {
-		if r, ok := o.(interface{ Refuse() }); ok {
-			r.Refuse()
-		}
+		dismiss(o)
 	}
 	m.overlays = nil
 	return m
+}
+
+// dismiss answers an overlay that is leaving the stack, if it has a question outstanding.
+//
+// It is the ONE place that knows an overlay may be holding somebody's blocked call, and every path
+// that removes an overlay goes through it. Refusing is idempotent — an overlay that already
+// answered is unaffected — so a caller never has to know which case it is in.
+func dismiss(o Overlay) {
+	if r, ok := o.(interface{ Refuse() }); ok {
+		r.Refuse()
+	}
 }
 
 // handleKey is the global keymap.

@@ -122,6 +122,17 @@ func (o ConfirmOverlay) handleKey(msg tea.KeyMsg) (Overlay, tea.Cmd) {
 	case tea.KeyEsc:
 		// Cancel is a REFUSAL, not a dismissal: the verb asked and must be told.
 		return o.resolve(false)
+	case tea.KeyCtrlD:
+		// ^D is END OF TRANSMISSION. On the plain path it makes the read FAIL — end of input on an
+		// empty line, and a line delivered without its terminator otherwise — and mi_confirm
+		// refuses on a failed read either way. Swallowing it here would leave the question open on
+		// a keystroke that means "no more input", which is the one divergence that makes the modal
+		// impossible to get out of by the means the other world offers.
+		return o.resolve(false)
+	case tea.KeyCtrlJ:
+		// ^J IS the line terminator a terminal delivers (NL); the Enter key delivers CR, which the
+		// line discipline turns into the same thing. Both submit.
+		return o.resolve(cliio.AcceptedReply(string(o.input)))
 	case tea.KeyEnter:
 		// The buffer is submitted AS TYPED. Trimming here would accept " y" in this world and
 		// refuse it in the plain one.
@@ -146,10 +157,38 @@ func (o ConfirmOverlay) handleKey(msg tea.KeyMsg) (Overlay, tea.Cmd) {
 		}
 		return o.insert(msg), nil
 	}
-	// Every other key — arrows, function keys, ctrl+anything this editor does not claim — is
-	// SWALLOWED. It reaches neither the buffer nor whatever is underneath the modal, which is the
-	// property that makes a confirmation a confirmation.
-	return o, nil
+	// EVERY OTHER KEY CONTRIBUTES TO THE LINE, exactly as it would on the plain path.
+	//
+	// Swallowing them was a real divergence, and it fell the DANGEROUS way: a terminal reading a
+	// line puts the tab byte into it, so `y<Tab><Enter>` gives the plain path "y\t" and REFUSES —
+	// while an editor that dropped the tab would submit "y" and ACCEPT. The same for every
+	// unclaimed control key and for an escape sequence from an arrow or function key. Reconstructing
+	// the byte keeps the buffer equal to the line the other world would have read, which is the only
+	// way the two can be held to one accept-set.
+	//
+	// Nothing reaches what is underneath the modal either way; that property is unchanged.
+	return o.appendUnclaimed(msg), nil
+}
+
+// appendUnclaimed adds the bytes an unclaimed key would have put into a line.
+//
+// Bubble Tea's control-key KeyTypes ARE their ASCII codes (KeyTab == 9, KeyCtrlA == 1, KeyNull == 0,
+// and so on up to DEL), so a control key reconstructs exactly. The navigation keys — arrows,
+// function keys, page and home — have negative KeyTypes and arrive at a line-reading terminal as an
+// ESCAPE SEQUENCE; the introducer alone is appended, which is enough to make the line refuse for the
+// same reason the full sequence would, and is not a claim to reproduce the sequence byte for byte.
+// An alt-modified key is ESC-prefixed, which is how a terminal sends it.
+func (o ConfirmOverlay) appendUnclaimed(msg tea.KeyMsg) ConfirmOverlay {
+	var rs []rune
+	if msg.Alt {
+		rs = append(rs, '\x1b')
+	}
+	if t := int(msg.Type); t >= 0 && t <= 127 {
+		rs = append(rs, rune(t))
+	} else {
+		rs = append(rs, '\x1b')
+	}
+	return o.appendRunes(rs)
 }
 
 // insert appends the message's runes to the buffer.
@@ -163,11 +202,17 @@ func (o ConfirmOverlay) insert(msg tea.KeyMsg) ConfirmOverlay {
 	if msg.Type == tea.KeySpace && len(msg.Runes) == 0 {
 		// Bubble Tea reports the space bar as KeySpace with the rune in Runes; a build that ever
 		// reports it empty must still insert a space rather than nothing.
-		o.input = append(append([]rune(nil), o.input...), ' ')
-		return o
+		if msg.Alt {
+			return o.appendRunes([]rune{'\x1b', ' '})
+		}
+		return o.appendRunes([]rune{' '})
 	}
 	if len(msg.Runes) == 0 {
 		return o
+	}
+	if msg.Alt {
+		// A terminal sends alt+x as ESC then x, so the line the plain path reads carries the ESC.
+		return o.appendRunes(append([]rune{'\x1b'}, msg.Runes...))
 	}
 	return o.appendRunes(msg.Runes)
 }

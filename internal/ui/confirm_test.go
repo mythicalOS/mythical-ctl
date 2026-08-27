@@ -17,6 +17,24 @@ import (
 	"mythicalos.ai/ctl/internal/cliio"
 )
 
+// keyForRune is the key a terminal + Bubble Tea produce for one character of typed input.
+//
+// It exists because the parity table must drive the overlay the way the RUNTIME does, not the way
+// that is convenient. Fabricating every character as KeyRunes was exactly that convenience, and it
+// hid a real divergence: a tab is not a rune to Bubble Tea, it is KeyTab, and an overlay that
+// dropped KeyTab accepted a line the plain path refuses. Control characters are reported as their
+// own KeyType — whose value IS the ASCII code — and the space bar as KeySpace.
+func keyForRune(r rune) tea.KeyMsg {
+	switch {
+	case r == ' ':
+		return tea.KeyMsg{Type: tea.KeySpace, Runes: []rune{' '}}
+	case r < 0x20 || r == 0x7f:
+		return tea.KeyMsg{Type: tea.KeyType(r)}
+	default:
+		return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}}
+	}
+}
+
 // typeRunes drives one keystroke per rune, the way a terminal delivers typing.
 func typeRunes(t *testing.T, o Overlay, s string) Overlay {
 	t.Helper()
@@ -24,11 +42,7 @@ func typeRunes(t *testing.T, o Overlay, s string) Overlay {
 		if o == nil {
 			return nil
 		}
-		msg := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}}
-		if r == ' ' {
-			msg = tea.KeyMsg{Type: tea.KeySpace, Runes: []rune{' '}}
-		}
-		o, _ = o.Update(msg)
+		o, _ = o.Update(keyForRune(r))
 	}
 	return o
 }
@@ -70,8 +84,12 @@ func TestOverlayAndPlainPathAgreeOnEveryReply(t *testing.T) {
 		"y", "Y", "yes", "Yes", "YES",
 		"n", "N", "no", "No", "NO",
 		"", " ", "  y", "y ", " y ", "yess", "yy", "ye", "YEs", "yEs", "yes!",
-		"ok", "1", "true", "Y\r", "yes\r", "\ry",
+		"ok", "1", "true",
 		"Y\u202e", "y\x00", "\u200by",
+		// The keys Bubble Tea reports as something other than a rune. A terminal reading a line
+		// puts every one of these bytes INTO the line, so each of them refuses on the plain path
+		// and must refuse here.
+		"y\t", "\ty", "y\x01", "y\x1b", "\x1by", "y\x0b", "y\x1f", "y\x7f\x7f",
 	}
 	for _, line := range lines {
 		plain := cliio.Confirm(nil, strings.NewReader(line+"\n"), io.Discard, "Proceed?")
@@ -221,24 +239,142 @@ func TestConfirmPastedNewlineSubmits(t *testing.T) {
 	}
 }
 
-// TestConfirmSwallowsUnclaimedKeys — a modal that let arrows through would move a selection the
-// operator cannot see.
-func TestConfirmSwallowsUnclaimedKeys(t *testing.T) {
-	r := NewReply()
-	var o Overlay = Confirm("Really?", r)
-	for _, k := range []tea.KeyType{tea.KeyUp, tea.KeyDown, tea.KeyTab, tea.KeyF1, tea.KeyCtrlA, tea.KeyHome} {
+// TestConfirmUnclaimedKeysEnterTheLine. A terminal reading a line puts an unclaimed key's bytes
+// into it, so the buffer must carry them too — dropping them is what made `y<Tab><Enter>` accept
+// here and refuse on the plain path. The keys still reach nothing underneath the modal.
+func TestConfirmUnclaimedKeysEnterTheLine(t *testing.T) {
+	// A control key's KeyType IS its ASCII code, so it reconstructs exactly.
+	for _, tc := range []struct {
+		key  tea.KeyType
+		want string
+	}{
+		{tea.KeyTab, "y\t"},
+		{tea.KeyCtrlA, "y\x01"},
+		{tea.KeyNull, "y\x00"},
+		{tea.KeyCtrlV, "y\x16"},
+	} {
+		r := NewReply()
+		var o Overlay = Confirm("Really?", r)
+		o = typeRunes(t, o, "y")
+		o = press(t, o, tc.key)
+		if o == nil {
+			t.Fatalf("key %v dismissed the overlay", tc.key)
+		}
+		if got := o.(ConfirmOverlay).Input(); got != tc.want {
+			t.Fatalf("key %v: buffer %q, want %q", tc.key, got, tc.want)
+		}
+		o = press(t, o, tea.KeyEnter)
+		if ok := <-r.C(); ok {
+			t.Fatalf("key %v: `y` plus an unclaimed key was ACCEPTED", tc.key)
+		}
+	}
+
+	// A navigation key arrives at a line-reading terminal as an escape sequence; the introducer is
+	// enough to make the line refuse for the same reason the whole sequence would.
+	for _, k := range []tea.KeyType{tea.KeyUp, tea.KeyDown, tea.KeyF1, tea.KeyHome, tea.KeyPgUp, tea.KeyShiftTab} {
+		r := NewReply()
+		var o Overlay = Confirm("Really?", r)
+		o = typeRunes(t, o, "yes")
 		o = press(t, o, k)
 		if o == nil {
 			t.Fatalf("key %v dismissed the overlay", k)
 		}
-		if got := o.(ConfirmOverlay).Input(); got != "" {
-			t.Fatalf("key %v wrote %q into the buffer", k, got)
+		if got := o.(ConfirmOverlay).Input(); got != "yes\x1b" {
+			t.Fatalf("key %v: buffer %q", k, got)
+		}
+		o = press(t, o, tea.KeyEnter)
+		if ok := <-r.C(); ok {
+			t.Fatalf("key %v: `yes` plus a navigation key was ACCEPTED", k)
 		}
 	}
-	select {
-	case <-r.C():
-		t.Fatal("an unclaimed key answered the question")
-	default:
+
+	// An alt-modified key is ESC-prefixed by the terminal, so the line carries the ESC.
+	r := NewReply()
+	var o Overlay = Confirm("Really?", r)
+	o, _ = o.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}, Alt: true})
+	if got := o.(ConfirmOverlay).Input(); got != "\x1by" {
+		t.Fatalf("alt+y: buffer %q", got)
+	}
+	o = press(t, o, tea.KeyEnter)
+	if ok := <-r.C(); ok {
+		t.Fatal("alt+y was ACCEPTED")
+	}
+}
+
+// TestConfirmCtrlDRefuses. ^D is end of transmission: on the plain path it makes the read fail —
+// end of input on an empty line, a line without its terminator otherwise — and mi_confirm refuses on
+// a failed read either way. Swallowing it here would leave the operator holding down the one key
+// that means "no more input" against a modal that will not take it.
+func TestConfirmCtrlDRefuses(t *testing.T) {
+	for _, typed := range []string{"", "y", "yes"} {
+		r := NewReply()
+		var o Overlay = Confirm("Really?", r)
+		o = typeRunes(t, o, typed)
+		o = press(t, o, tea.KeyCtrlD)
+		if o != nil {
+			t.Fatalf("typed %q: ^D left the question open", typed)
+		}
+		select {
+		case ok := <-r.C():
+			if ok {
+				t.Fatalf("typed %q: ^D accepted", typed)
+			}
+		default:
+			t.Fatalf("typed %q: ^D gave no answer — the asker would block", typed)
+		}
+		// And the plain path refuses the same input: the reply never gets its newline.
+		if cliio.Confirm(nil, strings.NewReader(typed), io.Discard, "Proceed?") {
+			t.Fatalf("typed %q: the plain path accepted an unterminated line", typed)
+		}
+	}
+}
+
+// TestConfirmCarriageReturnDependsOnHowItArRives, and both arrivals agree with the plain path.
+//
+// A bare CR is the one byte that is NOT the same input in the two worlds, and saying so is more
+// useful than pretending it is. A pipe carrying "Y\r\n" gives the plain path the line "Y\r", which
+// refuses. A TERMINAL never delivers a bare CR as data: the Enter key is the line terminator (the
+// line discipline turns CR into NL), which is what KeyEnter means here — so pressing Y then Enter is
+// the line "Y" and accepts, in both worlds. The only way a literal CR reaches the buffer is a PASTE,
+// and there it stays in the line and refuses, exactly as the pipe does.
+func TestConfirmCarriageReturnDependsOnHowItArrives(t *testing.T) {
+	// Pasted: the CR is data, and the line refuses — as it does on the plain path.
+	for _, paste := range []string{"Y\r", "yes\r", "\ry"} {
+		r := NewReply()
+		var o Overlay = Confirm("Really?", r)
+		o, _ = o.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(paste), Paste: true})
+		o = press(t, o, tea.KeyEnter)
+		if o != nil {
+			t.Fatalf("paste %q left the overlay open", paste)
+		}
+		if ok := <-r.C(); ok {
+			t.Fatalf("paste %q was accepted", paste)
+		}
+		if cliio.Confirm(nil, strings.NewReader(paste+"\n"), io.Discard, "Proceed?") {
+			t.Fatalf("paste %q: the plain path accepted it", paste)
+		}
+	}
+	// Pressed: Enter is the terminator, so the line is what was typed before it.
+	if !answerThroughOverlay(t, "Y") {
+		t.Fatal("Y followed by Enter was refused")
+	}
+	if !cliio.Confirm(nil, strings.NewReader("Y\n"), io.Discard, "Proceed?") {
+		t.Fatal("the plain path refused the line Y")
+	}
+}
+
+// TestConfirmCtrlJSubmits — ^J is the line terminator a terminal delivers; the Enter key delivers CR
+// and the line discipline turns it into the same thing.
+func TestConfirmCtrlJSubmits(t *testing.T) {
+	r := NewReply()
+	var o Overlay = Confirm("Really?", r)
+	o = typeRunes(t, o, "yes")
+	o = press(t, o, tea.KeyCtrlJ)
+	if o != nil {
+		t.Fatal("^J did not submit")
+	}
+	if ok := <-r.C(); !ok {
+		t.Fatal("`yes` submitted with ^J was refused")
 	}
 }
 
