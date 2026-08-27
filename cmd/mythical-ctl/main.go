@@ -24,7 +24,9 @@ USAGE
   mythical-ctl <command> [products...] [options]
 
 COMMANDS
-  (this build carries no lifecycle verbs yet — they land verb by verb; see --version)
+  migrate-storage <product> <role> --to-bind PATH
+                           move a product's storage from its named volume to a host directory
+                             --map-foreign-to-operator   map foreign-uid entries to the operator
 
 OPTIONS
   -v, --version            print the version and exit
@@ -51,10 +53,13 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	// known option after a global flag is consumed (and then ignored by that flag), an unknown
 	// option is a usage error, and a value-taking option with no value is a usage error with
 	// nothing attempted — all measured behaviors, all pinned by tests.
-	if _, rc := parseOpts(args[1:], stderr); rc >= 0 {
+	o, rc := parseOpts(args[1:], stderr)
+	if rc >= 0 {
 		return rc
 	}
 	switch verb {
+	case "migrate-storage":
+		return migrateStorage(o, stderr)
 	case "-v", "--version":
 		fmt.Fprintf(stdout, "mythical-ctl %s\n", version.Version)
 		return cliio.ExitOK
