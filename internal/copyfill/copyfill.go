@@ -723,6 +723,13 @@ func (c *Copier) Verify(ctx context.Context, ix *trust.Index, sourceVolume, dst 
 	if err != nil {
 		return err
 	}
+	// BELT AND BRACES, and ordered so the clearer message wins. A stated `checked=` that is not
+	// a number can only ever differ from the source's own count, so the binding check below
+	// would refuse it too — but it would refuse it by SAYING "the verifier checked many entries
+	// but the source has 5", which describes the wrong problem. Measured: mutating this branch
+	// away leaves the copy refused, with that worse message. It stays for the message, and
+	// because a reader must not have to prove the next check is exhaustive to know this one is
+	// safe. (Mutation-verified as subsumed-for-the-verdict, not for the diagnosis.)
 	if !allDigits(n) {
 		return fmt.Errorf("copy: verification did not say how many entries it checked (checked=%s).\n"+
 			"  Refusing: a completion claim with no count is not evidence that anything was compared.", orEmpty(n))
@@ -844,9 +851,20 @@ func HostAccessCheck(dst string) error {
 	}
 	var bad []string
 	_ = filepath.WalkDir(dst, func(p string, d fs.DirEntry, walkErr error) error {
+		// "I COULD NOT LOOK" IS NEVER "THERE IS NOTHING WRONG THERE" — a subtree that could not
+		// be descended into is a subtree nobody checked, so it is a FINDING and the walk goes
+		// on rather than stopping (one unreadable subtree must not hide the rest).
+		//
+		// STATED RESIDUAL: on every state POSIX mode bits can describe, the permission check
+		// below fires on the very entry this error is about — a directory that cannot be listed
+		// is also a directory missing r or x — so mutating this branch away does not change any
+		// verdict reachable with chmod, and no test here can isolate it. It is kept for the
+		// states mode bits cannot describe: an entry removed mid-walk, an I/O error, a
+		// filesystem refusing for a reason of its own. Removing it would turn exactly those into
+		// a silently shortened listing, which is the one outcome this whole module refuses.
 		if walkErr != nil {
 			bad = append(bad, fmt.Sprintf("copy: the migrated tree could not be fully examined: %s (%v)", p, walkErr))
-			return nil // keep walking: one unreadable subtree must not hide the rest
+			return nil
 		}
 		fi, ierr := d.Info()
 		if ierr != nil {

@@ -370,6 +370,26 @@ func (h *HelperImage) copy(args []string) (int, []byte) {
 	// the mapping on a DEFAULT invocation — one that never received --map-foreign.
 	case "foreign-mapped-unrequested":
 		fmt.Fprintf(&out, "mapped=%s/data/alien:4242\n", src)
+	// A symlink entry whose PATH IS NOT UNDER THE ROOT the escape rule is asked about, with an
+	// innocuous relative target. The question "does this target climb out of /src?" cannot be
+	// answered about a link that does not sit in /src, and a question that could not be asked is
+	// never an answer of "no" — so it must be refused AS AN ESCAPE, not measured from a garbage
+	// relative depth. (The reference's own fixture has no such knob.)
+	case "symlink-outside-root":
+		out.WriteString("entry=symlink:/elsewhere/evil\n")
+		out.WriteString(emitLinktarget("/elsewhere/evil", "sibling"))
+	// An EMPTY refused= record on the COPY step: a copier that refuses and names NOTHING, then
+	// claims completion anyway. Its PRESENCE is the problem — the value-iterating refusal pass
+	// drops it, so only a check by the KEY catches it. (The reference's own fixture has no such
+	// copy-side knob, so its equivalent guard was never exercised; this one is.)
+	case "empty-refused":
+		out.WriteString("refused=\n")
+	// COMPLETION IS STATED, NOT INFERRED: a copier that says `done=` something other than `ok`
+	// has not said it finished, whatever its exit status. Returned here so the conforming
+	// `done=ok` below cannot also be printed.
+	case "done-not-ok":
+		out.WriteString("done=notok\n")
+		return h.fin(0, out.String())
 	default:
 		return 2, nil
 	}
@@ -430,6 +450,11 @@ func (h *HelperImage) verify(args []string) (int, []byte) {
 	// Fewer entries checked than the copy enumerated: an UNDERSTATED count.
 	case "understate":
 		fmt.Fprintf(&out, "checked=3\nacl=%s\ndone=ok\n", acl)
+	// A stated `checked=` that is not a COUNT: it says something, so the absent-observation
+	// rule does not fire, and only the digit check stands between it and a comparison against
+	// a number nobody has.
+	case "badcount":
+		fmt.Fprintf(&out, "checked=many\nacl=%s\ndone=ok\n", acl)
 	// A verifier that HONESTLY checked three entries — the conforming partner of the copy's
 	// `count3`, so the end-to-end path passes when the copy also enumerated three, and no
 	// constant count works for both.
@@ -458,6 +483,13 @@ func (h *HelperImage) verify(args []string) (int, []byte) {
 		fmt.Fprintf(&out, "mismatch=%s/data:default-acl\n", dst)
 		out.WriteString("checked=5\nacl=fail\ndone=ok\n")
 		return h.fin(1, out.String())
+	// acl=fail with NO accompanying mismatch: the positive-observation requirement standing on
+	// its own, with the mismatch pass that normally backstops it silent.
+	// It EXITS 0 deliberately: with a nonzero exit the run-completion check fires first (as it
+	// does in the reference), and the acl arm would never be reached. A verifier that states
+	// acl=fail and exits 0 anyway is exactly the regression the STATED-result rule is for.
+	case "acl-fail-only":
+		out.WriteString("checked=5\nacl=fail\ndone=ok\n")
 	// The ACL application was never CHECKED: the answer omits the acl observation entirely.
 	case "acl-absent":
 		out.WriteString("checked=5\ndone=ok\n")

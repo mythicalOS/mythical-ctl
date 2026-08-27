@@ -672,6 +672,11 @@ func TestEscapingSymlinkRefused(t *testing.T) {
 		// A colon in the TARGET, with a `..` climb: the trailing length field keeps it from
 		// being read as the separator, so the climb is still measured.
 		{"escape-colon-target", "/src/data/evil"},
+		// A symlink that does not SIT in the tree the escape rule is about. The question cannot
+		// be asked about it, and a question that could not be asked is never an answer of "no" —
+		// so it is refused as an escape rather than measured from a garbage relative depth. (Its
+		// target is innocuous, so nothing else here would refuse it for escaping.)
+		{"symlink-outside-root", "/elsewhere/evil"},
 	}
 	for _, tc := range cases {
 		r := newRig(t)
@@ -902,6 +907,21 @@ func TestUidPrincipalsValidatedEverywhere(t *testing.T) {
 	}
 	mustContain(t, err.Error(), "out of range")
 
+	// REFUSED BY LENGTH, BEFORE ANY CONVERSION. A digit string too long for a machine integer
+	// is the shape that defeats a bare range test: converted first, it WRAPS, and a 20-digit
+	// "uid" comes out the other side as a small number that passes. The digit count is checked
+	// first precisely so no conversion of it ever happens.
+	// 18446744073709551616 is 2^64 exactly: fed to a 64-bit accumulator it WRAPS TO ZERO, and a
+	// bare range test then reads it as uid 0 — root. That is the whole reason the digit count is
+	// bounded before anything is converted, and it is the one input that proves it.
+	for _, huge := range []string{"99999999999", "18446744073709551616", "18446744073709552616", strings.Repeat("9", 20)} {
+		if _, err := r.c.Run(ctx, r.ix, "srcvol1", r.stage, huge, "1000", copyfill.Options{}); err == nil {
+			t.Fatalf("a %d-digit uid must be refused out of range", len(huge))
+		} else {
+			mustContain(t, err.Error(), "out of range")
+		}
+	}
+
 	if err := r.preflight("900", "4294967296"); err == nil {
 		t.Fatal("the preflight validates BOTH principals for range")
 	} else {
@@ -921,6 +941,14 @@ func TestUidPrincipalsValidatedEverywhere(t *testing.T) {
 	}
 	if n := len(r.fake.HelperLaunches()); n != 0 {
 		t.Fatalf("no uid-refused call may reach the daemon: %d helper launches", n)
+	}
+
+	// ...and a uid written with leading zeros is still the number it spells: the zeros are
+	// stripped BEFORE the digit count is taken, so the count means what it says and a legal uid
+	// spelled long is not refused. (A fresh rig: this one succeeds and does reach the daemon.)
+	r2 := newRig(t)
+	if _, err := r2.c.Run(ctx, r2.ix, "srcvol1", r2.stage, "0000000900", "1000", copyfill.Options{}); err != nil {
+		t.Fatalf("leading zeros do not make a uid out of range: %v", err)
 	}
 }
 
@@ -992,6 +1020,17 @@ func TestVerifyDefaultACLApplication(t *testing.T) {
 		t.Fatal("a copied directory missing the default ACL must fail verification")
 	}
 	mustContain(t, err.Error(), "default-acl")
+
+	// ...and the positive observation is REQUIRED on its own account: acl=fail with no
+	// accompanying mismatch still fails, so the requirement is not merely riding the mismatch
+	// pass that happens to accompany it above.
+	r1b := newRig(t)
+	r1b.img.Verify = "acl-fail-only"
+	if err := r1b.verify(5, "900", "1000"); err == nil {
+		t.Fatal("acl=fail must fail verification on its own")
+	} else {
+		mustContain(t, err.Error(), "did not pass the default-ACL application check")
+	}
 
 	// ...and non-vacuously: a verifier that never REPORTS the result (never looked) is refused,
 	// not read as a pass — the same "absent is not measured-clean" rule, one level down.
@@ -1138,6 +1177,26 @@ func TestHostAccessCheck(t *testing.T) {
 	if err := copyfill.HostAccessCheck(dir); err != nil {
 		t.Fatalf("a readable tree passes: %v", err)
 	}
+	// AN UNTRAVERSABLE DIRECTORY IS A FINDING IN ITS OWN RIGHT — isolated here from the
+	// "could not look" fold below by making it EMPTY and merely non-executable (mode 0600):
+	// the listing succeeds and there is nothing inside to fail on, so the mode bits are the
+	// only thing that can report it. The operator cannot cd into it, and a tree with a
+	// directory it cannot enter is not a tree it can use.
+	shut := filepath.Join(dir, "shut")
+	if err := os.Mkdir(shut, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err0 := copyfill.HostAccessCheck(dir)
+	if cerr := os.Chmod(shut, 0o755); cerr != nil {
+		t.Fatal(cerr)
+	}
+	if err0 == nil {
+		t.Fatal("a directory the operator cannot traverse must be a finding")
+	}
+	mustContain(t, err0.Error(), "shut")
+	if err := os.Remove(shut); err != nil {
+		t.Fatal(err)
+	}
 	// A directory the operator cannot traverse is a finding.
 	if err := os.Chmod(sub, 0o000); err != nil {
 		t.Fatal(err)
@@ -1191,6 +1250,16 @@ func TestHostAccessCheckDoesNotFollowSymlinks(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.Symlink(outside, filepath.Join(tree, "escape")); err != nil {
+		t.Fatal(err)
+	}
+	// ...and one pointing at an unreadable FILE outside the tree. This is the shape that
+	// separates an lstat walk from a stat walk: followed, it is a regular file with mode 000 and
+	// would be reported as a finding about something that is not in the migrated tree at all.
+	lockedFile := filepath.Join(outside, "locked-file")
+	if err := os.WriteFile(lockedFile, []byte("x\n"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(lockedFile, filepath.Join(tree, "escape-file")); err != nil {
 		t.Fatal(err)
 	}
 	err := copyfill.HostAccessCheck(tree)
@@ -1280,6 +1349,43 @@ func TestManifestDeclaresTheRuntimeUid(t *testing.T) {
 	}
 	if m.RuntimeUID() != "900" {
 		t.Fatalf("runtime uid: %q", m.RuntimeUID())
+	}
+}
+
+// Three guards the reference's own fixture cannot reach, and therefore never exercised. They
+// are not extra rules — they are rules lib/copy.sh states and copy.bats has no knob for — so
+// the port carries them AND the transcripts that make them fire. Each one is the same class:
+// a stated problem, or a stated non-answer, that a value-iterating or numeric reader lets past.
+func TestGuardsTheReferenceFixtureCannotReach(t *testing.T) {
+	// An EMPTY `refused=` on the COPY step. The value pass drops it, so only a check by the KEY
+	// sees it — and a copier that refuses without naming what is still a copier that refused.
+	r := newRig(t)
+	r.img.Copy = "empty-refused"
+	if _, err := r.run(); err == nil {
+		t.Fatal("a refusal that named nothing must still abandon the copy")
+	} else {
+		mustContain(t, err.Error(), "refusal that named nothing")
+	}
+
+	// `done=` something other than `ok` is not completion. An exit status is not a result, and
+	// neither is a completion field that says something else.
+	r2 := newRig(t)
+	r2.img.Copy = "done-not-ok"
+	if _, err := r2.run(); err == nil {
+		t.Fatal("done=notok is not completion")
+	} else {
+		mustContain(t, err.Error(), "rather than completion")
+	}
+
+	// A `checked=` that is STATED but is not a count. The absent-observation rule does not fire
+	// (something was said), so only the digit check stands between it and a comparison against
+	// a number nobody has.
+	r3 := newRig(t)
+	r3.img.Verify = "badcount"
+	if err := r3.verify(5, "900", "1000"); err == nil {
+		t.Fatal("a checked= that is not a count must be refused")
+	} else {
+		mustContain(t, err.Error(), "did not say how many entries it checked")
 	}
 }
 
