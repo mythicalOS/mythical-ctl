@@ -43,6 +43,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -985,6 +986,14 @@ func runStatus(ctx context.Context, base verbs.Deps, fn VerbFunc, mk func(Status
 	}
 	done := make(chan outcome, 1)
 	uiDone := make(chan struct{})
+	// The launch gate. THE DECISION IS A LOCK, NOT A RACE BETWEEN TWO CHANNELS. With `started`
+	// and `uiDone` both closed — which is what happens when the runtime ends after dispatching
+	// the start command but before its goroutine ran — a select over the two picks at RANDOM, and
+	// half the time it launches the report into an interface that has already gone. `barred` is
+	// set BEFORE uiDone is closed, so the goroutine either takes the lock first and runs, or takes
+	// it after and never starts; exactly one of those happens and both publish an outcome.
+	var gate sync.Mutex
+	barred := false
 
 	go func() {
 		// THE REPORT DOES NOT START UNTIL THE INTERFACE IS LIVE, for the same reason Run waits:
@@ -993,9 +1002,14 @@ func runStatus(ctx context.Context, base verbs.Deps, fn VerbFunc, mk func(Status
 		select {
 		case <-started:
 		case <-uiDone:
+		}
+		gate.Lock()
+		if barred {
+			gate.Unlock()
 			done <- outcome{}
 			return
 		}
+		gate.Unlock()
 		var last outcome
 		for gen := 1; ; gen++ {
 			// A FRESH BRIDGE PER RUN. Its record is what the runner replays on the way out, and
@@ -1037,6 +1051,15 @@ func runStatus(ctx context.Context, base verbs.Deps, fn VerbFunc, mk func(Status
 	}()
 
 	_, runErr := p.Run()
+	// Barred BEFORE uiDone is closed: a report that has not taken the gate by now never will.
+	//
+	// STATED RESIDUAL: this ORDER is the mechanism, and swapping the two statements reopens a
+	// window in which the goroutine wakes on uiDone and takes the gate before it is barred. That
+	// window is a few instructions wide and no test can reliably observe it, so it is guarded by
+	// this comment and by the two statements being adjacent — not by an assertion.
+	gate.Lock()
+	barred = true
+	gate.Unlock()
 	close(uiDone)
 	cancel()
 

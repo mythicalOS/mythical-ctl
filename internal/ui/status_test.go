@@ -832,7 +832,11 @@ type fakeStatusProgram struct {
 
 	model      StatusModel
 	neverStart bool
-	runErr     error
+	// endAfterInit dispatches the start command and then returns, WITHOUT running the message
+	// loop — the shape in which "the interface is live" and "the interface is gone" become true
+	// at the same moment.
+	endAfterInit bool
+	runErr       error
 
 	onUpdate func(m StatusModel, p *fakeStatusProgram)
 
@@ -872,6 +876,9 @@ func (p *fakeStatusProgram) Run() (tea.Model, error) {
 		return m, p.runErr
 	}
 	if p.exec(m.Init()) {
+		return m, p.runErr
+	}
+	if p.endAfterInit {
 		return m, p.runErr
 	}
 	for {
@@ -1004,6 +1011,39 @@ func TestRunStatusNeverStartedMeansTheReportNeverRan(t *testing.T) {
 	}
 	if code != 0 {
 		t.Fatalf("code %d — an outcome was reported for a report that never ran", code)
+	}
+}
+
+// TestTheReportIsNeverLaunchedIntoAnInterfaceThatHasAlreadyGone.
+//
+// The runtime can end AFTER dispatching the model's start command but BEFORE the goroutine that
+// runs it has been scheduled — and it does not wait for that goroutine. Both the "the interface
+// is live" and the "the interface is gone" signals are then true at once, and a select over the
+// two picks at random: half the time the report is launched into a program that has already
+// returned, with a Confirm nobody can answer and an outcome nobody sees.
+//
+// Asserted over many attempts BECAUSE it is a race: one attempt passes half the time with the
+// decision left to chance, and a hundred does not.
+func TestTheReportIsNeverLaunchedIntoAnInterfaceThatHasAlreadyGone(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		p := newFakeStatusProgram()
+		p.endAfterInit = true
+		ran := 0
+		d, _, _ := baseDeps()
+		code, err := runStatus(context.Background(), d, func(ctx context.Context, d verbs.Deps) int {
+			ran++
+			return 1
+		}, p.make, time.Second)
+		if ran != 0 {
+			t.Fatalf("attempt %d: the report ran into an interface that had already returned", i)
+		}
+		if !errors.Is(err, ErrNotStarted) {
+			t.Fatalf("attempt %d: err %v, want ErrNotStarted — a report that never ran must say so,\n"+
+				"  or the dispatcher reports an outcome for something it never attempted", i, err)
+		}
+		if code != 0 {
+			t.Fatalf("attempt %d: code %d", i, code)
+		}
 	}
 }
 
