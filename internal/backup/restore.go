@@ -690,6 +690,13 @@ func (d Deps) verify(ctx context.Context, ch Chain, vol, man string) error {
 			mcount++
 		}
 	}
+	// The three arms below OVERLAP DELIBERATELY, and the overlap is measured: an absent
+	// `checked=` is refused by the count comparison on its own, so removing this arm alone
+	// changes nothing observable (a mutation of it survives; removing the whole binding
+	// reddens the named test). It is kept because the three say different things — this one
+	// says the observation was never made, the numeric arm says it is not a count, and the
+	// comparison says it is the wrong count — and an operator meeting a verification failure
+	// on a restore needs to be told which.
 	checkedval, cerr := d.stated(text, "checked", "restore verification", "the checked count")
 	if cerr != nil {
 		bad = true

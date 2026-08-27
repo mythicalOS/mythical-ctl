@@ -170,6 +170,12 @@ func TestCorruptStagingLedgerAuthorizesNoCleanup(t *testing.T) {
 	out := r.stderr()
 	mustContain(t, out, "does not validate", "the refusal")
 	mustContain(t, out, "PRESERVED", "the refusal")
+	// A PURE REFUSAL: nothing is touched, so it returns BEFORE the confirmation gate rather
+	// than through it. Asking an operator to confirm a restore that cannot happen is how a
+	// refusal turns into a prompt they learn to answer yes to.
+	if len(r.prompts) != 0 {
+		t.Fatalf("a pure refusal asked for confirmation: %v", r.prompts)
+	}
 	if !r.hasCorruptAside() {
 		t.Fatal("the corrupt staging ledger was not preserved aside")
 	}
@@ -540,6 +546,9 @@ func TestAbandonWithNoRestoreInProgress(t *testing.T) {
 		t.Fatal("abandonment proceeded with nothing to abandon")
 	}
 	mustContain(t, r.stderr(), "no in-progress restore", "the refusal")
+	if len(r.prompts) != 0 {
+		t.Fatalf("a pure refusal asked for confirmation: %v", r.prompts)
+	}
 }
 
 func TestAbandonWithAnActiveLedgerIsRefusedDistinctly(t *testing.T) {
@@ -551,6 +560,12 @@ func TestAbandonWithAnActiveLedgerIsRefusedDistinctly(t *testing.T) {
 	// to abandon", and an operator on a live machine must not be told the machine is empty.
 	mustContain(t, r.stderr(), "there is no restore in progress", "the refusal")
 	mustNotContain(t, r.stderr(), "no in-progress restore to abandon", "the refusal")
+	if len(r.prompts) != 0 {
+		t.Fatalf("a pure refusal asked for confirmation: %v", r.prompts)
+	}
+	if !regularFile(livePath(r.home)) {
+		t.Fatal("the live ledger was touched")
+	}
 }
 
 func TestAbandonOnACorruptStagingLedger(t *testing.T) {
@@ -564,6 +579,9 @@ func TestAbandonOnACorruptStagingLedger(t *testing.T) {
 	mustContain(t, r.stderr(), "does not validate", "the refusal")
 	if !r.hasCorruptAside() {
 		t.Fatal("the corrupt staging ledger was not preserved aside")
+	}
+	if len(r.prompts) != 0 {
+		t.Fatalf("a pure refusal asked for confirmation: %v", r.prompts)
 	}
 	for _, v := range r.vols {
 		if _, err := r.nonceOf(v.name); err != nil {
@@ -944,7 +962,8 @@ func TestActivateRefusesOverALiveIntent(t *testing.T) {
 	if err := Activate(r.deps()); err == nil {
 		t.Fatal("a staging ledger carrying a live intent was activated")
 	}
-	mustContain(t, r.stderr(), "still carries a live restore intent", "the refusal")
+	mustContain(t, r.stderr(), "intent — refusing to activate.", "the refusal")
+	mustNotContain(t, r.stderr(), "could not be", "the refusal is about a KNOWN intent, not an unreadable one")
 	if regularFile(livePath(r.home)) {
 		t.Fatal("activated")
 	}

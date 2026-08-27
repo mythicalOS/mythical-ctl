@@ -415,6 +415,22 @@ func TestVerifierNotReportingCompletionIsRefused(t *testing.T) {
 	if regularFile(livePath(r.home)) {
 		t.Fatal("activated")
 	}
+
+	// And a verifier that never mentions completion AT ALL is refused on the same rule: the
+	// ABSENCE of the expected result is never the presence of a pass.
+	r2 := newRig(t)
+	r2.backupOK()
+	r2.dropLedger()
+	r2.cop.verify = func(string, []byte) (Transcript, error) {
+		return Transcript{Text: "checked=4\n"}, nil
+	}
+	if err := Restore(context.Background(), r2.deps(), r2.bk); err == nil {
+		t.Fatal("a verifier that never stated completion was read as a pass")
+	}
+	mustContain(t, r2.stderr(), "stated nothing about completion", "the refusal")
+	if regularFile(livePath(r2.home)) {
+		t.Fatal("activated")
+	}
 }
 
 func TestVerifierCheckedCountThatIsNotANumberIsRefused(t *testing.T) {
