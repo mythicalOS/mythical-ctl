@@ -55,7 +55,7 @@ import (
 // PORTED: tests/unit/config_product.bats: "an oversized product conf is refused, and leaves no snapshot behind" -> TestProductOversizedRefused (Go's snapshot is in-memory; "no snapshot file behind" has no on-disk artifact to leak)
 // PORTED: tests/unit/config_product.bats: "a retry after rc 5 repairs the mode and the group" -> TestProductOwnershipFailure
 // PORTED: tests/unit/config_product.bats: "a no-op merge does not rewrite the file" -> TestProductNoOpKeepsBytesAndInode
-// N/A: tests/unit/config_product.bats: "a chmod failure after the bytes have landed reports rc 5, not rc 1" -- the row induces its two states with a PATH shim over /bin/chmod, and this port calls the syscall: there is nothing to shim, and an unprivileged process cannot make chmod fail on a file it owns. So StateModeFailed and StateBothFailed are UNREACHABLE from a test here, and claiming this row as PORTED would overstate what runs. A round-1 pass did claim it, against TestProductOwnershipFailure, which induces only the THIRD state (StateGroupFailed) — a weaker assertion wearing the row's name. What IS guarded without the shim is the part that can still regress silently: TestOwnershipErrorNamesEachState pins all three states' diagnostics and the rc-5 mapping directly, and TestProductOwnershipFailure pins the one state that can be induced end to end (bytes committed, 0600 fallback, repair on retry)
+// N/A: tests/unit/config_product.bats: "a chmod failure after the bytes have landed reports rc 5, not rc 1" -- the row induces its two states with a PATH shim over /bin/chmod, and this port calls the syscall: there is nothing to shim, and an unprivileged process cannot make chmod fail on a file it owns. So StateModeFailed and StateBothFailed are UNREACHABLE from a test here, and claiming this row as PORTED would overstate what runs. A round-1 pass did claim it, against TestProductOwnershipFailure, which induces only the THIRD state (StateGroupFailed) — a weaker assertion wearing the row's name. What IS guarded without the shim is the part that can still regress silently: TestOwnershipErrorNamesEachState pins all three states' DIAGNOSTICS — each state's own facts and the ABSENCE of the other states' — and TestProductOwnershipFailure pins the one state that can be induced end to end, classification included (StateGroupFailed, bytes committed, 0600 fallback, repair on retry). STATED RESIDUAL: which state ProductAdd SELECTS for a chmod failure is not pinned by anything, because nothing unprivileged can induce that failure; the two chmod branches carry their wording and nothing more
 // PORTED: tests/unit/config_product.bats: "a rewrite keeps the same inode — a bind mount must not be detached" -> TestProductRewriteKeepsInode
 // PORTED: tests/unit/config_product.bats: "a value containing a newline is refused and nothing is written" -> TestProductAddRefusals
 // PORTED: tests/unit/config_product.bats: "a key outside the product spec is refused on write, leaving no partial file" -> TestProductAddRefusals
@@ -1222,14 +1222,15 @@ func TestOwnershipErrorNamesEachState(t *testing.T) {
 		seen[msg] = true
 	}
 
-	// AND THE RESULT MAPPING: every one of these is an *OwnershipError, which is what separates
-	// "the bytes are committed and the ownership spec is not fully applied" (the reference's rc 5)
-	// from every plain refusal — where the bytes are NOT committed. A state that stopped being an
-	// OwnershipError would be reported as an ordinary failure and read as "nothing was written".
-	for _, st := range []OwnershipState{StateGroupFailed, StateModeFailed, StateBothFailed} {
-		var oe *OwnershipError
-		if err := error(&OwnershipError{State: st, Path: "/tmp/x.conf", GID: 20}); !errors.As(err, &oe) || oe.State != st {
-			t.Errorf("state %d does not travel as an *OwnershipError", st)
-		}
-	}
+	// WHAT THIS TEST DOES NOT PROVE, SAID PLAINLY. It pins the three DIAGNOSTICS. It does not pin
+	// which state ProductAdd SELECTS for which syscall failure, and it cannot: the selection lives
+	// at product.go's chgrp/chmod branches, and an unprivileged process cannot make chmod fail on a
+	// file it owns — that is the same fact that makes the frozen chmod row an N/A here rather than a
+	// port. An earlier version of this comment claimed a "result mapping" was pinned, and the
+	// assertion under it constructed an *OwnershipError and then checked it was one, which proves
+	// nothing about product.go at all. The ONE state that can be induced end to end is asserted
+	// where it can be — TestProductOwnershipFailure drives ProductAdd into StateGroupFailed and
+	// checks the classification, the committed bytes and the 0600 fallback together. The other two
+	// branches carry their diagnostics from here and nothing more; that is the honest residual, and
+	// the N/A rationale for the frozen row says so in the same words.
 }

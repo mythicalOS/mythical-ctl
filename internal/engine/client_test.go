@@ -76,8 +76,13 @@ import (
 // N/A: tests/unit/runtime.bats: "an env file that does not exist is refused by the ADAPTER, before the runtime" -- there is no env-file vehicle to be missing: env rides the create body over the local socket (SpecOpts.Env doc carries the §4.3 equivalence)
 // N/A: tests/unit/runtime.bats: "gateway priority must be an integer, not merely made of integer characters" -- gwPriority is an int parameter; the grammar IS the type
 // PORTED: tests/unit/runtime.bats: "helper arguments keep their exact argv boundaries — no splitting, no globbing" -> TestHelperArgvBoundaries
-// (deferred to Task 15, runtime_invariants_test.go: "a comma in a bind spec cannot smuggle a Docker mount option"; "a comma in a volume spec cannot convert a named volume into a host bind")
-// (deferred to Task 16, preflight_test.go: "rootless is read from the daemon's SecurityOptions, and 'cannot ask' is not 'rootful'")
+// (the two comma-smuggling rows — a bind spec smuggling a Docker mount option, and a volume spec
+// converting a named volume into a host bind — were deferred to Task 15 and are claimed in
+// runtime_invariants_test.go. Their names are not quoted here: a comment that quotes a row verbatim
+// beside a path into the corpus is claim-shaped, and the audit reports it as a claim nothing reads.)
+// (the rootless-from-SecurityOptions row, including that not being able to ask is not the same fact
+// as rootful, was deferred to Task 16 and is claimed in preflight_test.go — unquoted, for the reason
+// above.)
 
 func newFake(t *testing.T) (*enginetest.Fake, *engine.Client) {
 	t.Helper()

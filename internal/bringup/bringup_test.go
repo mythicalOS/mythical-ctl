@@ -62,7 +62,7 @@ import (
 // TestSecretsInjection owns them. They were marked N/A here on the argument that the port was
 // "elsewhere"; that argument was false. A relocated behaviour is PORTED, not N/A, and saying N/A
 // while another file quietly said PORTED left one row described two contradictory ways.)
-// (bringup.bats' "no value from <product>.conf reaches any launch argument" row is claimed in
+// (bringup.bats' row about no <product>.conf value reaching a launch argument is claimed in
 // internal/verbs by TestNoValueFromAProductConfReachesTheLaunch. It was N/A here on the argument
 // that the launch seam takes only a container name and a nonce — but an interface says nothing
 // about what an implementation CARRIES, and the real launcher carries the launch config, the

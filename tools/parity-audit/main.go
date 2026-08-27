@@ -37,6 +37,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
 	"flag"
 	"fmt"
 	"io/fs"
@@ -59,6 +60,24 @@ const (
 	wantAcceptanceTests = 56
 	batsFilesInCorpus   = 34
 )
+
+// THE MANIFEST'S IDENTITY, NOT ONLY ITS SIZE.
+//
+// Counts and coverage together are not enough once the bats trees are gone. With nothing to
+// regenerate from, a row could be REPLACED — an original requirement deleted and an invented one of
+// the same shape put in its place, with a matching claim written beside it — and every count would
+// still add up and every row would still be claimed. The audit would exit 0 over a corpus that had
+// quietly lost a requirement, which is precisely the failure the whole task exists to prevent, one
+// step further along.
+//
+// So the corpus is pinned by CONTENT. Changing tests/parity-manifest.tsv now requires changing this
+// literal too — a two-place edit a reviewer sees, exactly like the owner map's prose counts. Before
+// the cutover the tree itself is the second witness (the regeneration byte-compare); after it, this
+// is the only one, which is why it is here rather than derived.
+//
+// A var only so the end-to-end tests can drive run() over a synthetic manifest; the shipped value is
+// asserted by TestPinnedCorpusSizeIsThePlansNumbers, and the tests restore it with t.Cleanup.
+var manifestSHA256 = "fe06341d4145d4686eaeeddb4984c6edea9fd88b2c4a967d0432354f5a187cb4"
 
 type lane struct {
 	prefix string
@@ -388,84 +407,118 @@ func parseInventory(rel string, content []byte) ([]claim, []malformed, []stray, 
 	var claims []claim
 	var bad []malformed
 	var strays []stray
-	inBlock := false
+	inBlock, inRaw := false, false
+	// THE COMMENT-BLOCK WINDOW. A hidden claim can be spread over THREE lines — the claim words,
+	// the bats path, and the quoted row — none of which is a claim and no two of which need share a
+	// line. Requiring the signals to coincide on one physical line left that shape invisible. So the
+	// paths and quoted strings of the CURRENT contiguous comment region are accumulated, and any
+	// pairing inside it is reported. The window resets at the first line that is not a comment,
+	// which is what keeps it from spanning unrelated prose.
+	type seenPath struct {
+		file string
+		line int
+		text string
+	}
+	var winPaths []seenPath
+	var winQuotes []string
 	sc := bufio.NewScanner(bytes.NewReader(content))
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	line := 0
 	for sc.Scan() {
 		line++
 		text := sc.Text()
-		// Track /* */ depth BEFORE classifying the line, so a line that opens a block counts as a
-		// comment and the line after it does too. Deliberately naive about strings containing the
-		// digraphs: erring toward "this is a comment" only ever widens the stray check, and the
-		// corpus-membership scoping is what keeps that from being noisy.
-		openedInBlock := inBlock
-		inBlock = blockDepthAfter(inBlock, text)
-		if !invAny.MatchString(text) {
-			// Not in claim position. If it nevertheless names a real corpus file in claim syntax,
-			// somebody wrote a claim the audit cannot see — record it and let auditCoverage decide,
-			// since only it knows what the corpus holds.
-			//
-			// NO COMMENT-MARKER PRECONDITION, DELIBERATELY. An earlier version required `//` on the
-			// line, which left a block comment — `/* PORTED: <a real corpus row> -> TestX */` — as a
-			// place a second claim on an already-claimed row could sit permanently invisible, and the
-			// exactly-once guarantee is worth exactly as much as its least-visible hiding place. The
-			// corpus-file scoping below is what keeps this narrow: a mention naming a bats file the
-			// corpus does not hold (this program's own `tests/unit/<file>.bats` documentation, its
-			// fixtures' `tests/unit/a.bats`) is not swept up, whatever syntax surrounds it.
-			// EVERY path on the line, not the first: a mention of a file the corpus does not hold,
-			// earlier on the same line, would otherwise shadow a real one after it.
-			paths := invStrayPath.FindAllString(text, -1)
-			if len(paths) == 0 {
+		// Lexical context BEFORE classification. A `// PORTED:` line that has been moved inside a
+		// multiline raw string is inert data, not a claim — counting it would let a fixture satisfy
+		// a row nothing actually covers. Block depth is tracked for the same reason in reverse: a
+		// continuation line inside /* */ opens with nothing and must still count as a comment.
+		openedInBlock, openedInRaw := inBlock, inRaw
+		inBlock, inRaw = lexAfter(inBlock, inRaw, text)
+		isComment := openedInBlock || inBlock || invCommentLine.MatchString(text)
+		if !isComment {
+			winPaths, winQuotes = nil, nil
+		}
+
+		claimable := !openedInRaw && !openedInBlock && invAny.MatchString(text)
+		if claimable {
+			if m := invPorted.FindStringSubmatch(text); m != nil {
+				targets := goTestID.FindAllString(m[3], -1)
+				if len(targets) == 0 {
+					bad = append(bad, malformed{rel, line, text})
+					continue
+				}
+				claims = append(claims, claim{
+					Kind: claimPorted, Pair: batsPair{File: m[1], Name: m[2]},
+					Detail: m[3], GoFile: rel, GoLine: line, Targets: targets,
+				})
 				continue
 			}
-			claimWords := invStrayClaim.MatchString(text)
-			var quoted []string
-			for _, q := range invQuoted.FindAllStringSubmatch(text, -1) {
-				quoted = append(quoted, q[1])
-			}
-			if !claimWords && len(quoted) == 0 {
+			if m := invNA.FindStringSubmatch(text); m != nil {
+				if len(strings.TrimSpace(m[3])) < minNAReason {
+					bad = append(bad, malformed{rel, line, text})
+					continue
+				}
+				if d := deferral(m[3]); d != "" {
+					bad = append(bad, malformed{rel, line,
+						fmt.Sprintf("its argument defers to a future event (%q) — an N/A that waits for something to land is a TODO, not an argument: it expires silently the moment the blocker lands and nothing notices. Port the row, or argue why it can never be ported. || %s", d, text)})
+					continue
+				}
+				claims = append(claims, claim{
+					Kind: claimNA, Pair: batsPair{File: m[1], Name: m[2]},
+					Detail: m[3], GoFile: rel, GoLine: line,
+				})
 				continue
 			}
-			// A CONTINUATION LINE INSIDE A /* */ BLOCK opens with nothing at all, so matching on the
-			// line's own first characters missed exactly the shape the split-claim signal exists to
-			// catch. The block depth is tracked instead, and a line is "in a comment" if it opens as
-			// one OR the scanner is inside a block when it arrives.
-			inComment := openedInBlock || inBlock || invCommentLine.MatchString(text)
-			for _, path := range paths {
-				strays = append(strays, stray{rel, line, path, text, claimWords, inComment, quoted})
-			}
+			bad = append(bad, malformed{rel, line, text})
 			continue
 		}
-		if m := invPorted.FindStringSubmatch(text); m != nil {
-			targets := goTestID.FindAllString(m[3], -1)
-			if len(targets) == 0 {
-				bad = append(bad, malformed{rel, line, text})
-				continue
-			}
-			claims = append(claims, claim{
-				Kind: claimPorted, Pair: batsPair{File: m[1], Name: m[2]},
-				Detail: m[3], GoFile: rel, GoLine: line, Targets: targets,
-			})
-			continue
+
+		// NOT A CLAIM. If it nevertheless names a corpus file in claim syntax, or pairs a corpus
+		// file with one of its row names anywhere in this comment block, somebody wrote a claim the
+		// audit cannot read — record it and let auditCoverage decide, since only it knows the corpus.
+		//
+		// EVERY path on the line, not the first: a mention of a file the corpus does not hold,
+		// earlier on the same line, would otherwise shadow a real one after it.
+		paths := invStrayPath.FindAllString(text, -1)
+		claimWords := invStrayClaim.MatchString(text)
+		var quoted []string
+		for _, q := range invQuoted.FindAllStringSubmatch(text, -1) {
+			quoted = append(quoted, q[1])
 		}
-		if m := invNA.FindStringSubmatch(text); m != nil {
-			if len(strings.TrimSpace(m[3])) < minNAReason {
-				bad = append(bad, malformed{rel, line, text})
-				continue
+		if isComment {
+			for _, p := range paths {
+				winPaths = append(winPaths, seenPath{p, line, text})
 			}
-			if d := deferral(m[3]); d != "" {
-				bad = append(bad, malformed{rel, line,
-					fmt.Sprintf("its argument defers to a future event (%q) — an N/A that waits for something to land is a TODO, not an argument: it expires silently the moment the blocker lands and nothing notices. Port the row, or argue why it can never be ported. || %s", d, text)})
-				continue
-			}
-			claims = append(claims, claim{
-				Kind: claimNA, Pair: batsPair{File: m[1], Name: m[2]},
-				Detail: m[3], GoFile: rel, GoLine: line,
-			})
-			continue
+			winQuotes = append(winQuotes, quoted...)
 		}
-		bad = append(bad, malformed{rel, line, text})
+		// DEDUPED PER (line, bats file). The window pairs every path with every quoted string, which
+		// is quadratic inside a long inventory block and says the same thing many times over; the
+		// report only ever names a line once anyway.
+		seenHere := map[string]bool{}
+		emit := func(file, text string, quoted []string) {
+			if seenHere[file] {
+				return
+			}
+			seenHere[file] = true
+			strays = append(strays, stray{rel, line, file, text, claimWords, isComment, quoted})
+		}
+		// The cross-line pairing FIRST, so the richer evidence wins the one slot per file: this
+		// line's quoted strings against paths seen earlier in the block, and this line's paths
+		// against quoted strings seen earlier.
+		if isComment {
+			if len(quoted) > 0 {
+				for _, sp := range winPaths {
+					emit(sp.file, sp.text+" || "+text, quoted)
+				}
+			}
+			if len(winQuotes) > 0 {
+				for _, p := range paths {
+					emit(p, text, winQuotes)
+				}
+			}
+		}
+		for _, p := range paths {
+			emit(p, text, quoted)
+		}
 	}
 	if err := sc.Err(); err != nil {
 		return nil, nil, nil, fmt.Errorf("%s: %w", rel, err)
@@ -473,20 +526,36 @@ func parseInventory(rel string, content []byte) ([]claim, []malformed, []stray, 
 	return claims, bad, strays, nil
 }
 
-// blockDepthAfter reports whether the scanner is inside a /* */ block after consuming one line.
-func blockDepthAfter(in bool, line string) bool {
-	for i := 0; i < len(line)-1; i++ {
-		if !in && line[i] == '/' && line[i+1] == '*' {
-			in = true
+// lexAfter reports the block-comment and raw-string state after consuming one line.
+//
+// DELIBERATELY APPROXIMATE, AND IN A KNOWN DIRECTION. It is not a Go lexer: a backtick inside a line
+// comment, or `/*` inside a string, will move it. Every way it can be wrong makes it think it is
+// inside a comment or a string, which WIDENS the stray check and NARROWS what counts as a claim —
+// so the error is toward reporting too much, never toward accepting a claim that is really data.
+// Corpus membership is what keeps the widening quiet.
+func lexAfter(inBlock, inRaw bool, line string) (bool, bool) {
+	for i := 0; i < len(line); i++ {
+		switch {
+		case inRaw:
+			if line[i] == '`' {
+				inRaw = false
+			}
+		case inBlock:
+			if i+1 < len(line) && line[i] == '*' && line[i+1] == '/' {
+				inBlock = false
+				i++
+			}
+		case line[i] == '`':
+			inRaw = true
+		case i+1 < len(line) && line[i] == '/' && line[i+1] == '*':
+			inBlock = true
 			i++
-			continue
-		}
-		if in && line[i] == '*' && line[i+1] == '/' {
-			in = false
-			i++
+		case i+1 < len(line) && line[i] == '/' && line[i+1] == '/':
+			// A line comment: nothing after it can open a block or a raw string.
+			return inBlock, inRaw
 		}
 	}
-	return in
+	return inBlock, inRaw
 }
 
 // skipDirs are not part of this module's source. third_party is a vendored submodule; dist is
@@ -575,26 +644,58 @@ func parseGoTestList(content []byte) map[string]map[string]bool {
 // candidatePackages is where a PORTED claim's target may legitimately live: the package of the file
 // making the claim, plus any package the claim's own text names. Claims that point across a package
 // boundary already say so in prose ("owned by internal/docfmt TestDocTypes", "enginetest/fake_test.go"),
-// so this reads that prose rather than requiring a new syntax — path segments, with a `_test.go` or
-// `.go` suffix stripped, matched against each package's last segment.
+// so this reads that prose rather than requiring a new syntax.
+//
+// A BASENAME IS NOT A PACKAGE. An earlier version kept one package per last segment, so `cmd/probe`
+// and `internal/probe` would have collapsed onto whichever was seen last, and a claim naming one
+// could resolve against the other — putting back exactly the namesake hole per-package resolution
+// exists to close. A multi-segment token must therefore match a real path SUFFIX, and a bare segment
+// matches only when it is unambiguous across the whole module.
 func candidatePackages(goTests map[string]map[string]bool, goFile, detail string) map[string]bool {
-	bySeg := map[string]string{}
+	bySeg := map[string][]string{}
 	for p := range goTests {
-		bySeg[path.Base(p)] = p
+		bySeg[path.Base(p)] = append(bySeg[path.Base(p)], p)
 	}
 	out := map[string]bool{}
 	own := path.Dir(filepath.ToSlash(goFile))
 	for p := range goTests {
-		if strings.HasSuffix(p, "/"+own) {
+		if p == own || strings.HasSuffix(p, "/"+own) {
 			out[p] = true
 		}
 	}
-	for _, tok := range pathish.FindAllString(detail, -1) {
-		for _, seg := range strings.Split(tok, "/") {
-			seg = strings.TrimSuffix(strings.TrimSuffix(seg, "_test.go"), ".go")
-			if p, ok := bySeg[seg]; ok {
-				out[p] = true
+	add := func(tok string) {
+		tok = strings.Trim(tok, "/")
+		if tok == "" {
+			return
+		}
+		if strings.Contains(tok, "/") {
+			// A PATH: it must be a genuine suffix of a package path, so cmd/probe can never
+			// resolve to internal/probe.
+			for p := range goTests {
+				if p == tok || strings.HasSuffix(p, "/"+tok) {
+					out[p] = true
+				}
 			}
+			return
+		}
+		// A BARE SEGMENT: only when it names exactly one package in the module. Two packages
+		// sharing a last segment make the reference ambiguous, and an ambiguous reference must
+		// not widen the candidate set — that is the hole, not the fix for it.
+		if ps := bySeg[tok]; len(ps) == 1 {
+			out[ps[0]] = true
+		}
+	}
+	for _, tok := range pathish.FindAllString(detail, -1) {
+		add(tok)
+		// ...and each leading path the token contains, with a Go-file suffix stripped, so
+		// "enginetest/fake_test.go" offers both that path and the package "enginetest".
+		segs := strings.Split(tok, "/")
+		for i := range segs {
+			segs[i] = strings.TrimSuffix(strings.TrimSuffix(segs[i], "_test.go"), ".go")
+		}
+		for i := range segs {
+			add(strings.Join(segs[:i+1], "/"))
+			add(segs[i])
 		}
 	}
 	return out
@@ -907,16 +1008,35 @@ func run(root, manifestRel string, writeMan bool, goLists []string, maxProblems 
 		if !assertCorpus(r, pairs) {
 			return fmt.Errorf("refusing to write a manifest for a corpus that is not the pinned one:\n  %s", strings.Join(r.Problems, "\n  "))
 		}
-		if err := os.WriteFile(manifestPath, renderManifest(pairs), 0o644); err != nil {
+		body := renderManifest(pairs)
+		if err := os.WriteFile(manifestPath, body, 0o644); err != nil {
 			return err
 		}
 		fmt.Printf("parity-audit: wrote %s (%d tests across %d files)\n", manifestRel, r.Tests, r.Files)
+		// The digest is PRINTED rather than written back into the source, so updating the pin stays a
+		// deliberate edit somebody reads a diff for. A tool that silently re-pinned itself would make
+		// the pin decorative.
+		fmt.Printf("parity-audit: its digest is %x\n", sha256.Sum256(body))
+		fmt.Printf("parity-audit: if this differs from manifestSHA256 in tools/parity-audit/main.go, READ THE DIFF\n")
+		fmt.Printf("parity-audit: and update that constant in the same commit — the pin is what stops a row being\n")
+		fmt.Printf("parity-audit: replaced by an invented one of the same shape once the bats trees are gone.\n")
 		return nil
 	}
 
 	committed, err := os.ReadFile(manifestPath)
 	if err != nil {
 		return fmt.Errorf("reading the committed manifest: %w", err)
+	}
+	// IDENTITY BEFORE ANYTHING IS READ OUT OF IT. A manifest whose CONTENT changed is a different
+	// corpus, whatever its row count says.
+	if got := fmt.Sprintf("%x", sha256.Sum256(committed)); got != manifestSHA256 {
+		return fmt.Errorf("%s does not match the pinned corpus digest.\n"+
+			"   have %s\n   want %s\n"+
+			"   The corpus is pinned by CONTENT, not only by row count: a row REPLACED by an invented one of\n"+
+			"   the same shape, with a claim written beside it, keeps every count and every coverage loop\n"+
+			"   happy while an original requirement is gone. If this change is deliberate, regenerate the\n"+
+			"   manifest, read the diff, and update manifestSHA256 in tools/parity-audit in the same commit.",
+			manifestRel, got, manifestSHA256)
 	}
 	pairs, err := parseManifest(committed)
 	if err != nil {

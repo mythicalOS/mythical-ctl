@@ -54,7 +54,7 @@ import (
 // PORTED: tests/unit/migrate.bats: "compare-and-set: attempt in progress, key ABSENT → STOP and require confirmation" -> internal/conf TestFamilyCASAttemptTable (refuse without confirmation; write only WITH it)
 // PORTED: tests/unit/migrate.bats: "compare-and-set: attempt in progress, key holds SOMETHING ELSE → STOP" -> internal/conf TestFamilyCASAttemptTable + TestOperatorEditIsNeverSilentlyOverwritten (the migration-level consequence: an operator's edit survives a crashed migration)
 // PORTED: tests/unit/migrate.bats: "the bind reaches mythical.conf BEFORE the container is replaced" -> TestBindIsWrittenBeforeTheContainerIsReplaced
-// (migrate.bats' "after the migration, a RECREATE keeps the product on the bind" row was N/A here —
+// (migrate.bats' row about a RECREATE after the migration keeping the product on the bind was N/A here —
 // "re-claim against recreate once that verb lands". Wave 5 landed it, so the row is claimed in
 // cmd/mythical-ctl/migrate_e2e_test.go by TestRecreateAfterAMigrationKeepsTheBind, where the real
 // verb runs rather than a stand-in. The migration-side precondition it rests on stays

@@ -28,7 +28,9 @@ import (
 // PORTED: tests/unit/layout.bats: "the host-tool amendment changed NO pre-existing classification" -> TestZoneClassification (the pre-amendment table is asserted in full)
 // PORTED: tests/unit/layout.bats: "the host-tool slot the document publishes is the one the classifier implements" -> TestSlotMatchesPublishedDocument
 // PORTED: tests/unit/layout.bats: "mi_ensure_layout neither creates nor disturbs a host-tool slot" -> TestEnsureLeavesSlotAlone
-// (layout.bats: "mi_digest matches a known sha256" — the machine-readable PORTED line lives in internal/cliio/confirm_test.go, its one owner)
+// (layout.bats' mi_digest known-vector row is claimed in internal/cliio/confirm_test.go, its one
+// owner. Named rather than quoted: a comment quoting a row verbatim is claim-shaped, and the audit
+// reports one the parser cannot read.)
 // PORTED: tests/unit/layout.bats: "mi_ensure_layout fails loudly when it cannot create the subtree" -> TestEnsureFailsLoudly
 
 func TestHomeResolution(t *testing.T) {

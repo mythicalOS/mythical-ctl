@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -597,6 +598,11 @@ func TestTheOnlyWholeFileNAsAreTheTwoPreDeclaredOnes(t *testing.T) {
 // The pinned numbers, asserted rather than assumed. The tests below shrink them; this is what says
 // what the shipped values are.
 func TestPinnedCorpusSizeIsThePlansNumbers(t *testing.T) {
+	// The corpus digest is pinned by CONTENT, and the pin ships as a literal so changing the manifest
+	// is a two-place edit somebody reads a diff for.
+	if len(manifestSHA256) != 64 {
+		t.Fatalf("manifestSHA256 = %q, which is not a sha256 hex digest", manifestSHA256)
+	}
 	if wantBatsFiles != 34 {
 		t.Fatalf("wantBatsFiles = %d, want 34", wantBatsFiles)
 	}
@@ -626,8 +632,10 @@ func TestProblemsIsWhatTurnsAFindingIntoAFailure(t *testing.T) {
 // where the audit must FAIL — would be the hardest to write.
 func tinyLanes(t *testing.T, unit, acceptance, files int) {
 	t.Helper()
-	oldLanes, oldFiles, oldNA := lanes, wantBatsFiles, wholeFileNA
-	t.Cleanup(func() { lanes, wantBatsFiles, wholeFileNA = oldLanes, oldFiles, oldNA })
+	oldLanes, oldFiles, oldNA, oldDigest := lanes, wantBatsFiles, wholeFileNA, manifestSHA256
+	t.Cleanup(func() {
+		lanes, wantBatsFiles, wholeFileNA, manifestSHA256 = oldLanes, oldFiles, oldNA, oldDigest
+	})
 	lanes = []lane{{"tests/unit/", unit}, {"tests/acceptance/", acceptance}}
 	wantBatsFiles = files
 	// The real pre-declaration names two files this synthetic corpus does not have, and the audit
@@ -664,7 +672,9 @@ func e2eTree(t *testing.T) (root, goList string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	write("tests/parity-manifest.tsv", string(renderManifest(pairs)))
+	body := renderManifest(pairs)
+	write("tests/parity-manifest.tsv", string(body))
+	manifestSHA256 = fmt.Sprintf("%x", sha256.Sum256(body))
 	goList = filepath.Join(root, "golist.txt")
 	if err := os.WriteFile(goList, lines(`TestOne`, `TestThree`, "ok  \tmythicalos.ai/ctl/internal/x\t0.1s"), 0o644); err != nil {
 		t.Fatal(err)
@@ -718,7 +728,9 @@ func TestEndToEndFailsWhenTheManifestDriftedFromTheTrees(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Rewrite one row's NAME. The row count is unchanged, so nothing but the byte-compare sees it.
+	// Rewrite one row's NAME, and RE-PIN the digest — so the identity check is satisfied and the
+	// byte-compare against the trees is the only thing left that can notice. Without the re-pin this
+	// test would pass on the digest refusal and prove nothing about the regeneration compare.
 	edited := strings.Replace(string(b), "\tone\n", "\tone (edited)\n", 1)
 	if edited == string(b) {
 		t.Fatal("fixture did not change")
@@ -726,6 +738,7 @@ func TestEndToEndFailsWhenTheManifestDriftedFromTheTrees(t *testing.T) {
 	if err := os.WriteFile(p, []byte(edited), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	manifestSHA256 = fmt.Sprintf("%x", sha256.Sum256([]byte(edited)))
 	err = e2eRun(root, goList)
 	if err == nil || !strings.Contains(err.Error(), "does not match the bats trees") {
 		t.Fatalf("err = %v, want a refusal naming the manifest/tree mismatch", err)
@@ -834,8 +847,11 @@ func TestAuditCoverageCatchesAClaimWrittenMidLine(t *testing.T) {
 		// A NON-CORPUS PATH EARLIER ON THE LINE must not shadow a real one after it.
 		`// see tests/unit/nowhere.bats and also PORTED: tests/unit/b.bats: "one"`,
 	)
-	if len(st) != 5 {
-		t.Fatalf("a mid-line claim went undetected (%d found): %+v", len(st), st)
+	// The COUNT is not the assertion — the window pairs signals across lines, so one hidden claim
+	// can surface as more than one piece of evidence. What matters is that each hiding shape below
+	// is REPORTED, which auditCoverage decides.
+	if len(st) == 0 {
+		t.Fatal("no mid-line claim was detected at all")
 	}
 	r := &report{}
 	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
@@ -910,8 +926,8 @@ func TestAuditCoverageCatchesAClaimSplitAcrossLines(t *testing.T) {
 		`// and the continuation line, carrying the row and nothing that looks like a claim:`,
 		`// tests/unit/a.bats: "two" -> TestTwo, claiming it a second time where nothing reads it`,
 	)
-	if len(st) != 1 {
-		t.Fatalf("the continuation line was not detected: %+v", st)
+	if len(st) == 0 {
+		t.Fatal("the continuation line was not detected")
 	}
 	r := &report{}
 	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
@@ -970,5 +986,117 @@ func TestAuditCoverageCatchesAClaimInABlockCommentContinuation(t *testing.T) {
 	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
 	if !hasProblem(r, "which is a real @test in that file") {
 		t.Fatalf("the block-comment continuation was not reported: %v", r.Problems)
+	}
+}
+
+// A CLAIM MOVED INSIDE A MULTILINE RAW STRING IS INERT DATA, NOT COVERAGE. Round 4 measured it:
+// a valid `// PORTED:` line relocated into a raw literal still counted, so a fixture could satisfy a
+// row nothing actually covers. Lexical context is tracked now — and the row it names is reported as
+// a claim the parser cannot read, rather than silently accepted or silently dropped.
+func TestParseInventoryDoesNotCountAClaimInsideARawString(t *testing.T) {
+	claims, _, st, err := parseInventory("internal/x/x_test.go", lines(
+		"const fixture = `",
+		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
+		"`",
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claims) != 0 {
+		t.Fatalf("a claim inside a raw string was counted as coverage: %+v", claims)
+	}
+	if len(st) == 0 {
+		t.Fatal("...and it was not reported either, so it is invisible rather than inert")
+	}
+}
+
+// THE THREE-LINE HIDDEN CLAIM. The claim words, the path and the quoted row on three separate lines
+// of one comment block: no line is a claim and no two share a line, so every same-line signal misses
+// it. The comment block is the window instead.
+func TestAuditCoverageCatchesAClaimSpreadOverThreeLines(t *testing.T) {
+	c, b, st := claimsFrom(t,
+		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
+		`// PORTED: tests/unit/a.bats: "two" -> TestTwo`,
+		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
+		`func f() {}`,
+		`/*`,
+		`   PORTED:`,
+		`   tests/unit/a.bats`,
+		`   "two" -> TestTwo, a second claim in three pieces`,
+		`*/`,
+	)
+	if len(st) == 0 {
+		t.Fatal("the three-line claim was not detected")
+	}
+	r := &report{}
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
+	if !hasProblem(r, "which is a real @test in that file") {
+		t.Fatalf("the three-line claim was not reported: %v", r.Problems)
+	}
+}
+
+// candidatePackages must not collapse packages onto their last segment: cmd/probe and
+// internal/probe are different packages, and letting a claim naming one resolve against the other
+// puts back the namesake hole per-package resolution exists to close.
+func TestCandidatePackagesDoesNotConfuseTwoPackagesSharingABasename(t *testing.T) {
+	goTests := map[string]map[string]bool{
+		"mythicalos.ai/ctl/internal/probe": {"TestInternal": true},
+		"mythicalos.ai/ctl/cmd/probe":      {"TestCmd": true},
+		"mythicalos.ai/ctl/internal/x":     {"TestOne": true},
+	}
+	got := candidatePackages(goTests, "internal/x/x_test.go", "TestOne (owned by cmd/probe)")
+	if !got["mythicalos.ai/ctl/cmd/probe"] {
+		t.Fatalf("a full path did not resolve: %v", got)
+	}
+	if got["mythicalos.ai/ctl/internal/probe"] {
+		t.Fatalf("cmd/probe resolved against internal/probe: %v", got)
+	}
+	// A BARE, AMBIGUOUS segment must widen nothing — an ambiguous reference is not a licence to
+	// accept either answer.
+	amb := candidatePackages(goTests, "internal/x/x_test.go", "TestInternal (see probe)")
+	if amb["mythicalos.ai/ctl/internal/probe"] || amb["mythicalos.ai/ctl/cmd/probe"] {
+		t.Fatalf("a bare ambiguous segment widened the candidate set: %v", amb)
+	}
+}
+
+// THE DIGEST PIN IS THE POST-CUTOVER GUARD, and this is the failure it exists for: with the bats
+// trees gone there is nothing to regenerate from, so a row could be REPLACED — an original
+// requirement deleted, an invented one of the same shape put in its place, and a claim written
+// beside it. Every count still adds up and every row is still claimed. Only the content says so.
+func TestEndToEndCatchesASwappedManifestRowAfterTheCutover(t *testing.T) {
+	tinyLanes(t, 2, 1, 2)
+	root, goList := e2eTree(t)
+	for _, d := range []string{"tests/unit", "tests/acceptance"} {
+		if err := os.RemoveAll(filepath.Join(root, filepath.FromSlash(d))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := e2eRun(root, goList); err != nil {
+		t.Fatalf("the post-cutover baseline does not pass: %v", err)
+	}
+	// Swap one row for an invented one of the same shape, and claim the invention. Counts unchanged,
+	// coverage unchanged, an original requirement gone.
+	mp := filepath.Join(root, "tests", "parity-manifest.tsv")
+	b, err := os.ReadFile(mp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(mp, []byte(strings.Replace(string(b), "\ttwo\n", "\tinvented\n", 1)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gp := filepath.Join(root, "internal", "x", "x_test.go")
+	g, err := os.ReadFile(gp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(gp, []byte(strings.Replace(string(g), `: "two" --`, `: "invented" --`, 1)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err = e2eRun(root, goList)
+	if err == nil {
+		t.Fatal("a manifest row was replaced by an invented one and the audit exited 0")
+	}
+	if !strings.Contains(err.Error(), "pinned corpus digest") {
+		t.Fatalf("err = %v, want the digest pin to be what refuses", err)
 	}
 }
