@@ -395,6 +395,28 @@ func TestConfirmKillClearsTheMark(t *testing.T) {
 		t.Fatal("a line retyped after ^U was refused")
 	}
 
+	// AN ALT-MODIFIED KILL IS NOT A KILL. `y`, alt+^U, `y`, Enter must refuse: a terminal sends
+	// alt+^U as ESC then 0x15, and the pipe bytes "y\x1b\x15y" refuse. Clearing the mark there let
+	// the modifier's own mark be laundered away by the key that carried it.
+	r3 := NewReply()
+	var o3 Overlay = Confirm("Really?", r3)
+	o3 = typeRunes(t, o3, "y")
+	o3, _ = o3.Update(tea.KeyMsg{Type: tea.KeyCtrlU, Alt: true})
+	if !o3.(ConfirmOverlay).Marked() {
+		t.Fatal("alt+^U laundered the mark it had just set")
+	}
+	if got := o3.(ConfirmOverlay).Input(); got != "" {
+		t.Fatalf("alt+^U left %q in the line", got)
+	}
+	o3 = typeRunes(t, o3, "y")
+	o3 = press(t, o3, tea.KeyEnter)
+	if ok := <-r3.C(); ok {
+		t.Fatal("`y`, alt+^U, `y` was ACCEPTED")
+	}
+	if cliio.Confirm(nil, strings.NewReader("y\x1b\x15y\n"), io.Discard, "Proceed?") {
+		t.Fatal("the plain path accepted the same bytes")
+	}
+
 	// And ^U alone does not make an empty line acceptable.
 	r2 := NewReply()
 	var o2 Overlay = Confirm("Really?", r2)

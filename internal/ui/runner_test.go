@@ -479,6 +479,42 @@ func TestRunReplayPreservesOrderAcrossAPartialLine(t *testing.T) {
 	}
 }
 
+// TestPaneDrawsALineWhenItIsCompleted pins the one place the pane and the record deliberately tell
+// the story differently, so it is a decision rather than an accident. The record is the bytes; the
+// pane draws a LINE when it is completed. For a verb that writes a line in pieces with a step
+// narrated in between, the replay reads "ap" then "b" while the pane drew the step and then "ab".
+// Drawing the fragment early is what was rejected — it turns one Fprintf into two lines on screen —
+// and the terminal keeps the record, not the pane.
+func TestPaneDrawsALineWhenItIsCompleted(t *testing.T) {
+	rec := &recordingSender{}
+	b := NewBridge(context.Background(), rec)
+	w := b.Writer(false)
+	fmt.Fprint(w, "a")
+	b.Progress(verbs.ProgressEvent{Stage: "s", Detail: "p"})
+	fmt.Fprint(w, "b\n")
+
+	var drawn []string
+	for _, m := range rec.msgs {
+		switch v := m.(type) {
+		case OutputMsg:
+			drawn = append(drawn, v.Line)
+		case ProgressMsg:
+			drawn = append(drawn, v.Event.Detail)
+		}
+	}
+	if len(drawn) != 2 || drawn[0] != "p" || drawn[1] != "ab" {
+		t.Fatalf("pane drew %q, want the step then the completed line", drawn)
+	}
+	var out, errb bytes.Buffer
+	b.Flush(&out, &errb)
+	if got, want := out.String(), "ap\nb\n"; got != want {
+		t.Fatalf("replay %q, want the bytes %q", got, want)
+	}
+	if errb.Len() != 0 {
+		t.Fatalf("stderr %q", errb.String())
+	}
+}
+
 // TestScreenNeverShowsALineBeforeOneRecordedEarlier. A partial write is held back from the screen
 // until its newline arrives; the danger is that the hold becomes an ORDERING inversion — the held
 // fragment drawn after a step that was narrated while it waited, though its bytes are recorded

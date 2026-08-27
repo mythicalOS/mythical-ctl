@@ -113,13 +113,26 @@ func TestImagePullOneRecordCarryingBoth(t *testing.T) {
 // pullServer serves one canned image-create stream over a unix socket and returns a client for it.
 func pullServer(t *testing.T, records []map[string]string) *engine.Client {
 	t.Helper()
-	// os.MkdirTemp rather than t.TempDir: a unix socket path has a hard length limit (~104 bytes
-	// on darwin) and t.TempDir bakes the test's name into the path, which overruns it.
-	dir, err := os.MkdirTemp("", "pullprog")
-	if err != nil {
-		t.Fatal(err)
+	// A unix socket path has a hard length limit (sun_path, ~104 bytes on darwin), so neither
+	// t.TempDir — which bakes the test's name into the path — nor a long $TMPDIR will do. The
+	// directory is created under whichever base keeps the path short, and its cleanup is registered
+	// BEFORE anything can fail, so a refused listen does not leak it.
+	dir, sock := "", ""
+	for _, base := range []string{"", "/tmp"} {
+		d, err := os.MkdirTemp(base, "pullprog")
+		if err != nil {
+			continue
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(d) })
+		if s := filepath.Join(d, "d.sock"); len(s) < 100 {
+			dir, sock = d, s
+			break
+		}
 	}
-	sock := filepath.Join(dir, "d.sock")
+	if sock == "" {
+		t.Skip("no temp directory short enough for a unix socket path")
+	}
+	_ = dir
 	ln, err := net.Listen("unix", sock)
 	if err != nil {
 		t.Fatal(err)
@@ -136,9 +149,6 @@ func pullServer(t *testing.T, records []map[string]string) *engine.Client {
 		}
 	})}
 	go func() { _ = srv.Serve(ln) }()
-	t.Cleanup(func() {
-		_ = srv.Close()
-		_ = os.RemoveAll(dir)
-	})
+	t.Cleanup(func() { _ = srv.Close() })
 	return engine.Dial(sock)
 }

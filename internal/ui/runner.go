@@ -72,6 +72,16 @@ type Bridge struct {
 	// while stderr records and posts B, and then the replayed record says A-then-B while the screen
 	// said B-then-A. The two must not be able to disagree about what happened first.
 	//
+	// WHAT THIS DOES AND DOES NOT GUARANTEE, precisely — the record is the durable artefact and is
+	// BYTE-IDENTICAL to what the plain path would have printed; the pane is a LINE-oriented
+	// rendering of the same events, and a line is drawn at the moment it is COMPLETED. Those two
+	// orderings coincide for every write that ends in a newline, which is every write any verb in
+	// this tree makes (they all go through one Fprintln/Fprintf). They diverge only for a verb that
+	// writes a line in pieces with something narrated in between: `Write("a")`, a step, `Write("b\n")`
+	// replays as `ap` then `b` — the bytes, exactly — while the pane drew the step and then `ab`.
+	// Neither is wrong; drawing the fragment early is what was rejected, because it turns one
+	// Fprintf into two lines on screen. The terminal keeps the record.
+	//
 	// It is held across the post, which can block until the message loop takes it. That is bounded
 	// by the program's lifetime, and nothing the message loop runs writes back through a Bridge, so
 	// there is no cycle. Lock order is ALWAYS order -> StreamWriter.mu -> mu, and nothing takes them

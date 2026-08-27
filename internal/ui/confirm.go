@@ -206,8 +206,16 @@ func (o ConfirmOverlay) handleKey(msg tea.KeyMsg) (Overlay, tea.Cmd) {
 		return o, nil
 	case tea.KeyCtrlU:
 		// KILL discards everything typed so far — the mark with it. See the type comment.
+		//
+		// AN ALT-MODIFIED KILL IS NOT A KILL. A terminal sends it as ESC then 0x15, two bytes that
+		// sit in the line and that no accepted reply contains; treating it as a KILL let alt+^U
+		// LAUNDER the mark the alt modifier had just set, and `y`, alt+^U, `y`, Enter accepted
+		// where the pipe bytes refuse. The line still clears — that costs nothing — but the mark
+		// stays.
 		o.input = nil
-		o.marked = false
+		if !msg.Alt {
+			o.marked = false
+		}
 		return o, nil
 	case tea.KeyRunes, tea.KeySpace:
 		// A NEWLINE INSIDE THE INPUT SUBMITS WHAT PRECEDES IT, and everything after it is
