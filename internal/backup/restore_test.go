@@ -1037,3 +1037,48 @@ func TestDepsRefusesIncompleteSeams(t *testing.T) {
 	}
 	_ = fmt.Sprint()
 }
+
+// TestResumeDoesNotClaimPartialContentsItNeverMeasured is the other side of the branch above, and
+// the reason the two are not one message.
+//
+// "IT HOLDS PARTIAL CONTENTS" IS A FINDING ABOUT THE DATA, and only a verifier that actually
+// compared this volume against this manifest can make it. When the verification could not be
+// PERFORMED at all — the copy image unobtainable, the manifest unreadable, the helper never
+// launched — nothing has been established about the volume, and saying otherwise steers the
+// operator to `restore --abandon`, which REMOVES volumes. Both outcomes refuse and neither fills
+// over anything; what differs is the claim, and the claim is what the operator acts on.
+func TestResumeDoesNotClaimPartialContentsItNeverMeasured(t *testing.T) {
+	r := interrupted(t)
+	victim := r.vols[0].name
+	r.cop.fillErr = nil
+	// Non-empty, exactly as the partial-contents case...
+	r.cop.count = func(vol string) (Transcript, error) {
+		if vol == victim {
+			return Transcript{Text: "checked=2\n"}, nil
+		}
+		return Transcript{Text: "checked=0\n"}, nil
+	}
+	// ...but the verifier could not be RUN, which is not an answer.
+	r.cop.verify = func(vol string, man []byte) (Transcript, error) {
+		if vol == victim {
+			return Transcript{}, errors.New("copy: the verify helper could not be run")
+		}
+		return Transcript{Text: "checked=4\ndone=ok\n"}, nil
+	}
+	fillsBefore := len(r.cop.fills)
+	err := Restore(context.Background(), r.deps(), r.bk)
+	if err == nil {
+		t.Fatal("a verification that could not run was treated as a pass")
+	}
+	mustContain(t, r.stderr(), "NOT EMPTY", "the refusal still names what it found")
+	mustContain(t, r.stderr(), "could not be established", "the refusal says the contents were not measured")
+	// THE CLAIM NOTHING ESTABLISHED, and the destructive recovery that follows from it.
+	mustNotContain(t, r.stderr(), "it holds partial contents from an interrupted attempt",
+		"a finding about the data that nothing measured")
+	if len(r.cop.fills) != fillsBefore {
+		t.Fatal("the unmeasured volume was filled over")
+	}
+	if regularFile(livePath(r.home)) {
+		t.Fatal("activated over a volume nothing verified")
+	}
+}
