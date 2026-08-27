@@ -79,6 +79,9 @@ type rig struct {
 	resolveAddr string
 
 	products []*prodSpec
+	// indexVersion is the family index's document version — the number its anti-rollback floor
+	// records. Bumping it is how a test asks whether a newer index was ACCEPTED or merely read.
+	indexVersion string
 }
 
 func newRig(t *testing.T) *rig {
@@ -88,13 +91,14 @@ func newRig(t *testing.T) *rig {
 	home := t.TempDir()
 	userHome := t.TempDir()
 	r := &rig{
-		t:    t,
-		fake: f,
-		c:    f.Client(),
-		home: home,
-		env:  []string{"MYTHICAL_HOME=" + home, "HOME=" + userHome},
-		out:  &bytes.Buffer{},
-		errb: &bytes.Buffer{},
+		t:            t,
+		fake:         f,
+		c:            f.Client(),
+		home:         home,
+		env:          []string{"MYTHICAL_HOME=" + home, "HOME=" + userHome},
+		out:          &bytes.Buffer{},
+		errb:         &bytes.Buffer{},
+		indexVersion: "1",
 	}
 	f.HelperEntry = r.helper
 	if err := layout.Ensure(home); err != nil {
@@ -214,7 +218,7 @@ func (r *rig) writeDocs() {
 
 	var idx strings.Builder
 	idx.WriteString("mythical-index 1\n")
-	idx.WriteString("version=1\n")
+	idx.WriteString("version=" + r.indexVersion + "\n")
 	idx.WriteString("expires=" + exp + "\n")
 	idx.WriteString("policy_digest=" + r.digestOf("policy") + "\n")
 	idx.WriteString("probe_image=" + digestRef("probe") + "\n")
@@ -276,6 +280,9 @@ func (r *rig) writeFile(name, content string) {
 		r.t.Fatal(err)
 	}
 }
+
+// ledgerPath is the installer state ledger's own file.
+func (r *rig) ledgerPath() string { return filepath.Join(r.home, ".state", "ledger") }
 
 func (r *rig) digestOf(name string) string {
 	r.t.Helper()

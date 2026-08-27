@@ -191,6 +191,10 @@ type session struct {
 	l    *ledger.Ledger
 	rt   *runtime.Runtime
 	objs intent.Objects
+	// stale marks the session's ledger as no longer known to contain everything on disk. Set by a
+	// failed adoption; it makes every later write REFUSE, because a write from here could erase a
+	// record this copy never saw.
+	stale bool
 }
 
 // openSession takes the family lock and wires everything that needs it.
@@ -241,14 +245,29 @@ func (s *session) reload() error {
 	return nil
 }
 
-func (s *session) persist() error { return ledger.Write(s.h, s.st, s.l) }
+func (s *session) persist() error {
+	if s.stale {
+		return errStaleLedger
+	}
+	return ledger.Write(s.h, s.st, s.l)
+}
+
+// errStaleLedger is the refusal a poisoned session answers every write with.
+var errStaleLedger = errors.New("verbs: refusing to write the installer state ledger — it was written during this\n" +
+	"  operation and could not be re-read, so this copy may be missing what was written and\n" +
+	"  writing it could erase it. Run 'mythical-ctl state repair'.")
 
 // persistFn is the write-ahead seam bringup and netref REQUIRE. It takes the ledger it is given
 // rather than closing over one: a closure bound to the copy that existed at construction would,
 // after a reload, write the OLD copy, report success, and let the runtime mutation proceed with the
 // new copy's record never written — the failure the seam exists to prevent, wearing its own success.
 func (s *session) persistFn() func(*ledger.Ledger) error {
-	return func(l *ledger.Ledger) error { return ledger.Write(s.h, s.st, l) }
+	return func(l *ledger.Ledger) error {
+		if s.stale {
+			return errStaleLedger
+		}
+		return ledger.Write(s.h, s.st, l)
+	}
 }
 
 // prober builds the probe arm for this installation, or reports that the identity is unreadable.
@@ -297,19 +316,54 @@ type sessionProber struct {
 }
 
 func (sp sessionProber) SelfCheck(ctx context.Context, ix *trust.Index, netID string) error {
-	err := sp.p.SelfCheck(ctx, ix, netID)
-	if aerr := sp.s.adoptDisk(); aerr != nil && err == nil {
+	ix, err := sp.indexFor(ix)
+	if err != nil {
+		return err
+	}
+	perr := sp.p.SelfCheck(ctx, ix, netID)
+	if aerr := sp.s.adoptDisk(); aerr != nil && perr == nil {
 		return aerr
 	}
-	return err
+	return perr
 }
 
 func (sp sessionProber) Resolve(ctx context.Context, ix *trust.Index, netID, alias string) (string, error) {
-	addr, err := sp.p.Resolve(ctx, ix, netID, alias)
-	if aerr := sp.s.adoptDisk(); aerr != nil && err == nil {
+	ix, err := sp.indexFor(ix)
+	if err != nil {
+		return "", err
+	}
+	addr, perr := sp.p.Resolve(ctx, ix, netID, alias)
+	if aerr := sp.s.adoptDisk(); aerr != nil && perr == nil {
 		return addr, aerr
 	}
-	return addr, err
+	return addr, perr
+}
+
+// indexFor supplies the verified family index a probe runs against, ACCEPTING it here when the
+// caller had none.
+//
+// THE ACCEPTING DOOR, NOT THE READ-ONLY ONE. The probe image is named by the index, so an index
+// that was merely parsed would let anyone with local write access to it name the image this
+// installer runs on the operator's daemon — and accepting is also what advances that document's
+// anti-rollback floor, so a read-only check would consume a newer index while leaving the bar
+// where an older one still clears it.
+//
+// It is LAZY because the reconciler computes its plan first and only a plan that live-verifies
+// needs an index at all: install and recreate have already accepted one and pass it in, while
+// start and restart pass nil and pay for it only if a probe actually runs.
+func (sp sessionProber) indexFor(ix *trust.Index) (*trust.Index, error) {
+	if ix != nil {
+		return ix, nil
+	}
+	accepted, err := trust.AcceptIndex(sp.s.h, sp.s.st, sp.s.d.IndexPath)
+	// Accepting writes the floor to the ledger FILE, so the session adopts it either way.
+	if aerr := sp.s.adoptDisk(); aerr != nil && err == nil {
+		return nil, aerr
+	}
+	if err != nil {
+		return nil, err
+	}
+	return accepted, nil
 }
 
 // adoptDisk re-reads the ledger from disk INTO the session's existing ledger object.
@@ -320,11 +374,16 @@ func (sp sessionProber) Resolve(ctx context.Context, ix *trust.Index, netID, ali
 // session's ledger in hand.
 func (s *session) adoptDisk() error {
 	fresh, err := ledger.Read(s.st)
-	if errors.Is(err, ledger.ErrMissingLedger) {
-		return nil
-	}
 	if err != nil {
-		return err
+		// A LEDGER THAT CANNOT BE RE-READ MID-VERB POISONS THE SESSION, absence included: something
+		// wrote to it (that is why we are adopting), so "it is not there" is not the legitimate
+		// first-use absence — it is a record we know exists and cannot see. From here the session's
+		// copy is no longer known to contain everything on disk, and writing it could erase exactly
+		// what it cannot see, so persist REFUSES rather than clobbering.
+		s.stale = true
+		return fmt.Errorf("verbs: the installer state ledger was written during this operation and could not be\n"+
+			"  re-read, so this session's copy may be missing what was written. Nothing further is\n"+
+			"  written to it. Run 'mythical-ctl state repair': %w", err)
 	}
 	return s.l.Adopt(fresh)
 }

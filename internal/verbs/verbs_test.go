@@ -553,6 +553,72 @@ func TestRecreateRefusesAnUnassemblableLaunchWithTheContainerIntact(t *testing.T
 	}
 }
 
+// TestRecreateRefusesAnUnsetSecretWithTheContainerIntact is not a bats port — the shell gets this
+// ordering structurally, because it stages the secrets before it stops anything. Here the secret
+// assembly lives inside the launch facade, which runs AFTER the removal, so the ordering has to be
+// asserted. A declared secret that the policy grants but mythical.conf does not SET is a refusal
+// the document door cannot see (it checks the GRANT, not the value), so this is the reachable half
+// of the facade's own secret gate.
+func TestRecreateRefusesAnUnsetSecretWithTheContainerIntact(t *testing.T) {
+	r := newRig(t)
+	r.writeProduct("p1")
+	r.mintIdentity()
+	r.mustInstall("p1")
+	c := r.container("p1")
+
+	// The operator empties mythical.conf of the value the manifest declares — and sets nothing else,
+	// so no earlier gate has anything to object to. The secret is still GRANTED, so every document
+	// still authenticates; there is simply nothing to inject.
+	r.writeFile("mythical.conf", "# the operator cleared this file\n")
+
+	if rc := r.recreate("p1"); rc != cliio.ExitFail {
+		t.Fatalf("rc = %d, want 1\n%s", rc, r.said())
+	}
+	if got := r.observed(c); got != state.ObsRunning {
+		t.Fatalf("observed %q — the recreate tore down a container it could never have replaced", got)
+	}
+}
+
+// TestStartAcceptsTheIndexOnlyWhenItProbes is not a bats port; it pins where the family index is
+// read on the start path, which the shell gets from its call structure. Two halves:
+// a plan that live-verifies ACCEPTS the index (advancing its anti-rollback floor, because the
+// probe image is named by it and a merely-parsed index would let anyone with local write access
+// name the image this installer runs); a plan that verifies nothing never touches it at all.
+func TestStartAcceptsTheIndexOnlyWhenItProbes(t *testing.T) {
+	r := newRig(t)
+	r.writeProduct("p1")
+	r.mintIdentity()
+	r.mustInstall("p1")
+	if got := r.floorOf("index"); got != "1" {
+		t.Fatalf("index floor is %q after the install, want 1", got)
+	}
+
+	// A NEWER index. A start that probes must ACCEPT it, not merely read it — consuming a newer
+	// document while leaving the bar where the older one still clears it is the rollback window
+	// the floor exists to close.
+	r.indexVersion = "2"
+	r.writeDocs()
+	if rc := r.start("p1"); rc != cliio.ExitOK {
+		t.Fatalf("start rc = %d\n%s", rc, r.said())
+	}
+	if got := r.floorOf("index"); got != "2" {
+		t.Fatalf("index floor is %q after a start that probed, want 2 — the index was read, not accepted", got)
+	}
+
+	// And a plan that verifies NOTHING never needs it: with the container gone out of band the
+	// reconciler answers "rebuild" without a probe, so an index that cannot be authenticated at all
+	// must not turn that into an index complaint.
+	r.reset()
+	r.removeObjects(r.container("p1"))
+	if err := os.Remove(filepath.Join(r.home, "index")); err != nil {
+		t.Fatal(err)
+	}
+	if rc := r.start("p1"); rc != cliio.ExitFail {
+		t.Fatalf("rc = %d, want 1\n%s", rc, r.said())
+	}
+	r.mustSay("needs a rebuild that start/restart cannot perform")
+}
+
 func TestRecreateNormalizesAContextFailure(t *testing.T) {
 	// The product is already installed, so ANY context failure — here the manifest is withdrawn to
 	// not-launched — is an operational failure for a recreate, NOT a clean "not launched yet" (which
@@ -719,10 +785,17 @@ func TestManifestForADifferentProductIsRefused(t *testing.T) {
 }
 
 func TestSharedBootstrapSecretGate(t *testing.T) {
-	// install and recreate reach the bootstrap secrets through ONE path, so the entitlement gate
-	// cannot drift between the verbs. GRANTED: the secret is really injected — positive evidence,
-	// not merely the absence of a refusal. REVOKED: the same manifest against a policy with the
-	// grant stripped is refused by BOTH verbs, and nothing is staged.
+	// install and recreate reach the bootstrap secrets through ONE path, so the gate cannot drift
+	// between the verbs — which is what the case is about, and what is asserted: BOTH refuse.
+	//
+	// WHICH gate fires here is worth stating, because it is not the one the shell test reaches. The
+	// reference calls its shared secret helper directly with a doctored policy; through the verbs,
+	// a policy that no longer grants a declared secret is refused at the DOCUMENT DOOR, by
+	// manifest.Check, before any launch is assembled. The facade's own per-key check behind it is
+	// defence in depth, and in this tree it is unreachable through any legal document pair for
+	// exactly that reason — an honest residual, not coverage. What the facade's secret assembly
+	// DOES own reachably is the other half of the same rule: a granted secret that is not SET,
+	// which TestRecreateRefusesAnUnsetSecretWithTheContainerIntact covers.
 	r := newRig(t)
 	r.writeProduct("p1")
 	r.mintIdentity()
@@ -1180,6 +1253,8 @@ func TestConcurrentInstallsAreSerialized(t *testing.T) {
 	var once sync.Once
 
 	var rc1, rc2 int
+	var ledgerBefore, ledgerAfter []byte
+	var worldBefore, worldAfter string
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
@@ -1188,6 +1263,8 @@ func TestConcurrentInstallsAreSerialized(t *testing.T) {
 		d.Stdout, d.Stderr = nil, nil // the buffers are not concurrency-safe
 		d.Progress = func(ProgressEvent) {
 			once.Do(func() {
+				ledgerBefore, _ = os.ReadFile(r.ledgerPath())
+				worldBefore = r.fake.Snapshot()
 				close(holding)
 				select {
 				case <-contended:
@@ -1208,6 +1285,8 @@ func TestConcurrentInstallsAreSerialized(t *testing.T) {
 		d := r.d
 		d.Stdout, d.Stderr = nil, nil
 		rc2 = Install(context.Background(), d, InstallOpts{Product: "p2"})
+		ledgerAfter, _ = os.ReadFile(r.ledgerPath())
+		worldAfter = r.fake.Snapshot()
 	}()
 	wg.Wait()
 
@@ -1218,8 +1297,15 @@ func TestConcurrentInstallsAreSerialized(t *testing.T) {
 	if rc2 != cliio.ExitFail {
 		t.Fatalf("the contender returned %d, want 1 — it did not refuse", rc2)
 	}
-	if r.isMember("p2") {
-		t.Fatal("the contender wrote state despite being refused")
+	// AND IT WROTE NOTHING AT ALL — not merely no membership. Measured across the contender's whole
+	// run, while the winner was still parked: a refusal that had already created a volume, opened
+	// an intent or moved a trust floor would be a refusal in name only, and membership is the last
+	// thing an install records, so its absence proves almost nothing on its own.
+	if string(ledgerAfter) != string(ledgerBefore) {
+		t.Fatalf("the contender changed the ledger:\n--- before ---\n%s\n--- after ---\n%s", ledgerBefore, ledgerAfter)
+	}
+	if worldAfter != worldBefore {
+		t.Fatalf("the contender changed the runtime:\n--- before ---\n%s\n--- after ---\n%s", worldBefore, worldAfter)
 	}
 
 	ident := r.ident()
@@ -1442,6 +1528,43 @@ func TestAFailedProbeKeepsItsRetainedIntent(t *testing.T) {
 	}
 	if _, ok := bd.Probe.(sessionProber); !ok {
 		t.Fatalf("the bring-up sequence is handed a %T — nothing adopts what the probe arm writes", bd.Probe)
+	}
+}
+
+// TestAFailedAdoptionRefusesToWrite is not a bats port. It is the other half of the retained-intent
+// case above: when the ledger was written during the operation and cannot be re-read, the session's
+// copy is no longer known to contain everything on disk — so writing it could erase exactly what it
+// cannot see. It refuses instead, which is the same fail-closed direction every other unreadable
+// answer in this tree takes.
+func TestAFailedAdoptionRefusesToWrite(t *testing.T) {
+	r := newRig(t)
+	r.writeProduct("p1")
+	r.mintIdentity()
+
+	s, err := openSession(r.d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.close()
+
+	probeErr := errors.New("probe: the leftover probe container could not be removed — its intent is preserved")
+	sp := sessionProber{s: s, p: stubProber{
+		write: func() { _ = os.Remove(r.ledgerPath()) },
+		err:   probeErr,
+	}}
+	// The probe's OWN error still comes back unchanged — the callers distinguish a failed check
+	// from an unavailable probe from an unaccounted one, and that identity must survive the wrapper.
+	if _, perr := sp.Resolve(context.Background(), nil, "netid", "mythical-p1"); !errors.Is(perr, probeErr) {
+		t.Fatalf("the wrapper replaced the probe's error with %v", perr)
+	}
+	if !s.stale {
+		t.Fatal("a ledger that could not be re-read left the session willing to write over it")
+	}
+	if perr := s.persist(); !errors.Is(perr, errStaleLedger) {
+		t.Fatalf("persist returned %v — it wrote a copy that may be missing what was written", perr)
+	}
+	if perr := s.persistFn()(s.l); !errors.Is(perr, errStaleLedger) {
+		t.Fatalf("the write-ahead seam returned %v — bring-up would still write the stale copy", perr)
 	}
 }
 

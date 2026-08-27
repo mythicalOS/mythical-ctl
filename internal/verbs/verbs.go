@@ -178,7 +178,7 @@ func (s *session) install(ctx context.Context, opts InstallOpts) int {
 		return cliio.ExitFail
 	}
 	// The launch must be assemblable BEFORE the existing container is replaced.
-	if err := s.checkLaunchable(pc); err != nil {
+	if err := s.checkLaunchable(pc, image, netID); err != nil {
 		d.warnErr(err)
 		return cliio.ExitFail
 	}
@@ -488,7 +488,7 @@ func (s *session) recreate(ctx context.Context, product string) int {
 	}
 	// The launch must be assemblable BEFORE the working container is removed — the sibling of the
 	// image gate above, and for the same reason.
-	if err := s.checkLaunchable(pc); err != nil {
+	if err := s.checkLaunchable(pc, image, netID); err != nil {
 		d.warnErr(err)
 		return cliio.ExitFail
 	}
@@ -624,14 +624,14 @@ func (s *session) reconcile(ctx context.Context, product, container, netID, alia
 		s.d.warnErr(ierr)
 		return cliio.ExitFail
 	}
-	ix, xerr := trust.CheckIndex(s.st, s.d.IndexPath)
-	if xerr != nil {
-		s.d.warn("verbs: the family index could not be authenticated, so %q cannot be verified after it", product)
-		s.d.warn("  starts — and an unverified start is the one this installer does not report as done.")
-		s.d.warnErr(xerr)
-		return cliio.ExitFail
-	}
-	bd, err := s.bringupDeps(ix, ident)
+	// THE INDEX IS NOT FETCHED HERE. The reconciler computes its plan first, and only a plan that
+	// live-verifies needs the family index at all — so authenticating it up front would refuse a
+	// start whose plan is "nothing to do", "deferred" or "stop", which the reference completes
+	// without ever reading the index. It is accepted lazily, at the moment a probe actually runs,
+	// by the wrapper around the probe arm; that is also the door that ADVANCES the index's
+	// anti-rollback floor, which a read-only check here would have skipped while still consuming
+	// the newer document.
+	bd, err := s.bringupDeps(nil, ident)
 	if err != nil {
 		s.d.warnErr(err)
 		return cliio.ExitFail
@@ -827,12 +827,34 @@ func (s *session) ensureVolume(ctx context.Context, ident, product, role, vol, p
 // replacement that could never have been created. In this tree the spec is assembled inside the
 // launch facade, which runs after the removal, so the same assembly is asked for here first and its
 // answer thrown away. It is the sibling of the image gate a few lines up, for the same reason.
-func (s *session) checkLaunchable(pc *productContext) error {
-	if _, err := s.rt.MountsFor(pc.Manifest, pc.Policy); err != nil {
+func (s *session) checkLaunchable(pc *productContext, image, netID string) error {
+	ident, err := s.l.IdentGet()
+	if err != nil {
 		return err
 	}
-	_, err := hostPorts(s.d.Home, pc.Product, pc.Manifest)
-	return err
+	cfg, cerr := s.launchConfig(pc, ident, image, netID, "prelaunch-check")
+	if cerr != nil {
+		return cerr
+	}
+	return s.rt.PrelaunchCheck(pc.Manifest, pc.Policy, cfg)
+}
+
+// launchConfig assembles what the launch varies. The nonce is a PARAMETER because the dry run and
+// the real create need different ones: the real one is the intent's, minted and recorded ahead of
+// the container; the dry run's is a placeholder that never reaches a label because nothing is
+// created from it.
+func (s *session) launchConfig(pc *productContext, ident, image, netID, nonce string) (runtime.LaunchConfig, error) {
+	ports, err := hostPorts(s.d.Home, pc.Product, pc.Manifest)
+	if err != nil {
+		return runtime.LaunchConfig{}, err
+	}
+	return runtime.LaunchConfig{
+		Identity:  ident,
+		Nonce:     nonce,
+		NetworkID: netID,
+		Image:     image,
+		HostPorts: ports,
+	}, nil
 }
 
 // replaceContainer removes the container standing under this name, if any, so bring-up can create
@@ -882,23 +904,15 @@ func (s *session) launch(ctx context.Context, pc *productContext, image, netID s
 	if err != nil {
 		return err
 	}
-	ports, perr := hostPorts(s.d.Home, pc.Product, pc.Manifest)
-	if perr != nil {
-		return perr
+	cfg, cerr := s.launchConfig(pc, ident, image, netID, "")
+	if cerr != nil {
+		return cerr
 	}
 	bd, berr := s.bringupDeps(pc.Index, ident)
 	if berr != nil {
 		return berr
 	}
-	launcher := &productLauncher{
-		rt:        s.rt,
-		m:         pc.Manifest,
-		p:         pc.Policy,
-		ident:     ident,
-		netID:     netID,
-		image:     image,
-		hostPorts: ports,
-	}
+	launcher := &productLauncher{rt: s.rt, m: pc.Manifest, p: pc.Policy, cfg: cfg}
 	rerr := bringup.Run(ctx, s.l, bd, launcher, pc.Container, netID, pc.Alias, desired)
 	if err := s.persist(); err != nil {
 		return err
@@ -925,23 +939,16 @@ func (s *session) annotate(product, kind string, on bool, extra ...ledger.Field)
 // the launch varies and reaches the SOLE creation site through the runtime facade. Nothing here
 // assembles a container spec — that is the facade's, and it is a boundary the build enforces.
 type productLauncher struct {
-	rt        *runtime.Runtime
-	m         *manifest.Manifest
-	p         *policy.Policy
-	ident     string
-	netID     string
-	image     string
-	hostPorts map[uint16]uint16
+	rt  *runtime.Runtime
+	m   *manifest.Manifest
+	p   *policy.Policy
+	cfg runtime.LaunchConfig
 }
 
 func (pl *productLauncher) Launch(ctx context.Context, container, nonce string) (string, error) {
-	return pl.rt.LaunchProduct(ctx, pl.m, pl.p, runtime.LaunchConfig{
-		Identity:  pl.ident,
-		Nonce:     nonce,
-		NetworkID: pl.netID,
-		Image:     pl.image,
-		HostPorts: pl.hostPorts,
-	})
+	cfg := pl.cfg
+	cfg.Nonce = nonce
+	return pl.rt.LaunchProduct(ctx, pl.m, pl.p, cfg)
 }
 
 // ensureMountPoints creates the core-fixed user-data mount points: ~/.mythical/transcripts and

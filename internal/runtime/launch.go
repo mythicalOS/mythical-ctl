@@ -181,30 +181,61 @@ func (r *Runtime) secretsFor(m *manifest.Manifest, p *policy.Policy) ([]string, 
 // product's family alias (D42 step 1) — the verify/start/verify-live protocol around it is
 // the bring-up layer's, which calls back down through the facade's other methods.
 func (r *Runtime) LaunchProduct(ctx context.Context, m *manifest.Manifest, p *policy.Policy, cfg LaunchConfig) (string, error) {
-	if err := r.assert(); err != nil {
+	name, spec, err := r.buildSpec(m, p, cfg)
+	if err != nil {
 		return "", err
+	}
+	id, err := r.m.ContainerCreate(ctx, spec)
+	if err != nil {
+		return "", fmt.Errorf("runtime: creating %q: %w", name, err)
+	}
+	return id, nil
+}
+
+// PrelaunchCheck answers "could this launch be assembled?" and creates NOTHING.
+//
+// IT IS THE SAME ASSEMBLY LaunchProduct PERFORMS, not a second opinion about it — which is the
+// whole point: every refusal the create path can raise (a role the policy index does not make
+// bindable, a bind inside the family home, two overlapping writable binds, a declared bootstrap
+// secret mythical.conf does not define or does not SET, a host port that will not serialize) is
+// raised here too, and cannot drift, because there is one assembler.
+//
+// It exists because the lifecycle verbs must be able to REFUSE BEFORE they tear a working
+// container down. The reference builds its launch arguments before it stops anything, so it gets
+// that ordering structurally; here the assembly lives inside this facade, so the facade has to
+// offer it separately. It returns ONLY an error: no spec, no mounts, and in particular no secret
+// VALUES leave this package.
+func (r *Runtime) PrelaunchCheck(m *manifest.Manifest, p *policy.Policy, cfg LaunchConfig) error {
+	_, _, err := r.buildSpec(m, p, cfg)
+	return err
+}
+
+// buildSpec is the assembly both of the above share. It performs no runtime mutation.
+func (r *Runtime) buildSpec(m *manifest.Manifest, p *policy.Policy, cfg LaunchConfig) (string, engine.ContainerSpec, error) {
+	if err := r.assert(); err != nil {
+		return "", engine.ContainerSpec{}, err
 	}
 	// The manifest must be inside its policy envelope — every violation reported, before
 	// anything is derived from either.
 	if err := manifest.Check(m, p); err != nil {
-		return "", err
+		return "", engine.ContainerSpec{}, err
 	}
 	product := m.Product()
 	name, err := manifest.ContainerName(cfg.Identity, product)
 	if err != nil {
-		return "", err
+		return "", engine.ContainerSpec{}, err
 	}
 	alias, err := manifest.Alias(product)
 	if err != nil {
-		return "", err
+		return "", engine.ContainerSpec{}, err
 	}
 	raw, bound, err := r.mountsFor(m, p)
 	if err != nil {
-		return "", err
+		return "", engine.ContainerSpec{}, err
 	}
 	env, err := r.secretsFor(m, p)
 	if err != nil {
-		return "", err
+		return "", engine.ContainerSpec{}, err
 	}
 	// Every role the operator did not bind rides its NAMED VOLUME (D6: storage defaults to
 	// named volumes), at the target the manifest places it.
@@ -217,17 +248,17 @@ func (r *Runtime) LaunchProduct(ctx context.Context, m *manifest.Manifest, p *po
 		seen[v.Role] = true
 		volName, verr := manifest.VolumeName(cfg.Identity, product, v.Role)
 		if verr != nil {
-			return "", verr
+			return "", engine.ContainerSpec{}, verr
 		}
 		target, terr := RoleTarget(m, v.Role)
 		if terr != nil {
-			return "", terr
+			return "", engine.ContainerSpec{}, terr
 		}
 		raw = append(raw, rawMount{volume: true, source: volName, target: target})
 	}
 	mounts, err := buildMounts(raw)
 	if err != nil {
-		return "", err
+		return "", engine.ContainerSpec{}, err
 	}
 
 	var ports []engine.PortPublish
@@ -238,7 +269,7 @@ func (r *Runtime) LaunchProduct(ctx context.Context, m *manifest.Manifest, p *po
 		}
 		pub, perr := engine.NewPortPublish(cp, hp)
 		if perr != nil {
-			return "", perr
+			return "", engine.ContainerSpec{}, perr
 		}
 		ports = append(ports, pub)
 	}
@@ -253,7 +284,7 @@ func (r *Runtime) LaunchProduct(ctx context.Context, m *manifest.Manifest, p *po
 	}
 	attach, err := engine.NewNetworkAttach(cfg.NetworkID, alias)
 	if err != nil {
-		return "", err
+		return "", engine.ContainerSpec{}, err
 	}
 	imageRef := m.Image()
 	if cfg.Image != "" {
@@ -267,11 +298,7 @@ func (r *Runtime) LaunchProduct(ctx context.Context, m *manifest.Manifest, p *po
 		Ports:   ports,
 	})
 	if err != nil {
-		return "", err
+		return "", engine.ContainerSpec{}, err
 	}
-	id, err := r.m.ContainerCreate(ctx, spec)
-	if err != nil {
-		return "", fmt.Errorf("runtime: creating %q: %w", name, err)
-	}
-	return id, nil
+	return name, spec, nil
 }
