@@ -140,10 +140,13 @@ func TestContinuationLinesStayWithTheirHead(t *testing.T) {
 	}
 }
 
-// TestAWarningsOwnSecondLineDoesNotAttachToAReportLine — the two streams interleave, and an
-// indented stderr line must continue the stderr entry above it, not adopt the report line that
-// happens to precede it.
-func TestAWarningsOwnSecondLineDoesNotAttachToAReportLine(t *testing.T) {
+// TestAContinuationAttachesOnlyWithinItsOwnStream — the two streams interleave, and an indented
+// line continues the entry above it ONLY if that entry came from the same stream. Both
+// directions are asserted, because the guard is one condition and either direction alone leaves
+// it half-tested: a report line must not adopt a warning's second line, and a warning must not
+// adopt an indented report line filed under a different section.
+func TestAContinuationAttachesOnlyWithinItsOwnStream(t *testing.T) {
+	// A warning's own second line goes to the warning, not to the report line before it.
 	m := NewStatusModel(nil)
 	m = say(m, "installation: 4f2ab9c1")
 	m = warn(m, "ledger: the records could not be read")
@@ -156,6 +159,22 @@ func TestAWarningsOwnSecondLineDoesNotAttachToAReportLine(t *testing.T) {
 	}
 	if got := m.entries[1].cont; len(got) != 1 {
 		t.Fatalf("the warning lost its own continuation: %q", got)
+	}
+
+	// And the other way: an indented REPORT line arriving after a warning is its own entry. The
+	// warning is filed under the diagnostics and the report line is not; folding one into the
+	// other would move a report line into a section it does not belong to, and hide it there.
+	m2 := NewStatusModel(nil)
+	m2 = warn(m2, "ledger: the records could not be read")
+	m2 = say(m2, "  an indented line the report wrote")
+	if m2.Entries() != 2 {
+		t.Fatalf("entries: %d, want 2 — an indented report line was adopted by a warning", m2.Entries())
+	}
+	if got := m2.entries[0].cont; len(got) != 0 {
+		t.Fatalf("the warning adopted a line from the other stream: %q", got)
+	}
+	if m2.entries[1].stderr {
+		t.Fatal("the report line was filed as a diagnostic")
 	}
 }
 
@@ -472,21 +491,52 @@ func TestWidthIsMeasuredInTheUnitItIsCutIn(t *testing.T) {
 	}
 }
 
+// TestColumnsStartAtTheSameCellInEveryRow. Padding is counted in the same unit the widths are —
+// terminal cells. Counted in bytes, a row with a multibyte cell is padded short and every column
+// after it slides left, so a value can be read under a neighbouring column's heading.
+func TestColumnsStartAtTheSameCellInEveryRow(t *testing.T) {
+	widths := []int{10, 6}
+	ascii := padRow([]string{"abc", "xx"}, widths, 2)
+	wide := padRow([]string{"名前名", "yy"}, widths, 2)
+	at := func(row, cell string) int {
+		i := strings.Index(row, cell)
+		if i < 0 {
+			t.Fatalf("%q is not in %q", cell, row)
+		}
+		return ansi.StringWidth(row[:i])
+	}
+	if got, want := at(wide, "yy"), at(ascii, "xx"); got != want {
+		t.Fatalf("the second column starts at cell %d on a row with wide runes and cell %d on an\n"+
+			"  ASCII row — the columns do not line up:\n  %q\n  %q", got, want, ascii, wide)
+	}
+}
+
 // TestControlCharactersNeverReachTheScreen. A ledger record's fields end up in this table; an
 // escape sequence or a bidi override in one of them can make a refusing line render as a
 // reassuring one.
 func TestControlCharactersNeverReachTheScreen(t *testing.T) {
-	m := sized(NewStatusModel(nil), 160, 40)
+	m := sized(NewStatusModel(nil), 200, 60)
+	// One in a table cell and one in prose, because they are laid out by different code and a
+	// sanitiser applied to only one of them would leave the other open.
 	m = say(m, "volume v\x1b[31m1\u202e: role=data data=UNREGENERABLE product=brokkr — present, created by this installation")
 	m = say(m, "an unrecognised line with \x1b]0;title\x07 in it")
+
+	// ASSERTED ON THE RAW VIEW, NOT ON A STRIPPED ONE. Stripping escape sequences and then
+	// checking that none is present tests the stripper, not the view; the sequence the operator's
+	// terminal would act on is the one in View()'s own bytes.
 	v := m.View()
-	for _, bad := range []string{"\x1b", "\u202e", "\x07"} {
-		if strings.Contains(ansi.Strip(strings.ReplaceAll(v, "\x1b[0m", "")), bad) {
+	// The escape INTRODUCER is what a terminal acts on; the printable tail of a broken sequence
+	// ("[31m") is just text once the ESC is gone, which is exactly what sanitising achieves.
+	for _, bad := range []string{"\x1b]", "\x1b[31m", "\x07", "\u202e"} {
+		if strings.Contains(v, bad) {
 			t.Fatalf("%q reached the screen:\n%q", bad, v)
 		}
 	}
-	if !strings.Contains(plain(m), "\ufffd") {
-		t.Fatalf("the offending runes were dropped rather than shown as replaced:\n%s", plain(m))
+	// Replaced, not deleted: a rune silently dropped would make a name render as a different,
+	// legitimate-looking name.
+	if n := strings.Count(v, "\ufffd"); n != 4 {
+		t.Fatalf("%d replacement runes on screen, want 4 (ESC and RLO in the cell, ESC and BEL in\n"+
+			"  the prose) — the offending runes were dropped rather than shown as replaced:\n%s", n, plain(m))
 	}
 }
 
@@ -952,20 +1002,40 @@ func TestRunStatusReleasesAReportBlockedOnAQuestion(t *testing.T) {
 	p.onUpdate = func(m StatusModel, p *fakeStatusProgram) { p.kill() }
 	answered := make(chan bool, 1)
 	d, _, _ := baseDeps()
-	code, _ := runStatus(context.Background(), d, func(ctx context.Context, d verbs.Deps) int {
-		answered <- d.Confirm("really?")
-		return 7
-	}, p.make, 2*time.Second)
+
+	// runStatus is driven from a goroutine and waited on with THIS TEST'S OWN deadline. If it
+	// were called inline, a runner that failed to release the blocked report would hang here and
+	// the failure would arrive as go test's timeout — a panic naming no cause. The deadline below
+	// is what turns that into a sentence.
+	type result struct {
+		code int
+		err  error
+	}
+	finished := make(chan result, 1)
+	go func() {
+		code, err := runStatus(context.Background(), d, func(ctx context.Context, d verbs.Deps) int {
+			answered <- d.Confirm("really?")
+			return 7
+		}, p.make, 500*time.Millisecond)
+		finished <- result{code, err}
+	}()
+
 	select {
 	case ok := <-answered:
 		if ok {
 			t.Fatal("a question nobody could answer was answered yes")
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("the report is still blocked on a question the interface can no longer show")
+	case <-time.After(5 * time.Second):
+		t.Fatal("the report is still blocked on a question the interface can no longer show — a\n" +
+			"  report parked on an unanswerable question never returns and never releases what it holds")
 	}
-	if code != 7 {
-		t.Fatalf("code %d", code)
+	select {
+	case r := <-finished:
+		if r.code != 7 {
+			t.Fatalf("code %d", r.code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("runStatus never returned after the interface went away")
 	}
 }
 

@@ -91,6 +91,33 @@ func TestPlainIsAcceptedByStatus(t *testing.T) {
 	}
 }
 
+// TestStatusActuallyRoutesThroughTheDashboardDecision. Without this, the whole routing could be
+// removed — status calling the verb directly again — and every other test here would still pass:
+// they exercise the decision function, not the fact that `status` consults it.
+//
+// The seam is what makes the assertion possible without a terminal: it is consulted exactly once
+// per status invocation, and a status that did not route through driveStatus would not consult it
+// at all.
+func TestStatusActuallyRoutesThroughTheDashboardDecision(t *testing.T) {
+	consulted := 0
+	prev := statusIsInteractive
+	statusIsInteractive = func([]string, io.Reader, io.Writer) bool {
+		consulted++
+		return false
+	}
+	t.Cleanup(func() { statusIsInteractive = prev })
+
+	var out, errb bytes.Buffer
+	// A real family home, so the report gets past locating it and actually runs. There is no
+	// container runtime here, which is the "unobservable" path the report is built to survive.
+	env := []string{"MYTHICAL_HOME=" + t.TempDir(), "DOCKER_HOST=tcp://127.0.0.1:1"}
+	runEnv([]string{"status"}, env, strings.NewReader(""), &out, &errb)
+	if consulted != 1 {
+		t.Fatalf("the terminal decision was consulted %d times; status is not routed through\n"+
+			"  driveStatus, so at a terminal it would print instead of drawing", consulted)
+	}
+}
+
 // TestPlainIsDocumented — a flag the help does not mention is a flag nobody finds.
 func TestPlainIsDocumented(t *testing.T) {
 	if !strings.Contains(usage, "--plain") {
