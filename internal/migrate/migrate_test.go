@@ -1681,3 +1681,98 @@ func TestPhase7DefaultsAnAbsentAttemptToStarted(t *testing.T) {
 		t.Fatalf("mythical.conf holds %q", got)
 	}
 }
+
+// --- gate round 3 ---------------------------------------------------------------------------------
+
+func TestATrailingSlashNamesTheSameDestination(t *testing.T) {
+	// A TRAILING SLASH IS AN ORDINARY WAY TO WRITE A DIRECTORY PATH. `dirname`/`basename` strip it
+	// before splitting, so the reference reads `/target/dir/` as parent `/target`, leaf `dir`. The
+	// Go split does not: Dir answers `/target/dir` while Base still answers `dir`, and joining the
+	// two lands one level BELOW the directory the operator named — a migration into the wrong place,
+	// under a name that looks right.
+	f := newFx(t)
+	want := f.canonDest()
+	for _, spelling := range []string{f.dest, f.dest + "/", f.dest + "//"} {
+		got, err := canonDest(spelling)
+		if err != nil {
+			t.Fatalf("%q: %v", spelling, err)
+		}
+		if got != want {
+			t.Fatalf("--to-bind %q resolves to %q, want %q", spelling, got, want)
+		}
+		// The staging sibling is derived from the same split, so it must not move either.
+		if s := StagingPath(spelling, "nz"); s != StagingPath(f.dest, "nz") {
+			t.Fatalf("--to-bind %q derives staging %q, want %q", spelling, s, StagingPath(f.dest, "nz"))
+		}
+	}
+
+	// End to end: the trailing-slash spelling migrates to the SAME directory and records it.
+	f2 := newFx(t)
+	if err := MigrateStorage(ctx(), f2.l, f2.d, testProduct, testRole, Options{ToBind: f2.dest + "/"}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := f2.confValue(f2.confkey); got != f2.canonDest() {
+		t.Fatalf("mythical.conf holds %q, want %q", got, f2.canonDest())
+	}
+	if !exists(f2.canonDest()) {
+		t.Fatal("nothing landed at the destination the operator named")
+	}
+	if exists(filepath.Join(f2.canonDest(), filepath.Base(f2.dest))) {
+		t.Fatal("the migration landed one level below the destination the operator named")
+	}
+}
+
+func TestPhase7PreparesTheReplacementBeforeRemovingTheOldOne(t *testing.T) {
+	// THE REMOVAL CANNOT BE UNDONE, so every fallible step of working out WHAT to build runs while
+	// the old container is still there. A launch spec that could not be resolved — a missing image,
+	// a secret that will not render — must fail with the old container standing and the migration
+	// resumable, not after the product has been left with no container at all.
+	f := newFx(t)
+	canon := f.canonDest()
+	if err := os.Mkdir(canon, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sid, _ := Identity(canon)
+	f.seed(record{Phase: 7, Dest: canon, Nonce: "nz", Staging: StagingPath(canon, "nz"),
+		StageID: sid, Attempt: "started", Desired: "running"})
+	f.bld.prepareErr = errors.New("the product's secrets could not be rendered")
+	err := Run(ctx(), f.l, f.d, testProduct, testRole, canon, 7)
+	mustContain(t, err, "could not be prepared", "nothing was", "removed")
+	if len(f.mut.removed) != 0 {
+		t.Fatalf("the old container was removed before the replacement could be prepared: %v", f.mut.removed)
+	}
+	if _, ferr := prov.Find(f.l, prov.ClassContainer, f.container); ferr != nil {
+		t.Fatalf("the old container's record was consumed despite the preparation failing: %v", ferr)
+	}
+	if p, perr := Phase(f.l, testProduct, testRole); perr != nil || p != 7 {
+		t.Fatalf("the intent is at %d (%v), want 7 — the migration must stay resumable", p, perr)
+	}
+
+	// PREPARE PRECEDES THE REMOVAL on the ordinary path too, and whatever it rendered is released
+	// on every path out, built or abandoned.
+	f2 := newFx(t)
+	var removedAtPrepare int
+	f2.bld.hook = func() { removedAtPrepare = len(f2.mut.removed) }
+	if err := MigrateStorage(ctx(), f2.l, f2.d, testProduct, testRole, Options{ToBind: f2.dest}); err != nil {
+		t.Fatal(err)
+	}
+	if len(f2.bld.prepared) != 1 || len(f2.bld.rebuilt) != 1 {
+		t.Fatalf("prepared=%v rebuilt=%v", f2.bld.prepared, f2.bld.rebuilt)
+	}
+	if removedAtPrepare != 1 {
+		t.Fatalf("the replacement was created with %d containers removed, want 1", removedAtPrepare)
+	}
+	if f2.bld.discarded != 1 {
+		t.Fatalf("the prepared replacement was discarded %d times, want 1", f2.bld.discarded)
+	}
+
+	// And on a FAILED create, too — the phase must not leak what it rendered.
+	f3 := newFx(t)
+	f3.bld.rebuildErr = errors.New("the daemon refused the create")
+	if err := MigrateStorage(ctx(), f3.l, f3.d, testProduct, testRole, Options{ToBind: f3.dest}); err == nil {
+		t.Fatal("a failed create reported success")
+	}
+	if f3.bld.discarded != 1 {
+		t.Fatalf("a failed create discarded %d times, want 1", f3.bld.discarded)
+	}
+}

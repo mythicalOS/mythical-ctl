@@ -48,7 +48,7 @@ type Escaper interface {
 // onto a destination that does not exist OR is empty — the only two cases the non-empty-destination
 // rule permits.
 func StagingPath(dest, nonce string) string {
-	return filepath.Join(filepath.Dir(dest), ".mythical-staging-"+nonce)
+	return filepath.Join(filepath.Dir(filepath.Clean(dest)), ".mythical-staging-"+nonce)
 }
 
 // Identity is a path's `device:inode`. rename() PRESERVES both, which is what makes the destination
@@ -534,7 +534,10 @@ func deviceOf(p string) (int64, error) {
 // ancestor's symlink component resolving into it) can be renamed or repointed by someone else the
 // instant after this check passes.
 func CheckParentTrust(dest string) error {
-	pdir := filepath.Dir(dest)
+	// Cleaned for the same reason canonDest cleans: this is a public entry point, and a trailing
+	// slash would otherwise make it verify the chain to the destination ITSELF rather than to its
+	// parent.
+	pdir := filepath.Dir(filepath.Clean(dest))
 	canon, err := runtime.Canon(pdir)
 	if err != nil {
 		return fmt.Errorf("migrate: the destination's parent directory %q does not resolve. Refusing: %w", pdir, err)
@@ -559,6 +562,12 @@ func CheckParentTrust(dest string) error {
 // resolved via its PARENT, which the other precheck rules already require to exist. A failed resolve
 // is a REFUSAL, never a silent fall-back to the raw value.
 func canonDest(dest string) (string, error) {
+	// CLEANED FIRST. `dirname`/`basename` strip trailing slashes before splitting, so the reference
+	// reads `/target/dir/` as parent `/target` and leaf `dir`. Go's Dir does NOT: it reads the same
+	// spelling as parent `/target/dir`, while Base still answers `dir` — joining the two produces
+	// `/target/dir/dir`, a directory one level below the one the operator named. A trailing slash
+	// is an ordinary way to write a directory path, so this is not an exotic input.
+	dest = filepath.Clean(dest)
 	pdir := filepath.Dir(dest)
 	pcanon, err := runtime.Canon(pdir)
 	if err != nil {

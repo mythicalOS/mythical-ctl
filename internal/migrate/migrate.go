@@ -84,14 +84,32 @@ type Copier interface {
 // CREATION — there is no update call that exposes a mount, volume or bind option — so "switch the
 // mount" is not an operation and the container must be rebuilt from its launch spec. The spec lives
 // with the verb that owns product bring-up, so this is a seam.
+//
+// IT IS SPLIT IN TWO BECAUSE THE ORDER IS A SAFETY PROPERTY. Everything that can fail while working
+// out WHAT to build — resolving the network, the image, the mount and publish set, rendering the
+// secrets — happens in Prepare, BEFORE the old container is removed. A single Rebuild call would
+// necessarily do that work after the irreversible removal, so a launch spec that could not be built
+// would leave the product with no container at all, where the reference leaves the old one standing
+// and the migration resumable.
 type Rebuilder interface {
-	// Rebuild creates the replacement container. `preserve` is not a parameter because the
-	// migration MUST NOT EXPRESS INTENT: the replacement reads the desired state already recorded.
-	Rebuild(ctx context.Context, l *ledger.Ledger, product, container, netID string) error
-	// Reconcile drives the container toward its recorded desired state.
-	Reconcile(ctx context.Context, l *ledger.Ledger, container, netID string) error
 	// NetTarget resolves the network the family attaches to.
 	NetTarget(ctx context.Context, l *ledger.Ledger) (string, error)
+	// Prepare resolves and renders EVERYTHING the replacement needs. It runs before anything
+	// irreversible, so it must acquire nothing the caller cannot abandon — whatever it does
+	// acquire is released by Discard.
+	Prepare(ctx context.Context, l *ledger.Ledger, product, container, netID string) (Replacement, error)
+	// Reconcile drives the container toward its recorded desired state.
+	Reconcile(ctx context.Context, l *ledger.Ledger, container, netID string) error
+}
+
+// Replacement is one prepared container, ready to be created once the old one is actually gone.
+type Replacement interface {
+	// Create builds it. `preserve` is not a parameter because the migration MUST NOT EXPRESS
+	// INTENT: the replacement reads the desired state already recorded.
+	Create(ctx context.Context, l *ledger.Ledger) error
+	// Discard releases what Prepare rendered — a secrets env file, say. Called on EVERY path out
+	// of the phase, whether the replacement was built or abandoned.
+	Discard()
 }
 
 // EntryCount carries the source-entry count from the copy (phase 3) to the verification (phase 4),
@@ -1024,6 +1042,19 @@ func runPhase7(ctx context.Context, l *ledger.Ledger, d Deps, r record, containe
 	if err != nil {
 		return err
 	}
+	// EVERY FALLIBLE STEP OF WORKING OUT WHAT TO BUILD RUNS FIRST, while the old container is still
+	// there. The removal below cannot be undone, so a launch spec that could not be resolved — a
+	// missing image, a secret that will not render, a mount set that does not validate — must fail
+	// HERE, with the old container standing and the migration resumable, rather than after the
+	// product has been left with no container at all.
+	rep, perr := d.Build.Prepare(ctx, l, r.Product, container, netID)
+	if perr != nil {
+		return fmt.Errorf("migrate: the replacement container for %q could not be prepared, so nothing was\n"+
+			"  removed — the old container is still there and the migration stays at phase 7: %w", container, perr)
+	}
+	// Released on EVERY path out, built or abandoned: whatever Prepare rendered is this phase's to
+	// clean up, exactly as the reference removes its rendered secrets file on every branch.
+	defer rep.Discard()
 	switch aerr := prov.Authority(ctx, l, d.Prov, prov.ClassContainer, container); {
 	case aerr == nil:
 		if rerr := d.Mut.ContainerRemove(ctx, container); rerr != nil {
@@ -1042,7 +1073,7 @@ func runPhase7(ctx context.Context, l *ledger.Ledger, d Deps, r record, containe
 			"  7 and can be resumed; run 'mythical-ctl state repair' if a later step reports the\n"+
 			"  object as already accounted for: %w", container, err)
 	}
-	return d.Build.Rebuild(ctx, l, r.Product, container, netID)
+	return rep.Create(ctx, l)
 }
 
 // runPhase8 verifies the mount BY INSPECTION.

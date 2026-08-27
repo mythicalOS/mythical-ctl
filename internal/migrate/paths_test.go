@@ -140,6 +140,15 @@ func TestParentTrustAcceptsASafeChain(t *testing.T) {
 	if err := CheckParentTrust(filepath.Join(base, "dest")); err != nil {
 		t.Fatalf("an operator-owned, non-group/other-writable chain was refused: %v", err)
 	}
+	// A TRAILING SLASH NAMES THE SAME DESTINATION. This is a public entry point, and the Go path
+	// split reads `<base>/dest/` as parent `<base>/dest` where `dirname` reads it as `<base>` — so
+	// without cleaning first, a perfectly ordinary spelling of a not-yet-created destination is
+	// refused because its own leaf cannot be resolved as a parent.
+	for _, spelling := range []string{filepath.Join(base, "dest") + "/", filepath.Join(base, "dest") + "//"} {
+		if err := CheckParentTrust(spelling); err != nil {
+			t.Fatalf("CheckParentTrust(%q) refused a chain it accepts without the trailing slash: %v", spelling, err)
+		}
+	}
 }
 
 func TestParentTrustWalksTheWholeChain(t *testing.T) {

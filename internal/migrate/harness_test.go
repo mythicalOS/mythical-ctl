@@ -263,10 +263,13 @@ func (f *fakeCopy) LinkEscapes(linkPath, target, root string) bool {
 type fakeBuild struct {
 	netID        string
 	netErr       error
+	prepareErr   error
 	rebuildErr   error
 	reconcileErr error
+	prepared     []string
 	rebuilt      []string
 	reconciled   []string
+	discarded    int
 	// objs and prv are updated on a successful rebuild, the way a real bring-up leaves the world:
 	// a new container, mounting the bind, with its own provenance recorded.
 	objs  *fakeObjs
@@ -283,7 +286,24 @@ func (f *fakeBuild) NetTarget(context.Context, *ledger.Ledger) (string, error) {
 	return f.netID, f.netErr
 }
 
-func (f *fakeBuild) Rebuild(_ context.Context, l *ledger.Ledger, _, container, _ string) error {
+// Prepare resolves the replacement BEFORE anything irreversible happens; Create builds it after.
+func (f *fakeBuild) Prepare(_ context.Context, _ *ledger.Ledger, _, container string, _ string) (Replacement, error) {
+	if f.prepareErr != nil {
+		return nil, f.prepareErr
+	}
+	f.prepared = append(f.prepared, container)
+	return &fakeReplacement{b: f, container: container}, nil
+}
+
+type fakeReplacement struct {
+	b         *fakeBuild
+	container string
+}
+
+func (r *fakeReplacement) Discard() { r.b.discarded++ }
+
+func (r *fakeReplacement) Create(_ context.Context, l *ledger.Ledger) error {
+	f, container := r.b, r.container
 	if f.rebuildErr != nil {
 		return f.rebuildErr
 	}
