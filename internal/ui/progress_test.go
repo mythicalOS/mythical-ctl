@@ -111,6 +111,28 @@ func TestProgressAppendDoesNotMutateAnEarlierValue(t *testing.T) {
 	}
 }
 
+// TestProgressAppendNeverWritesIntoSharedBacking is the same guard driven at the ONE shape that can
+// actually alias: a transcript slice with spare capacity. Through the public API every transcript
+// happens to be built at exactly len == cap, so a plain append would reallocate anyway and the
+// black-box test above cannot tell the two implementations apart. Constructed directly here, it
+// can: a plain append writes "right" into the array "left" is still reading.
+func TestProgressAppendNeverWritesIntoSharedBacking(t *testing.T) {
+	shared := make([]string, 1, 8)
+	shared[0] = "shared"
+	base := Progress{lines: shared}
+	left := base.append("left")
+	right := base.append("right")
+	if got := left.Lines()[1]; got != "left" {
+		t.Fatalf("the second append wrote into the first's backing array: %q", got)
+	}
+	if got := right.Lines()[1]; got != "right" {
+		t.Fatalf("right: %q", got)
+	}
+	if got := len(base.Lines()); got != 1 {
+		t.Fatalf("the base transcript grew: %d", got)
+	}
+}
+
 // TestProgressStopsShowingALiveStepWhenDone — a spinner still turning after the verb has returned
 // says the operation is still running when it is not.
 func TestProgressStopsShowingALiveStepWhenDone(t *testing.T) {

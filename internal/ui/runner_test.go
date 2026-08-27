@@ -178,6 +178,12 @@ func TestRunAnswersAConfirmThroughTheOverlay(t *testing.T) {
 		d, _, _ := baseDeps()
 		var answered bool
 		code, err := run(context.Background(), d, func(ctx context.Context, d verbs.Deps) int {
+			// Named rather than left to panic: a nil seam means the verb falls back to the
+			// plain-CLI default, which reads a stdin the renderer has taken over.
+			if d.Confirm == nil {
+				t.Error("the runner left Confirm nil")
+				return 1
+			}
 			answered = d.Confirm("Remove every volume?")
 			if answered {
 				return 0
@@ -251,6 +257,10 @@ func TestRunRefusesWhenTheContextIsCancelled(t *testing.T) {
 	var answered bool
 	var sawCtxDone bool
 	code, err := run(ctx, d, func(vctx context.Context, d verbs.Deps) int {
+		if d.Confirm == nil {
+			t.Error("the runner left Confirm nil")
+			return 4
+		}
 		answered = d.Confirm("Remove every volume?")
 		sawCtxDone = vctx.Err() != nil
 		return 4
