@@ -985,13 +985,13 @@ func (s *session) repairNetref(ctx context.Context, rd repairSeams, ident string
 		// out equal to the resolved one, and a CLEAN reference was recorded with no migration
 		// intent. The old attachment then had no record anywhere: the ledger reported the migration
 		// complete while it had not even been recorded as started.
-		set := map[string]bool{}
+		seen := map[string]bool{}
 		var ids []string
 		for _, n := range nets {
-			if n.NetworkID == "" || set[n.NetworkID] {
+			if n.NetworkID == "" || seen[n.NetworkID] {
 				continue
 			}
-			set[n.NetworkID] = true
+			seen[n.NetworkID] = true
 			ids = append(ids, n.NetworkID)
 		}
 		if len(ids) == 0 {
