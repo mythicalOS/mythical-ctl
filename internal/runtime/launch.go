@@ -105,6 +105,16 @@ type LaunchConfig struct {
 	NetworkID string
 	// Generation, when non-empty, is recorded as the generation label.
 	Generation string
+	// Image, when non-empty, is the reference to run INSTEAD of the manifest's — the operator's
+	// explicit `--image` override, and the recorded override a later recreate must preserve.
+	//
+	// IT IS A LAUNCH PARAMETER RATHER THAN A SECOND SPEC BUILDER because the spec is assembled
+	// only here: a caller that wanted to run its own reference would otherwise need its own
+	// create call, which is the one thing this facade exists to prevent. The manifest's digest
+	// pin does not apply to an overridden reference — that is the documented meaning of the
+	// override, and the loudness and the ledger record that make it accountable are the verb
+	// layer's, not this one's. Empty means the manifest's image, which is the ordinary case.
+	Image string
 	// HostPorts maps a declared container port to the host port to publish it at; a declared
 	// port with no entry publishes at its own number. The host IP is not here and not
 	// anywhere: the engine serializer emits 127.0.0.1 unconditionally.
@@ -245,7 +255,11 @@ func (r *Runtime) LaunchProduct(ctx context.Context, m *manifest.Manifest, p *po
 	if err != nil {
 		return "", err
 	}
-	spec, err := engine.NewContainerSpec(name, m.Image(), engine.SpecOpts{
+	imageRef := m.Image()
+	if cfg.Image != "" {
+		imageRef = cfg.Image
+	}
+	spec, err := engine.NewContainerSpec(name, imageRef, engine.SpecOpts{
 		Network: attach,
 		Labels:  labels,
 		Env:     env,
