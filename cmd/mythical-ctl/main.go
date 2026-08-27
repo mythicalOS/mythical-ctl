@@ -167,17 +167,21 @@ func lifecycle(verb string, o opts, env []string, stdin io.Reader, stdout, stder
 	}
 	ctx := context.Background()
 	if extra {
-		return verbs.Install(ctx, d, verbs.InstallOpts{
-			Product:  o.products[0],
-			Image:    o.image,
-			ImageSet: o.image != "",
-			Force:    o.forced,
+		return drive(ctx, d, stdin, stdout, func(ctx context.Context, d verbs.Deps) int {
+			return verbs.Install(ctx, d, verbs.InstallOpts{
+				Product:  o.products[0],
+				Image:    o.image,
+				ImageSet: o.image != "",
+				Force:    o.forced,
+			})
 		})
 	}
 	// One product with no per-product option goes through the batch driver too — the reference
 	// does exactly this, so the per-product report and the aggregate are the same code for one
 	// product as for five.
-	return verbs.Batch(ctx, d, verb, o.products)
+	return drive(ctx, d, stdin, stdout, func(ctx context.Context, d verbs.Deps) int {
+		return verbs.Batch(ctx, d, verb, o.products)
+	})
 }
 
 // status dispatches the read-only report.
@@ -264,9 +268,13 @@ func uninstall(o opts, env []string, stdin io.Reader, stdout, stderr io.Writer) 
 		return cliio.ExitFail
 	}
 	if o.family {
-		return verbs.UninstallFamily(context.Background(), d, o.purge)
+		return drive(context.Background(), d, stdin, stdout, func(ctx context.Context, d verbs.Deps) int {
+			return verbs.UninstallFamily(ctx, d, o.purge)
+		})
 	}
-	return verbs.Uninstall(context.Background(), d, o.products[0], o.purge)
+	return drive(context.Background(), d, stdin, stdout, func(ctx context.Context, d verbs.Deps) int {
+		return verbs.Uninstall(ctx, d, o.products[0], o.purge)
+	})
 }
 
 // deps assembles the verb layer's dependencies: the daemon connection, the family home, the
