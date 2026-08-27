@@ -440,10 +440,16 @@ func TestRunReplaysTheRecordToTheRealStreams(t *testing.T) {
 	if errb.String() != wantErr {
 		t.Fatalf("stderr replay:\n%q\nwant\n%q", errb.String(), wantErr)
 	}
-	// And the same lines were on screen while it ran.
+	// And the COMPLETE lines were on screen while it ran. The trailing partial one is not a line
+	// yet, so it is never drawn; it is in the record, which is what the terminal keeps.
 	lines := p.Final().Progress().Lines()
-	if len(lines) != 4 {
+	if len(lines) != 3 {
 		t.Fatalf("the pane saw %d lines: %q", len(lines), lines)
+	}
+	for _, l := range lines {
+		if strings.Contains(l, "a line with no newline") {
+			t.Fatalf("a partial line was drawn: %q", lines)
+		}
 	}
 }
 
@@ -470,6 +476,38 @@ func TestRunReplayPreservesOrderAcrossAPartialLine(t *testing.T) {
 	}
 	if got, want := errb.String(), "e1e2\n"; got != want {
 		t.Fatalf("stderr replay %q, want %q", got, want)
+	}
+}
+
+// TestScreenNeverShowsALineBeforeOneRecordedEarlier. A partial write is held back from the screen
+// until its newline arrives; the danger is that the hold becomes an ORDERING inversion — the held
+// fragment drawn after a step that was narrated while it waited, though its bytes are recorded
+// first. Every drawn line must sit at the position of the write that COMPLETED it.
+func TestScreenNeverShowsALineBeforeOneRecordedEarlier(t *testing.T) {
+	rec := &recordingSender{}
+	b := NewBridge(context.Background(), rec)
+	w := b.Writer(true)
+	fmt.Fprint(w, "A")
+	b.Progress(verbs.ProgressEvent{Stage: "s", Detail: "B"})
+	_ = w.Close()
+
+	var drawn []string
+	for _, m := range rec.msgs {
+		switch v := m.(type) {
+		case OutputMsg:
+			drawn = append(drawn, v.Line)
+		case ProgressMsg:
+			drawn = append(drawn, v.Event.Detail)
+		}
+	}
+	if len(drawn) != 1 || drawn[0] != "B" {
+		t.Fatalf("drawn %q — a partial line must not be drawn out of order, or at all", drawn)
+	}
+	// The bytes are still in the record, in write order, and that is what the terminal keeps.
+	var out, errb bytes.Buffer
+	b.Flush(&out, &errb)
+	if errb.String() != "A" || out.String() != "B\n" {
+		t.Fatalf("record replay stdout %q stderr %q", out.String(), errb.String())
 	}
 }
 
@@ -714,18 +752,21 @@ func TestStreamWriterDrawsCompleteLinesOnly(t *testing.T) {
 	if got := rec.count(); got != 2 {
 		t.Fatalf("drew %d lines, want 2", got)
 	}
+	// Close DRAWS NOTHING. A partial line held while a later step was narrated would otherwise be
+	// drawn after that step, though its bytes are recorded before it — the last way the record and
+	// the screen could disagree about order. Nothing is lost: the bytes are in the record, and the
+	// record is what the terminal keeps.
 	_ = w.Close()
-	if got := rec.count(); got != 3 {
-		t.Fatalf("Close did not draw the trailing partial line: %d", got)
+	if got := rec.count(); got != 2 {
+		t.Fatalf("Close drew something: %d", got)
 	}
 	first, ok := rec.msgs[0].(OutputMsg)
 	if !ok || first.Line != "mythical-ctl: refused" || !first.Stderr {
 		t.Fatalf("first drawn line %#v", rec.msgs[0])
 	}
-	// Closing twice must not re-draw.
 	_ = w.Close()
-	if got := rec.count(); got != 3 {
-		t.Fatalf("a second Close re-drew: %d", got)
+	if got := rec.count(); got != 2 {
+		t.Fatalf("a second Close drew something: %d", got)
 	}
 	// Write reports the full length it was given, as io.Writer requires.
 	n, err := w.Write([]byte("abc\n"))
@@ -755,7 +796,7 @@ func TestStreamWriterRecordIsByteExact(t *testing.T) {
 	if out.Len() != 0 {
 		t.Fatalf("a stderr write landed on stdout: %q", out.String())
 	}
-	// Close adds nothing to the record: the bytes were already there.
+	// Close adds nothing to the record either: the bytes were already there.
 	before := len(b.Record())
 	_ = w.Close()
 	if got := len(b.Record()); got != before {

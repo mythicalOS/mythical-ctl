@@ -315,6 +315,64 @@ func TestConfirmUnclaimedKeysVetoTheReply(t *testing.T) {
 	}
 }
 
+// TestConfirmMarksOnInputItCannotName. Bubble Tea delivers more than KeyMsg: an unmapped CSI
+// sequence (ctrl+delete on xterm, ESC [ 3 ; 5 ~) and a byte that is not valid UTF-8 each arrive as
+// their own UNEXPORTED message type. Ignoring what cannot be named is how `y`, ctrl+delete, Enter
+// came to ACCEPT while a pipe carrying "y\x1b[3;5~" refuses.
+func TestConfirmMarksOnInputItCannotName(t *testing.T) {
+	// Stand-ins for the unexported types: the test asserts the DEFAULT, which is what makes those
+	// types safe without being nameable.
+	type unnameableInput []byte
+	for _, msg := range []tea.Msg{
+		unnameableInput("\x1b[3;5~"),
+		struct{ mouse int }{1},
+		tea.Msg(nil),
+	} {
+		r := NewReply()
+		var o Overlay = Confirm("Really?", r)
+		o = typeRunes(t, o, "y")
+		o, _ = o.Update(msg)
+		if o == nil {
+			t.Fatalf("%T dismissed the overlay", msg)
+		}
+		if !o.(ConfirmOverlay).Marked() {
+			t.Fatalf("%T did not mark the line", msg)
+		}
+		o = press(t, o, tea.KeyEnter)
+		if ok := <-r.C(); ok {
+			t.Fatalf("%T: `y` plus unnameable input was ACCEPTED", msg)
+		}
+	}
+
+	// The package's own DATA messages are broadcast to every layer and must NOT mark: a narration
+	// step arriving while a question is up would otherwise make the question unanswerable.
+	for _, msg := range []tea.Msg{
+		ProgressMsg{},
+		OutputMsg{Line: "x"},
+		PullProgressMsg{Status: "x"},
+		VerbDoneMsg{},
+		ConfirmRequestMsg{},
+		PushOverlayMsg{},
+		PopOverlayMsg{},
+		tea.WindowSizeMsg{Width: 80, Height: 24},
+	} {
+		r := NewReply()
+		var o Overlay = Confirm("Really?", r)
+		o = typeRunes(t, o, "y")
+		o, _ = o.Update(msg)
+		if o == nil {
+			t.Fatalf("%T dismissed the overlay", msg)
+		}
+		if o.(ConfirmOverlay).Marked() {
+			t.Fatalf("%T marked the line — a data message is not input", msg)
+		}
+		o = press(t, o, tea.KeyEnter)
+		if ok := <-r.C(); !ok {
+			t.Fatalf("%T made a typed `y` unacceptable", msg)
+		}
+	}
+}
+
 // TestConfirmKillClearsTheMark. ^U discards everything typed so far — that is the line discipline's
 // own semantics, and it is the operator's way back from a stray keystroke without abandoning the
 // operation. It cannot widen the accept-set: the reply must be typed again from nothing.

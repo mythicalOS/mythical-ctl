@@ -261,18 +261,18 @@ func (w *StreamWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// Close draws a trailing partial line. It adds NOTHING to the record — the bytes are already there,
-// exactly as they were written.
+// Close drops whatever partial line is still held. It adds NOTHING to the record — the bytes are
+// already there, exactly as written — and it DRAWS NOTHING.
+//
+// Drawing here was the last way the record and the screen could disagree about order: a partial
+// line held while a later step was narrated would be drawn AFTER that step, though its bytes are
+// recorded before it. And the draw bought nothing — Close runs when the verb has returned, so the
+// frame is erased and the record replayed within microseconds. Every line the screen shows is now
+// drawn at the position of the write that completed it, which is the same order the record has.
 func (w *StreamWriter) Close() error {
-	w.b.order.Lock()
-	defer w.b.order.Unlock()
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	rest := string(w.buf)
 	w.buf = nil
-	if rest != "" {
-		w.emit(rest)
-	}
 	return nil
 }
 

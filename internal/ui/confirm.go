@@ -79,12 +79,14 @@ type ConfirmRequestMsg struct {
 // Esc refuses. So does ^D, which is the operator saying there is no more input. So does the
 // interface going away without an answer — see Bridge.
 //
-// STATED RESIDUAL, not reachable by anything but the operator's own hands: Bubble Tea's input
-// decoder DISCARDS bytes that are not valid UTF-8 (including a typed or pasted U+FFFD) before any
-// model sees them, so a paste of "y" followed by such a byte arrives here as plain "y" and is
-// accepted, where the same bytes down a pipe would refuse. Nothing in a model can restore an event
-// it is never given. The exposure is nil in the sense that matters: a confirmation exists to
-// establish that the person at the keyboard deliberately said yes, and the person pasted a "y".
+// STATED RESIDUAL, narrowed to what it really is (measured against bubbletea v1.3.10): inside a
+// BRACKETED PASTE, and only there, the decoder drops every rune that decodes to U+FFFD — an invalid
+// byte, or a correctly encoded U+FFFD, both — before any model sees it. So pasting "y" followed by
+// such a byte arrives here as plain "y" and is accepted, where the same bytes down a pipe refuse.
+// Nothing in a model can restore an event it is never given. TYPED input is not affected: an
+// invalid byte outside a paste is delivered as its own message and marks the line (see Update).
+// The exposure is nil in the sense that matters: a confirmation exists to establish that the person
+// at the keyboard deliberately said yes, and the person pasted a "y".
 //
 // Signature note (a deliberate, documented widening of the plan's `Confirm(prompt string)
 // Overlay`): the constructor takes the Reply as well. An overlay with nowhere to send its answer
@@ -139,6 +141,18 @@ func (o ConfirmOverlay) accepted() bool {
 func (o ConfirmOverlay) Init() tea.Cmd { return nil }
 
 // Update implements Overlay.
+//
+// THE DEFAULT BRANCH MARKS THE LINE, and that is the whole point of writing it this way.
+//
+// Bubble Tea does not deliver only KeyMsg. Input it cannot map — an unknown CSI sequence from a key
+// this build has no name for (ctrl+delete on xterm, `ESC [ 3 ; 5 ~`), or a byte that is not valid
+// UTF-8 — arrives as its OWN message type, and those types are UNEXPORTED, so they cannot be named
+// here. Ignoring what cannot be named is how `y`, ctrl+delete, Enter came to ACCEPT while a pipe
+// carrying "y\x1b[3;5~" refuses. A mouse click or a focus change is not typed text either.
+//
+// So everything this package did not itself send is treated as input that is not text. A DATA
+// message added to this package later must be added to the list below; the failure if it is not is a
+// confirmation that refuses and says so in its own footer — loud, safe, and visible.
 func (o ConfirmOverlay) Update(msg tea.Msg) (Overlay, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -146,7 +160,13 @@ func (o ConfirmOverlay) Update(msg tea.Msg) (Overlay, tea.Cmd) {
 		return o, nil
 	case tea.KeyMsg:
 		return o.handleKey(msg)
+	case ProgressMsg, OutputMsg, PullProgressMsg, VerbDoneMsg,
+		ConfirmRequestMsg, PushOverlayMsg, PopOverlayMsg:
+		// This package's own messages, broadcast to every layer. They say nothing about what the
+		// operator typed.
+		return o, nil
 	}
+	o.marked = true
 	return o, nil
 }
 
