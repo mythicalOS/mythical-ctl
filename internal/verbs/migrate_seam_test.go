@@ -90,12 +90,29 @@ func TestPrepareRefusesAnotherProduct(t *testing.T) {
 // derive is not ours to replace, and preparing a replacement for it would mean building p1's
 // container while the phase removes something else.
 func TestPrepareRefusesAContainerThisInstallationDoesNotDerive(t *testing.T) {
-	r, s, rb, _, _ := preparedRig(t)
-	// A RESOLVED NETWORK, so the only thing that can refuse this call is the guard: with an
-	// unresolved one the launch assembly refuses first and the guard is never measured.
+	// ANOTHER INSTALLED PRODUCT'S CONTAINER, not an invented name. A name nothing installed
+	// derives has no recorded desired state either, so the readability check would refuse it first
+	// and this guard would never be measured; a sibling product's real container has one, which
+	// leaves the guard as the only thing that can refuse. It is also the realistic hazard: the two
+	// names differ by a product, not by a stranger's spelling.
+	r := newRig(t)
+	r.writeProduct("p1")
+	r.writeProduct("p2")
+	for _, p := range []string{"p1", "p2"} {
+		if rc := r.install(p); rc != 0 {
+			t.Fatalf("install %s rc = %d\n%s", p, rc, r.said())
+		}
+	}
+	c2 := r.container("p2")
+	s, oerr := openSession(r.d)
+	if oerr != nil {
+		t.Fatal(oerr)
+	}
+	defer s.close()
+	rb := &rebuilder{s: s, product: "p1"}
 	netID := netFor(t, s, rb)
 	before := r.fake.Snapshot()
-	_, err := rb.Prepare(context.Background(), s.l, "p1", "mythical-someoneelse-p1", netID)
+	_, err := rb.Prepare(context.Background(), s.l, "p1", c2, netID)
 	if err == nil {
 		t.Fatal("a container this installation does not derive was accepted")
 	}
