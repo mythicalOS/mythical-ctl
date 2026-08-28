@@ -18,7 +18,7 @@ This file grants no edit, run, commit, push, or release permission.
 |------|-----------|
 | `cmd/mythical-ctl/` | The entrypoint: argument parsing, verb dispatch, exit codes. |
 | `internal/*` | One package per module — layout, conf, trust, engine, runtime, verbs, and the rest. Tests live beside the code they test, hermetically (a fake container engine, no daemon). |
-| `check.sh` | **Every check this tree gets, in one place.** CI and a person run the same script; see its header for why the release lane is a stage in it rather than a second list of commands. |
+| `check.sh` | **Every check the GO TREE gets, in one place** — the `go`, `parity` and `release` lanes. CI and a person run the same script; see its header for why the release lane is a stage in it rather than a second list of commands. CI adds what is not Go: shellcheck, the executable-bit check, the public-safety gate, and two smoke runs. |
 | `tests/smoke.sh` | Transport-level CLI smoke — exit codes, the `--version` line, `-v` as its twin, usage errors staying off stdout. Run against a built binary (`MCTL_BIN`), or with nothing set, in which case it builds one. |
 | `tests/parity-manifest.tsv` | The retired bash suite's 1,178 test names, in committed form. `check.sh parity` proves every one of them is still accounted for by a `PORTED:`/`N/A:` inventory line in the Go tree. **Do not hand-edit it** — it is pinned by content digest in `tools/parity-audit`. |
 | `tools/` | `build-release.sh` + `release-verify` (the published artifacts and their grading), `parity-audit`, `boundary-gate`. |

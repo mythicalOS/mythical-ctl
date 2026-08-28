@@ -49,7 +49,18 @@ runs, and `set -e` cannot take your own shell with it:
 (
   set -e
   ver=v0.0.0            # the release you want
-  plat=darwin_arm64     # darwin_amd64 · darwin_arm64 · linux_amd64 · linux_arm64
+
+  # The platform is DERIVED, not chosen. All four artifacts have valid published
+  # digests, so a leftover choice from a copy-paste verifies perfectly and then
+  # installs a binary that cannot run on this machine — over a working one.
+  case "$(uname -s)/$(uname -m)" in
+    Darwin/arm64)              plat=darwin_arm64 ;;
+    Darwin/x86_64)             plat=darwin_amd64 ;;
+    Linux/x86_64)              plat=linux_amd64  ;;
+    Linux/aarch64|Linux/arm64) plat=linux_arm64  ;;
+    *) echo "no published binary for $(uname -s)/$(uname -m)"; exit 1 ;;
+  esac
+
   base="https://github.com/mythicalOS/mythical-ctl/releases/download/$ver"
 
   curl -fsSL --proto '=https' -O "$base/mythical-ctl_$plat"
@@ -68,11 +79,19 @@ runs, and `set -e` cannot take your own shell with it:
 )
 ```
 
-The version string is not the integrity guarantee — the digest is. Every published binary also
-carries a signed GitHub build-provenance attestation, so `gh attestation verify mythical-ctl
---repo mythicalOS/mythical-ctl` will tell you which workflow run, from which commit, produced
-exactly those bytes. [get.mythicalos.ai](https://get.mythicalos.ai) serves a pinned release
-artifact from here, so a product's own getting-started page can hand you the same bytes.
+If you have the GitHub CLI, one more check goes further than the digest — it says which workflow
+run, from which commit, produced exactly those bytes:
+
+```sh
+gh attestation verify /usr/local/bin/mythical-ctl --repo mythicalOS/mythical-ctl
+```
+
+(It takes a **file path**, so name the installed file — or run it on `mythical-ctl_<plat>` in the
+download directory, before the `mv`.)
+
+The version string is not the integrity guarantee — the digest is; anyone can print a version.
+[get.mythicalos.ai](https://get.mythicalos.ai) serves a pinned release artifact from here, so a
+product's own getting-started page can hand you the same bytes.
 
 Product images are pinned by content digest (`@sha256:…`) and verified by the container runtime on
 pull; if the bytes don't match, the install stops rather than run unverified bytes.

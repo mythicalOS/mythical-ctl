@@ -128,9 +128,11 @@ runtime, verbs and the rest — with tests beside the code they test. The engine
 hermetic fake rather than a daemon, so a green suite proves logic, not Docker behaviour;
 `bash check.sh acceptance` re-measures those behaviours against a real daemon and is opt-in.
 
-Every check lives in `check.sh`, which CI and a person run identically — spelling the commands out
-in a workflow as well guarantees the two drift, and the direction is always the same: the release
-lane ends up laxer than the pull-request lane.
+Every check the Go tree gets lives in `check.sh`, which CI and a person run identically — spelling
+the commands out in a workflow as well guarantees the two drift, and the direction is always the
+same: the release lane ends up laxer than the pull-request lane. CI adds the checks that are not
+Go: shellcheck over the four remaining scripts, an executable-bit check on the same four, a gate on
+what may appear in a public tree, and the smoke script twice.
 
 ```sh
 bash check.sh go        # gofmt, build, vet, the reference-boundary gate, the whole test suite

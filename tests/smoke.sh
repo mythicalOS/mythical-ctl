@@ -92,19 +92,26 @@ check_exit_code 'unknown command exits 2'       2 "$CTL" not-a-real-command
 # fail on every binary except a final release, which is the one this script least
 # needs to be able to run against.
 #
-# THE LINE COUNT IS PART OF THE ASSERTION, and it is not decoration. `grep -E`
+# THE WHOLE OF STDOUT IS THE ASSERTION, not "a line of it somewhere". `grep -E`
 # with anchors matches a LINE, so `junk\nmythical-ctl 1.2.3\n` satisfies the
-# pattern while being nothing a caller could parse. Requiring exactly one newline
-# in the whole file pins "one line, and it is terminated": zero newlines means an
-# unterminated line, two or more means there is something else on stdout.
-"$CTL" --version > "$WORK/version.out" 2>/dev/null
-version_line="$(cat "$WORK/version.out")"
-version_nl="$(wc -l < "$WORK/version.out" | tr -d '[:space:]')"
-if [ "$version_nl" = 1 ] \
-  && grep -qE '^mythical-ctl [0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' "$WORK/version.out"; then
-  printf '  ok    --version is one line, "mythical-ctl <semver>"\n'; pass=$((pass + 1))
+# pattern while being nothing a caller could parse — and counting NEWLINES does
+# not fix it either, because `mythical-ctl 1.2.3\nTRAILING-JUNK` has exactly one
+# newline and two records. So the capture is required to equal its own first line
+# plus a terminator, byte for byte: that is one record, terminated, and nothing
+# else on the stream. Then the shape is asked of that line.
+#
+# The redirect is rc-guarded. Under `set -e` an unguarded one aborts the script
+# on a binary whose --version fails, which truncates the report and drops the
+# summary — a run that tested less than it says, in silence.
+version_rc=0
+"$CTL" --version > "$WORK/version.out" 2>/dev/null || version_rc=$?
+version_line="$(head -n 1 "$WORK/version.out")"
+printf '%s\n' "$version_line" > "$WORK/version.want"
+if [ "$version_rc" -eq 0 ] && cmp -s "$WORK/version.out" "$WORK/version.want" \
+  && printf '%s' "$version_line" | grep -qE '^mythical-ctl [0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+  printf '  ok    --version is exactly one line, "mythical-ctl <semver>"\n'; pass=$((pass + 1))
 else
-  printf '  FAIL  --version: %d newline(s), content %q\n' "$version_nl" "$version_line"
+  printf '  FAIL  --version: rc=%d, stdout %q\n' "$version_rc" "$(cat "$WORK/version.out")"
   fail=$((fail + 1))
 fi
 
