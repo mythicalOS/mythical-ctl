@@ -1751,16 +1751,17 @@ func TestACancelledFIRSTReportIsStillPublished(t *testing.T) {
 //
 // WHAT THE OUTCOME GUARD GIVES BACK IS NARROWER THAN "it is discarded", and the narrow version is
 // the true one: an INTERRUPTED run never replaces a completed one, so a run torn off in that
-// window cannot reach the operator as the report. A run that both starts AND FINISHES before the
-// cancel is not torn, samples vctx.Err() as nil, and does replace; if it also finishes after Run
-// returned, the operator never saw it. So the unseen-replacement span is the five statements
-// between p.Run() returning and cancel() — not, as this said before, the one gap between
-// close(uiDone) and the cancel that immediately follows it. What escapes is a COMPLETE report the
-// operator
-// asked for, replacing an older complete one, which is what the refresh path is specified to do
-// (TestRunStatusRefreshRunsTheReportAgain); the code cannot differ either, since the only verb
-// this runner drives always returns 0. It is a stated residual of the runner, and this test
-// settles none of it either way.
+// window cannot reach the operator as the report. WHAT DECIDES "torn" IS THE vctx.Err() SAMPLE
+// taken on the instruction after the run returns — not the run returning — so an escape needs that
+// SAMPLE to land before the cancel; a run that finished in time but was descheduled before the
+// sample observes the cancellation and does not replace. A sample that does land in time belongs
+// to a run that was not torn, and it replaces; if it lands after p.Run() returned as well, the
+// operator never saw what replaced. That is the whole unseen-replacement span: the five statements
+// between p.Run() returning and cancel(), with the sample inside them. What escapes is a COMPLETE
+// report the operator asked for, replacing an older complete one, which is what the refresh path
+// is specified to do (TestRunStatusRefreshRunsTheReportAgain); the code cannot differ either,
+// since the only verb this runner drives always returns 0. It is a stated residual of the runner,
+// and this test settles none of it either way.
 //
 // So the interface is torn down here by the keystroke that tears it down for real. 'r' and 'q' are
 // queued together and this fake's loop handles them IN ORDER and runs each command synchronously,
