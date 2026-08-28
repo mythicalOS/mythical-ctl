@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -195,6 +196,257 @@ func TestCorruptStagingLedgerAuthorizesNoCleanup(t *testing.T) {
 func (r *rig) hasCorruptAside() bool {
 	matches, err := filepath.Glob(stagingPath(r.home) + ".corrupt.*")
 	return err == nil && len(matches) > 0
+}
+
+func (r *rig) corruptAsides() []string {
+	matches, err := filepath.Glob(stagingPath(r.home) + ".corrupt.*")
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	return matches
+}
+
+// checksummedLedger builds a ledger file body at an ARBITRARY schema, with a checksum that is
+// genuinely correct over its own bytes. A schema NEWER than this build understands is only
+// interesting if everything else about the file is right: a fixture with a wrong checksum would
+// be refused as corruption before the schema was ever looked at, and would prove nothing.
+func checksummedLedger(schema string, rows ...string) []byte {
+	body := "#mythical-ctl-ledger schema=" + schema + "\n"
+	for _, r := range rows {
+		body += r + "\n"
+	}
+	return []byte(body + "#sha256=" + cliio.SHA256Hex([]byte(body)) + "\n")
+}
+
+// stagingVerbs is the pair of entry points that act on the staging classification. BOTH of them
+// move a StateCorrupt ledger aside, so every test about what may be CALLED corruption has to
+// drive both — a fix applied to one path only is exactly the shape of defect this pair catches.
+var stagingVerbs = []struct {
+	name string
+	run  func(context.Context, Deps) error
+}{
+	{"restore", func(ctx context.Context, d Deps) error { return Restore(ctx, d, d.Home+"/nonexistent-backup") }},
+	{"restore --abandon", Abandon},
+}
+
+// TestPreservingCorruptEvidenceNeverOverwritesEarlierEvidence: the preservation step must not
+// destroy the thing it exists to keep.
+//
+// The destination used to be `<staging>.corrupt.<pid>` moved with a REPLACING os.Rename. A PID is
+// not a unique name — it is reused across processes, and within ONE process it is a constant — so
+// a second corruption computed the same destination as the first and silently overwrote it. The
+// bytes preserved as forensic evidence were gone, with nothing reporting that they had ever been
+// there: evidence of a corruption destroyed by the next corruption.
+//
+// TWO CORRUPTIONS IN ONE PROCESS is the case that needs no PID reuse at all, which is why it is
+// the one driven here — and it is exactly what an operator does: `restore`, read the refusal, then
+// `restore --abandon`.
+func TestPreservingCorruptEvidenceNeverOverwritesEarlierEvidence(t *testing.T) {
+	r := newRig(t)
+	r.backupOK()
+	r.dropLedger()
+	ctx := context.Background()
+
+	first := []byte("the FIRST corruption, and its bytes are the evidence\n")
+	write(t, stagingPath(r.home), first)
+	if err := Restore(ctx, r.deps(), r.bk); err == nil {
+		t.Fatal("a corrupt staging ledger authorized a restore")
+	}
+	asides := r.corruptAsides()
+	if len(asides) != 1 {
+		t.Fatalf("the first corruption was not preserved exactly once: %v", asides)
+	}
+	kept := asides[0]
+
+	second := []byte("the SECOND corruption, a different attempt entirely\n")
+	write(t, stagingPath(r.home), second)
+	r.reset()
+	if err := Abandon(ctx, r.deps()); err == nil {
+		t.Fatal("a corrupt staging ledger authorized an abandonment")
+	}
+
+	asides = r.corruptAsides()
+	if len(asides) != 2 {
+		t.Fatalf("two corruptions were preserved under %d name(s) — the second landed on the first: %v",
+			len(asides), asides)
+	}
+	got, err := os.ReadFile(kept)
+	if err != nil {
+		t.Fatalf("the first preserved evidence is gone: %v", err)
+	}
+	if string(got) != string(first) {
+		t.Fatalf("the first preserved evidence was overwritten:\n got %q\nwant %q", got, first)
+	}
+	// And the second is preserved too — a fix that simply refused the second preservation would
+	// keep the first file while losing the second, which is the same defect facing the other way.
+	var other string
+	for _, a := range asides {
+		if a != kept {
+			other = a
+		}
+	}
+	got, err = os.ReadFile(other)
+	if err != nil {
+		t.Fatalf("the second preserved evidence is gone: %v", err)
+	}
+	if string(got) != string(second) {
+		t.Fatalf("the second preserved evidence is not the second corruption:\n got %q\nwant %q", got, second)
+	}
+}
+
+// TestPreserveCorruptTakesOnlyAFreeName is the property one layer down, and it is the one a
+// same-name test cannot establish on its own: the move is a NO-REPLACE move, so a destination
+// occupied by ANYTHING — a regular file, a directory, a dangling symlink — is left exactly as it
+// is and the next candidate is taken. A check-then-rename would satisfy the regular-file case and
+// still replace whatever appeared in the window between the two calls.
+func TestPreserveCorruptTakesOnlyAFreeName(t *testing.T) {
+	for _, tc := range append(nonRegular, struct {
+		name string
+		make func(t *testing.T, p string)
+	}{"regular file", func(t *testing.T, p string) {
+		t.Helper()
+		write(t, p, []byte("evidence from an earlier run\n"))
+	}}) {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			sf := filepath.Join(dir, "ledger.staging")
+			want := []byte("the corruption being preserved now\n")
+			write(t, sf, want)
+			occupied := sf + ".corrupt." + strconv.Itoa(os.Getpid())
+			tc.make(t, occupied)
+			before := whatIsAt(occupied)
+
+			aside, residue, err := preserveCorrupt(sf)
+			if err != nil {
+				t.Fatalf("preserveCorrupt: %v", err)
+			}
+			if residue != nil {
+				t.Fatalf("an ordinary preservation reported a residue: %v", residue)
+			}
+			if aside == occupied {
+				t.Fatalf("preserveCorrupt took the occupied name %s", occupied)
+			}
+			if after := whatIsAt(occupied); after != before {
+				t.Fatalf("the occupied name changed from %q to %q", before, after)
+			}
+			got, rerr := os.ReadFile(aside)
+			if rerr != nil {
+				t.Fatalf("the evidence is not at the name preserveCorrupt returned: %v", rerr)
+			}
+			if string(got) != string(want) {
+				t.Fatalf("the preserved bytes are not the corrupt ledger:\n got %q\nwant %q", got, want)
+			}
+			if exists(sf) {
+				t.Fatal("the corrupt ledger is still sitting at the well-known staging name")
+			}
+		})
+	}
+}
+
+// TestNewerSchemaStagingLedgerIsNotCorruption pins the difference between an ANSWER about a
+// file and a REFUSAL to judge it.
+//
+// A schema-2 staging ledger is checksum-valid and parses cleanly; the single thing wrong with it
+// is that THIS build is too old to understand it. Classifying it as corruption made both verbs
+// move it aside — so a record a newer mythical-ctl wrote, and could still read, disappeared from
+// the well-known name because an older build met it. internal/ledger draws this line explicitly
+// (ErrNewerSchema is documented as "never mistaken for corruption"); this is the restore verb
+// holding the same line.
+func TestNewerSchemaStagingLedgerIsNotCorruption(t *testing.T) {
+	for _, v := range stagingVerbs {
+		t.Run(v.name, func(t *testing.T) {
+			r := newRig(t)
+			r.backupOK()
+			r.dropLedger()
+			want := checksummedLedger("2", "somekind\tkey=value")
+			write(t, stagingPath(r.home), want)
+			r.reset()
+
+			err := v.run(context.Background(), r.deps())
+			if err == nil {
+				t.Fatal("a staging ledger this build cannot read authorized the verb")
+			}
+			// A PURE REFUSAL: nothing is touched, so it must return BEFORE the confirmation gate
+			// rather than through it. Asking an operator to confirm an operation that cannot
+			// happen is how a refusal turns into a prompt they learn to answer yes to.
+			if len(r.prompts) != 0 {
+				t.Fatalf("a pure refusal asked for confirmation: %v", r.prompts)
+			}
+			out := r.stderr()
+			mustContain(t, out, "NEWER mythical-ctl", "the refusal")
+			mustContain(t, out, "LEFT EXACTLY", "the promise that nothing was touched")
+			mustNotContain(t, out, "does not validate", "corruption wording on a checksum-valid ledger")
+			mustNotContain(t, out, "PRESERVED at", "an aside report for a file that was not moved")
+
+			// THE FILE IS THE ASSERTION. Wording can be fixed later; a ledger that has been moved
+			// is gone from the name every other tool looks at.
+			if aside := r.corruptAsides(); len(aside) != 0 {
+				t.Fatalf("a checksum-valid newer-schema ledger was moved aside as corrupt: %v", aside)
+			}
+			got, rerr := os.ReadFile(stagingPath(r.home))
+			if rerr != nil {
+				t.Fatalf("the staging ledger is no longer at its own name: %v", rerr)
+			}
+			if string(got) != string(want) {
+				t.Fatalf("the staging ledger was rewritten:\n got %q\nwant %q", got, want)
+			}
+		})
+	}
+}
+
+// TestUnreadableStagingLedgerIsNotCorruption is the same rule for the other half of the same
+// fold: a read that FAILED is not a checksum that DISAGREED. Nothing here says anything about the
+// bytes, so nothing here may move them.
+//
+// THE PREMISE IS MEASURED, not assumed — a user that bypasses the mode bit (root, or a filesystem
+// that does not enforce it) would leave the read SUCCEEDING and turn every assertion below into a
+// statement about a different branch. Same discipline as TestCurrentStateRefusesAPathItCannotExamine.
+func TestUnreadableStagingLedgerIsNotCorruption(t *testing.T) {
+	for _, v := range stagingVerbs {
+		t.Run(v.name, func(t *testing.T) {
+			r := newRig(t)
+			r.backupOK()
+			r.dropLedger()
+			sf := stagingPath(r.home)
+			want := checksummedLedger(ledger.Schema, "somekind\tkey=value")
+			write(t, sf, want)
+			if err := os.Chmod(sf, 0o000); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.Chmod(sf, 0o600) })
+			if _, err := os.ReadFile(sf); err == nil {
+				t.Skipf("this user can still read %s — the unreadable branch is not reachable here", sf)
+			}
+			r.reset()
+
+			err := v.run(context.Background(), r.deps())
+			if err == nil {
+				t.Fatal("a staging ledger that could not be read authorized the verb")
+			}
+			if len(r.prompts) != 0 {
+				t.Fatalf("a pure refusal asked for confirmation: %v", r.prompts)
+			}
+			out := r.stderr()
+			mustContain(t, out, "could not be read", "the refusal")
+			mustContain(t, out, "never", "the reason: nothing was established")
+			mustNotContain(t, out, "does not validate", "corruption wording on a file nobody read")
+			mustNotContain(t, out, "PRESERVED at", "an aside report for a file that was not moved")
+
+			if aside := r.corruptAsides(); len(aside) != 0 {
+				t.Fatalf("a ledger nobody could read was moved aside as corrupt: %v", aside)
+			}
+			if err := os.Chmod(sf, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			got, rerr := os.ReadFile(sf)
+			if rerr != nil {
+				t.Fatalf("the staging ledger is no longer at its own name: %v", rerr)
+			}
+			if string(got) != string(want) {
+				t.Fatalf("the staging ledger was rewritten:\n got %q\nwant %q", got, want)
+			}
+		})
+	}
 }
 
 func TestPhase2CreatesWithTheRecordedNonceAndReInspects(t *testing.T) {

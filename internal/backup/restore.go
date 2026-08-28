@@ -30,7 +30,12 @@ const (
 	// StateNoIntent — a checksum-valid staging ledger with NO intent: phase 5 completed, so
 	// the only thing left is activation.
 	StateNoIntent State = "staging-no-intent"
-	// StateCorrupt — a staging ledger that does not validate. It authorizes nothing.
+	// StateCorrupt — a staging ledger POSITIVELY CONFIRMED corrupt (ledger.ErrCorrupt): its
+	// checksum, computed over a complete copy of its own bytes, disagrees with what they claim,
+	// or those proven bytes do not parse. It authorizes nothing. It is deliberately NOT the
+	// classification for "the ledger could not be read" or "a newer build wrote it" — both
+	// branches that act on this state MOVE THE FILE ASIDE, and a file may only be moved out of
+	// the way on evidence about the file, never on the failure of the question.
 	StateCorrupt State = "staging-corrupt"
 	// StateActive — this machine has a live installation. Restore is a RECOVERY operation and
 	// refuses.
@@ -50,6 +55,12 @@ const (
 // verb (create volumes, fill them, install a ledger at the active name), so it must mean
 // "nothing is there", not "the thing that is there is not a regular file" and not "I could not
 // look". See ledgerPresence.
+//
+// NOR IS THE VALIDITY QUESTION FOLDED, for the same reason one step further in. StateCorrupt is
+// the other authorizing answer: both verbs act on it by MOVING THE STAGING LEDGER ASIDE. So it
+// means "these bytes are confirmed wrong" and nothing else — a schema this build is too old to
+// read, and a read that failed outright, are refusals, and they return an error rather than a
+// state so that neither verb reaches a branch that touches the file.
 func CurrentState(d Deps) (State, error) {
 	if err := d.check(); err != nil {
 		return "", err
@@ -73,8 +84,39 @@ func CurrentState(d Deps) (State, error) {
 		return "", err
 	}
 	l, err := ledger.Read(st)
-	if err != nil {
+	switch {
+	case err == nil:
+	case errors.Is(err, ledger.ErrCorrupt):
+		// THE ONLY ANSWER THAT MAY BE CALLED CORRUPTION. ErrCorrupt is positive evidence about
+		// the BYTES: a checksum computed over a complete, faithfully-read copy of them disagrees
+		// with what they claim, or those proven bytes do not parse. Both callers of this
+		// classification act on StateCorrupt by MOVING THE FILE ASIDE, so every other read
+		// failure reaching this arm would be a file destroyed on the strength of a question that
+		// was never answered.
 		return StateCorrupt, nil
+	case errors.Is(err, ledger.ErrNewerSchema):
+		// CHECKSUM-VALID AND CLEANLY PARSED — written by a NEWER mythical-ctl. Nothing about it
+		// is corrupt; this build simply does not understand its schema. Classifying it as
+		// corruption moved a still-valid record a newer build wrote out of the way, which is
+		// the one thing an unreadable-but-intact file must never have happen to it.
+		d.warn("restore: the staging ledger was written by a NEWER mythical-ctl than this one:")
+		d.warn("    %s: %v", stagingPath(d.Home), err)
+		d.warn("  It is checksum-VALID and it parsed cleanly — this build does not understand its")
+		d.warn("  schema, which is not the same fact as its contents being wrong. It is LEFT EXACTLY")
+		d.warn("  WHERE IT IS: nothing is moved aside, nothing is removed, and no volume is touched.")
+		d.warn("  Upgrade mythical-ctl to a build that understands it and run this again.")
+		return "", fmt.Errorf("restore: the staging ledger was written by a newer mythical-ctl: %w", err)
+	default:
+		// THE QUESTION COULD NOT BE ASKED. An unreadable file, a file that vanished between the
+		// presence test and this read — none of it establishes anything about the bytes, so none
+		// of it may be reported as "the checksum failed" and none of it may authorize moving the
+		// file out of the way.
+		d.warn("restore: the staging ledger could not be read, so whether it is valid was never")
+		d.warn("  established:")
+		d.warn("    %s: %v", stagingPath(d.Home), err)
+		d.warn("  A read that FAILED is not a checksum that DISAGREED, and only the second is evidence")
+		d.warn("  about the bytes. Nothing is moved aside and nothing is removed.")
+		return "", fmt.Errorf("restore: the staging ledger could not be read: %w", err)
 	}
 	if _, ferr := l.Find(restoreKind, "key", "restore"); ferr != nil {
 		return StateNoIntent, nil
@@ -140,12 +182,13 @@ func Restore(ctx context.Context, d Deps, rawDir string) error {
 	case StateCorrupt:
 		// A CORRUPT STAGING LEDGER CANNOT AUTHORIZE CLEANUP — its contents are exactly what
 		// the checksum says not to trust.
-		aside, merr := preserveCorrupt(sf)
+		aside, residue, merr := preserveCorrupt(sf)
 		if merr != nil {
 			d.warn("restore: cannot preserve the corrupt staging ledger: %v", merr)
 			return fmt.Errorf("restore: cannot preserve the corrupt staging ledger: %w", merr)
 		}
 		d.warn("restore: the staging ledger does not validate. It has been PRESERVED at %s.", aside)
+		d.reportResidue(residue, sf)
 		d.warn("  It authorizes nothing: the record of which partial volumes a previous attempt created is")
 		d.warn("  exactly what the checksum says not to trust.")
 		d.warn("  Any partial volumes from that attempt are PRESERVED and are BLOCKING a fresh restore.")
@@ -620,12 +663,13 @@ func Abandon(ctx context.Context, d Deps) error {
 		// corrupt file in place here while the other path moved it aside would mean the SAME
 		// corrupt ledger is preserved as forensic evidence on one path and left sitting at the
 		// well-known name on the other, for no reason tied to what actually happened.
-		aside, merr := preserveCorrupt(sf)
+		aside, residue, merr := preserveCorrupt(sf)
 		if merr != nil {
 			d.warn("restore: cannot preserve the corrupt staging ledger: %v", merr)
 			return fmt.Errorf("restore: cannot preserve the corrupt staging ledger: %w", merr)
 		}
 		d.warn("restore: the staging ledger does not validate. It has been PRESERVED at %s.", aside)
+		d.reportResidue(residue, sf)
 		d.warn("  It authorizes no cleanup: the record of which partial volumes a previous attempt")
 		d.warn("  created is exactly what the checksum says not to trust.")
 		d.reportBlocking(ctx)
@@ -698,15 +742,72 @@ func Abandon(ctx context.Context, d Deps) error {
 	return nil
 }
 
-// preserveCorrupt moves the staging ledger aside under a name unique to this process and
-// returns where it went. It is EVIDENCE: a checksum that failed is a fact worth keeping, and
-// nothing else in this package is allowed to delete it.
-func preserveCorrupt(sf string) (string, error) {
-	aside := sf + ".corrupt." + strconv.Itoa(os.Getpid())
-	if err := os.Rename(sf, aside); err != nil {
-		return "", err
+// preserveCorrupt moves the staging ledger aside under a name NOTHING ELSE OCCUPIES and returns
+// where it went. It is EVIDENCE: a checksum that failed is a fact worth keeping, and nothing else
+// in this package is allowed to delete it.
+//
+// A PID IS NOT A UNIQUE NAME, AND os.Rename REPLACES. Together those two made the preservation
+// step destroy the very thing it exists to keep: PIDs are reused, and a single process reaching
+// this twice (the restore verb and then `restore --abandon`, or two staging ledgers in one run)
+// computes the SAME destination both times — so the second corruption silently overwrote the
+// first, and the bytes that were preserved as forensic evidence were gone with no record that
+// they had ever been there. "Evidence of a corruption destroyed by the next corruption" is the
+// module's own answer-versus-refusal rule broken by its own cleanup step.
+//
+// So the move is the same ATOMIC NO-REPLACE primitive activation uses (see activate.go): the
+// kernel decides, once, whether the destination is free, and installs the file only if it is.
+// A destination that IS occupied comes back as fs.ErrExist — an ANSWER — and the next candidate
+// name is tried. Nothing races between choosing a name and taking it, so two processes reaching
+// here at the same instant cannot both win the same one.
+//
+// THE RESIDUE IS RETURNED, NOT SWALLOWED, and it is not a failure. On a filesystem whose
+// no-replace rename is refused, activateRename falls back to link+unlink; if the link succeeds
+// and the unlink does not, the evidence IS at `aside` and a copy also remains at the staging
+// name. Reporting that as "cannot preserve" would tell an operator the bytes were lost when they
+// were kept, and reporting it as plain success would leave a second copy at the well-known name
+// unmentioned. Both callers say the two things separately.
+func preserveCorrupt(sf string) (aside string, residue error, err error) {
+	// A BOUND, so a directory that somehow answers EEXIST forever cannot spin. 128 is far past
+	// any real collision count: it takes 128 distinct preserved corruptions beside one staging
+	// ledger, none of them ever cleaned up.
+	const candidates = 128
+	base := sf + ".corrupt." + strconv.Itoa(os.Getpid())
+	for i := 0; i < candidates; i++ {
+		to := base
+		if i > 0 {
+			to += "-" + strconv.Itoa(i)
+		}
+		merr := activateRename(sf, to)
+		switch {
+		case merr == nil:
+			return to, nil, nil
+		case errors.Is(merr, errActivatedWithResidue):
+			// The move HAPPENED — `to` holds the corrupt bytes. Only the source could not be
+			// unlinked, which is a leftover, not a lost file.
+			return to, merr, nil
+		case errors.Is(merr, fs.ErrExist):
+			// AN ANSWER: that name is taken. Never retried through a replacing move — the whole
+			// point is that an occupied name is left alone.
+			continue
+		default:
+			return "", nil, merr
+		}
 	}
-	return aside, nil
+	return "", nil, fmt.Errorf("restore: %d preserved copies of a corrupt staging ledger already exist beside %s;\n"+
+		"  refusing to overwrite any of them. Move or remove them and run this again", candidates, sf)
+}
+
+// reportResidue says the second half of a preservation that half-succeeded: the evidence IS at
+// the aside name, and a copy is ALSO still at the staging name. It is deliberately not an error —
+// the bytes were kept — but it must be SAID, because the leftover sits at the well-known staging
+// name where the next run will meet it and preserve it all over again.
+func (d Deps) reportResidue(residue error, sf string) {
+	if residue == nil {
+		return
+	}
+	d.warn("  A COPY ALSO REMAINS at %s — the move was made by linking and the original could not be", sf)
+	d.warn("  unlinked: %v", residue)
+	d.warn("  The evidence is safe at the preserved name; remove the leftover yourself.")
 }
 
 // reportBlocking names the volumes that may belong to an attempt whose record just failed its

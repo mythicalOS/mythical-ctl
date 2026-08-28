@@ -3,9 +3,11 @@ package prov
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"mythicalos.ai/ctl/internal/engine"
@@ -623,44 +625,137 @@ func TestFirstUseLedgerNotRegular(t *testing.T) {
 	}
 }
 
+// resumePrescriptions are the two commands the in-progress-restore diagnostic tells the operator
+// to run, byte for byte. This diagnostic used to name `restore --resume`, which the CLI has never
+// had: the option loop refuses any unknown `-*` before the verb runs, so an operator recovering an
+// interrupted restore was handed "unknown option: --resume", exit 2. A recovery instruction that
+// cannot be executed is worse than none, and the only thing that keeps one honest is a test that
+// breaks when somebody renames the verb or the flag. The cmd package drives these strings through
+// the real dispatcher (TestStagingDiagnosticPrescribesRunnableCommands); this half pins the words.
+var resumePrescriptions = []string{
+	"'mythical-ctl restore <the same backup directory>'",
+	"'mythical-ctl restore --abandon'",
+}
+
 func TestFirstUseStaging(t *testing.T) {
-	// An in-progress restore is its own third state: not first use, not inconsistent-with-traces.
-	// Any PRESENCE at the path is the marker — a restore that failed while creating it is exactly
-	// the case this catches.
-	for _, mk := range []func(t *testing.T, h string){
-		func(t *testing.T, h string) { mustWrite(t, filepath.Join(h, ".state", "ledger.staging"), "x") },
-		func(t *testing.T, h string) { mustMkdir(t, filepath.Join(h, ".state", "ledger.staging")) },
-		func(t *testing.T, h string) {
+	// A REGULAR staging ledger is the in-progress restore: its own third state, not first use and
+	// not inconsistent. It is the ONLY shape the resume-or-abandon prescription is true of.
+	home := homeWith(t, func(h string) { mustWrite(t, filepath.Join(h, ".state", "ledger.staging"), "x") })
+	err := FirstUse(context.Background(), home, newFakeObjs())
+	if err == nil || !strings.Contains(err.Error(), "restore is in progress") {
+		t.Fatalf("a regular staging ledger is an in-progress restore: %v", err)
+	}
+	for _, cmd := range resumePrescriptions {
+		if !strings.Contains(err.Error(), cmd) {
+			t.Fatalf("the in-progress-restore diagnostic does not prescribe %s:\n%v", cmd, err)
+		}
+	}
+	if strings.Contains(err.Error(), "--resume") {
+		t.Fatalf("the diagnostic prescribes a --resume flag the CLI does not have:\n%v", err)
+	}
+}
+
+// TestFirstUseStagingNotRegular: a staging path that is NOT a regular file still BLOCKS first use —
+// a restore that failed while creating it is exactly the case that leaves a directory or a
+// dangling symlink there, and a machine with one is not fresh.
+//
+// BUT IT IS NOT A RESUMABLE RESTORE, AND SAYING IT IS WAS THE DEFECT. These shapes got the
+// in-progress diagnostic and its two prescribed commands — and internal/backup's own classifier
+// REFUSES a staging path that is not a regular file, so both commands could only produce a second
+// refusal. Prescribing a recovery the tool will not perform is an ANSWER given where the truth is
+// a refusal, and it is handed to the operator at the one moment they are following instructions
+// literally.
+func TestFirstUseStagingNotRegular(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		make func(t *testing.T, h string)
+	}{
+		{"directory", func(t *testing.T, h string) { mustMkdir(t, filepath.Join(h, ".state", "ledger.staging")) }},
+		{"dangling symlink", func(t *testing.T, h string) {
 			if err := os.Symlink(filepath.Join(h, "gone"), filepath.Join(h, ".state", "ledger.staging")); err != nil {
 				t.Fatal(err)
 			}
-		},
-	} {
-		home := homeWith(t, func(h string) { mk(t, h) })
-		err := FirstUse(context.Background(), home, newFakeObjs())
-		if err == nil || !strings.Contains(err.Error(), "restore is in progress") {
-			t.Fatalf("staging marker: %v", err)
-		}
-		// AND THE TWO COMMANDS IT PRESCRIBES ARE PINNED HERE, BYTE FOR BYTE. This diagnostic used
-		// to name `restore --resume`, which the CLI has never had: the option loop refuses any
-		// unknown `-*` before the verb runs, so an operator recovering an interrupted restore was
-		// handed "unknown option: --resume", exit 2. A recovery instruction that cannot be
-		// executed is worse than none, and the only thing that keeps one honest is a test that
-		// breaks when somebody renames the verb or the flag. The cmd package drives both of these
-		// strings through the real dispatcher (TestStagingDiagnosticPrescribesRunnableCommands);
-		// this half pins the words.
-		for _, cmd := range []string{
-			"'mythical-ctl restore <the same backup directory>'",
-			"'mythical-ctl restore --abandon'",
-		} {
-			if !strings.Contains(err.Error(), cmd) {
-				t.Fatalf("the in-progress-restore diagnostic does not prescribe %s:\n%v", cmd, err)
+		}},
+		{"named pipe", func(t *testing.T, h string) {
+			if err := syscall.Mkfifo(filepath.Join(h, ".state", "ledger.staging"), 0o600); err != nil {
+				t.Fatal(err)
 			}
-		}
-		if strings.Contains(err.Error(), "--resume") {
-			t.Fatalf("the diagnostic prescribes a --resume flag the CLI does not have:\n%v", err)
-		}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := homeWith(t, func(h string) { tc.make(t, h) })
+			err := FirstUse(context.Background(), home, newFakeObjs())
+			// STILL BLOCKS: present is present, and a present staging path is not a fresh machine.
+			if err == nil || errors.Is(err, ErrNotFirstUse) {
+				t.Fatalf("a %s at the staging path did not block first use: %v", tc.name, err)
+			}
+			if !strings.Contains(err.Error(), "not a regular file") {
+				t.Fatalf("the refusal does not say what is wrong with the path:\n%v", err)
+			}
+			if !strings.Contains(err.Error(), "'mythical-ctl state repair'") {
+				t.Fatalf("the refusal prescribes nothing runnable:\n%v", err)
+			}
+			// AND IT DOES NOT PRESCRIBE A RECOVERY THE RESTORE VERB WILL REFUSE.
+			for _, cmd := range resumePrescriptions {
+				if strings.Contains(err.Error(), cmd) {
+					t.Fatalf("a %s at the staging path was prescribed %s, which the restore verb refuses for\n"+
+						"this exact path:\n%v", tc.name, cmd, err)
+				}
+			}
+		})
 	}
+}
+
+// TestFirstUseStagingUnexaminable covers the fourth fact the single `err == nil` test folded away,
+// and it is the fail-open one: an Lstat that failed for anything other than ENOENT fell THROUGH,
+// past the staging state entirely, toward "genuinely first use" — the one answer that authorizes
+// initialising over this machine.
+//
+// REACHING IT NEEDS THE STAGING PATH TO FAIL WHILE THE ACTIVE ONE ANSWERS CLEANLY, and the two
+// live in the same directory, so no permission bit can separate them — an unsearchable `.state`
+// stops the ACTIVE ledger's own Lstat first and asserts nothing about this branch. What does
+// separate them is their LENGTH: `ledger.staging` is seven bytes longer than `ledger`, so a home
+// can be grown until the active path still fits under the path limit and the staging path does
+// not. That window is exactly seven bytes wide, so it is found by measurement, one byte at a time,
+// and the premise is re-measured before the assertion rather than assumed.
+func TestFirstUseStagingUnexaminable(t *testing.T) {
+	home := homeTooLongForTheStagingPathOnly(t)
+	err := FirstUse(context.Background(), home, newFakeObjs())
+	if err == nil || errors.Is(err, ErrNotFirstUse) {
+		t.Fatalf("a staging path nobody could examine was read as an answer: %v", err)
+	}
+	// The two halves are asserted separately because the message wraps between them.
+	if !strings.Contains(err.Error(), "staging ledger path could not be examined") ||
+		!strings.Contains(err.Error(), "absence cannot be") ||
+		!strings.Contains(err.Error(), "established — refusing rather than treating this as a fresh machine") {
+		t.Fatalf("the refusal does not say the STAGING question failed:\n%v", err)
+	}
+}
+
+// homeTooLongForTheStagingPathOnly grows a directory until `<home>/.state/ledger` still answers a
+// clean ENOENT while `<home>/.state/ledger.staging` answers something else — ENAMETOOLONG in
+// practice. It returns a home whose ReadDir still works, so every step of FirstUse before the
+// staging question runs normally.
+func homeTooLongForTheStagingPathOnly(t *testing.T) string {
+	t.Helper()
+	home := t.TempDir()
+	for i := 0; i < 5000; i++ {
+		led := filepath.Join(home, ".state", "ledger")
+		_, lerr := os.Lstat(led)
+		_, serr := os.Lstat(led + ".staging")
+		if errors.Is(lerr, fs.ErrNotExist) && serr != nil && !errors.Is(serr, fs.ErrNotExist) {
+			// Measured, not assumed: this is the state the branch under test needs.
+			return home
+		}
+		next := filepath.Join(home, "a")
+		if err := os.Mkdir(next, 0o755); err != nil {
+			t.Skipf("this filesystem does not reach a path-length limit that separates the two ledger "+
+				"paths (%v) — the unexaminable-staging branch is not reachable here", err)
+		}
+		home = next
+	}
+	t.Skip("no path length separated the active and staging ledger paths — the branch is not reachable here")
+	return ""
 }
 
 func TestFirstUseTraces(t *testing.T) {

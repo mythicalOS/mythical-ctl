@@ -197,6 +197,23 @@ func provenOurs(ctx context.Context, d Deps, l *ledger.Ledger, container, nonce 
 	return nil
 }
 
+// imageRefusal is the one refusal both confirmation sites make about the image identity.
+//
+// AN EMPTY ANSWER AND A FAILED QUESTION ARE DIFFERENT FACTS and it says which. Neither may be
+// written into a provenance record: the record is what a later run reads to know what this
+// container was built from, and `id=` with nothing after it is not a smaller answer, it is a
+// record that will be believed and cannot be checked.
+func imageRefusal(container string, ierr error, kept string) error {
+	if ierr != nil {
+		return fmt.Errorf("bringup: the image %q was created from could not be read, so its provenance record would\n"+
+			"  carry no image identity — and a confirmed record nothing can check is worse than an\n"+
+			"  unfinished one. %s: %w", container, kept, errors.Join(errCannotAsk, ierr))
+	}
+	return fmt.Errorf("bringup: the runtime reports NO image for %q. A provenance record confirmed with an empty\n"+
+		"  image identity says this container was built from nothing, which is not a fact anything\n"+
+		"  measured. %s.", container, kept)
+}
+
 func barrier(d Deps, l *ledger.Ledger, what string) error {
 	if d.Persist == nil {
 		return fmt.Errorf("bringup: refusing to %s with no way to persist the record written ahead of it —\n"+
@@ -468,7 +485,20 @@ func Run(ctx context.Context, l *ledger.Ledger, d Deps, launch Launcher, contain
 				"  %v\n"+
 				"  It failed to verify because: %w", container, oerr, verr)
 		}
-		_ = d.Mut.ContainerRemove(ctx, container)
+		// THE REMOVAL'S OWN STATUS IS CHECKED, NEVER DISCARDED. This used to be
+		// `_ = d.Mut.ContainerRemove(...)` with the very next line telling the operator the
+		// container was removed — so a daemon that REFUSED the removal produced a message saying
+		// the object is gone while it was still standing, running or not, under this
+		// installation's labels. An operator told a container was removed does not go looking for
+		// it, and that is the whole cost: the report is the only thing they act on.
+		if rerr := d.Mut.ContainerRemove(ctx, container); rerr != nil {
+			return fmt.Errorf("bringup: %q did not verify, and REMOVING IT FAILED — the container this bring-up\n"+
+				"  created and owns is STILL THERE, unverified and unconfirmed. Nothing was confirmed and\n"+
+				"  nothing was started; the write-ahead intent is KEPT, so a recovery can finish or unwind\n"+
+				"  it. Remove it yourself, or re-run once the runtime accepts the removal.\n"+
+				"  The removal failed because: %v\n"+
+				"  It failed to verify because: %w", container, rerr, verr)
+		}
 		return fmt.Errorf("bringup: removed %q because it did not verify. Nothing was confirmed: %w", container, verr)
 	}
 	// OWNERSHIP IS RE-ESTABLISHED BEFORE CONFIRMATION rather than assumed from the create. A create
@@ -492,7 +522,18 @@ func Run(ctx context.Context, l *ledger.Ledger, d Deps, launch Launcher, contain
 	// intent — and a Confirm that refused left the commit behind. The commit still comes before the
 	// confirmation WITHIN the transaction, because a crash between them must not leave a container
 	// accounted for with no desired state.
-	image, _ := d.Objs.Image(ctx, container)
+	//
+	// THE IMAGE IS READ BEFORE THE TRANSACTION, AND A FAILED READ REFUSES. This used to be
+	// `image, _ := ...`, so an inspection that failed confirmed the provenance record with an
+	// EMPTY image identity and CONSUMED the intent — the record that would have said this
+	// bring-up never finished. The result was a success return over a container accounted for
+	// with no image, and nothing left on disk to notice it. Refusing HERE, before staged(),
+	// leaves the caller's ledger byte-identical and the intent open, which is exactly the state a
+	// recovery is written for.
+	image, ierr := d.Objs.Image(ctx, container)
+	if ierr != nil || image == "" {
+		return imageRefusal(container, ierr, "The intent is KEPT and nothing is started")
+	}
 	if err := staged(d, l, what, func(c *ledger.Ledger) error {
 		if cerr := state.Commit(c, container, want, []state.Check{{Kind: state.CheckAlias, Param: netID}}, false); cerr != nil {
 			return cerr
@@ -591,7 +632,19 @@ func Recover(ctx context.Context, l *ledger.Ledger, d Deps, container, netID, al
 			"  %w", container, oerr)
 	}
 	if verr := VerifyAttach(ctx, l, d, container, netID, alias); verr != nil {
-		_ = d.Mut.ContainerRemove(ctx, container)
+		// A FAILED REMOVAL IS NOT A REBUILD, and that is the second half of checking it. The
+		// caller acts on ErrRebuild by RE-CREATING the container from its launch spec — under the
+		// same derived name. If the removal was refused, that name is still held by the container
+		// standing here, so the rebuild would meet itself as a same-name survivor. So the error
+		// says the container REMAINS and deliberately does not carry ErrRebuild.
+		if rerr := d.Mut.ContainerRemove(ctx, container); rerr != nil {
+			return fmt.Errorf("bringup: the intent for %q describes a container whose topology does not verify, and\n"+
+				"  REMOVING IT FAILED — it is STILL THERE, still holding that name. Nothing is confirmed,\n"+
+				"  the intent is KEPT, and no rebuild is asked for: re-creating under a name this\n"+
+				"  container still holds would meet it as a same-name survivor.\n"+
+				"  The removal failed because: %v\n"+
+				"  The topology does not verify because: %w", container, rerr, verr)
+		}
 		return fmt.Errorf("bringup: removed %q — it was created but its topology does not verify, and a\n"+
 			"  confirmed-but-detached container is a state this sequence must never produce: %w",
 			container, errors.Join(ErrRebuild, verr))
@@ -601,7 +654,13 @@ func Recover(ctx context.Context, l *ledger.Ledger, d Deps, container, netID, al
 	// behind — a recovery that reported failure while having already half-finished the intent it
 	// was recovering. Recover does not persist: its caller writes the ledger once, so what this
 	// owes is that a refusal leaves that ledger byte-identical.
-	image, _ := d.Objs.Image(ctx, container)
+	//
+	// SAME REFUSAL, SAME REASON, one step before the clone — so the caller's ledger is
+	// byte-identical, which is the whole of what Recover owes on a refusal.
+	image, ierr := d.Objs.Image(ctx, container)
+	if ierr != nil || image == "" {
+		return imageRefusal(container, ierr, "The intent is KEPT and nothing is confirmed")
+	}
 	cp := l.Clone()
 	if cerr := state.Commit(cp, container, want, []state.Check{{Kind: state.CheckAlias, Param: param}}, false); cerr != nil {
 		return cerr

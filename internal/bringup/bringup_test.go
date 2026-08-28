@@ -81,16 +81,17 @@ const (
 )
 
 type fakeObjs struct {
-	nets    map[string][]Attachment
-	labels  map[string]map[string]string
-	image   map[string]string
-	err     map[string]error
-	netCall int
+	nets     map[string][]Attachment
+	labels   map[string]map[string]string
+	image    map[string]string
+	imageErr map[string]error
+	err      map[string]error
+	netCall  int
 }
 
 func newObjs() *fakeObjs {
 	return &fakeObjs{nets: map[string][]Attachment{}, labels: map[string]map[string]string{},
-		image: map[string]string{}, err: map[string]error{}}
+		image: map[string]string{}, imageErr: map[string]error{}, err: map[string]error{}}
 }
 
 func (f *fakeObjs) Attachments(_ context.Context, c string) ([]Attachment, error) {
@@ -112,12 +113,24 @@ func (f *fakeObjs) Label(_ context.Context, c, label string) (string, error) {
 	return m[label], nil
 }
 
-func (f *fakeObjs) Image(_ context.Context, c string) (string, error) { return f.image[c], nil }
+// imageErr is its own knob rather than reusing `err`: `err` fails Attachments and Label too, so a
+// container using it never reaches the image read at all. The defect under test is an inspection
+// that fails while everything BEFORE it succeeded.
+func (f *fakeObjs) Image(_ context.Context, c string) (string, error) {
+	if err := f.imageErr[c]; err != nil {
+		return "", err
+	}
+	return f.image[c], nil
+}
 
 type fakeMut struct {
 	started, stopped, removed []string
 	startErr, stopErr         error
-	onStart                   func()
+	// removeErr is the daemon REFUSING a removal — the commonest real cause being a volume or a
+	// network still bound to the container. `removed` still records the attempt, so a test can
+	// tell "never asked" from "asked and refused".
+	removeErr error
+	onStart   func()
 	// atStartEntry fires as the FIRST thing ContainerStart does, so a test can observe what DISK
 	// held at the instant the runtime was asked to act. Inspecting after the call returns cannot
 	// tell "written before" from "written after" — which is what made the first durability tests
@@ -141,7 +154,7 @@ func (m *fakeMut) ContainerStop(_ context.Context, id string) error {
 }
 func (m *fakeMut) ContainerRemove(_ context.Context, id string) error {
 	m.removed = append(m.removed, id)
-	return nil
+	return m.removeErr
 }
 
 type fakeProbe struct {
@@ -1395,5 +1408,199 @@ func TestReconcilerSaysWhyItDidNothing(t *testing.T) {
 	st4.down(c1)
 	if err := Reconcile(ctx, l4, d4, c1, net1, al1); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// --- a removal that was REFUSED, and a confirmation with no image identity ----------------------
+
+// errRemoveRefused is what a daemon says when it will not remove a container — most often because
+// something is still bound to it.
+var errRemoveRefused = errors.New("container is in use by a running task")
+
+// TestRunReportsAContainerItCouldNotRemove: the removal's status is the operator's whole picture.
+//
+// Both removal sites used to read `_ = d.Mut.ContainerRemove(ctx, container)` with the NEXT LINE
+// telling the operator the container was removed. A daemon that refused the removal therefore
+// produced "removed %q" about an object that is still standing, under this installation's labels,
+// at this installation's derived name. An operator told a container was removed has no reason to
+// look for it — so the object outlives the run, invisible, and the next bring-up meets it as a
+// same-name survivor for reasons nothing in the transcript explains.
+func TestRunReportsAContainerItCouldNotRemove(t *testing.T) {
+	ctx := context.Background()
+	l, objs, mut, _, st, d := fixture(t)
+	mut.removeErr = errRemoveRefused
+	lau := &fakeLauncher{objs: objs, st: st, nets: []Attachment{attach(net3, "", al1)}} // wrong network
+	err := Run(ctx, l, d, lau, c1, net1, al1, Running)
+	if err == nil {
+		t.Fatal("a bring-up whose container could not be removed reported success")
+	}
+	// IT WAS ASKED — the fix is checking the answer, not skipping the attempt.
+	if len(mut.removed) != 1 || mut.removed[0] != c1 {
+		t.Fatalf("the removal was not attempted: %v", mut.removed)
+	}
+	if strings.Contains(err.Error(), "removed \"") {
+		t.Fatalf("a container that was NOT removed was reported as removed: %v", err)
+	}
+	for _, want := range []string{"REMOVING IT FAILED", "STILL THERE", errRemoveRefused.Error()} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("the report does not say %q:\n%v", want, err)
+		}
+	}
+	// The verification failure that prompted the removal is reported ALONGSIDE it, not replaced
+	// by it: an operator needs both facts to know what to do next.
+	if !strings.Contains(err.Error(), "not permitted") {
+		t.Fatalf("the report drops the verification failure that prompted the removal:\n%v", err)
+	}
+	// And nothing was confirmed, while the write-ahead intent is kept.
+	if _, ferr := prov.Find(l, prov.ClassContainer, c1); !errors.Is(ferr, ledger.ErrAbsentRecord) {
+		t.Fatal("provenance was confirmed for a container that did not verify")
+	}
+	if _, ierr := intent.Find(l, prov.ClassContainer, c1); ierr != nil {
+		t.Fatalf("the write-ahead intent was consumed: %v", ierr)
+	}
+	if len(mut.started) != 0 {
+		t.Fatalf("an unverified container was started: %v", mut.started)
+	}
+}
+
+// TestRecoverReportsAContainerItCouldNotRemove is the same fact on the recovery path, plus the
+// consequence that is specific to it: the caller acts on ErrRebuild by RE-CREATING the container
+// from its launch spec, under the same derived name. If the removal was refused, that name is
+// still held by the container standing here — so asking for a rebuild sends the caller to meet
+// this very container as a same-name survivor. The refusal must not carry ErrRebuild.
+func TestRecoverReportsAContainerItCouldNotRemove(t *testing.T) {
+	ctx := context.Background()
+	l, objs, mut, _, st, d := fixture(t)
+	mut.removeErr = errRemoveRefused
+	crashedAfterCreate(t, l, objs, st, state.Running, net1, []Attachment{attach(net3, "", al1)})
+	err := Recover(ctx, l, d, c1, net1, al1)
+	if err == nil {
+		t.Fatal("a recovery whose container could not be removed reported success")
+	}
+	if len(mut.removed) != 1 {
+		t.Fatalf("the removal was not attempted: %v", mut.removed)
+	}
+	if strings.Contains(err.Error(), "removed \"") {
+		t.Fatalf("a container that was NOT removed was reported as removed: %v", err)
+	}
+	if errors.Is(err, ErrRebuild) {
+		t.Fatalf("a rebuild was requested for a name the unremoved container still holds:\n%v", err)
+	}
+	for _, want := range []string{"REMOVING IT FAILED", "STILL THERE", "same-name survivor", errRemoveRefused.Error()} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("the report does not say %q:\n%v", want, err)
+		}
+	}
+	if _, ferr := prov.Find(l, prov.ClassContainer, c1); !errors.Is(ferr, ledger.ErrAbsentRecord) {
+		t.Fatal("provenance was confirmed for a container that did not verify")
+	}
+	if _, ierr := intent.Find(l, prov.ClassContainer, c1); ierr != nil {
+		t.Fatalf("the intent was consumed by a recovery that removed nothing: %v", ierr)
+	}
+}
+
+// imageUnknown is the two ways the image identity can fail to arrive. They are DIFFERENT FACTS —
+// a failed question and an empty answer — and each has to refuse on its own.
+var imageUnknown = []struct {
+	name  string
+	arm   func(objs *fakeObjs)
+	wants []string
+}{
+	{"the inspection failed", func(objs *fakeObjs) {
+		objs.imageErr[c1] = errors.New("inspect: connection reset")
+	}, []string{"could not be read", "connection reset"}},
+	{"the runtime reports no image", func(objs *fakeObjs) {
+		objs.image[c1] = ""
+	}, []string{"NO image"}},
+}
+
+// TestRunRefusesToConfirmWithoutAnImageIdentity: `image, _ := d.Objs.Image(...)` discarded the
+// error and then wrote `id=<image>` into the provenance record and CONSUMED the intent — in one
+// transaction, reported as success. So a failed inspection produced a confirmed container record
+// carrying no image identity, and the one thing on disk that would have said this bring-up never
+// finished was gone. Nothing afterwards can tell that record from a good one.
+//
+// The refusal is made BEFORE the staged transaction, which is what makes it free: staged() edits a
+// clone and publishes only after the write succeeds, so refusing ahead of it leaves the caller's
+// ledger byte-identical and the intent open — exactly the state Recover is written for.
+func TestRunRefusesToConfirmWithoutAnImageIdentity(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range imageUnknown {
+		t.Run(tc.name, func(t *testing.T) {
+			l, objs, mut, pr, st, d := fixture(t)
+			dk := &disk{}
+			d.Persist = dk.persist()
+			lau := &fakeLauncher{objs: objs, st: st, nets: []Attachment{attach(net1, "", al1)}}
+			pr.resolveTo[net1+"/"+al1] = "10.0.0.2"
+			// The launcher sets a good image; the arm removes it AFTER the create, which is when
+			// the inspection actually happens.
+			lau.after = func() { tc.arm(objs) }
+
+			err := Run(ctx, l, d, lau, c1, net1, al1, Running)
+			if err == nil {
+				t.Fatal("a bring-up confirmed provenance with no image identity")
+			}
+			for _, want := range append(tc.wants, "The intent is KEPT") {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("the refusal does not say %q:\n%v", want, err)
+				}
+			}
+			if len(mut.started) != 0 {
+				t.Fatalf("an unconfirmed container was started: %v", mut.started)
+			}
+			// IN MEMORY: nothing confirmed, the intent still open.
+			if _, ferr := prov.Find(l, prov.ClassContainer, c1); !errors.Is(ferr, ledger.ErrAbsentRecord) {
+				t.Fatal("provenance was confirmed without an image identity")
+			}
+			if _, serr := state.DesiredGet(l, c1); !errors.Is(serr, ledger.ErrAbsentRecord) {
+				t.Fatal("desired state was committed by a refused confirmation")
+			}
+			if _, ierr := intent.Find(l, prov.ClassContainer, c1); ierr != nil {
+				t.Fatalf("the intent was consumed by a refused confirmation: %v", ierr)
+			}
+			// AND ON DISK: the last thing persisted is still the write-ahead intent — the
+			// confirmation transaction never ran, so the record a recovery reads is intact.
+			back := dk.reload()
+			if _, ierr := intent.Find(back, prov.ClassContainer, c1); ierr != nil {
+				t.Fatalf("the persisted intent is gone, so nothing can recover this bring-up: %v", ierr)
+			}
+			if _, ferr := prov.Find(back, prov.ClassContainer, c1); !errors.Is(ferr, ledger.ErrAbsentRecord) {
+				t.Fatal("a confirmation with no image identity reached disk")
+			}
+		})
+	}
+}
+
+// TestRecoverRefusesToConfirmWithoutAnImageIdentity is the same refusal on the recovery path. What
+// it owes additionally is Recover's own contract: it does not persist, so a refusal must leave the
+// caller's ledger BYTE-IDENTICAL to what it was handed.
+func TestRecoverRefusesToConfirmWithoutAnImageIdentity(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range imageUnknown {
+		t.Run(tc.name, func(t *testing.T) {
+			l, objs, mut, _, st, d := fixture(t)
+			crashedAfterCreate(t, l, objs, st, state.Running, net1, []Attachment{attach(net1, "", al1)})
+			tc.arm(objs)
+			before := strings.Join(l.Lines(), "\n")
+
+			err := Recover(ctx, l, d, c1, net1, al1)
+			if err == nil {
+				t.Fatal("a recovery confirmed provenance with no image identity")
+			}
+			for _, want := range append(tc.wants, "The intent is KEPT") {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("the refusal does not say %q:\n%v", want, err)
+				}
+			}
+			if len(mut.removed) != 0 {
+				t.Fatalf("a container was removed by a refusal about its image: %v", mut.removed)
+			}
+			if got := strings.Join(l.Lines(), "\n"); got != before {
+				t.Fatalf("a refused recovery changed the caller's ledger:\n got %q\nwant %q", got, before)
+			}
+			if _, ierr := intent.Find(l, prov.ClassContainer, c1); ierr != nil {
+				t.Fatalf("the intent was consumed by a refused recovery: %v", ierr)
+			}
+		})
 	}
 }

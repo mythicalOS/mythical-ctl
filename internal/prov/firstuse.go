@@ -116,9 +116,24 @@ func FirstUse(ctx context.Context, home string, objs Objects) error {
 	}
 
 	// A STAGING ledger is its own third state (§6c/D59): an in-progress restore is not first use
-	// and not inconsistent. Any presence at the path is the marker, for the same reason as the
-	// active ledger above — a restore that failed while creating it is exactly the case this
-	// branch catches.
+	// and not inconsistent.
+	//
+	// BUT ONLY A REGULAR FILE IS THAT STATE, AND THE OTHER THREE ANSWERS ARE NOT IT. This asked
+	// one question — `Lstat succeeded` — and folded four facts into two wrong ones.
+	//
+	//   - A DIRECTORY, a device node or a symlink at that path got the RESUMABLE-RESTORE
+	//     diagnostic and its two prescribed commands. Neither command can act on it: the restore
+	//     verb classifies the machine first and REFUSES a staging path that is not a regular
+	//     file, so the operator was handed instructions whose only possible outcome is a second
+	//     refusal. That is an ANSWER ("a restore is in progress, here is how to finish it") given
+	//     where the truth is a REFUSAL ("something is there that nothing can classify").
+	//   - An Lstat that FAILED for any other reason fell straight through toward GENUINE FIRST
+	//     USE — the fail-open on the single thing this function decides. "I could not look" is
+	//     not "there is nothing here", and this is the one path where reading it that way ends in
+	//     initialising over a machine that is not fresh.
+	//
+	// So the four are separated: regular ⇒ resume, present-but-not-regular ⇒ inconsistent,
+	// ENOENT ⇒ genuinely absent (fall through), anything else ⇒ refuse.
 	// THE PRESCRIBED COMMANDS ARE THE ONES THE CLI ACTUALLY HAS. This diagnostic named a
 	// `restore --resume` flag that does not exist and never did: the option loop refuses any
 	// unknown `-*` before the verb runs, so an operator following it literally got
@@ -136,14 +151,31 @@ func FirstUse(ctx context.Context, home string, objs Objects) error {
 	// possessive in the surrounding sentence closes one prescription early and swallows the next
 	// — which is not a cosmetic problem: the reader that extracts these commands and runs them
 	// then never sees the second one. Measured while writing this fix; the guard is
-	// TestStagingDiagnosticPrescribesRunnableCommands requiring at least two runnable commands.
-	if _, err := os.Lstat(filepath.Join(home, ".state", "ledger.staging")); err == nil {
+	// TestStagingDiagnosticPrescribesRunnableCommands, which requires that this diagnostic
+	// prescribes BOTH commands and that each one, run on a fresh machine in this exact state, is
+	// neither a usage error nor answered by the verb with "there is nothing here I can act on".
+	staging := filepath.Join(home, ".state", "ledger.staging")
+	switch si, serr := os.Lstat(staging); {
+	case serr == nil && si.Mode().IsRegular():
 		return errors.New("prov: there is no active ledger, but a restore is in progress (.state/ledger.staging).\n" +
 			"  Resume it by re-running 'mythical-ctl restore <the same backup directory>' — the source\n" +
 			"  directory is recorded inside the staging ledger, so re-running continues that attempt\n" +
 			"  rather than starting a new one.\n" +
 			"  Or give it up with 'mythical-ctl restore --abandon', which removes the partial volumes\n" +
 			"  that attempt created under their recorded identity.")
+	case serr == nil:
+		// PRESENT, SO NOT FIRST USE — and unclassifiable, so not a resumable restore either.
+		// Prescribing resume or abandon here would send the operator to a verb that refuses this
+		// exact path, which is a recovery instruction whose only outcome is a second refusal.
+		return errors.New("prov: the restore staging ledger is present but is not a regular file — a directory, a\n" +
+			"  symlink or a device node (.state/ledger.staging).\n" +
+			"  Something is there, so this is not a first install; but it is also not a restore that can\n" +
+			"  be resumed or abandoned: the restore verb refuses a staging path it cannot classify, so\n" +
+			"  neither of those commands can act on this. It is reported instead.\n" +
+			"  Run 'mythical-ctl state repair'.")
+	case !errors.Is(serr, fs.ErrNotExist):
+		return fmt.Errorf("prov: the restore staging ledger path could not be examined, so absence cannot be\n"+
+			"  established — refusing rather than treating this as a fresh machine: %w", serr)
 	}
 
 	if len(found) > 0 {
