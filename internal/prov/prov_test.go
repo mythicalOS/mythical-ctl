@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"testing"
 
+	"mythicalos.ai/ctl/internal/cliio"
 	"mythicalos.ai/ctl/internal/engine"
 	"mythicalos.ai/ctl/internal/ledger"
 )
@@ -52,7 +53,7 @@ import (
 // PORTED: tests/unit/prov.bats: "a tombstone cannot forge a record through the object NAME it serializes" -> TestTombstoneCannotForge
 // PORTED: tests/unit/prov.bats: "a ledger path that is a DIRECTORY is inconsistent, not a fresh machine" -> TestFirstUseLedgerNotRegular
 // PORTED: tests/unit/prov.bats: "a DANGLING SYMLINK at the ledger path is inconsistent, not a fresh machine" -> TestFirstUseLedgerNotRegular
-// PORTED: tests/unit/prov.bats: "a STAGING ledger that is not a regular file still blocks first use" -> TestFirstUseStaging
+// PORTED: tests/unit/prov.bats: "a STAGING ledger that is not a regular file still blocks first use" -> TestFirstUseStagingNotRegular
 // PORTED: tests/unit/prov.bats: "a DANGLING SYMLINK product conf is a trace too — presence is the test, not readability" -> TestFirstUseTraces
 // PORTED: tests/unit/prov.bats: "a product DIRECTORY entry is a trace whether it is real, a link, or a dangling link" -> TestFirstUseTraces
 // PORTED: tests/unit/prov.bats: "a GENERATION out of the ledger is DIGITS before arithmetic — it is never EVALUATED" -> TestGenerationMustBeDigits
@@ -637,21 +638,98 @@ var resumePrescriptions = []string{
 	"'mythical-ctl restore --abandon'",
 }
 
+// checksummedLedger builds a ledger body at an arbitrary schema whose checksum is genuinely correct
+// over its own bytes. A fixture with a wrong checksum reads as CORRUPT, which is a different case.
+func checksummedLedger(schema string, rows ...string) string {
+	body := "#mythical-ctl-ledger schema=" + schema + "\n"
+	for _, r := range rows {
+		body += r + "\n"
+	}
+	return body + "#sha256=" + cliio.SHA256Hex([]byte(body)) + "\n"
+}
+
+// TestFirstUseStaging: a regular staging ledger is the in-progress restore — but WHICH diagnostic
+// it earns depends on what is INSIDE it, and that is the point.
+//
+// Presence used to be the whole test, so every regular file was called resumable and prescribed
+// resume-or-abandon. internal/backup classifies the CONTENTS before either verb acts: a staging
+// ledger whose checksum fails authorizes neither, so both prescriptions named an outcome that
+// could not happen. The two modules must give ONE answer about one path.
 func TestFirstUseStaging(t *testing.T) {
-	// A REGULAR staging ledger is the in-progress restore: its own third state, not first use and
-	// not inconsistent. It is the ONLY shape the resume-or-abandon prescription is true of.
-	home := homeWith(t, func(h string) { mustWrite(t, filepath.Join(h, ".state", "ledger.staging"), "x") })
+	for _, tc := range []struct {
+		name     string
+		body     string
+		wants    []string
+		promises bool // does this state genuinely offer resume AND abandon?
+	}{
+		{"a valid staging ledger", checksummedLedger(ledger.Schema, "restore\tkey=restore\tphase=2"),
+			[]string{"restore is in progress"}, true},
+		{"one that does not validate", "an interrupted restore left this\n",
+			[]string{"does NOT validate", "neither resumed nor abandoned", "'mythical-ctl restore --abandon'"}, false},
+		{"one a newer build wrote", checksummedLedger("2", "restore\tkey=restore"),
+			[]string{"NEWER", "checksum-VALID", "Upgrade mythical-ctl"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := homeWith(t, func(h string) {
+				mustWrite(t, filepath.Join(h, ".state", "ledger.staging"), tc.body)
+			})
+			err := FirstUse(context.Background(), home, newFakeObjs())
+			if err == nil || errors.Is(err, ErrNotFirstUse) {
+				t.Fatalf("a regular staging ledger did not block first use: %v", err)
+			}
+			for _, w := range tc.wants {
+				if !strings.Contains(err.Error(), w) {
+					t.Fatalf("the diagnostic does not say %q:\n%v", w, err)
+				}
+			}
+			// THE PROMISES, NOT THE COMMAND NAMES. A corrupt staging ledger DOES have something
+			// worth running — `restore --abandon` preserves it aside and names what may be
+			// blocking — so the command may appear. What may not appear is either promise that
+			// state cannot keep: that re-running RESUMES the attempt, and that abandoning REMOVES
+			// the partial volumes.
+			for _, promise := range []string{
+				"'mythical-ctl restore <the same backup directory>'",
+				"removes the partial volumes",
+			} {
+				if got := strings.Contains(err.Error(), promise); got != tc.promises {
+					t.Fatalf("promises %q = %v, want %v — a prescription is a claim about what the named\n"+
+						"verb will DO, and this state cannot deliver it:\n%v", promise, got, tc.promises, err)
+				}
+			}
+			if strings.Contains(err.Error(), "--resume") {
+				t.Fatalf("the diagnostic prescribes a --resume flag the CLI does not have:\n%v", err)
+			}
+		})
+	}
+}
+
+// TestFirstUseStagingUnreadable: a staging file that cannot be READ says nothing about whether a
+// restore can be resumed, so no recovery is prescribed for it.
+func TestFirstUseStagingUnreadable(t *testing.T) {
+	home := homeWith(t, func(h string) {
+		mustWrite(t, filepath.Join(h, ".state", "ledger.staging"), "x")
+	})
+	sf := filepath.Join(home, ".state", "ledger.staging")
+	if err := os.Chmod(sf, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(sf, 0o600) })
+	// The premise is MEASURED: a user that bypasses the mode bit leaves the read succeeding, and
+	// the assertion below would then be about a different branch entirely.
+	if _, err := os.ReadFile(sf); err == nil {
+		t.Skipf("this user can still read %s — the unreadable branch is not reachable here", sf)
+	}
 	err := FirstUse(context.Background(), home, newFakeObjs())
-	if err == nil || !strings.Contains(err.Error(), "restore is in progress") {
-		t.Fatalf("a regular staging ledger is an in-progress restore: %v", err)
+	if err == nil || errors.Is(err, ErrNotFirstUse) {
+		t.Fatalf("an unreadable staging ledger was read as an answer: %v", err)
+	}
+	if !strings.Contains(err.Error(), "could not be READ") || !strings.Contains(err.Error(), "never established") {
+		t.Fatalf("the refusal does not say the question failed:\n%v", err)
 	}
 	for _, cmd := range resumePrescriptions {
-		if !strings.Contains(err.Error(), cmd) {
-			t.Fatalf("the in-progress-restore diagnostic does not prescribe %s:\n%v", cmd, err)
+		if strings.Contains(err.Error(), cmd) {
+			t.Fatalf("a recovery was prescribed for a state nobody could determine: %s\n%v", cmd, err)
 		}
-	}
-	if strings.Contains(err.Error(), "--resume") {
-		t.Fatalf("the diagnostic prescribes a --resume flag the CLI does not have:\n%v", err)
 	}
 }
 

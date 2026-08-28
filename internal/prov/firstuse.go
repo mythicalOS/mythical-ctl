@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"mythicalos.ai/ctl/internal/layout"
+	"mythicalos.ai/ctl/internal/ledger"
 	"mythicalos.ai/ctl/internal/manifest"
 )
 
@@ -157,12 +158,7 @@ func FirstUse(ctx context.Context, home string, objs Objects) error {
 	staging := filepath.Join(home, ".state", "ledger.staging")
 	switch si, serr := os.Lstat(staging); {
 	case serr == nil && si.Mode().IsRegular():
-		return errors.New("prov: there is no active ledger, but a restore is in progress (.state/ledger.staging).\n" +
-			"  Resume it by re-running 'mythical-ctl restore <the same backup directory>' — the source\n" +
-			"  directory is recorded inside the staging ledger, so re-running continues that attempt\n" +
-			"  rather than starting a new one.\n" +
-			"  Or give it up with 'mythical-ctl restore --abandon', which removes the partial volumes\n" +
-			"  that attempt created under their recorded identity.")
+		return stagingDiagnostic(staging)
 	case serr == nil:
 		// PRESENT, SO NOT FIRST USE — and unclassifiable, so not a resumable restore either.
 		// Prescribing resume or abandon here would send the operator to a verb that refuses this
@@ -229,6 +225,66 @@ func FirstUse(ctx context.Context, home string, objs Objects) error {
 			"  Run 'mythical-ctl state repair'.", strings.Join(anyobj, " "))
 	}
 	return nil
+}
+
+// stagingDiagnostic says what an operator can actually DO about the staging ledger standing here,
+// which requires READING it.
+//
+// PRESENCE IS NOT RESUMABILITY, AND CALLING IT SO WAS THE SAME DEFECT ONE LEVEL IN. Every regular
+// file at this path got the resume-or-abandon prescription without anything looking inside it — but
+// internal/backup classifies the CONTENTS before either verb acts, and a staging ledger whose
+// checksum fails authorizes neither: `restore` preserves it aside and refuses, and `restore
+// --abandon` does the same and removes NO volumes, because the record of which partial volumes the
+// attempt created is exactly what the checksum says not to trust. So the diagnostic promised two
+// outcomes, neither of which can happen — an ANSWER where the truth is a refusal, handed to the
+// operator at the moment they are following instructions literally.
+//
+// IT READS THE BYTES, NOT THE STORE. ledger.ReadBytes exists precisely to judge a ledger that
+// arrives from somewhere else before it is installed: it takes no store, no lock and no write
+// capability, so this module can ask internal/backup's own question without reaching for the
+// staging store (which check.sh's boundary gate reserves for internal/backup) and without the two
+// modules being able to give two different answers about one path.
+//
+// NO APOSTROPHE IN THE PROSE OF THESE MESSAGES. Single quotes delimit the commands, so a possessive
+// in the surrounding sentence closes one prescription early and swallows the next — the reader that
+// extracts these commands and runs them then never sees the second one.
+func stagingDiagnostic(path string) error {
+	data, rerr := os.ReadFile(path)
+	if rerr != nil {
+		return fmt.Errorf("prov: there is no active ledger, and the restore staging ledger could not be READ, so\n"+
+			"  whether a restore can be resumed was never established (.state/ledger.staging).\n"+
+			"  Refusing rather than prescribing a recovery for a state nobody could determine: %w", rerr)
+	}
+	_, verr := ledger.ReadBytes(data)
+	switch {
+	case verr == nil:
+		return errors.New("prov: there is no active ledger, but a restore is in progress (.state/ledger.staging).\n" +
+			"  Resume it by re-running 'mythical-ctl restore <the same backup directory>' — the source\n" +
+			"  directory is recorded inside the staging ledger, so re-running continues that attempt\n" +
+			"  rather than starting a new one.\n" +
+			"  Or give it up with 'mythical-ctl restore --abandon', which removes the partial volumes\n" +
+			"  that attempt created under their recorded identity.")
+	case errors.Is(verr, ledger.ErrCorrupt):
+		// NEITHER PROMISE IS AVAILABLE HERE, so neither is made. What --abandon really does for
+		// this state is preserve the evidence and NAME what may be blocking; that is worth
+		// running, and it is described as what it is.
+		return errors.New("prov: there is no active ledger, and a restore was interrupted — but its staging ledger\n" +
+			"  does NOT validate (.state/ledger.staging), so it authorizes nothing.\n" +
+			"  It can be neither resumed nor abandoned: the record of which partial volumes that attempt\n" +
+			"  created is exactly what the checksum says not to trust, so no volume is removed on its\n" +
+			"  authority.\n" +
+			"  Run 'mythical-ctl restore --abandon' to have it PRESERVED aside as evidence and the\n" +
+			"  volumes that may belong to that attempt NAMED. Removing those volumes is your explicit\n" +
+			"  call.")
+	case errors.Is(verr, ledger.ErrNewerSchema):
+		return errors.New("prov: there is no active ledger, and the restore staging ledger was written by a NEWER\n" +
+			"  mythical-ctl than this one (.state/ledger.staging).\n" +
+			"  It is checksum-VALID and it parsed cleanly; this build does not understand its schema, so\n" +
+			"  it is left exactly where it is and nothing here acts on it.\n" +
+			"  Upgrade mythical-ctl and run this again.")
+	}
+	return fmt.Errorf("prov: there is no active ledger, and the restore staging ledger could not be judged, so\n"+
+		"  whether a restore can be resumed was never established (.state/ledger.staging): %w", verr)
 }
 
 // hostToolOnly reports whether <rel> — ONE home-relative component — is a real directory holding

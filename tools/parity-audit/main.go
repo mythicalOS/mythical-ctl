@@ -882,12 +882,6 @@ func candidatePackages(all map[string]map[string]bool, goFile, detail, target st
 		bySeg[path.Base(p)] = append(bySeg[path.Base(p)], p)
 	}
 	out := map[string]bool{}
-	own := path.Dir(filepath.ToSlash(goFile))
-	for p := range all {
-		if p == own || strings.HasSuffix(p, "/"+own) {
-			out[p] = true
-		}
-	}
 	add := func(tok string) {
 		tok = strings.Trim(tok, "/")
 		if tok == "" {
@@ -907,8 +901,25 @@ func candidatePackages(all map[string]map[string]bool, goFile, detail, target st
 	}
 	// FOR THIS TARGET ONLY. A claim naming two tests may qualify one of them and not the other,
 	// and the unqualified one must not borrow the qualified one's package.
-	for _, tok := range qualifiersFor(detail, target) {
-		add(tok)
+	//
+	// A QUALIFICATION CONSTRAINS; IT DOES NOT WIDEN. The first version of this fix added the
+	// qualified package BESIDE the claiming file's own one, which left the hole open facing the
+	// other way: `internal/w.TestShared`, written in internal/x, stayed green after
+	// internal/w.TestShared was DELETED, because a namesake in internal/x satisfied it. A claim
+	// that says where its target lives is answered by THAT package or by nothing.
+	quals := qualifiersFor(detail, target)
+	if len(quals) > 0 {
+		for _, tok := range quals {
+			add(tok)
+		}
+		return out
+	}
+	// UNQUALIFIED: the claiming file's own package, and nothing else.
+	own := path.Dir(filepath.ToSlash(goFile))
+	for p := range all {
+		if p == own || strings.HasSuffix(p, "/"+own) {
+			out[p] = true
+		}
 	}
 	return out
 }

@@ -213,11 +213,12 @@ const (
 	// removalGone — it is NOT at that name: removed by this call, or already absent. The name is
 	// free and a rebuild may proceed.
 	removalGone removalOutcome = iota
-	// removalRemains — the daemon ANSWERED and refused (still in use, denied, removal already in
-	// progress). The container is there and the name is held.
-	removalRemains
-	// removalUnknown — the daemon could not be asked. Nothing is established either way, so
-	// nothing may be asserted and no rebuild may be authorized.
+	// removalRefused — the daemon ANSWERED and the removal did NOT succeed (still in use, denied,
+	// a server error). What is established is that the DELETE did not report success; whether the
+	// container is still standing is NOT — a 5xx can follow a partial removal. So callers may say
+	// the removal failed and may not say the object is there.
+	removalRefused
+	// removalUnknown — the daemon could not be asked at all. Nothing is established either way.
 	removalUnknown
 )
 
@@ -230,7 +231,30 @@ func classifyRemoval(err error) removalOutcome {
 	case errors.Is(err, engine.ErrDaemonDown):
 		return removalUnknown
 	}
-	return removalRemains
+	return removalRefused
+}
+
+// imageRemedy says what to do next, based ONLY on what the image-read failure established about
+// the container itself.
+//
+// A "just re-run" remedy is false while the container stands: a re-run opens a FRESH intent under a
+// new nonce (a keyed put supersedes) and then fails to create over the occupied name, after which
+// the surviving container matches no record and the unaccounted gate stops the next run. But that
+// reasoning only applies when something IS standing there, which is exactly what has to be
+// established rather than assumed.
+func imageRemedy(ierr error) string {
+	switch {
+	case errors.Is(ierr, engine.ErrAbsent):
+		// AN ANSWER: the daemon says there is no such object. Nothing to remove, and the
+		// write-ahead intent is the record a recovery or a re-run reads.
+		return "\n  The container is GONE from that name — the runtime answered that no such object exists.\n" +
+			"  There is nothing to remove; the write-ahead intent is what a recovery reads."
+	case errors.Is(ierr, engine.ErrDaemonDown):
+		return "\n  Whether the container is still standing at that name was NOT established — the container\n" +
+			"  runtime did not answer. Ask it before re-running."
+	}
+	return "\n  The container was created and STILL STANDS at that name: remove it with the container\n" +
+		"  runtime before re-running, or run 'mythical-ctl state repair'."
 }
 
 // imageRefusal is the one refusal both confirmation sites make about the image identity.
@@ -240,13 +264,13 @@ func classifyRemoval(err error) removalOutcome {
 // container was built from, and `id=` with nothing after it is not a smaller answer, it is a
 // record that will be believed and cannot be checked.
 func imageRefusal(container string, ierr error, kept string) error {
-	// THE REMEDY NAMED HERE IS THE ONE THAT WORKS, not the one that reads well. The container was
-	// created and still stands at its derived name, so "just re-run" is false: a re-run opens a
-	// FRESH intent under a new nonce (a keyed put supersedes), then fails to create over the
-	// occupied name — after which the surviving container matches no record and the unaccounted
-	// gate stops the next run. Removing it first is what actually clears the way.
-	const remedy = "\n  The container was created and STILL STANDS at that name: remove it with the container" +
-		"\n  runtime before re-running, or run 'mythical-ctl state repair'."
+	// THE REMEDY IS CLASSIFIED FROM WHAT THE FAILURE ESTABLISHED, and the first version of it was
+	// not — it asserted the container "STILL STANDS" whatever went wrong. Production Image is a
+	// ContainerInspect, so an ErrAbsent here says the daemon ANSWERED that no such object exists,
+	// and an ErrDaemonDown says nothing at all. Telling an operator to go and remove a container
+	// that does not exist is the same wrong-answer defect this whole change is about, committed by
+	// the fix for it.
+	remedy := imageRemedy(ierr)
 	if ierr != nil {
 		return fmt.Errorf("bringup: the image %q was created from could not be read, so its provenance record would\n"+
 			"  carry no image identity — and a confirmed record nothing can check is worse than an\n"+
@@ -537,14 +561,14 @@ func Run(ctx context.Context, l *ledger.Ledger, d Deps, launch Launcher, contain
 		// it, and that is the whole cost: the report is the only thing they act on.
 		rerr := d.Mut.ContainerRemove(ctx, container)
 		switch classifyRemoval(rerr) {
-		case removalRemains:
-			return fmt.Errorf("bringup: %q did not verify, and REMOVING IT WAS REFUSED — the container this\n"+
-				"  bring-up created and owns is STILL THERE, unverified and unconfirmed. Nothing was\n"+
-				"  confirmed and nothing was started.\n"+
-				"  REMOVE IT WITH THE CONTAINER RUNTIME BEFORE RE-RUNNING: while it stands at that name a\n"+
-				"  re-run cannot create the container, and the write-ahead record that ties this one to\n"+
-				"  this bring-up is replaced by the attempt.\n"+
-				"  The removal was refused because: %v\n"+
+		case removalRefused:
+			return fmt.Errorf("bringup: %q did not verify, and REMOVING IT DID NOT SUCCEED — the container runtime\n"+
+				"  answered with a failure, so whether the container is still standing at that name was NOT\n"+
+				"  established. Nothing was confirmed and nothing was started.\n"+
+				"  ASK THE CONTAINER RUNTIME AND REMOVE IT YOURSELF BEFORE RE-RUNNING: while something\n"+
+				"  stands at that name a re-run cannot create the container, and the write-ahead record\n"+
+				"  that ties this one to this bring-up is replaced by the attempt.\n"+
+				"  The removal failed because: %v\n"+
 				"  It failed to verify because: %w", container, rerr, verr)
 		case removalUnknown:
 			return fmt.Errorf("bringup: %q did not verify, and WHETHER IT WAS REMOVED IS UNKNOWN — the container\n"+
@@ -694,15 +718,16 @@ func Recover(ctx context.Context, l *ledger.Ledger, d Deps, container, netID, al
 		// says the container REMAINS and deliberately does not carry ErrRebuild.
 		rerr := d.Mut.ContainerRemove(ctx, container)
 		switch classifyRemoval(rerr) {
-		case removalRemains:
+		case removalRefused:
 			// NO REBUILD. The caller acts on ErrRebuild by RE-CREATING from the launch spec, under
-			// the same derived name — which this container still holds, so the rebuild would meet
-			// it as a same-name survivor.
+			// the same derived name — and a removal that did not succeed leaves no evidence that
+			// the name is free, so the rebuild could meet a same-name survivor.
 			return fmt.Errorf("bringup: the intent for %q describes a container whose topology does not verify, and\n"+
-				"  REMOVING IT WAS REFUSED — it is STILL THERE, still holding that name. Nothing is\n"+
-				"  confirmed, the intent is KEPT, and no rebuild is asked for: re-creating under a name\n"+
-				"  this container still holds would meet it as a same-name survivor.\n"+
-				"  The removal was refused because: %v\n"+
+				"  REMOVING IT DID NOT SUCCEED — the container runtime answered with a failure, so whether\n"+
+				"  that name is free was NOT established. Nothing is confirmed, the intent is KEPT, and no\n"+
+				"  rebuild is asked for: re-creating under a name something may still hold would meet it\n"+
+				"  as a same-name survivor.\n"+
+				"  The removal failed because: %v\n"+
 				"  The topology does not verify because: %w", container, rerr, verr)
 		case removalUnknown:
 			// NO REBUILD EITHER, and for the opposite reason: not "the name is held" but "whether
@@ -729,7 +754,16 @@ func Recover(ctx context.Context, l *ledger.Ledger, d Deps, container, netID, al
 	// byte-identical, which is the whole of what Recover owes on a refusal.
 	image, ierr := d.Objs.Image(ctx, container)
 	if ierr != nil || image == "" {
-		return imageRefusal(container, ierr, "The intent is KEPT and nothing is confirmed")
+		refusal := imageRefusal(container, ierr, "The intent is KEPT and nothing is confirmed")
+		// THE SAME ANSWER THIS FUNCTION ALREADY GIVES FOR AN ABSENT CONTAINER. The ObsAbsent
+		// branch above returns ErrRetained — the intent is kept so the verb that opened it can
+		// re-create from the launch spec — and a container that vanished between that observation
+		// and this read is the same fact arriving later. Not ErrRebuild: this package does not
+		// hold the launch spec, and the verb that does acts on ErrRetained.
+		if errors.Is(ierr, engine.ErrAbsent) {
+			return errors.Join(ErrRetained, refusal)
+		}
+		return refusal
 	}
 	cp := l.Clone()
 	if cerr := state.Commit(cp, container, want, []state.Check{{Kind: state.CheckAlias, Param: param}}, false); cerr != nil {

@@ -1204,6 +1204,49 @@ func TestQualificationUsesGosNameGrammarNotASCII(t *testing.T) {
 	}
 }
 
+// TestAQualificationConstrainsRatherThanWidens: saying where a target lives must NARROW resolution
+// to that package, not add it beside the local one.
+//
+// The first version of this fix added the qualified package and KEPT the claiming file's own, which
+// left the false-green facing the other way: `internal/w.TestShared` written in internal/x stayed
+// green after internal/w.TestShared was DELETED, because a namesake in internal/x answered for it.
+// A claim that names where its target is must be answered by THAT package or by nothing — otherwise
+// the qualification is decoration and the claim still survives the deletion of the thing it claims.
+func TestAQualificationConstrainsRatherThanWidens(t *testing.T) {
+	// internal/w no longer has TestShared (it was deleted); internal/x has a namesake.
+	goTests := map[string]map[string]bool{
+		"mythicalos.ai/ctl/internal/w": {"TestOther": true},
+		"mythicalos.ai/ctl/internal/x": {"TestShared": true},
+	}
+	got := candidatePackages(goTests, "internal/x/x_test.go", "internal/w.TestShared", "TestShared")
+	if got["mythicalos.ai/ctl/internal/x"] {
+		t.Fatalf("a claim naming internal/w was offered its own package as well: %v", got)
+	}
+	if !got["mythicalos.ai/ctl/internal/w"] {
+		t.Fatalf("the named package was not offered: %v", got)
+	}
+	// AND THE AUDIT SAYS SO END TO END: the claim must FAIL, not be satisfied by the namesake.
+	c, b, st := claimsFrom(t,
+		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
+		`// PORTED: tests/unit/a.bats: "two" -> internal/w.TestShared`,
+		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
+	)
+	lanes := []testLane{{name: "default",
+		list: map[string]map[string]bool{
+			"mythicalos.ai/ctl/internal/w": {"TestOther": true},
+			"mythicalos.ai/ctl/internal/x": {"TestOne": true, "TestThree": true, "TestShared": true},
+		},
+		src: map[string]map[string]bool{
+			"mythicalos.ai/ctl/internal/w": {"TestOther": true},
+			"mythicalos.ai/ctl/internal/x": {"TestOne": true, "TestThree": true, "TestShared": true},
+		}}}
+	r := &report{}
+	auditCoverage(r, tiny, c, b, st, lanes, noPreDeclared)
+	if !hasProblem(r, "TestShared") {
+		t.Fatalf("a deleted cross-package target was satisfied by a local namesake: %v", r.Problems)
+	}
+}
+
 // THE DIGEST PIN IS THE POST-CUTOVER GUARD, and this is the failure it exists for: with the bats
 // trees gone there is nothing to regenerate from, so a row could be REPLACED — an original
 // requirement deleted, an invented one of the same shape put in its place, and a claim written

@@ -1423,8 +1423,9 @@ func TestReconcilerSaysWhyItDidNothing(t *testing.T) {
 var removalAnswers = []struct {
 	name string
 	err  error
-	// remains — the report must say the container is still there.
-	remains bool
+	// refused — the daemon answered and the removal did not succeed. The report must say the
+	// removal FAILED, and must not assert that the container is or is not there.
+	refused bool
 	// unknown — the report must say nothing was established.
 	unknown bool
 	// rebuild — Recover may ask for a rebuild (the name is provably free).
@@ -1433,6 +1434,7 @@ var removalAnswers = []struct {
 	{"removed", nil, false, false, true},
 	{"already absent (404)", fmt.Errorf("engine: %w: No such container", engine.ErrAbsent), false, false, true},
 	{"refused by the daemon", errors.New("container is in use by a running task"), true, false, false},
+	{"a server error", errors.New("engine: 500 Internal Server Error"), true, false, false},
 	{"the daemon did not answer", fmt.Errorf("engine: %w: dial unix: connection refused", engine.ErrDaemonDown), false, true, false},
 }
 
@@ -1462,14 +1464,19 @@ func TestRunReportsWhatTheRemovalActuallyEstablished(t *testing.T) {
 			}
 			says := func(needle string) bool { return strings.Contains(err.Error(), needle) }
 			switch {
-			case tc.remains:
-				for _, want := range []string{"REMOVING IT WAS REFUSED", "STILL THERE", "REMOVE IT WITH THE CONTAINER RUNTIME"} {
+			case tc.refused:
+				for _, want := range []string{"REMOVING IT DID NOT SUCCEED", "NOT\n  established", "ASK THE CONTAINER RUNTIME"} {
 					if !says(want) {
 						t.Fatalf("the report does not say %q:\n%v", want, err)
 					}
 				}
 				if says("removed \"") {
 					t.Fatalf("a container that was NOT removed was reported as removed:\n%v", err)
+				}
+				// AND IT DOES NOT ASSERT PRESENCE. A 5xx can follow a partial removal, so
+				// "it is STILL THERE" is a fact the answer does not carry.
+				if says("STILL THERE") {
+					t.Fatalf("a failed removal asserted the container is still there:\n%v", err)
 				}
 			case tc.unknown:
 				if !says("WHETHER IT WAS REMOVED IS UNKNOWN") {
@@ -1532,11 +1539,14 @@ func TestRecoverReportsWhatTheRemovalActuallyEstablished(t *testing.T) {
 			}
 			says := func(needle string) bool { return strings.Contains(err.Error(), needle) }
 			switch {
-			case tc.remains:
-				for _, want := range []string{"REMOVING IT WAS REFUSED", "STILL THERE", "same-name survivor"} {
+			case tc.refused:
+				for _, want := range []string{"REMOVING IT DID NOT SUCCEED", "was NOT established", "same-name survivor"} {
 					if !says(want) {
 						t.Fatalf("the report does not say %q:\n%v", want, err)
 					}
+				}
+				if says("STILL THERE") {
+					t.Fatalf("a failed removal asserted the container is still there:\n%v", err)
 				}
 			case tc.unknown:
 				if !says("WHETHER IT WAS REMOVED IS UNKNOWN") || !says("never established") {
@@ -1691,5 +1701,87 @@ func TestRunConfirmsWithTheImageItRead(t *testing.T) {
 	id, ok := ledger.FieldOf(rec, "id")
 	if !ok || id != "sha256:the-one-the-runtime-reported" {
 		t.Fatalf("the provenance record carries id %q (present=%v), not the image the runtime reported", id, ok)
+	}
+}
+
+// TestTheImageRefusalRemedyMatchesWhatTheFailureEstablished: the fix for the discarded image error
+// prescribed a remedy that asserted a fact of its own — "the container was created and STILL
+// STANDS at that name: remove it" — whatever the failure had been.
+//
+// Production Image is a ContainerInspect, so engine.ErrAbsent here is the daemon ANSWERING that no
+// such object exists, and engine.ErrDaemonDown is no answer at all. The first version sent an
+// operator to hunt and remove a container the runtime had just said does not exist, and asserted
+// presence when nothing had been established: the same wrong-answer defect this change exists to
+// remove, committed by the fix for it.
+func TestTheImageRefusalRemedyMatchesWhatTheFailureEstablished(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name     string
+		err      error
+		wants    []string
+		notWants []string
+		// retained — Recover must carry ErrRetained, the answer this function already gives for a
+		// container that is not there.
+		retained bool
+	}{
+		{"the container is gone (404)", fmt.Errorf("engine: %w: No such container", engine.ErrAbsent),
+			[]string{"GONE from that name", "nothing to remove"},
+			[]string{"STILL STANDS", "NOT established"}, true},
+		{"the runtime did not answer", fmt.Errorf("engine: %w: connection refused", engine.ErrDaemonDown),
+			[]string{"NOT established", "Ask it before re-running"},
+			[]string{"STILL STANDS", "GONE from that name"}, false},
+		{"the runtime answered with some other failure", errors.New("inspect: 500 Internal Server Error"),
+			[]string{"STILL STANDS", "remove it with the container"},
+			[]string{"GONE from that name"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// --- Run ---
+			l, objs, mut, pr, st, d := fixture(t)
+			lau := &fakeLauncher{objs: objs, st: st, nets: []Attachment{attach(net1, "", al1)}}
+			pr.resolveTo[net1+"/"+al1] = "10.0.0.2"
+			lau.after = func() { objs.imageErr[c1] = tc.err }
+			err := Run(ctx, l, d, lau, c1, net1, al1, Running)
+			if err == nil {
+				t.Fatal("a bring-up confirmed provenance with no image identity")
+			}
+			for _, w := range tc.wants {
+				if !strings.Contains(err.Error(), w) {
+					t.Fatalf("Run: the remedy does not say %q:\n%v", w, err)
+				}
+			}
+			for _, w := range tc.notWants {
+				if strings.Contains(err.Error(), w) {
+					t.Fatalf("Run: the remedy claims %q, which this failure did not establish:\n%v", w, err)
+				}
+			}
+			if len(mut.started) != 0 {
+				t.Fatalf("an unconfirmed container was started: %v", mut.started)
+			}
+
+			// --- Recover ---
+			l2, objs2, _, _, st2, d2 := fixture(t)
+			crashedAfterCreate(t, l2, objs2, st2, state.Running, net1, []Attachment{attach(net1, "", al1)})
+			objs2.imageErr[c1] = tc.err
+			before := strings.Join(l2.Lines(), "\n")
+			rerr := Recover(ctx, l2, d2, c1, net1, al1)
+			if rerr == nil {
+				t.Fatal("a recovery confirmed provenance with no image identity")
+			}
+			for _, w := range tc.wants {
+				if !strings.Contains(rerr.Error(), w) {
+					t.Fatalf("Recover: the remedy does not say %q:\n%v", w, rerr)
+				}
+			}
+			// A CONTAINER THAT IS GONE IS THE CASE THIS FUNCTION ALREADY HAS AN ANSWER FOR: the
+			// intent is RETAINED for the verb holding the launch spec. Withholding that signal
+			// leaves the caller with a bare failure for a state it knows how to finish.
+			if got := errors.Is(rerr, ErrRetained); got != tc.retained {
+				t.Fatalf("Recover: ErrRetained = %v, want %v:\n%v", got, tc.retained, rerr)
+			}
+			// And a refusal still leaves the caller's ledger byte-identical.
+			if got := strings.Join(l2.Lines(), "\n"); got != before {
+				t.Fatalf("Recover: a refusal changed the caller's ledger")
+			}
+		})
 	}
 }

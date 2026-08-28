@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"mythicalos.ai/ctl/internal/cliio"
+	"mythicalos.ai/ctl/internal/ledger"
 	"mythicalos.ai/ctl/internal/prov"
 )
 
@@ -60,12 +61,23 @@ var stagingShapes = []struct {
 	// resume and abandon commands? Exactly one shape may.
 	resumable bool
 }{
-	{"a regular staging ledger", func(t *testing.T, p string) {
+	{"a valid staging ledger", func(t *testing.T, p string) {
+		t.Helper()
+		// A CHECKSUM-VALID ledger, because that is the only shape for which resume-or-abandon is
+		// a true promise. The earlier version of this table used INVALID bytes here and called
+		// them resumable — which is exactly the defect it was supposed to be guarding.
+		body := "#mythical-ctl-ledger schema=" + ledger.Schema + "\nrestore\tkey=restore\tphase=2\n"
+		body += "#sha256=" + cliio.SHA256Hex([]byte(body)) + "\n"
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}, true},
+	{"a staging ledger that does not validate", func(t *testing.T, p string) {
 		t.Helper()
 		if err := os.WriteFile(p, []byte("an interrupted restore left this\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-	}, true},
+	}, false},
 	{"a directory", func(t *testing.T, p string) {
 		t.Helper()
 		if err := os.Mkdir(p, 0o755); err != nil {
@@ -96,6 +108,20 @@ var contradictions = []string{
 	"is present but is not a regular file",
 	"there is no in-progress restore to abandon",
 	"there is no restore in progress",
+}
+
+// promises are the claims the resumable diagnostic makes about what the named verbs will DO, paired
+// with the answer that PROVES the verb did not do it. A diagnostic may only make a promise the verb
+// can keep for the state that produced the diagnostic.
+//
+// THIS IS THE ASSERTION THE EARLIER VERSION OF THIS TEST WAS MISSING, and it is why a
+// mis-classified staging ledger survived it: the table used INVALID staging bytes, called them
+// resumable, and accepted both commands merely because neither was a usage error. In reality both
+// classify those bytes as corrupt, move them aside and refuse — no resume, and no volume removal —
+// so the diagnostic promised two outcomes that could not happen and the test could not tell.
+var promises = []struct{ claim, disproof string }{
+	{"the source\n  directory is recorded inside the staging ledger", "does not validate"},
+	{"removes the partial volumes", "authorizes no cleanup"},
 }
 
 // TestStagingDiagnosticPrescribesRunnableCommands closes the gap that let the in-progress-restore
@@ -194,6 +220,17 @@ func TestStagingDiagnosticPrescribesRunnableCommands(t *testing.T) {
 							shape.name, m[0], c, one.said())
 					}
 				}
+				// AND EVERY PROMISE IT MADE SURVIVES CONTACT WITH THE VERB. Exit status cannot see
+				// this: a diagnostic that says a re-run RESUMES the attempt, answered by "the
+				// staging ledger does not validate", is an ordinary operational failure — exit 1,
+				// nothing wrong on the surface, and the promise simply was not true.
+				for _, pr := range promises {
+					if strings.Contains(err.Error(), pr.claim) && strings.Contains(one.said(), pr.disproof) {
+						t.Fatalf("with %s at the staging path the diagnostic promises %q, and running %q answers\n"+
+							"%q — the promise is not one this state can keep:\n%s",
+							shape.name, pr.claim, m[0], pr.disproof, one.said())
+					}
+				}
 				ran = append(ran, args[0]+" "+strings.Join(args[1:], " "))
 			}
 
@@ -202,18 +239,19 @@ func TestStagingDiagnosticPrescribesRunnableCommands(t *testing.T) {
 			// and one that keeps prescribing a resume for a path no resume can touch cannot pass by
 			// having its prescription merely not blow up.
 			joined := strings.Join(ran, "\n")
-			resume := []string{"restore --abandon", "restore " + placeholders["<the same backup directory>"]}
-			for _, want := range resume {
-				if shape.resumable && !strings.Contains(joined, want) {
-					t.Fatalf("the diagnostic no longer prescribes %q; it prescribes:\n%s", want, joined)
-				}
-				if !shape.resumable && strings.Contains(joined, want) {
-					t.Fatalf("with %s at the staging path the diagnostic still prescribes %q:\n%s",
-						shape.name, want, joined)
-				}
+			resume := "restore " + placeholders["<the same backup directory>"]
+			if got := strings.Contains(joined, resume); got != shape.resumable {
+				t.Fatalf("with %s at the staging path, prescribes %q = %v, want %v:\n%s",
+					shape.name, resume, got, shape.resumable, joined)
 			}
-			if !shape.resumable && !strings.Contains(joined, "state repair") {
-				t.Fatalf("with %s at the staging path the diagnostic prescribes no repair:\n%s", shape.name, joined)
+			if shape.resumable && !strings.Contains(joined, "restore --abandon") {
+				t.Fatalf("the resumable diagnostic no longer prescribes the abandon; it prescribes:\n%s", joined)
+			}
+			// A NON-RESUMABLE STATE STILL PRESCRIBES SOMETHING RUNNABLE — the abandon (which
+			// preserves the evidence and names what blocks) or a repair. A diagnostic that
+			// prescribes nothing has already been refused above.
+			if !shape.resumable && !strings.Contains(joined, "restore --abandon") && !strings.Contains(joined, "state repair") {
+				t.Fatalf("with %s at the staging path the diagnostic prescribes no recovery:\n%s", shape.name, joined)
 			}
 		})
 	}
