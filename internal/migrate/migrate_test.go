@@ -2098,10 +2098,29 @@ func TestPhase7ResumesAfterA404RemovalWhoseReplacementFailed(t *testing.T) {
 	f.seed(record{Phase: 7, Dest: canon, Nonce: "nz", Staging: StagingPath(canon, "nz"),
 		StageID: sid, Attempt: "started", Desired: "running"})
 	f.mut.rmGone = true
-	f.bld.rebuildErr = errors.New("the daemon refused the create")
+	boom := errors.New("the daemon refused the create")
+	f.bld.rebuildErr = boom
 
-	if err := Run(ctx(), f.l, f.d, testProduct, testRole, canon, 7); err == nil {
+	err := Run(ctx(), f.l, f.d, testProduct, testRole, canon, 7)
+	if err == nil {
 		t.Fatal("the armed create failure reported success")
+	}
+	// THE FAILURE'S IDENTITY, NOT MERELY THAT SOMETHING FAILED — and this assertion is the whole
+	// reason the test can be trusted. Restore the defect this file exists to close and phase 7
+	// refuses on the 404 itself: it returns its OWN error here, never reaches the create, never
+	// spends the record, and the state this test is about is never entered at all. Every
+	// assertion below would then still pass — the retry converges through prov.ErrGone regardless
+	// — so a bare "it failed" check would let the test go on claiming a recovery it never
+	// exercised.
+	if !errors.Is(err, boom) {
+		t.Fatalf("phase 7 failed BEFORE it reached the replacement's create, so the state this test is\n"+
+			"about — the removal answered 404, the old record was spent, and the create THEN failed —\n"+
+			"was never entered: %v", err)
+	}
+	// And the removal arm really was taken to completion: the old record is spent into a
+	// tombstone, which is what leaves the retry with no evidence to authorize itself from.
+	if _, terr := prov.TombstoneFind(f.l, prov.ClassContainer, f.container); terr != nil {
+		t.Fatalf("the old container's record was not consumed before the create was attempted: %v", terr)
 	}
 	if p, perr := Phase(f.l, testProduct, testRole); perr != nil || p != 7 {
 		t.Fatalf("the intent is at %d (%v), want 7 — the migration must stay resumable", p, perr)
