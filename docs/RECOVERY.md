@@ -91,11 +91,12 @@ a diagnostic; it is neither authoritative nor guaranteed fresh, so a contender c
 by an earlier run. A pid that is not running does **not** prove the lock is free, and a pid that IS
 running is not necessarily the holder.
 
-*"In progress" is what every locking failure reports.* The refusal covers "somebody else has it" and
-"this lock could not be taken at all" — a filesystem that does not implement `flock` (some network
-mounts), or one out of lock records — because the answer to each is the same: do not proceed. So if
-it persists with no other `mythical-ctl` running anywhere on the machine, stop looking for a phantom
-process and suspect the filesystem `~/.mythical` is on.
+*"In progress" is what every locking failure reports.* The refusal does not carry a reason: the same
+message covers another `mythical-ctl` holding the lock, some unrelated program holding a lock on
+that same file, a filesystem that does not implement `flock` (some network mounts), and a system out
+of lock records. The CLI does not distinguish them, because the answer to all of them is the same:
+do not proceed. So a refusal that repeats with no other `mythical-ctl` running tells you the lock
+could not be taken, and nothing more about why.
 
 **There is no stale lock to clear, ever — and deleting the file is worse than useless.** The lock is
 a kernel `flock(2)`, and a lock held by a process that dies is released by the kernel along with
@@ -118,8 +119,9 @@ there is not the installer's lock file at all: with no `mythical-ctl` running, r
 a symlink or a second hard link at that path.
 
 **Next command.** The one you were running, once the other operation finishes. If it never
-finishes — nothing else is running and the refusal repeats — the lock is not the problem; move
-`~/.mythical` to storage that supports file locking, or ask why that one does not.
+finishes — nothing else is running and the refusal repeats — investigate before you touch anything:
+find out what holds `~/.mythical/.state/lock` (`lsof` names it), and what kind of filesystem
+`~/.mythical` is on. Deleting the lock file is not one of the options; see above for why.
 
 ## A retained network intent
 
