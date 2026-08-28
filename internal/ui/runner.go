@@ -226,11 +226,13 @@ func (b *Bridge) Record() []recordChunk {
 // contains no control byte at all, which is all of them. Fixing it here is the only change that
 // covers every path at once, and it leaves those runners identical again.
 //
-// LF IS PRESERVED EXACTLY, because LF is the record's boundary between lines: a sanitiser that
-// touched it would relocate every line break in the replay, which is a different and worse defect
-// than the one it fixes. Everything else unicode.IsControl covers — including CR, which is the
-// overwrite-this-line vector, and TAB, which no verb in this tree emits — plus the bidi controls
-// and the BOM become U+FFFD, the same visible placeholder the pane draws for them.
+// NOTHING IS HELD, DEFERRED OR JOINED ACROSS CHUNKS. Each chunk is filtered on its own and written
+// exactly where it sits in the record, so the replay's order is the record's order under any
+// arrangement of the two streams — separate destinations, one shared writer, or `2>&1`. Two
+// earlier versions of this filter did join across chunks, to render a rune split by a chunk
+// boundary as itself, and both reordered bytes when the streams converge: whatever is held back
+// surfaces after an intervening chunk of the OTHER stream. Order is worth more than that, and
+// see sanitizeReplay for why nothing is lost on the safety side by giving the joining up.
 func (b *Bridge) Flush(stdout, stderr io.Writer) {
 	if stdout == nil {
 		stdout = io.Discard
@@ -238,82 +240,55 @@ func (b *Bridge) Flush(stdout, stderr io.Writer) {
 	if stderr == nil {
 		stderr = io.Discard
 	}
-	rec := b.Record()
-	// PLANNED PER STREAM, THEN WRITTEN IN RECORD ORDER. The filtering has to see each stream whole,
-	// because a rune can be SPLIT ACROSS TWO WRITES of that stream (the record takes the raw bytes
-	// of every Write, and a Write may end part-way through one). Judging a chunk alone is wrong in
-	// both directions: a legitimate rune split in two is replaced twice over, and a bidi override
-	// split in two passes through as two innocent-looking fragments that the TERMINAL reassembles
-	// into exactly the override this exists to stop.
-	//
-	// The two streams are planned SEPARATELY because only same-stream bytes are adjacent to each
-	// other; joining a stdout fragment to a stderr one would invent a rune neither stream wrote.
-	out := sanitizeStream(rec, false)
-	errs := sanitizeStream(rec, true)
-	for _, c := range rec {
-		w, q := stdout, &out
+	for _, c := range b.Record() {
+		w := stdout
 		if c.stderr {
-			w, q = stderr, &errs
+			w = stderr
 		}
-		text := (*q)[0]
-		*q = (*q)[1:]
-		_, _ = io.WriteString(w, text)
+		_, _ = io.WriteString(w, sanitizeReplay(c.text))
 	}
 }
 
-// sanitizeStream returns one sanitised string per chunk of the named stream, in order.
+// sanitizeReplay is Flush's filter for one chunk.
 //
-// SEEING THE STREAM WHOLE WITHOUT MOVING ANYTHING. A rune that straddles a chunk boundary is
-// emitted with the chunk its FIRST BYTE fell in, and the chunk that held the remainder emits
-// nothing for it. That is the only assignment that keeps the replay in record order: the two
-// streams converge on a real terminal (and under `2>&1`), so a filter that HELD bytes back until
-// the next chunk of its own stream would emit them after an intervening chunk of the other one —
-// writing a later line before an earlier one. Measured on the first version of this fix, which did
-// hold: a fragment on stderr followed by a line on stdout replayed in the wrong order.
+// LF IS PRESERVED EXACTLY, because LF is the record's boundary between lines: a filter that touched
+// it would relocate every line break in the replay, which is a different and worse defect than the
+// one it fixes. Everything else unicode.IsControl covers — including CR, the overwrite-this-line
+// vector, and TAB, which no verb in this tree emits — plus the bidi controls and the BOM become
+// U+FFFD, the same visible placeholder the pane draws for them.
 //
-// Record boundaries survive: only a multi-byte remainder is ever attributed to an earlier chunk,
-// and LF is a single ASCII byte that can never be part of one.
-func sanitizeStream(rec []recordChunk, stderr bool) []string {
-	var data []byte
-	var ends []int
-	for _, c := range rec {
-		if c.stderr != stderr {
-			continue
-		}
-		data = append(data, c.text...)
-		ends = append(ends, len(data))
-	}
-	out := make([]string, len(ends))
+// A BYTE THAT IS NOT PART OF A COMPLETE RUNE IN THIS CHUNK BECOMES THE PLACEHOLDER TOO, and that
+// single rule is what makes the stateless version SAFER than the joining ones rather than weaker.
+// The worry that motivated joining was a hostile rune split across two writes: judged in halves it
+// might pass through as two innocent fragments that the TERMINAL rejoins into the override. It
+// cannot, because no raw byte of a multi-byte sequence ever leaves here — each fragment is replaced
+// where it stands. There is nothing left for any terminal to rejoin, under any arrangement of the
+// streams, which is more than either joining version could say: each of those had to GUESS whether
+// stdout and stderr converge in order to know which bytes a terminal would see as adjacent, and
+// Flush cannot know that.
+//
+// THE RESIDUAL, STATED: a LEGITIMATE rune split across two writes of one stream renders as one
+// placeholder per byte instead of as the character. Nothing in this tree splits one — every verb
+// write reaches StreamWriter through fmt.Fprint*, which writes the whole formatted string in a
+// single Write, and the tree's only io.Copy copies a file to a file. If some future writer does
+// chunk mid-rune, the result is a cosmetically degraded character, never an unsafe one and never a
+// reordering.
+func sanitizeReplay(s string) string {
 	var b strings.Builder
-	ci := 0
-	closeThrough := func(i int) {
-		for ci < len(ends) && i >= ends[ci] {
-			out[ci] = b.String()
-			b.Reset()
-			ci++
-		}
-	}
-	for i := 0; i < len(data); {
-		// A rune belongs to the chunk its first byte is in, so the boundary is crossed BEFORE the
-		// rune is decoded, never part-way through it.
-		closeThrough(i)
-		r, size := utf8.DecodeRune(data[i:])
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
 		switch {
 		case r == '\n':
 			b.WriteByte('\n')
 		case r == utf8.RuneError && size == 1, terminalHostile(r):
-			// A byte that is not valid UTF-8 becomes the placeholder too — it cannot be printed as
-			// itself, and passing it through raw would let a hostile rune cross a chunk boundary in
-			// pieces the terminal rejoins. It matches what the pane already draws: ranging over a
-			// string yields U+FFFD for such a byte, so screen and replay agree.
 			b.WriteRune('\ufffd')
 		default:
-			b.Write(data[i : i+size])
+			b.WriteString(s[i : i+size])
 		}
 		i += size
 	}
-	closeThrough(len(data))
-	return out
+	return b.String()
 }
 
 // Writer returns an io.Writer that routes a stream's writes into the interface line by line, and

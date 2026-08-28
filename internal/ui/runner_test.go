@@ -963,11 +963,15 @@ func TestFlushDoesNotReplayTerminalControlBytes(t *testing.T) {
 
 // A RUNE SPLIT ACROSS TWO WRITES, on interleaved streams. The record takes the raw bytes of every
 // Write, so a multi-byte rune can straddle two chunks with a chunk of the OTHER stream between
-// them. Judging each chunk alone is wrong in both directions: a legitimate rune arrives as two
-// invalid fragments and is replaced twice, and — the reason this is a security test and not a
-// cosmetic one — a bidi override arrives as two innocent-looking fragments that pass through and
-// are reassembled by the terminal into exactly the override the filter exists to stop.
-func TestFlushJoinsARuneSplitAcrossChunksBeforeJudgingIt(t *testing.T) {
+// them. THE DANGEROUS ANSWER would be to pass the fragments through as the innocent-looking bytes
+// they individually are: the TERMINAL rejoins adjacent bytes, so a bidi override written in halves
+// would arrive intact and the filter would have protected nothing.
+//
+// Neither half survives. Every byte that is not a complete rune within its own chunk is replaced
+// where it stands, so there is nothing for any terminal to rejoin — and, unlike joining the halves
+// back together first, that holds without having to guess whether stdout and stderr converge.
+// The stated cost is here in the open: the legitimate rune on stderr is degraded the same way.
+func TestFlushReplacesEveryHalfOfARuneSplitAcrossChunks(t *testing.T) {
 	b := NewBridge(context.Background(), blackHole{})
 	out := b.Writer(false)
 	errw := b.Writer(true)
@@ -988,13 +992,17 @@ func TestFlushJoinsARuneSplitAcrossChunksBeforeJudgingIt(t *testing.T) {
 	b.Flush(&o, &e)
 
 	if strings.Contains(o.String(), "\u202e") {
-		t.Fatalf("a bidi override split across two writes was reassembled by the TERMINAL: %q", o.String())
+		t.Fatalf("a bidi override split across two writes could be reassembled by the TERMINAL: %q", o.String())
 	}
-	if o.String() != "ok \ufffd done\n" {
-		t.Fatalf("stdout replay %q, want the split override replaced exactly once", o.String())
+	// One placeholder per byte of the override: the leading byte in its chunk, the two trailing
+	// bytes in theirs. No raw byte of the sequence left the filter.
+	if got, want := o.String(), "ok \ufffd\ufffd\ufffd done\n"; got != want {
+		t.Fatalf("stdout replay %q, want %q", got, want)
 	}
-	if e.String() != "\u00e9 rejoined\ncaf\u00e9\n" {
-		t.Fatalf("stderr replay %q — a legitimate rune split across two writes was mangled", e.String())
+	// The legitimate rune is degraded the same way, in the same place — the stated residual, and
+	// the safe direction of it.
+	if got, want := e.String(), "\ufffd\ufffd rejoined\ncaf\u00e9\n"; got != want {
+		t.Fatalf("stderr replay %q, want %q", got, want)
 	}
 }
 
@@ -1020,8 +1028,8 @@ func TestFlushKeepsRecordOrderAcrossStreamsWhenARuneIsSplit(t *testing.T) {
 
 	var merged bytes.Buffer
 	b.Flush(&merged, &merged)
-	if got, want := merged.String(), "\ufffdok\n"; got != want {
-		t.Fatalf("merged replay %q, want %q — the record has the stderr fragment BEFORE the stdout line, and the replay must too", got, want)
+	if got, want := merged.String(), "\ufffdok\n\ufffd\ufffd"; got != want {
+		t.Fatalf("merged replay %q, want %q — every byte must stay at the position the verb wrote it", got, want)
 	}
 
 	// And a lone invalid byte, which is never completed at all, behaves the same way.
@@ -1045,8 +1053,78 @@ func TestFlushKeepsRecordOrderAcrossStreamsWhenARuneIsSplit(t *testing.T) {
 	o3.Write([]byte("three\n"))
 	var merged3 bytes.Buffer
 	b3.Flush(&merged3, &merged3)
-	if got, want := merged3.String(), "one\n\ufffdtwo\nthree\n"; got != want {
+	if got, want := merged3.String(), "one\n\ufffd\ufffdtwo\n\ufffdthree\n"; got != want {
 		t.Fatalf("merged replay %q, want %q", got, want)
+	}
+}
+
+// EVERY BYTE STAYS AT THE POSITION THE VERB WROTE IT, and a record with nothing hostile in it
+// replays BYTE-IDENTICALLY to the plain path. Those are the two invariants the sanitising cost the
+// first two versions of this filter, each in a way that only shows when the streams converge — and
+// they converge on a real terminal and under `2>&1`, which is where the operator reads the result.
+//
+// THE SHARED WRITER IS THE POINT OF THE TEST. Flushing into two separate buffers cannot see either
+// defect: separate buffers erase the relative order of stdout and stderr, so both broken versions
+// passed a two-buffer test. One buffer is what a terminal is.
+func TestFlushReplayIsPositionExactAgainstThePlainPath(t *testing.T) {
+	// The exact shape that defeated the second version: one stream opens a multi-byte rune, the
+	// other writes a whole line, the first supplies the remainder. Under a filter that joined the
+	// halves, the trailing byte moved AHEAD of the intervening line.
+	b := NewBridge(context.Background(), blackHole{})
+	o, e := b.Writer(false), b.Writer(true)
+	e.Write([]byte{0xc3})
+	o.Write([]byte("ok\n"))
+	e.Write([]byte{0xa9})
+	var merged bytes.Buffer
+	b.Flush(&merged, &merged)
+	if got, want := merged.String(), "\ufffdok\n\ufffd"; got != want {
+		t.Fatalf("merged replay %q, want %q — the trailing byte belongs AFTER the line the other stream wrote", got, want)
+	}
+	// Stated positionally, against the record itself: chunk k's replay begins where chunk k begins.
+	var at int
+	for _, c := range b.Record() {
+		f := sanitizeReplay(c.text)
+		if got := merged.String()[at : at+len(f)]; got != f {
+			t.Fatalf("chunk %q replayed at the wrong position: found %q at offset %d", c.text, got, at)
+		}
+		at += len(f)
+	}
+	if at != merged.Len() {
+		t.Fatalf("the replay is %d bytes but the chunks account for %d", merged.Len(), at)
+	}
+
+	// A CLEAN RECORD -- which is every real one -- is untouched, byte for byte, merged order and
+	// all. A filter that quietly rewrote ordinary output would be a regression against `--plain`,
+	// a pipe, and the frozen shell original alike.
+	b2 := NewBridge(context.Background(), blackHole{})
+	o2, e2 := b2.Writer(false), b2.Writer(true)
+	fmt.Fprint(o2, "checking the runtime\n")
+	fmt.Fprint(e2, "mythical-ctl: the network was already attached\n")
+	fmt.Fprint(o2, "started brokkr\ncafé 日本語 \U0001F600\n")
+	fmt.Fprint(e2, "warn: two\n")
+	fmt.Fprint(o2, "no trailing newline")
+
+	var got bytes.Buffer
+	b2.Flush(&got, &got)
+	var raw bytes.Buffer
+	for _, c := range b2.Record() {
+		raw.WriteString(c.text)
+	}
+	if got.String() != raw.String() {
+		t.Fatalf("a record with nothing hostile in it was rewritten:\n got %q\nwant %q", got.String(), raw.String())
+	}
+	// And into separate streams, each is its own raw bytes.
+	var so, se, rso, rse bytes.Buffer
+	b2.Flush(&so, &se)
+	for _, c := range b2.Record() {
+		if c.stderr {
+			rse.WriteString(c.text)
+		} else {
+			rso.WriteString(c.text)
+		}
+	}
+	if so.String() != rso.String() || se.String() != rse.String() {
+		t.Fatalf("split replay diverged from the record: stdout %q/%q stderr %q/%q", so.String(), rso.String(), se.String(), rse.String())
 	}
 }
 
