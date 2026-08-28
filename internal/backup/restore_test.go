@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -1659,4 +1660,52 @@ func TestLinkThenVerifiedUnlinkAgainstAConcurrentReplacer(t *testing.T) {
 				"replacement", round, string(got))
 		}
 	}
+}
+
+// TestAnUnconfirmablePreservedCopyIsAFailureNotAResidue: "residue" is reported as SUCCESS, and its
+// words tell the operator the evidence is safe elsewhere and to remove the leftover.
+//
+// If the destination cannot be examined after the link — ENOENT, most sharply, meaning the new link
+// has vanished — then nothing is known to be at that name, and the file still at the staging name
+// is the ONLY copy. Calling that a residue tells the operator to delete the last copy of the
+// evidence the function exists to keep. It is a failed preservation: nothing is claimed and nothing
+// is unlinked.
+func TestAnUnconfirmablePreservedCopyIsAFailureNotAResidue(t *testing.T) {
+	dir := t.TempDir()
+	from := filepath.Join(dir, "ledger.staging")
+	evidence := []byte("the only copy\n")
+	write(t, from, evidence)
+	to := filepath.Join(dir, "ledger.staging.corrupt.1")
+
+	// THE ARM IS REACHED THROUGH ITS OWN SEAM, because no fixture can open the window from
+	// outside: the link must SUCCEED and the destination be unexaminable only afterwards. The
+	// alternative — a test that re-implements the arm and checks its own restatement — passes
+	// however wrong the code is.
+	orig := lstatAfterLink
+	t.Cleanup(func() { lstatAfterLink = orig })
+	lstatAfterLink = func(string) (os.FileInfo, error) { return nil, fs.ErrNotExist }
+
+	err := linkThenVerifiedUnlink(from, to)
+	if err == nil {
+		t.Fatal("an unconfirmable preserved copy was reported as a success")
+	}
+	if errors.Is(err, errActivatedWithResidue) || errors.Is(err, errStagingNameTaken) {
+		t.Fatalf("an unconfirmable preserved copy was reported as a residue — which preserveCorrupt reads\n"+
+			"as SUCCESS, so the operator is told the evidence is safe and to delete the only copy\n"+
+			"left: %v", err)
+	}
+	if !strings.Contains(err.Error(), "never established") {
+		t.Fatalf("the refusal does not say the question failed: %v", err)
+	}
+	// THE EVIDENCE IS UNTOUCHED at the staging name.
+	got, rerr := os.ReadFile(from)
+	if rerr != nil || string(got) != string(evidence) {
+		t.Fatalf("the only remaining copy was disturbed: %q, %v", got, rerr)
+	}
+
+	// preserveCorrupt's propagation of this — a plain error becomes ("", nil, err), so the caller
+	// prints "cannot preserve the corrupt staging ledger" instead of naming an aside — is asserted
+	// by TestPreserveCorruptRefusesAFileThatChangedUnderIt, which drives that same default arm.
+	// It cannot be driven from here: on a filesystem whose no-replace rename works, preserveMove
+	// never reaches the fallback at all.
 }

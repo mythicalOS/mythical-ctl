@@ -887,13 +887,32 @@ func linkThenVerifiedUnlink(from, to string) error {
 	// described the old one — and if the old inode then reappeared at `from`, the comparison would
 	// succeed, the ORIGINAL evidence would be deleted, and `to` would hold unrelated bytes. Lstat
 	// of `to` is the inode that is now preserved, by construction, whatever happened before it.
-	linked, lerr := os.Lstat(to)
+	linked, lerr := lstatAfterLink(to)
 	if lerr != nil {
-		return fmt.Errorf("%w: the preserved copy could not be examined, so the staging name was left\n"+
-			"  alone rather than unlinked on an unchecked assumption: %w", errActivatedWithResidue, lerr)
+		// NOT A RESIDUE — A FAILED PRESERVATION. errActivatedWithResidue means "the evidence IS at
+		// the other name and a leftover copy remains", and preserveCorrupt reports that as SUCCESS:
+		// its callers then print "It has been PRESERVED at <to>" and tell the operator to remove
+		// the leftover. If this Lstat failed with ENOENT the link has vanished, so <to> holds
+		// NOTHING and the file at the staging name is the ONLY copy left — following that advice
+		// would destroy the very evidence the function exists to keep. Whether the copy exists was
+		// never established, so nothing is claimed and nothing is unlinked.
+		return fmt.Errorf("restore: the preserved copy at %s could not be examined after it was made, so whether\n"+
+			"  the evidence is there was never established. The staging ledger is LEFT WHERE IT IS and\n"+
+			"  nothing is removed; a link may have been created at that name and was not confirmed: %w",
+			to, lerr)
 	}
 	return unlinkIfSame(linked, from)
 }
+
+// lstatAfterLink is the confirmation that the link really produced the preserved copy. It is a
+// variable ONLY so that failure can be driven: the arm below is reached when the link SUCCEEDS and
+// the destination is then unexaminable, and no single-threaded fixture can open that window from
+// outside — a destination whose directory is unsearchable makes the LINK fail instead, which is a
+// different path. Production never assigns it; a test that does restores it.
+//
+// The alternative was a test that re-implements this arm and asserts against its own restatement,
+// which passes however wrong the code is.
+var lstatAfterLink = os.Lstat
 
 // unlinkIfSame removes `from` ONLY IF it is still the inode `before` describes. A file that
 // replaced it is left exactly where it is and reported as a residue — the honest answer, because
