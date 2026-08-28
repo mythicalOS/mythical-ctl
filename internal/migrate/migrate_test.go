@@ -654,9 +654,20 @@ func TestPhase6PresentsTheRecordedAttemptState(t *testing.T) {
 	if got, _ := f.confValue(f.confkey); got != canon {
 		t.Fatalf("fresh phase 6 wrote %q", got)
 	}
+	// AND IT SAYS SO, THROUGH THE ADAPTER THIS MODULE SUPPLIES. The compare-and-set's report of the
+	// value it wrote is one of the three grounds on which the reference accepts that this write is
+	// not atomic against a human editor ("the command REPORTS the value it wrote, so a lost edit is
+	// visible immediately"). internal/conf asserts that FamilyCAS CALLS its report seam; nothing
+	// asserted that THIS module hands it one, so deleting the CASReport adapter left every suite
+	// green while the narrative disappeared. It matters most when the migration fails at a LATER
+	// phase and never reaches its own success output.
+	if got := f.log.String(); !strings.Contains(got, "set "+f.confkey+"="+canon) {
+		t.Fatalf("phase 6 wrote the bind and said nothing about it:\n%s", got)
+	}
 	// Resumed: attempt=started and the key already holds our value → advance without rewriting,
 	// and with no confirmation asked for.
 	f.prompts = nil
+	f.log.Reset()
 	f.seed(record{Phase: 6, Dest: canon, Nonce: "nz", Staging: StagingPath(canon, "nz"),
 		Attempt: "started", Desired: "running"})
 	if err := Run(ctx(), f.l, f.d, testProduct, testRole, canon, 6); err != nil {
@@ -664,6 +675,10 @@ func TestPhase6PresentsTheRecordedAttemptState(t *testing.T) {
 	}
 	if len(f.prompts) != 0 {
 		t.Fatalf("an already-written key asked for confirmation: %v", f.prompts)
+	}
+	// The no-op advance says so too, rather than looking like a write that did not happen.
+	if got := f.log.String(); !strings.Contains(got, "already holds the migrated destination") {
+		t.Fatalf("the advance was silent:\n%s", got)
 	}
 }
 
@@ -1977,7 +1992,13 @@ func TestTheAmbiguityIsExplainedEvenWhenTheConfirmationIsShortCircuited(t *testi
 		}
 		_ = Resume(ctx(), f.l, f.d)
 
+		// f.warn is what Deps.Warn writes to, so this also asserts the CASReport adapter this module
+		// supplies is wired to the WARN stream rather than the narrative one — internal/conf asserts
+		// FamilyCAS calls the seam; nothing else asserts migrate hands it one.
 		said := f.warn.String()
+		if strings.Contains(f.log.String(), "equally") {
+			t.Fatalf("the ambiguity explanation reached the NARRATIVE stream, which callers parse:\n%s", f.log.String())
+		}
 		for _, want := range []string{"IN PROGRESS", "/operators/own/choice", "equally", "deleted or changed the line by hand"} {
 			if !strings.Contains(said, want) {
 				t.Fatalf("MI_CONFIRM=%s: the operator was never told %q — the whole explanation:\n%s", mi, want, said)

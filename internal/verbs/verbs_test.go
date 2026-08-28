@@ -1775,8 +1775,9 @@ func TestWorstRefusals(t *testing.T) {
 	}
 }
 
-// TestExitNameNamesEveryCode ports exit.bats' "every code has a human name, for reports". The bats
-// row checks one code; every code is checked here because the batch report prints this string per
+// TestExitNameNamesEveryCode ports exit.bats' row about every code having a human name for reports
+// (quoted verbatim only in the machine-readable claim above, never in prose). The bats row checks
+// one code; every code is checked here because the batch report prints this string per
 // product, and a code with no name of its own would surface as another code's word — a report that
 // is wrong rather than a report that is missing.
 func TestExitNameNamesEveryCode(t *testing.T) {

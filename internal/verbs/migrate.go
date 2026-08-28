@@ -60,6 +60,41 @@ func MigrateStorage(ctx context.Context, d Deps, product, role string, o migrate
 	return s.migrateStorage(ctx, product, role, o)
 }
 
+// migrateDeps assembles the phase machine's dependencies.
+//
+// IT IS A FUNCTION RATHER THAN A LITERAL AT THE CALL SITE so the WIRING can be asserted. Two of
+// these fields are diagnostic streams that the reference emits unconditionally and this port had
+// dropped: Log carries the compare-and-set's report of the value it wrote, Warn carries the
+// ambiguity explanation an operator reads BEFORE answering its confirmation. Both were restored in
+// this task, and both were then reachable only through a test that injected its own writers — so
+// deleting either assignment here left every suite green while the CLI went silent. A seam nothing
+// drives is a diagnostic nobody reads.
+//
+// THE TWO STREAMS ARE NOT INTERCHANGEABLE: mi_log's narrative goes to stdout, mi_warn's diagnostics
+// to stderr. A caller parsing this verb's stdout must never receive a diagnostic.
+func (s *session) migrateDeps(cop migrate.Copier, product string) migrate.Deps {
+	d := s.d
+	return migrate.Deps{
+		Lock:   s.h,
+		Docs:   sessionDocs{s: s},
+		Objs:   migrateObjects{c: d.Engine},
+		Mut:    s.rt,
+		Prov:   prov.Engine(d.Engine),
+		State:  state.Engine(d.Engine),
+		Copy:   cop,
+		Build:  &rebuilder{s: s, product: product},
+		Mounts: migrate.SystemMounts{},
+		// THE CONFIRMATION IS THE SESSION'S OWN SEAM, so a front-end that answers through an
+		// overlay and the plain terminal path cannot disagree about what "yes" means.
+		Confirm:  d.ask,
+		Persist:  s.persistFn(),
+		Entries:  &migrate.EntryCount{},
+		Log:      d.out(),
+		Warn:     d.errw(),
+		NewNonce: intent.NonceNew,
+	}
+}
+
 func (s *session) migrateStorage(ctx context.Context, product, role string, o migrate.Options) int {
 	d := s.d
 	if err := s.prepare(ctx); err != nil {
@@ -88,25 +123,7 @@ func (s *session) migrateStorage(ctx context.Context, product, role string, o mi
 		d.warnErr(cerr)
 		return cliio.ExitFail
 	}
-	md := migrate.Deps{
-		Lock:   s.h,
-		Docs:   sessionDocs{s: s},
-		Objs:   migrateObjects{c: d.Engine},
-		Mut:    s.rt,
-		Prov:   prov.Engine(d.Engine),
-		State:  state.Engine(d.Engine),
-		Copy:   cop,
-		Build:  &rebuilder{s: s, product: product},
-		Mounts: migrate.SystemMounts{},
-		// THE CONFIRMATION IS THE SESSION'S OWN SEAM, so a front-end that answers through an
-		// overlay and the plain terminal path cannot disagree about what "yes" means.
-		Confirm:  d.ask,
-		Persist:  s.persistFn(),
-		Entries:  &migrate.EntryCount{},
-		Log:      d.out(),
-		Warn:     d.errw(),
-		NewNonce: intent.NonceNew,
-	}
+	md := s.migrateDeps(cop, product)
 	if err := migrate.MigrateStorage(ctx, s.l, md, product, role, o); err != nil {
 		d.warnErr(err)
 		return cliio.ExitFail

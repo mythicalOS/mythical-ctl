@@ -1132,3 +1132,28 @@ func TestLexAfterIsNotFooledByASlashInsideAString(t *testing.T) {
 		t.Fatalf("a line inside a raw string closed it: block %v raw %v", b, rr)
 	}
 }
+
+// A claim whose PATH is itself split across lines: `tests/unit/` on one, `a.bats: "row"` on the
+// next. Neither line carries a whole path, so the path signal saw nothing to pair. Every corpus
+// basename is unique, so a bare `<name>.bats` identifies its file — and the corpus still has to
+// HOLD it, which keeps this from firing on prose about somebody else's suite.
+func TestAuditCoverageCatchesAClaimNamedByBareFilename(t *testing.T) {
+	c, b, st := claimsFrom(t,
+		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
+		`// PORTED: tests/unit/a.bats: "two" -> TestTwo`,
+		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
+		`func f() {}`,
+		`/* PORTED:`,
+		`   tests/unit/`,
+		`   a.bats: "two" -> TestTwo, claimed again where nothing reads it`,
+		`*/`,
+	)
+	if len(st) == 0 {
+		t.Fatal("the bare-filename claim was not detected")
+	}
+	r := &report{}
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
+	if !hasProblem(r, "which is a real @test in that file") {
+		t.Fatalf("the bare-filename claim was not reported: %v", r.Problems)
+	}
+}

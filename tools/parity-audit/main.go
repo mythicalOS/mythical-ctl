@@ -303,6 +303,12 @@ var (
 	// ignored whatever syntax surrounds it.
 	invStrayClaim = regexp.MustCompile(`(PORTED|N/A):`)
 	invStrayPath  = regexp.MustCompile(`tests/[A-Za-z0-9_./-]+\.bats`)
+	// A BARE FILENAME, because a full path can itself be split across lines. Round 6: `tests/unit/`
+	// on one line and `foo.bats: "row"` on the next produced no path match at all, so the window had
+	// nothing to pair. Every corpus file's basename is unique (34 files, verified), so a bare
+	// `<name>.bats` identifies one file unambiguously — and auditCoverage still requires the corpus
+	// to HOLD it, which is what keeps this from firing on prose about some other project's suite.
+	invStrayBase = regexp.MustCompile(`\b[A-Za-z0-9_.-]+\.bats\b`)
 	// EVERY quoted string, at any length. A length floor here was a silent hole: it only ever costs
 	// a map lookup to consider one more candidate, and the signal fires only on an EXACT match with
 	// a real @test name, so a short quoted word can never be a false positive.
@@ -419,7 +425,7 @@ func parseInventory(rel string, content []byte) ([]claim, []malformed, []stray, 
 		line int
 		text string
 	}
-	var winPaths []seenPath
+	var winPaths, winBases []seenPath
 	var winQuotes []string
 	sc := bufio.NewScanner(bytes.NewReader(content))
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
@@ -435,7 +441,7 @@ func parseInventory(rel string, content []byte) ([]claim, []malformed, []stray, 
 		inBlock, inRaw = lexAfter(inBlock, inRaw, text)
 		isComment := openedInBlock || inBlock || invCommentLine.MatchString(text)
 		if !isComment {
-			winPaths, winQuotes = nil, nil
+			winPaths, winBases, winQuotes = nil, nil, nil
 		}
 
 		claimable := !openedInRaw && !openedInBlock && invAny.MatchString(text)
@@ -479,6 +485,7 @@ func parseInventory(rel string, content []byte) ([]claim, []malformed, []stray, 
 		// EVERY path on the line, not the first: a mention of a file the corpus does not hold,
 		// earlier on the same line, would otherwise shadow a real one after it.
 		paths := invStrayPath.FindAllString(text, -1)
+		bases := invStrayBase.FindAllString(text, -1)
 		claimWords := invStrayClaim.MatchString(text)
 		var quoted []string
 		for _, q := range invQuoted.FindAllStringSubmatch(text, -1) {
@@ -487,6 +494,9 @@ func parseInventory(rel string, content []byte) ([]claim, []malformed, []stray, 
 		if isComment {
 			for _, p := range paths {
 				winPaths = append(winPaths, seenPath{p, line, text})
+			}
+			for _, b := range bases {
+				winBases = append(winBases, seenPath{b, line, text})
 			}
 			winQuotes = append(winQuotes, quoted...)
 		}
@@ -509,10 +519,16 @@ func parseInventory(rel string, content []byte) ([]claim, []malformed, []stray, 
 				for _, sp := range winPaths {
 					emit(sp.file, sp.text+" || "+text, quoted)
 				}
+				for _, sb := range winBases {
+					emit(sb.file, sb.text+" || "+text, quoted)
+				}
 			}
 			if len(winQuotes) > 0 {
 				for _, p := range paths {
 					emit(p, text, winQuotes)
+				}
+				for _, b := range bases {
+					emit(b, text, winQuotes)
 				}
 			}
 		}
@@ -831,12 +847,18 @@ func auditCoverage(r *report, pairs []batsPair, claims []claim, bad []malformed,
 	// it quotes one of that file's actual @test names. The second signal is what closes the
 	// split-across-lines hiding place: the continuation line carries the row identity even when the
 	// claim words sat on the line above.
+	// Keyed by BOTH the full corpus path and its basename: a hidden claim can name either, and every
+	// corpus basename is unique so the second key is unambiguous.
 	namesOf := map[string]map[string]bool{}
+	fullOf := map[string]string{}
 	for _, p := range pairs {
-		if namesOf[p.File] == nil {
-			namesOf[p.File] = map[string]bool{}
+		for _, k := range []string{p.File, path.Base(p.File)} {
+			if namesOf[k] == nil {
+				namesOf[k] = map[string]bool{}
+			}
+			namesOf[k][p.Name] = true
+			fullOf[k] = p.File
 		}
-		namesOf[p.File][p.Name] = true
 	}
 	type where struct {
 		file string
@@ -844,7 +866,8 @@ func auditCoverage(r *report, pairs []batsPair, claims []claim, bad []malformed,
 	}
 	reported := map[where]bool{}
 	for _, s := range strays {
-		if len(perFile[s.BatsFile]) == 0 {
+		full, known := fullOf[s.BatsFile]
+		if !known || len(perFile[full]) == 0 {
 			continue
 		}
 		why := ""
@@ -865,7 +888,7 @@ func auditCoverage(r *report, pairs []batsPair, claims []claim, bad []malformed,
 		}
 		reported[where{s.GoFile, s.GoLine}] = true
 		r.fail("%s:%d: this names %s where the inventory parser does not read it (%s) — a claim here is invisible to every gate, so it can contradict the real one forever. Put it at the start of its own comment line, or reword it so it neither uses the claim syntax nor quotes a row name: %s",
-			s.GoFile, s.GoLine, s.BatsFile, why, strings.TrimSpace(s.Text))
+			s.GoFile, s.GoLine, full, why, strings.TrimSpace(s.Text))
 	}
 
 	byPair := map[batsPair][]claim{}
