@@ -328,11 +328,6 @@ var (
 	invCommentLine = regexp.MustCompile(`^[ \t]*(//|/\*|\*)`)
 	invPorted      = regexp.MustCompile(`^[ \t]*// PORTED:[ \t]+(\S+):[ \t]+"(.+)"[ \t]+->[ \t]+(.*\S)[ \t]*$`)
 	invNA          = regexp.MustCompile(`^[ \t]*// N/A:[ \t]+(\S+):[ \t]+"(.+)"[ \t]+--[ \t]+(.*\S)[ \t]*$`)
-	// Go IDENTIFIERS, extracted; whether one is a TEST name is decided by isGoTestName below rather
-	// than by this pattern. Go identifiers are Unicode — a letter or underscore, then letters,
-	// digits and underscores — and an ASCII-only class silently TRUNCATES one that is not, so
-	// `TestAlphaÉ` would be read as `TestAlpha` and a claim on the former satisfied by the latter.
-	goIdent = regexp.MustCompile(`\b[\p{L}_][\p{L}\p{Nd}_]*`)
 )
 
 // isGoTestName applies the testing package's OWN rule, in Go rather than in a regular expression
@@ -352,10 +347,65 @@ func isGoTestName(s string) bool {
 	return !unicode.IsLower(r)
 }
 
+// identRune reports the runes a Go identifier may CONTAIN. The Go spec: a letter (any Unicode
+// Letter, plus `_`) or a Unicode decimal digit (category Nd, which is what unicode.IsDigit tests).
+func identRune(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' }
+
+// goIdentsIn returns the MAXIMAL identifier-shaped rune runs in s that are legal Go identifiers.
+//
+// SCANNED RUNE BY RUNE RATHER THAN MATCHED BY A REGEXP, and that is the whole point of it. The
+// pattern this replaced anchored on `\b`, and RE2's `\b` is ASCII-ONLY: between a non-ASCII letter
+// and an ASCII one it sees a non-word/word transition and reports a boundary. So `ÉTestByteGate`
+// matched starting at the `T` and yielded `TestByteGate` — and a PORTED claim naming a test that
+// does not exist RESOLVED against a real one with a different name while the audit exited 0.
+// Reproduced end to end on this tree: a claim retargeted to `ÉTestVerifyDigest` passed
+// `check.sh parity` clean. Go identifiers are Unicode, so `É` is a legal identifier START; that is
+// exactly why the boundary sat in the wrong place, and why no `\b`-anchored pattern can be right
+// here.
+//
+// MAXIMAL, SO EACH RUN IS JUDGED WHOLE. Everything identifier-shaped is consumed first and only
+// then asked whether it can legally BEGIN an identifier, so `1TestOne` is one run starting with a
+// digit and yields nothing — never the `TestOne` inside it. Truncating a run and keeping a legal
+// tail is the defect being fixed; it must not come back at the other end.
+//
+// THIS IS ABOUT WHERE AN IDENTIFIER STARTS AND ENDS, and nothing else. That a target expression is
+// free text, so a `TestFoo` written in an English aside beside the name is extracted too, is a
+// separate and deliberate property of the column's grammar — a different question from this one,
+// and not changed here.
+func goIdentsIn(s string) []string {
+	var out []string
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if !identRune(r) {
+			i += size
+			continue
+		}
+		start, first := i, r
+		for i < len(s) {
+			r2, sz := utf8.DecodeRuneInString(s[i:])
+			if !identRune(r2) {
+				break
+			}
+			i += sz
+		}
+		if unicode.IsLetter(first) || first == '_' {
+			out = append(out, s[start:i])
+		}
+	}
+	return out
+}
+
+// isGoIdent reports whether s is one Go identifier and nothing besides — no surrounding text, no
+// second token. Used where a WHOLE LINE must be a bare identifier to count.
+func isGoIdent(s string) bool {
+	ids := goIdentsIn(s)
+	return len(ids) == 1 && ids[0] == s
+}
+
 // testNamesIn returns the Go test names appearing in a claim's target expression.
 func testNamesIn(expr string) []string {
 	var out []string
-	for _, id := range goIdent.FindAllString(expr, -1) {
+	for _, id := range goIdentsIn(expr) {
 		if isGoTestName(id) {
 			out = append(out, id)
 		}
@@ -696,7 +746,7 @@ func parseGoTestList(content []byte) map[string]map[string]bool {
 	var cur []string
 	for sc.Scan() {
 		t := strings.TrimRight(sc.Text(), "\r")
-		if isGoTestName(t) && goIdent.FindString(t) == t {
+		if isGoTestName(t) && isGoIdent(t) {
 			cur = append(cur, t)
 			continue
 		}

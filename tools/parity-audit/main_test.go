@@ -498,6 +498,55 @@ func TestAuditCoverageResolvesEverySecondaryTarget(t *testing.T) {
 	}
 }
 
+// A TARGET WHOSE FIRST RUNE IS NOT ASCII must not resolve to the ASCII test whose name it merely
+// ENDS WITH. This is the false-green this test was written for, reproduced end to end on the real
+// tree before it was fixed: a claim retargeted from `TestVerifyDigest` to `ÉTestVerifyDigest` — a
+// Go test that does not exist and never has — passed `bash check.sh parity` with exit 0 and the
+// line "every PORTED target resolves".
+//
+// THE MECHANISM was the `\b` anchoring the identifier pattern. RE2's `\b` is ASCII-ONLY: between
+// `É` and `T` it sees a non-word/word transition and reports a boundary, so the scan STARTED at
+// the `T` and returned the ASCII tail. `É` is a legal Go identifier start (Go identifiers are
+// Unicode), which is precisely why the boundary sat in the wrong place. Identifier runs are now
+// scanned rune by rune and judged whole; see goIdentsIn.
+//
+// WHY THIS IS THE WORST PLACE FOR IT: the bats trees are deleted, tests/parity-manifest.tsv IS
+// the corpus, and this program is the only thing that reads it. A claim that resolves to nothing
+// while the audit certifies it is the entire failure mode the audit exists to prevent.
+func TestANonASCIIIdentifierStartCannotResolveToADifferentTest(t *testing.T) {
+	// The extractor, first: the run is returned WHOLE or not at all.
+	if got := goIdentsIn("ÉTestByteGate"); len(got) != 1 || got[0] != "ÉTestByteGate" {
+		t.Fatalf("goIdentsIn(%q) = %q — a leading non-ASCII rune was skipped and the ASCII tail returned as an identifier", "ÉTestByteGate", got)
+	}
+	// ...so it names NO Go test, rather than the real one it ends with.
+	if got := testNamesIn("-> ÉTestVerifyDigest"); len(got) != 0 {
+		t.Fatalf("testNamesIn(%q) = %q — a target that is not a Go test name was read as one", "-> ÉTestVerifyDigest", got)
+	}
+	// A run that cannot START an identifier yields nothing either, rather than its own tail: the
+	// defect being fixed is truncation, and it must not reappear at the other end.
+	if got := goIdentsIn("1TestOne"); len(got) != 0 {
+		t.Fatalf("goIdentsIn(%q) = %q — an identifier-shaped run beginning with a digit was truncated to a legal tail", "1TestOne", got)
+	}
+	// And the whole audit refuses it. Under the old pattern this inventory was CLEAN: `ÉTestOne`
+	// resolved to `TestOne`, which exists in both witnesses, and every row read as covered.
+	c, b, st := claimsFrom(t,
+		`// PORTED: tests/unit/a.bats: "one" -> ÉTestOne`,
+		`// PORTED: tests/unit/a.bats: "two" -> TestTwo`,
+		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
+	)
+	r := &report{}
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
+	if len(r.Problems) == 0 {
+		t.Fatal(`the audit certified a PORTED claim naming ÉTestOne, which is not a Go test that exists — it resolved to TestOne, a DIFFERENT test, and the row read as covered`)
+	}
+	if !hasProblem(r, "inventory line does not parse") {
+		t.Fatalf("the unreadable claim was not reported as such: %v", r.Problems)
+	}
+	if !hasProblem(r, `tests/unit/a.bats: "one" is claimed by NO inventory line`) {
+		t.Fatalf("the row the bogus target was meant to cover was not reported unclaimed: %v", r.Problems)
+	}
+}
+
 func TestAuditCoverageReportsMalformedLines(t *testing.T) {
 	c, b, st := claimsFrom(t,
 		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
