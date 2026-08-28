@@ -15,12 +15,12 @@ import (
 // expiry/rollback, Fix 3 tampered policy, Fix 7 mismatch label — are owned by the trust task):
 // PORTED: tests/unit/manifest.bats: "a valid manifest loads" -> TestValidManifestLoads
 // PORTED: tests/unit/manifest.bats: "a digest-pinned image is required; a tag is refused" -> TestImagePinning
-// PORTED: tests/unit/manifest.bats: "a tag alongside a digest is accepted (still pinned by the digest); a bare tag is not" -> TestImagePinning
+// PORTED: tests/unit/manifest.bats: "a tag alongside a digest is accepted (still pinned by the digest); a bare tag with no digest is refused" -> TestImagePinning
 // PORTED: tests/unit/manifest.bats: "mi_manifest_image returns the pinned reference" -> TestValidManifestLoads
 // PORTED: tests/unit/manifest.bats: "launched=false reports rc 3 — the not-launched contract code" -> TestLaunched
 // PORTED: tests/unit/manifest.bats: "launched=true reports rc 0" -> TestLaunched
 // PORTED: tests/unit/manifest.bats: "a missing launched field is refused — launch state is never inferred" -> TestSchemaRefusals
-// PORTED: tests/unit/manifest.bats: "T5: mi_manifest_launched refuses a non-boolean launch state rather than defaulting" -> TestSchemaRefusals (the bool type refuses at parse; no Manifest value with a non-boolean state can exist)
+// PORTED: tests/unit/manifest.bats: "T5: mi_manifest_launched refuses a non-boolean launch state rather than reporting it launched" -> TestSchemaRefusals (the bool type refuses at parse; no Manifest value with a non-boolean state can exist)
 // PORTED: tests/unit/manifest.bats: "a manifest selecting only entitled things passes the check" -> TestEntitlementCheck
 // PORTED: tests/unit/manifest.bats: "a manifest asking for a role it is not entitled to is rejected" -> TestEntitlementCheck
 // PORTED: tests/unit/manifest.bats: "a manifest asking for a secret outside its namespace is rejected" -> TestEntitlementCheck
@@ -28,8 +28,8 @@ import (
 // PORTED: tests/unit/manifest.bats: "a manifest for a product the policy index does not know is rejected" -> TestEntitlementCheck
 // PORTED: tests/unit/manifest.bats: "a manifest declaring bindability is rejected" -> TestSchemaRefusals
 // PORTED: tests/unit/manifest.bats: "a manifest cannot choose a network at all" -> TestSchemaRefusals
-// PORTED: tests/unit/manifest.bats: "a manifest requiring a newer core is refused, even when fully authenticated" -> internal/trust TestNewerCoreRefusedThroughDoorWithoutFloorMovement (the door wiring; the comparator itself is TestCoreOK)
-// PORTED: tests/unit/manifest.bats: "a manifest with no min_core is refused — unstated must not mean any core" -> TestSchemaRefusals
+// PORTED: tests/unit/manifest.bats: "a manifest requiring a newer core is refused, even when fully authentic" -> internal/trust TestNewerCoreRefusedThroughDoorWithoutFloorMovement (the door wiring; the comparator itself is TestCoreOK)
+// PORTED: tests/unit/manifest.bats: "a manifest with no min_core is refused — unstated must not mean any core will do" -> TestSchemaRefusals
 // PORTED: tests/unit/manifest.bats: "the version comparator orders components numerically, not lexically" -> TestVersionComparator
 // PORTED: tests/unit/manifest.bats: "the core version tracks the entrypoint's VERSION" -> TestCoreOK (CoreOK takes internal/version.Version itself — there is no second constant to drift; the test compares against that exact value)
 // PORTED: tests/unit/manifest.bats: "coreversion accepts MAJOR[.MINOR[.PATCH]] and nothing else" -> (owned by internal/docfmt TestDocTypes)

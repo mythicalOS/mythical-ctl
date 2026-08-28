@@ -206,6 +206,17 @@ func FamilyAdd(h famlock.Held, key, value string) error {
 	return atomicReplace(f, content)
 }
 
+// CASReport is where FamilyCAS says what it is doing. TWO SEAMS, because the reference uses two
+// STREAMS and the difference is contract: mi_log writes the narrative to stdout (what was written),
+// mi_warn writes diagnostics to stderr (why you are being asked something). Collapsing them would
+// put a diagnostic on the stream a script parses, or bury the narrative where nobody looks. Both are
+// optional — a caller with nowhere to write passes neither — and neither changes what the function
+// DOES.
+type CASReport struct {
+	Say  func(string) // the narrative: stdout, as the reference's mi_log
+	Warn func(string) // the diagnostics: stderr, as the reference's mi_warn
+}
+
 // Attempt is FamilyCAS's recorded write-attempt state.
 type Attempt int
 
@@ -229,7 +240,29 @@ const (
 //
 // The rewrite re-verifies the expected value AT the write, per line, and a key deleted between
 // check and rewrite refuses — nothing acts on a fact this call did not re-establish.
-func FamilyCAS(h famlock.Held, key, value, prior string, attempt Attempt, confirm cliio.ConfirmFunc) error {
+//
+// THIS DOOR NARRATES, and that is not decoration — it is one of the three grounds on which the
+// reference accepts that the compare-and-set is NOT atomic against a human editor. The operation
+// lock serializes mythical-ctl processes; it has no authority over a text editor, so an operator
+// who saves mythical.conf inside the read-to-rename window loses that edit. The reference accepts
+// that window because it is milliseconds long, because the operator invoked the command that
+// touches this key, and because "the command REPORTS the value it wrote, so a lost edit is visible
+// immediately". A silent version of this function keeps the window and drops the mitigation the
+// design leaned on — and drops it hardest when it matters most: if the migration fails at a later
+// phase, its own success narrative never runs, and the operator sees an error with no statement
+// anywhere that mythical.conf was already rewritten. So `note` carries the three lines the
+// reference printed. A nil note is allowed (a caller with nowhere to write), never assumed.
+func FamilyCAS(h famlock.Held, key, value, prior string, attempt Attempt, confirm cliio.ConfirmFunc, report CASReport) error {
+	say := func(format string, a ...any) {
+		if report.Say != nil {
+			report.Say(fmt.Sprintf(format, a...))
+		}
+	}
+	warn := func(format string, a ...any) {
+		if report.Warn != nil {
+			report.Warn(fmt.Sprintf(format, a...))
+		}
+	}
 	if err := famlock.Assert(h, "compare-and-set a value in mythical.conf"); err != nil {
 		return err
 	}
@@ -268,9 +301,34 @@ func FamilyCAS(h famlock.Held, key, value, prior string, attempt Attempt, confir
 		}
 	case AttemptStarted:
 		if haveCur && cur == value {
-			return nil // already holds the migrated destination; advance without rewriting
+			say("config: %s already holds the migrated destination; advancing without rewriting.", key)
+			return nil
 		}
-		if confirm == nil || !confirm(fmt.Sprintf("config: write %s=%s, discarding what is there?", key, value)) {
+		// THE EXPLANATION IS EMITTED BEFORE THE PROMPT, NOT INSIDE IT, and that placement is the
+		// whole point of it.
+		//
+		// It used to live only in the error returned when the operator DECLINED — which reaches
+		// nobody who says yes, and the person who says yes is the one about to discard something.
+		// Moving it into the prompt fixed that and broke something worse: cliio.Confirm
+		// SHORT-CIRCUITS on MI_CONFIRM=yes/no and never renders the prompt at all. So under
+		// MI_CONFIRM=yes — a script, or an operator who set it once — the file would have been
+		// rewritten with nothing ever said about what was discarded, and under MI_CONFIRM=no the
+		// reference's own bats row asserts the words "equally" and "deleted", which would have been
+		// absent. The reference emits these lines with mi_warn and THEN calls mi_confirm; so does
+		// this. The prompt itself stays the one-line question, exactly as there.
+		found := cur
+		if !haveCur {
+			found = "<nothing>"
+		}
+		warn("config: a write of %s was recorded as IN PROGRESS, and the key now holds\n"+
+			"    %s\n"+
+			"  rather than the value this write was in the middle of landing. The write may have\n"+
+			"  crashed before it landed, or you may have deleted or changed the line by hand — the\n"+
+			"  two are equally possible from the file alone, and guessing which one happened would\n"+
+			"  overwrite exactly the edit this file's additive-only rule promises to keep.\n"+
+			"  Stopping. Confirm explicitly to write %q anyway.", key, found, value)
+		prompt := fmt.Sprintf("config: write %s=%s, discarding what is there?", key, value)
+		if confirm == nil || !confirm(prompt) {
 			return fmt.Errorf("config: a write of %s was recorded as IN PROGRESS and the key now holds %q — a crash and a hand edit are indistinguishable from the file alone; refusing without explicit confirmation", key, cur)
 		}
 	default:
@@ -320,5 +378,9 @@ func FamilyCAS(h famlock.Held, key, value, prior string, attempt Attempt, confir
 	if err := identityOK(f); err != nil {
 		return err
 	}
-	return atomicReplace(f, []byte(out.String()))
+	if err := atomicReplace(f, []byte(out.String())); err != nil {
+		return err
+	}
+	say("config: set %s=%s in %s (this is the one setting migrate-storage may change).", key, value, f)
+	return nil
 }

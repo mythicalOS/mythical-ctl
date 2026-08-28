@@ -11,8 +11,10 @@ import (
 
 // The endpoint-locality rows of tests/unit/preflight.bats are inventoried in Task 16's
 // preflight_test.go (they are that file's tests); the resolver they now exercise lives here.
-// runtime.bats's "the daemon endpoint is read from the active context (D30)" is inventoried in
-// client_test.go -> TestResolveEndpointContextSelection below.
+// runtime.bats's row about the daemon endpoint being read from the active context (D30) is
+// inventoried in client_test.go, against TestResolveEndpointContextSelection below. Named rather
+// than quoted: a comment that quotes a row verbatim beside a corpus filename reads as a claim, and
+// the audit reports one the parser cannot read.
 
 // writeContext puts a context's meta.json where the docker CLI's store keeps it.
 func writeContext(t *testing.T, root, name, host string) {

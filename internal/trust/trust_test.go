@@ -15,8 +15,8 @@ import (
 
 // Inventory — tests/unit/trust.bats:
 // PORTED: tests/unit/trust.bats: "digest verification accepts a match and reports both sides on mismatch" -> TestVerifyDigest
-// PORTED: tests/unit/trust.bats: "digest verification refuses a malformed expectation rather than comparing" -> TestVerifyDigest
-// N/A: tests/unit/trust.bats: "a missing file is a verification failure, not a pass" -- VerifyDigestData is bytes-first by design (round-1 plan gate); absence is refused earlier, by Snapshot, asserted in TestAcceptorRefusals
+// PORTED: tests/unit/trust.bats: "digest verification refuses a malformed expectation rather than comparing strings" -> TestVerifyDigest
+// PORTED: tests/unit/trust.bats: "a missing file is a verification failure, not a pass" -> TestAcceptorRefusals ("a missing file is a refusal from the snapshot step, never a pass" — VerifyDigestData is bytes-first by design (round-1 plan gate), so absence is refused one step earlier, by Snapshot; the property is the same one and it is asserted)
 // PORTED: tests/unit/trust.bats: "an absent floor is first use, not a rollback" -> TestFloorLifecycle
 // PORTED: tests/unit/trust.bats: "a floor round-trips through the ledger" -> TestFloorLifecycle
 // PORTED: tests/unit/trust.bats: "floors are per document id and do not bleed" -> TestFloorLifecycle
@@ -27,22 +27,22 @@ import (
 // PORTED: tests/unit/trust.bats: "a downgrade is recorded in the ledger, not just printed" -> TestFloorOverride
 // PORTED: tests/unit/trust.bats: "there is nothing to override when no floor was ever recorded" -> TestFloorOverride
 // PORTED: tests/unit/trust.bats: "D2: a failed write leaves neither the floor lowered nor a partial audit record" -> TestFloorOverride
-// PORTED: tests/unit/trust.bats: "D3: an over-long downgrade reason is refused, matching the config module's bound" -> TestFloorOverride
-// PORTED: tests/unit/trust.bats: "D4: the message does not say DOWNGRADING when the override raises or re-records" -> TestFloorOverride
+// PORTED: tests/unit/trust.bats: "D3: an over-long downgrade reason is refused, matching the config module's value cap" -> TestFloorOverride
+// PORTED: tests/unit/trust.bats: "D4: the message does not say DOWNGRADING when the override raises or repeats the floor" -> TestFloorOverride
 // PORTED: tests/unit/trust.bats: "setting the same floor again is accepted" -> TestFloorLifecycle
 // PORTED: tests/unit/trust.bats: "floors survive other ledger records" -> TestFloorLifecycle
 // PORTED: tests/unit/trust.bats: "writing a floor without the family lock is refused" -> TestLockRequired
-// PORTED: tests/unit/trust.bats: "an absent anchor reports rc 3, and is NOT treated as first use by mi_trust_check_only" -> TestAnchorLifecycle
+// PORTED: tests/unit/trust.bats: "an absent anchor reports rc 3, and is NOT treated as first use by mi_trust_check" -> TestAnchorLifecycle
 // PORTED: tests/unit/trust.bats: "the anchor round-trips and is replaceable" -> TestAnchorLifecycle
 // PORTED: tests/unit/trust.bats: "a malformed anchor is refused" -> TestAnchorLifecycle
 // PORTED: tests/unit/trust.bats: "an index cannot be accepted without a recorded anchor" -> TestAcceptIndex
 // PORTED: tests/unit/trust.bats: "an index listing a product twice is refused as ambiguous" -> TestAcceptIndex
-// PORTED: tests/unit/trust.bats: "an index whose real digest matches the recorded anchor is accepted, and returns records" -> TestAcceptIndex
-// PORTED: tests/unit/trust.bats: "an index is refused when its real digest does not match the recorded anchor" -> TestAcceptIndex
+// PORTED: tests/unit/trust.bats: "an index whose real digest matches the recorded anchor is accepted, and its records come back" -> TestAcceptIndex
+// PORTED: tests/unit/trust.bats: "an index is refused when its real digest does not match the recorded anchor, and the message names the mismatch" -> TestAcceptIndex
 // PORTED: tests/unit/trust.bats: "D1: an ABSENT anchor is first use for mi_accept_index too, and it is rc 4" -> TestAcceptIndex (ErrNoAnchor is the rc-4 analogue)
-// PORTED: tests/unit/trust.bats: "D1: an anchor that cannot be READ is refused by mi_accept_index, never re-anchored" -> TestUnreadableAnchorNeverFirstUse
-// PORTED: tests/unit/trust.bats: "T2: mi_accept_index refuses an expired family index even though its digest matches" -> TestAcceptIndex
-// PORTED: tests/unit/trust.bats: "T5: _mi_index_manifest_digest returns THIS product's digest, never merely the first" -> TestIndexManifestDigest
+// PORTED: tests/unit/trust.bats: "D1: an anchor that cannot be READ is refused by mi_accept_index, never reported as first use" -> TestUnreadableAnchorNeverFirstUse
+// PORTED: tests/unit/trust.bats: "T2: mi_accept_index refuses an expired family index even though its digest matches the anchor" -> TestAcceptIndex
+// PORTED: tests/unit/trust.bats: "T5: _mi_index_manifest_digest returns THIS product's digest, never merely any colon-bearing entry" -> TestIndexManifestDigest
 // PORTED: tests/unit/trust.bats: "a document with no expiry is refused — it would replay forever" -> TestFreshnessRequiresExpiry
 // PORTED: tests/unit/trust.bats: "a first-seen document is accepted and records its version" -> TestCheckAndCommit
 // PORTED: tests/unit/trust.bats: "an equal version is accepted; a lower one is refused as replay" -> TestFreshness
@@ -56,24 +56,24 @@ import (
 // PORTED: tests/unit/trust.bats: "an ABSENT anchor is first use, and it is rc 3 from the ledger that says so" -> TestAnchorLifecycle
 // PORTED: tests/unit/trust.bats: "an anchor that cannot be READ is refused, never reported as first use" -> TestUnreadableAnchorNeverFirstUse
 // PORTED: tests/unit/trust.bats: "mi_trust_commit refuses a malformed anchor without moving the floor" -> TestCheckAndCommit
-// PORTED: tests/unit/trust.bats: "mi_trust_commit called directly refuses a version below the floor, and does not lower it" -> TestCheckAndCommit
+// PORTED: tests/unit/trust.bats: "mi_trust_commit called directly refuses a version below the floor, and the floor is unchanged" -> TestCheckAndCommit
 // PORTED: tests/unit/trust.bats: "a version floor recorded twice is REFUSED, not silently compared as one string" -> TestDamagedTrustRecords
 // PORTED: tests/unit/trust.bats: "a floor that is RECORDED but unreadable is refused, never read as never-seen" -> TestDamagedTrustRecords
 // PORTED: tests/unit/trust.bats: "a trust record with no fields at all is refused, not read as absent" -> TestDamagedTrustRecords
 // PORTED: tests/unit/trust.bats: "a genuinely absent floor is still rc 3, and a good floor still reads back" -> TestDamagedTrustRecords
 //
 // Deferred chain rows owned HERE — tests/unit/policy.bats:
-// PORTED: tests/unit/policy.bats: "mi_accept_policy end to end: a matching chain is accepted and its records returned" -> TestAcceptPolicy
-// PORTED: tests/unit/policy.bats: "mi_accept_policy refuses when the policy file's digest does not match the index" -> TestAcceptPolicy
-// PORTED: tests/unit/policy.bats: "mi_accept_policy refuses with the chain's own code when no anchor has been accepted" -> TestAcceptPolicy
-// PORTED: tests/unit/policy.bats: "T1: mi_accept_policy refuses a forged index it would otherwise merely re-parse" -> TestAcceptPolicy
-// PORTED: tests/unit/policy.bats: "T2: mi_accept_policy refuses an expired policy even though its digest matches" -> TestAcceptPolicy
+// PORTED: tests/unit/policy.bats: "mi_accept_policy end to end: a matching chain is accepted and its records come back" -> TestAcceptPolicy
+// PORTED: tests/unit/policy.bats: "mi_accept_policy refuses when the policy file's digest does not match what the index vouches for" -> TestAcceptPolicy
+// PORTED: tests/unit/policy.bats: "mi_accept_policy refuses with the chain's own code when no anchor has ever been recorded" -> TestAcceptPolicy
+// PORTED: tests/unit/policy.bats: "T1: mi_accept_policy refuses a forged index it would otherwise merely have parsed" -> TestAcceptPolicy
+// PORTED: tests/unit/policy.bats: "T2: mi_accept_policy refuses an expired policy even though its digest matches the index" -> TestAcceptPolicy
 //
 // Deferred chain rows owned HERE — tests/unit/manifest.bats:
-// N/A: tests/unit/manifest.bats: "every acceptance path verifies and parses one snapshot, never the live pathname twice" -- structural in Go: each acceptor performs exactly one docfmt.Snapshot per file and every later step consumes that byte slice; there is no second open to trace
-// PORTED: tests/unit/manifest.bats: "a forged record blob passed where a file belongs is refused" -> (structural: the acceptors take PATHS and re-derive everything; no API accepts a record blob at all — asserted by the type system, noted here for the audit)
-// PORTED: tests/unit/manifest.bats: "the anchor is consulted on every acceptance, not cached from a previous call" -> TestAnchorConsultedEveryTime
-// PORTED: tests/unit/manifest.bats: "T5: mi_accept_manifest's own index authentication cannot be bypassed even by a caller that skips it" -> TestAcceptManifestChain (the door re-derives the chain itself; no caller-supplied index exists)
+// PORTED: tests/unit/manifest.bats: "every acceptance path verifies and parses one snapshot, never the live file twice" -> TestAcceptorRefusals + TestAnchorConsultedEveryTime (the row's hazard is verifying one set of bytes and PARSING ANOTHER; in Go each check takes ONE docfmt.Snapshot and both verifies and parses that same byte slice, so the two can never diverge. An earlier rationale here waived the row on the stronger and FALSE claim that no file is ever opened twice: acceptManifest calls checkIndex, then checkPolicy which calls checkIndex again, so the index really is snapshotted twice. That is not the hazard — each snapshot is verified against the recorded anchor before it is parsed, so a file swapped between the two reads is REFUSED by the anchor rather than adopted)
+// N/A: tests/unit/manifest.bats: "a forged record blob passed where a file belongs is refused" -- structural in Go, with no test to name: every acceptor takes a PATH and re-derives the records from the bytes it reads, so there is no API that accepts a caller-supplied record blob and therefore nothing a forged one could be passed to
+// PORTED: tests/unit/manifest.bats: "the anchor is consulted on every acceptance, not cached from a previous one" -> TestAnchorConsultedEveryTime
+// PORTED: tests/unit/manifest.bats: "T5: mi_accept_manifest's own index authentication cannot be bypassed even when the policy step is stubbed" -> TestAcceptManifestChain (the door re-derives the chain itself; no caller-supplied index exists)
 // PORTED: tests/unit/manifest.bats: "the chain accepts an untampered index, policy and manifest" -> TestAcceptManifestChain
 // PORTED: tests/unit/manifest.bats: "a manifest the index vouches for, but which declares another product, is refused" -> TestAcceptManifestChain
 // PORTED: tests/unit/manifest.bats: "tampering at any level of the chain is refused" -> TestAcceptManifestChain
@@ -85,8 +85,8 @@ import (
 // PORTED: tests/unit/manifest.bats: "Fix 1: an accepted-but-not-launched manifest still advances the version floor" -> TestFloorDiscipline
 // PORTED: tests/unit/manifest.bats: "Fix 2: an expired manifest is refused through the door" -> TestAcceptManifestChain
 // PORTED: tests/unit/manifest.bats: "Fix 2: a version rollback is refused through the door" -> TestFloorDiscipline
-// PORTED: tests/unit/manifest.bats: "Fix 3: a policy tampered with locally after the chain was built is refused" -> TestAcceptManifestChain
-// PORTED: tests/unit/manifest.bats: "Fix 7: a digest mismatch through the door names the operator's manifest path" -> TestAcceptManifestChain
+// PORTED: tests/unit/manifest.bats: "Fix 3: a policy tampered with locally after the chain was built is refused, naming the digest mismatch" -> TestAcceptManifestChain
+// PORTED: tests/unit/manifest.bats: "Fix 7: a digest mismatch through the door names the operator's manifest path, not the temp snapshot" -> TestAcceptManifestChain
 
 const hex64 = "abababababababababababababababababababababababababababababababab"
 

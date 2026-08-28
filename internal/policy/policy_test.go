@@ -13,9 +13,9 @@ import (
 // PORTED: tests/unit/policy.bats: "a precious role that is also permitted loads" -> TestPrecious
 // PORTED: tests/unit/policy.bats: "a precious role that is NOT permitted is rejected as malformed, not silently ignored" -> TestStructuralInvariants
 // PORTED: tests/unit/policy.bats: "precious and bindable COMPOSE — precious data is exactly what an operator relocates" -> TestPrecious
-// PORTED: tests/unit/policy.bats: "mi_policy_precious matches whole records — never a prefix, and never across products" -> TestWholeRecordMatching
+// PORTED: tests/unit/policy.bats: "mi_policy_precious matches whole records — never a prefix, and never another product's" -> TestWholeRecordMatching
 // PORTED: tests/unit/policy.bats: "a bindable SECRETS role is rejected outright" -> TestStructuralInvariants
-// PORTED: tests/unit/policy.bats: "a permitted secrets role that is NOT bindable is fine — that is the point" -> TestValidPolicyLoads
+// PORTED: tests/unit/policy.bats: "a permitted secrets role that is NOT bindable is fine — that is the point of two lists" -> TestValidPolicyLoads
 // PORTED: tests/unit/policy.bats: "entitlements do not bleed between products" -> TestWholeRecordMatching
 // PORTED: tests/unit/policy.bats: "an unknown product is entitled to nothing" -> TestWholeRecordMatching
 // PORTED: tests/unit/policy.bats: "bindable is queried separately from permitted" -> TestBindableQuery

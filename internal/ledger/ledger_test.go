@@ -35,7 +35,7 @@ import (
 // N/A: tests/unit/ledger.bats: "the ledger path override refuses anything outside the two paths this code owns" -- no override exists in Go: the sealed Store's three constructors own both paths and nothing else is expressible
 // N/A: tests/unit/ledger.bats: "the ledger path override accepts the real ledger path with no further conditions" -- same: no override
 // N/A: tests/unit/ledger.bats: "the staging path is refused UNLESS the internal marker is also set (codex gate round 1, fix 1)" -- the marker protocol guarded an env seam that does not exist; staging is a distinct sealed constructor whose caller set check.sh's boundary gate pins
-// N/A: tests/unit/ledger.bats: "the staging path is accepted once BOTH the override and the internal marker are set" -- same
+// N/A: tests/unit/ledger.bats: "the staging path is accepted once BOTH the override and the internal marker are set" -- the other half of the same override protocol, and it does not exist in Go either: staging is reached through the sealed OpenStaging constructor, not by setting two environment variables, and check.sh's boundary rule pins its only legal caller
 // PORTED: tests/unit/ledger.bats: "the staging reader/writer round-trip, without touching the real ledger" -> TestStagingRoundTripLeavesLiveAlone
 // PORTED: tests/unit/ledger.bats: "Plan 1's ledger.bats still passes unchanged: an ordinary write/read never sees the override" -> TestStagingRoundTripLeavesLiveAlone (Live and staging paths asserted distinct; an ordinary store never resolves to staging)
 //

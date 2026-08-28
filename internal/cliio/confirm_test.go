@@ -6,16 +6,10 @@ import (
 	"testing"
 )
 
-// Inventory — tests/unit/exit.bats (this package owns only the vocabulary test; the batch
-// worst-wins aggregate is verbs-wave scope and inventoried there):
-// (exit.bats: "the four codes are exactly §7.3's" — the machine-readable PORTED line lives in exit_test.go, its one owner)
-// (exit.bats: "batch precedence is worst-wins: all success is 0" — owned by the verbs wave)
-// (exit.bats: "success plus not-launched is 3" — owned by the verbs wave)
-// (exit.bats: "any operational failure wins over not-launched" — owned by the verbs wave)
-// (exit.bats: "a usage error is never aggregated, wherever it sits in the batch" — verbs wave)
-// (exit.bats: "an empty batch is a usage error, not a success" — owned by the verbs wave)
-// (exit.bats: "an unknown code is refused rather than mapped to failure, wherever it sits in the batch" — verbs wave)
-// (exit.bats: "every code has a human name, for reports" — owned by the verbs wave)
+// Inventory — NONE here. exit.bats' one vocabulary row is claimed in exit_test.go and its seven
+// aggregate rows in internal/verbs/verbs_test.go, each exactly once. This file used to restate
+// all eight as parenthetical prose pointing elsewhere; a pointer in a shape no gate reads is how
+// a row ends up claimed by nobody while three files appear to be discussing it.
 //
 // The confirmation contract has no dedicated bats file — it is exercised through verbs.bats'
 // purge tests (verbs-wave inventory); these direct tests pin the tri-state itself.

@@ -15,8 +15,13 @@ import (
 // PORTED: tests/acceptance/restore.bats: "mi_verb_backup/mi_verb_restore reject the wrong number of arguments as a usage error" -> TestBackupOperandMatrix, TestRestoreOperandMatrix
 // PORTED: tests/unit/backup.bats: "mi_verb_backup and mi_verb_restore reject bad arity as a USAGE error (rc 2)" -> TestBackupOperandMatrix, TestRestoreOperandMatrix
 //
-// N/A: tests/acceptance/restore.bats: "backup then restore: through the actual CLI (bin/mythical-ctl)" -- claimed elsewhere: it is a CLI-level test now that the production copy seam is wired, and it lives in roundtrip_test.go as TestBackupRestoreRoundTripThroughTheCLI.
-// N/A: tests/acceptance/restore.bats: "CLI: --abandon on other verbs is refused, not silently ignored" -- the verb it names (install) is not wired in this build; refusing --abandon there belongs to that verb's own option matrix, which lands with it. Asserting exit 2 for `install p1 --abandon` today would pass on "unknown command", not on the refusal — a test that cannot fail for the reason it claims. The half of the rule this build CAN prove — that --abandon is refused by a verb that does not take it — is asserted by TestBackupRefusesOtherVerbsOptions.
+// (restore.bats' "backup then restore: through the actual CLI" row is claimed in roundtrip_test.go,
+// which owns the wired copy seam. It used to carry an N/A here as well; two claims on one row is
+// how the wrong one of a pair hides behind the right one, so this is prose, not a second claim.)
+// (restore.bats' "CLI: --abandon on other verbs is refused" row was N/A here while install was
+// unwired. Install landed in Wave 5, so the row is portable and is claimed in lifecycle_test.go by
+// TestCLIInstallRejectsAbandon. The half this file still owns — that --abandon is refused by a verb
+// which does not take it — stays asserted by TestBackupRefusesOtherVerbsOptions.)
 
 // rcOf runs the entrypoint in process and returns its exit code and both streams.
 func rcOf(args ...string) (int, string, string) {

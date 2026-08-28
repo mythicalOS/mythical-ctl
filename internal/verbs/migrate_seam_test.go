@@ -2,6 +2,7 @@ package verbs
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -612,5 +613,52 @@ func TestPrepareRefusesWhenThereIsNoRecordedDesiredStateToPreserve(t *testing.T)
 	}
 	if !r.containerExists(c1) {
 		t.Fatal("the working container was taken down by a preparation that failed")
+	}
+}
+
+// TestMigrateDepsAreWiredToTheRightStreams is the WIRING half of migrate's two diagnostic seams,
+// and the test the round-6 gate asked for.
+//
+// internal/migrate asserts that its phase machine CALLS Log and Warn. Nothing asserted that this
+// package HANDS it either one — so deleting `Log:` or `Warn:` from the Deps built here left every
+// suite green while the CLI lost, respectively, the compare-and-set's report of the value it wrote
+// and the explanation an operator reads BEFORE answering its confirmation. Both are diagnostics the
+// reference emits unconditionally, and both were restored in this task precisely because losing them
+// is silent.
+//
+// THE TWO STREAMS ARE NOT INTERCHANGEABLE. The reference uses mi_log (stdout) for the narrative and
+// mi_warn (stderr) for the diagnostics; a caller parsing this verb's stdout must never receive a
+// diagnostic, and a narrative buried on stderr is one nobody sees in a log. So the test asserts
+// which stream each lands on, not merely that something was written.
+func TestMigrateDepsAreWiredToTheRightStreams(t *testing.T) {
+	r := newRig(t)
+	r.writeProduct("p1")
+	r.mintIdentity()
+
+	s, err := openSession(r.d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	md := s.migrateDeps(nil, "p1")
+	if md.Log == nil {
+		t.Fatal("migrate is handed no Log — the compare-and-set's report of what it wrote goes nowhere")
+	}
+	if md.Warn == nil {
+		t.Fatal("migrate is handed no Warn — the ambiguity explanation an operator reads before confirming goes nowhere")
+	}
+	r.reset()
+	fmt.Fprintln(md.Log, "narrative-marker")
+	fmt.Fprintln(md.Warn, "diagnostic-marker")
+	if got := r.out.String(); !strings.Contains(got, "narrative-marker") {
+		t.Fatalf("the narrative did not reach stdout: %q", got)
+	}
+	if got := r.errb.String(); !strings.Contains(got, "diagnostic-marker") {
+		t.Fatalf("the diagnostic did not reach stderr: %q", got)
+	}
+	if strings.Contains(r.out.String(), "diagnostic-marker") {
+		t.Fatalf("a diagnostic reached STDOUT, which callers parse: %q", r.out.String())
+	}
+	if strings.Contains(r.errb.String(), "narrative-marker") {
+		t.Fatalf("the narrative reached STDERR: %q", r.errb.String())
 	}
 }

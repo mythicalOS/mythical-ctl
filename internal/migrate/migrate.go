@@ -171,6 +171,10 @@ type Deps struct {
 	MapForeign bool
 	// Log is where the success-path narrative goes (never the refusals, which are errors).
 	Log io.Writer
+	// Warn is where a diagnostic goes that is NOT a refusal — something the operator must read
+	// before answering a question, which is therefore emitted before the question rather than
+	// carried in an error nobody sees when they say yes.
+	Warn io.Writer
 	// NewNonce mints a fresh staging nonce.
 	NewNonce func() (string, error)
 }
@@ -182,6 +186,16 @@ func (d Deps) logf(format string, a ...any) {
 		return
 	}
 	fmt.Fprintf(d.Log, format+"\n", a...)
+}
+
+// warnf writes a diagnostic to STDERR, the stream the reference's mi_warn uses. It is a separate
+// seam from logf on purpose: a caller parsing this verb's stdout must never receive a diagnostic,
+// and a diagnostic buried in stdout is one nobody reads at the moment it matters.
+func (d Deps) warnf(format string, a ...any) {
+	if d.Warn == nil {
+		return
+	}
+	fmt.Fprintf(d.Warn, format+"\n", a...)
 }
 
 // staged runs edit on a COPY of the ledger, PERSISTS the copy, and only then publishes it into the
@@ -1019,7 +1033,10 @@ func runPhase6(l *ledger.Ledger, d Deps, prev, r record) error {
 			"  path rather than this refusal. Run 'mythical-ctl state repair' if it persists.",
 			carriedAttempt, r.Product, r.Role)
 	}
-	return conf.FamilyCAS(d.Lock, r.ConfKey, r.Dest, prev.Prior, attempt, d.Confirm)
+	return conf.FamilyCAS(d.Lock, r.ConfKey, r.Dest, prev.Prior, attempt, d.Confirm, conf.CASReport{
+		Say:  func(s string) { d.logf("%s", s) },
+		Warn: func(s string) { d.warnf("%s", s) },
+	})
 }
 
 // runPhase7 REPLACES THE CONTAINER, because "switch the mount" is not an operation: mounts are fixed

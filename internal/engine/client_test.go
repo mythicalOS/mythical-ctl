@@ -28,7 +28,7 @@ import (
 // PORTED: tests/unit/harness.bats: "runtime snapshot captures volumes and their labels" -> TestSnapshot (enginetest/fake_test.go)
 // PORTED: tests/unit/harness.bats: "a name that traverses out of the state directory is refused for every resource kind" -> TestCreateNameValidation (enginetest/fake_test.go; the traversal MECHANICS are structurally absent in map-backed state — what survives is the daemon's own name class on every create, so the fake is never more permissive than the daemon)
 // N/A: tests/unit/harness.bats: "a traversing name cannot read or rewrite a file that already exists outside the state dir" -- map-backed state: no name is ever resolved as a filesystem path
-// PORTED: tests/unit/harness.bats: "every subcommand that takes a name validates it, not only create" -> TestCreateNameValidation (creates refuse the class) + TestWeirdNameLookupsAnswer404 (inspect/start/stop/remove/connect/disconnect of a weird-but-routable name answer 404 — the daemon's own answer for an absent object; a traversal spelling is unroutable at the HTTP layer — real daemon 301-path-cleans (measured), the fake's closed surface hard-errors — and is asserted never to address an object)
+// PORTED: tests/unit/harness.bats: "every subcommand that takes a name validates it, not only create" -> TestCreateNameValidation (enginetest/fake_test.go; creates refuse the class) + TestWeirdNameLookupsAnswer404 (inspect/start/stop/remove/connect/disconnect of a weird-but-routable name answer 404 — the daemon's own answer for an absent object; a traversal spelling is unroutable at the HTTP layer — real daemon 301-path-cleans (measured), the fake's closed surface hard-errors — and is asserted never to address an object)
 // PORTED: tests/unit/harness.bats: "image records are keyed by the exact reference, not a character-folded one" -> TestImageKeyExactRef (enginetest/fake_test.go)
 // PORTED: tests/unit/harness.bats: "a container cannot be created on a network that does not exist" -> TestCreateUnknownNetwork
 // PORTED: tests/unit/harness.bats: "network connect refuses a network that does not exist, and attaches by ID" -> TestConnectResolvesNetwork
@@ -76,8 +76,13 @@ import (
 // N/A: tests/unit/runtime.bats: "an env file that does not exist is refused by the ADAPTER, before the runtime" -- there is no env-file vehicle to be missing: env rides the create body over the local socket (SpecOpts.Env doc carries the §4.3 equivalence)
 // N/A: tests/unit/runtime.bats: "gateway priority must be an integer, not merely made of integer characters" -- gwPriority is an int parameter; the grammar IS the type
 // PORTED: tests/unit/runtime.bats: "helper arguments keep their exact argv boundaries — no splitting, no globbing" -> TestHelperArgvBoundaries
-// (deferred to Task 15, runtime_invariants_test.go: "a comma in a bind spec cannot smuggle a Docker mount option"; "a comma in a volume spec cannot convert a named volume into a host bind")
-// (deferred to Task 16, preflight_test.go: "rootless is read from the daemon's SecurityOptions, and 'cannot ask' is not 'rootful'")
+// (the two comma-smuggling rows — a bind spec smuggling a Docker mount option, and a volume spec
+// converting a named volume into a host bind — were deferred to Task 15 and are claimed in
+// runtime_invariants_test.go. Their names are not quoted here: a comment that quotes a row verbatim
+// beside a path into the corpus is claim-shaped, and the audit reports it as a claim nothing reads.)
+// (the rootless-from-SecurityOptions row, including that not being able to ask is not the same fact
+// as rootful, was deferred to Task 16 and is claimed in preflight_test.go — unquoted, for the reason
+// above.)
 
 func newFake(t *testing.T) (*enginetest.Fake, *engine.Client) {
 	t.Helper()
@@ -515,6 +520,27 @@ func TestConstructorRefusals(t *testing.T) {
 	}
 	if _, err := engine.NewContainerSpec("c1", "img", engine.SpecOpts{}); err == nil {
 		t.Error("a spec with no network attachment")
+	}
+	// THE THREE ARGUMENT REFUSALS the reference spells out one per line (lib/runtime.sh:388-390).
+	// They were carried into the constructors and then went unasserted: deleting any of the three
+	// left the whole suite green, which is the state that makes a guard decorative. The rule is the
+	// reference's own — non-empty, no control byte, at most 4096 bytes, under LC_ALL=C so
+	// "control byte" means bytes rather than the operator's locale.
+	//
+	// The control byte is the case that matters: these values become argv/JSON on the way to the
+	// daemon, and a name carrying one is how a field boundary gets moved. Written as an ESCAPE,
+	// never as a literal byte — a literal makes the file binary to every grep in this tree.
+	na0, _ := engine.NewNetworkAttach("net", "a")
+	for _, bad := range []string{"", "c\x01name", strings.Repeat("c", 4097)} {
+		if _, err := engine.NewContainerSpec(bad, "img", engine.SpecOpts{Network: na0}); err == nil {
+			t.Errorf("container name %q accepted", bad)
+		}
+		if _, err := engine.NewContainerSpec("c1", bad, engine.SpecOpts{Network: na0}); err == nil {
+			t.Errorf("image reference %q accepted", bad)
+		}
+		if _, err := engine.NewNetworkAttach("net", bad); err == nil {
+			t.Errorf("network alias %q accepted", bad)
+		}
 	}
 	na, _ := engine.NewNetworkAttach("net", "a")
 	if _, err := engine.NewContainerSpec("c1", "img", engine.SpecOpts{

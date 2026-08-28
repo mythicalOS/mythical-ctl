@@ -6,6 +6,12 @@
 #   bash check.sh packages   # only the "does this lane actually cover anything" guard
 #   bash check.sh go         # packages + gofmt + build + vet + boundary + test
 #   bash check.sh boundary   # only the reference-boundary gates
+#   bash check.sh parity     # the PARITY lane: proves every @test in the frozen bats corpus is
+#                            # accounted for EXACTLY ONCE by a PORTED:/N/A: inventory line in the
+#                            # Go tree, and that every PORTED target names a test that really
+#                            # runs. It is the evidence that deleting the bash tree loses
+#                            # nothing, so it runs on every change rather than once - and it
+#                            # keeps running AFTER that deletion, from the committed manifest.
 #   bash check.sh release    # the RELEASE lane: builds the published platform matrix with the
 #                            # release flags, grades the artifacts, and proves byte
 #                            # reproducibility by building the whole matrix a second time from
@@ -38,8 +44,8 @@ cd "$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 # Floors, not exact counts: the tree grows a package per port task, and each task raises these
 # two literals in its commit. Overridable ONLY so a test harness can prove the guard refuses.
-MIN_PACKAGES="${MIN_PACKAGES:-29}"
-MIN_TESTED_PACKAGES="${MIN_TESTED_PACKAGES:-29}"
+MIN_PACKAGES="${MIN_PACKAGES:-30}"
+MIN_TESTED_PACKAGES="${MIN_TESTED_PACKAGES:-30}"
 
 # The reference-boundary rules, one per line: `<guarded-import-path>:<Identifier>=<allowed
 # import path>[,<more allowed>]`. Each rule is
@@ -161,6 +167,14 @@ check_release() {
   bash tools/build-release.sh --repro 0.0.0-checksh "$RELEASE_OUTDIR"
 }
 
+# THE PARITY LANE. Delegated to tools/parity-audit.sh for the same reason the release lane is
+# delegated to tools/build-release.sh: the toolchain driving belongs in a script and the grading
+# belongs in a separately-testable Go program. See that script's header for what it proves.
+check_parity() {
+  step "parity (bats corpus vs the Go inventory)"
+  bash tools/parity-audit.sh
+}
+
 check_acceptance() {
   step "acceptance (real daemon)"
   GOFLAGS='' GOENV=off go test -tags acceptance ./internal/engine/ -run 'TestAcceptance' -count=1 -v
@@ -207,6 +221,7 @@ case "${1:-all}" in
   packages) check_packages ;;
   boundary) check_boundary ;;
   go) check_go ;;
+  parity) check_parity ;;
   release) check_release ;;
   acceptance) check_acceptance ;;
   # Reads `go test -json` output on stdin and applies the floor, so a harness can prove the
@@ -214,9 +229,10 @@ case "${1:-all}" in
   tested-floor) assert_tested_floor "$(count_ok)" ;;
   all)
     check_go
+    check_parity
     check_release
     ;;
-  *) die "unknown stage: $1 (want one of: all, packages, boundary, go, release, acceptance, tested-floor)" ;;
+  *) die "unknown stage: $1 (want one of: all, packages, boundary, go, parity, release, acceptance, tested-floor)" ;;
 esac
 
 printf '\ncheck.sh: OK\n'

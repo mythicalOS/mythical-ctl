@@ -6,11 +6,15 @@ import (
 	"testing"
 )
 
-// PORTED: tests/smoke.sh: "--version format is \"mythical-ctl <semver>\"" -> TestVersionFlag
-// PORTED: tests/smoke.sh: "unknown command exits 2" -> TestUnknownVerbIsUsageErrorOnStderr
-// PORTED: tests/smoke.sh: "usage errors go to stderr, not stdout" -> TestUnknownVerbIsUsageErrorOnStderr
-// PORTED: tests/smoke.sh: "no arguments prints usage and exits 0" -> TestNoArgsPrintsUsageAndExitsZero
-// (smoke.sh remains live against the built artifact; these are the same contracts in-process.)
+// Inventory — NONE. The PORTED:/N/A: syntax is reserved for the bats corpus, which is the thing
+// the cutover deletes and therefore the only thing needing a claim; tests/smoke.sh SURVIVES the
+// cutover and keeps running against the built artifact, so a machine-readable claim on it would
+// look audited without being auditable — and was in fact wrong three ways when it was one (two
+// names paraphrased, one invented). What is true, in prose: the tests below assert in-process the
+// same four contracts smoke.sh asserts against the binary — the "mythical-ctl <semver>" version
+// shape (TestVersionFlag), an unknown command exiting 2 with nothing on stdout
+// (TestUnknownVerbIsUsageErrorOnStderr), and no-args printing usage and exiting 0
+// (TestNoArgsPrintsUsageAndExitsZero). Two lanes on one contract, deliberately.
 
 func TestVersionFlag(t *testing.T) {
 	for _, flag := range []string{"--version", "-v"} {

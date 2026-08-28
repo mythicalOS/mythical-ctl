@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	"io"
+
 	"mythicalos.ai/ctl/internal/cliio"
 	"mythicalos.ai/ctl/internal/conf"
 	"mythicalos.ai/ctl/internal/engine"
@@ -21,10 +23,10 @@ import (
 // Inventory — tests/unit/migrate.bats (the machine half; the path/identity/secure-location half is
 // in paths_test.go).
 //
-// N/A: tests/unit/migrate.bats: "migrate-storage with NO ROLE is rejected — a product may have several volume roles" -- Go signatures fix arity at compile time: MigrateStorage takes product and role as separate typed parameters, so "the role is missing" is not expressible. The same contract at the surface where it IS expressible — the CLI, where operands are a list — is cmd/mythical-ctl TestMigrateStorageDispatchRefusals ("needs exactly <product> <role>", exit 2, nothing attempted).
+// PORTED: tests/unit/migrate.bats: "migrate-storage with NO ROLE is rejected — a product may have several volume roles" -> cmd/mythical-ctl TestMigrateStorageDispatchRefusals ("needs exactly <product> <role>", exit 2, nothing attempted — the surface where a missing operand is expressible at all; the library signature takes product and role as separate typed parameters, so this package cannot be handed the shape)
 // PORTED: tests/unit/migrate.bats: "an UNKNOWN role is rejected against the manifest, which names the valid roles" -> TestPrecheckRoleGates
 // PORTED: tests/unit/migrate.bats: "a SECRETS role is REFUSED WITH THE REASON — permitted but not bindable (D53)" -> TestPrecheckRoleGates
-// N/A: tests/unit/migrate.bats: "a policy index collapsing permitted and bindable is rejected as MALFORMED (Plan 3's invariant)" -- the invariant is enforced at policy LOAD, not by this module: internal/policy TestStructuralInvariants asserts bindable⊄permitted is refused, and this package can only ever hold a policy that already passed it (policy.ParseVerified is boundary-gated to the trust acceptors).
+// PORTED: tests/unit/migrate.bats: "a policy index collapsing permitted and bindable is rejected as MALFORMED (Plan 3's invariant)" -> internal/policy TestStructuralInvariants (the invariant is enforced at policy LOAD; this package can only ever hold a policy that already passed it, because policy.ParseVerified is boundary-gated to the trust acceptors)
 // PORTED: tests/unit/migrate.bats: "the role must be VOLUME-BACKED, proved by POSITIVE INSPECTION of the container's mounts" -> TestPrecheckRequiresPositiveVolumeBacking
 // PORTED: tests/unit/migrate.bats: "an ALREADY-BIND-BACKED role with NO live intent is refused, naming the current bind" -> TestPrecheckRefusesAnAlreadyBindBackedRole
 // PORTED: tests/unit/migrate.bats: "a live intent is checked FIRST, so a present bind after a crash RESUMES rather than refusing" -> TestPrecheckResumesAMatchingLiveIntent
@@ -44,12 +46,19 @@ import (
 // PORTED: tests/unit/migrate.bats: "mi_mig_run invoked DIRECTLY refuses through an unsafe ancestor, even bypassing the verb/precheck" -> TestRunRefusesAnUnsafeAncestorDirectly
 // PORTED: tests/unit/migrate.bats: "phase 3 derives the staging mkdir path from the canonical dest, ignoring a bogus carried staging field" -> TestPhase3DerivesStagingFromTheCanonicalDest
 // PORTED: tests/unit/migrate.bats: "phase 5 refuses to commit a staging tree that gained an ESCAPING symlink after phase 4" -> TestPhase5RefusesAPlantedEscapingSymlink
-// N/A: tests/unit/migrate.bats: "compare-and-set: not started, key absent → write" -- the compare-and-set is internal/conf's FamilyCAS, the one door authorized to CHANGE a mythical.conf value; its whole attempt table is asserted by internal/conf TestFamilyCASAttemptTable. What THIS module owns is which attempt state it presents, asserted by TestPhase6PresentsTheRecordedAttemptState.
-// N/A: tests/unit/migrate.bats: "compare-and-set: attempt in progress, key holds OUR value → advance without rewriting" -- same: internal/conf TestFamilyCASAttemptTable ("started + holds our value => advance without rewriting", asserted on the file's mtime).
-// N/A: tests/unit/migrate.bats: "compare-and-set: attempt in progress, key ABSENT → STOP and require confirmation" -- same: internal/conf TestFamilyCASAttemptTable ("started + absent => refuse without confirmation; write only WITH it").
-// N/A: tests/unit/migrate.bats: "compare-and-set: attempt in progress, key holds SOMETHING ELSE → STOP" -- same: internal/conf TestFamilyCASAttemptTable, and the migration-level consequence (an operator's edit survives a crashed migration) is TestOperatorEditIsNeverSilentlyOverwritten.
+// The compare-and-set is internal/conf's FamilyCAS, the one door authorized to CHANGE a mythical.conf
+// value, and its whole attempt table is asserted there. What THIS module owns — which attempt state
+// it presents to that door — is TestPhase6PresentsTheRecordedAttemptState.
+// PORTED: tests/unit/migrate.bats: "compare-and-set: not started, key absent → write" -> internal/conf TestFamilyCASAttemptTable
+// PORTED: tests/unit/migrate.bats: "compare-and-set: attempt in progress, key holds OUR value → advance without rewriting" -> internal/conf TestFamilyCASAttemptTable (asserted on the file's mtime — nothing was rewritten) + TestFamilyCASNarratesWhatItDid (it says so rather than looking like a write that did not happen)
+// PORTED: tests/unit/migrate.bats: "compare-and-set: attempt in progress, key ABSENT → STOP and require confirmation" -> internal/conf TestFamilyCASAttemptTable (refuse without confirmation; write only WITH it)
+// PORTED: tests/unit/migrate.bats: "compare-and-set: attempt in progress, key holds SOMETHING ELSE → STOP" -> internal/conf TestFamilyCASAttemptTable + TestOperatorEditIsNeverSilentlyOverwritten (the migration-level consequence: an operator's edit survives a crashed migration)
 // PORTED: tests/unit/migrate.bats: "the bind reaches mythical.conf BEFORE the container is replaced" -> TestBindIsWrittenBeforeTheContainerIsReplaced
-// N/A: tests/unit/migrate.bats: "after the migration, a RECREATE keeps the product on the bind" -- `recreate` is a lifecycle verb this package does not carry (internal/verbs, Wave 5 Task 22), and asserting it against a stand-in would assert the stand-in. The migration-side precondition it rests on — the canonical bind is in mythical.conf and SURVIVES to the end of the migration, so anything later built from mythical.conf picks it up — is TestBindIsWrittenBeforeTheContainerIsReplaced. Re-claim against recreate once that verb lands.
+// (migrate.bats' row about a RECREATE after the migration keeping the product on the bind was N/A here —
+// "re-claim against recreate once that verb lands". Wave 5 landed it, so the row is claimed in
+// cmd/mythical-ctl/migrate_e2e_test.go by TestRecreateAfterAMigrationKeepsTheBind, where the real
+// verb runs rather than a stand-in. The migration-side precondition it rests on stays
+// TestBindIsWrittenBeforeTheContainerIsReplaced here.)
 // PORTED: tests/unit/migrate.bats: "phase 7 REPLACES the container and tombstones the old one — mounts are immutable" -> TestPhase7ReplacesAndTombstonesInOrder
 // PORTED: tests/unit/migrate.bats: "phase 8 verifies the mount BY INSPECTION and claims nothing about the container-side read" -> TestPhase8VerifiesByInspectionAndClaimsNothingMore
 // PORTED: tests/unit/migrate.bats: "a migration of a desired-STOPPED product leaves it stopped and still verifies phase 8" -> TestDesiredStoppedSurvivesTheMigration
@@ -77,8 +86,16 @@ import (
 // PORTED: tests/acceptance/migrate.bats: "a resume with NO confirmation input is refused, not carried out silently" -> TestResumeWithoutConfirmationDoesNothing
 // (The three CLI arity/option rows of tests/acceptance/migrate.bats are claimed by the file that
 //  carries the dispatcher under test: cmd/mythical-ctl/migrate_test.go.)
-// N/A: tests/acceptance/migrate.bats: "CLI: an unrelated verb rejects --to-bind rather than silently ignoring it" -- the reciprocal refusal lives in the option matrix of the OTHER verb (`install`), which lands with internal/verbs in Wave 5 Task 22; this build's dispatcher carries no such verb, so the assertion would pass off the unknown-command path (also exit 2) and could not catch a regression in the rule it names. The half this task owns — migrate-storage refuses every option it does not own, rather than ignoring it — is cmd/mythical-ctl TestMigrateStorageDispatchRefusals. Re-claim against install once that verb lands.
-// N/A: tests/acceptance/migrate.bats: "CLI: migrate-storage end to end, through the real entrypoint, moves the product onto the bind" -- the end-to-end path needs the copy-helper image and a live container runtime, which the hermetic Go lane does not have (check.sh's acceptance stage is the real-daemon lane and covers internal/engine only). The whole nine-phase run, in process and against the real ledger and the real mythical.conf writer, is TestMigrationCompletesEndToEnd; the dispatcher half is cmd/mythical-ctl TestMigrateStorageDispatchRefusals. Re-claim once the copy and rebuild seams are wired into the dispatcher.
+// (acceptance/migrate.bats' "CLI: an unrelated verb rejects --to-bind" row was N/A here while
+// install was unwired — "re-claim against install once that verb lands". It landed in Wave 5, so the
+// row is claimed in cmd/mythical-ctl/lifecycle_test.go by TestCLIInstallRejectsToBind. The half this
+// package owns — migrate-storage refuses every option it does not own — is still
+// cmd/mythical-ctl TestMigrateStorageDispatchRefusals.)
+// (acceptance/migrate.bats' "CLI: migrate-storage end to end" row was N/A here — "re-claim once the
+// copy and rebuild seams are wired into the dispatcher". They are wired, and the row is claimed in
+// cmd/mythical-ctl/migrate_e2e_test.go by TestMigrateStorageMovesARoleEndToEnd, which runs the verb
+// through the real entrypoint against the fake daemon and the copy-helper stand-in. The in-process
+// nine-phase run stays TestMigrationCompletesEndToEnd here.)
 
 func ctx() context.Context { return context.Background() }
 
@@ -637,9 +654,20 @@ func TestPhase6PresentsTheRecordedAttemptState(t *testing.T) {
 	if got, _ := f.confValue(f.confkey); got != canon {
 		t.Fatalf("fresh phase 6 wrote %q", got)
 	}
+	// AND IT SAYS SO, THROUGH THE ADAPTER THIS MODULE SUPPLIES. The compare-and-set's report of the
+	// value it wrote is one of the three grounds on which the reference accepts that this write is
+	// not atomic against a human editor ("the command REPORTS the value it wrote, so a lost edit is
+	// visible immediately"). internal/conf asserts that FamilyCAS CALLS its report seam; nothing
+	// asserted that THIS module hands it one, so deleting the CASReport adapter left every suite
+	// green while the narrative disappeared. It matters most when the migration fails at a LATER
+	// phase and never reaches its own success output.
+	if got := f.log.String(); !strings.Contains(got, "set "+f.confkey+"="+canon) {
+		t.Fatalf("phase 6 wrote the bind and said nothing about it:\n%s", got)
+	}
 	// Resumed: attempt=started and the key already holds our value → advance without rewriting,
 	// and with no confirmation asked for.
 	f.prompts = nil
+	f.log.Reset()
 	f.seed(record{Phase: 6, Dest: canon, Nonce: "nz", Staging: StagingPath(canon, "nz"),
 		Attempt: "started", Desired: "running"})
 	if err := Run(ctx(), f.l, f.d, testProduct, testRole, canon, 6); err != nil {
@@ -647,6 +675,10 @@ func TestPhase6PresentsTheRecordedAttemptState(t *testing.T) {
 	}
 	if len(f.prompts) != 0 {
 		t.Fatalf("an already-written key asked for confirmation: %v", f.prompts)
+	}
+	// The no-op advance says so too, rather than looking like a write that did not happen.
+	if got := f.log.String(); !strings.Contains(got, "already holds the migrated destination") {
+		t.Fatalf("the advance was silent:\n%s", got)
 	}
 }
 
@@ -1923,5 +1955,54 @@ func TestPhase9PreservesAStoppedContainersOutstandingCheck(t *testing.T) {
 	}
 	if _, perr := Phase(f.l, testProduct, testRole); !errors.Is(perr, ErrNoMigration) {
 		t.Fatalf("the intent survived a completed migration: %v", perr)
+	}
+}
+
+// TestTheAmbiguityIsExplainedEVENWhenTheConfirmationIsShortCircuited is the integration half of the
+// compare-and-set's explanation, and the test that would have caught the defect the round-2 gate
+// found.
+//
+// THE UNIT TEST INJECTS A CONFIRM CALLBACK, so it can only prove the explanation exists — not that
+// an operator ever receives it. Production confirmation is cliio.Confirm, which SHORT-CIRCUITS on
+// MI_CONFIRM=yes/no and never renders a prompt at all. An explanation carried inside the prompt
+// therefore reaches nobody who set that variable: under MI_CONFIRM=yes the file is rewritten and
+// nothing is ever said about what was discarded, and under MI_CONFIRM=no the reference's own bats
+// row asserts the words "equally" and "deleted", which would be missing. The reference emits these
+// lines with mi_warn BEFORE calling mi_confirm; this asserts that placement through the real
+// confirmation implementation, on the real diagnostic stream.
+func TestTheAmbiguityIsExplainedEvenWhenTheConfirmationIsShortCircuited(t *testing.T) {
+	// MI_CONFIRM=yes is the arm that matters and the one the unit test cannot reach: the resume's
+	// own gate passes, the compare-and-set's question is auto-answered, the file IS rewritten — and
+	// without this the operator is never told what was discarded. (MI_CONFIRM=no refuses at the
+	// resume's own gate before the compare-and-set is reached, which is why the =no half of the
+	// contract is asserted in internal/conf against FamilyCAS directly, exactly as the reference's
+	// bats row calls mi_conf_family_cas directly.)
+	for _, mi := range []string{"yes"} {
+		f := newFx(t)
+		canon := f.canonDest()
+		if err := conf.FamilyAdd(f.lock, f.confkey, "/operators/own/choice"); err != nil {
+			t.Fatal(err)
+		}
+		f.seed(record{Phase: 6, Dest: canon, Nonce: "nz", Staging: StagingPath(canon, "nz"),
+			Attempt: "started", Desired: "running"})
+		// The real thing, not a stand-in: MI_CONFIRM is exactly what an operator or a script sets,
+		// and it is the input that makes the prompt disappear.
+		f.d.Confirm = func(prompt string) bool {
+			return cliio.Confirm([]string{"MI_CONFIRM=" + mi}, strings.NewReader(""), io.Discard, prompt)
+		}
+		_ = Resume(ctx(), f.l, f.d)
+
+		// f.warn is what Deps.Warn writes to, so this also asserts the CASReport adapter this module
+		// supplies is wired to the WARN stream rather than the narrative one — internal/conf asserts
+		// FamilyCAS calls the seam; nothing else asserts migrate hands it one.
+		said := f.warn.String()
+		if strings.Contains(f.log.String(), "equally") {
+			t.Fatalf("the ambiguity explanation reached the NARRATIVE stream, which callers parse:\n%s", f.log.String())
+		}
+		for _, want := range []string{"IN PROGRESS", "/operators/own/choice", "equally", "deleted or changed the line by hand"} {
+			if !strings.Contains(said, want) {
+				t.Fatalf("MI_CONFIRM=%s: the operator was never told %q — the whole explanation:\n%s", mi, want, said)
+			}
+		}
 	}
 }

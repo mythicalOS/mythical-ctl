@@ -28,6 +28,16 @@ import (
 // PORTED: tests/acceptance/lifecycle.bats: "CLI: a value-taking option with no value is a usage error (2), not an operational failure (1)" -> TestCLIValuelessOptionIsAUsageError
 // PORTED: tests/acceptance/lifecycle.bats: "CLI: install rejects --purge (an uninstall-only option) and installs nothing" -> TestCLIInstallRejectsPurge
 // PORTED: tests/acceptance/lifecycle.bats: "CLI: start rejects --family (an uninstall-only option) even for a valid product" -> TestCLIStartRejectsFamily
+//
+// The other two halves of the same matrix, claimed here because the verb they are asserted through
+// (install) is wired NOW. Both rows were N/A until the parity audit, on the argument that install
+// did not exist in the build and the assertion would therefore pass off the unknown-command path
+// (also exit 2) — a test that cannot fail for the reason it claims. That argument was right when it
+// was written and expired when Wave 5 landed; the tests below assert the refusal DIAGNOSTIC, which
+// is what makes them unable to pass off the unknown-command path again.
+//
+// PORTED: tests/acceptance/restore.bats: "CLI: --abandon on other verbs is refused, not silently ignored" -> TestCLIInstallRejectsAbandon
+// PORTED: tests/acceptance/migrate.bats: "CLI: an unrelated verb rejects --to-bind rather than silently ignoring it" -> TestCLIInstallRejectsToBind
 
 const cliHex64 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
@@ -269,5 +279,92 @@ func TestCLIStartRejectsFamily(t *testing.T) {
 	}
 	if !strings.Contains(r.said(), "--family applies to uninstall only") {
 		t.Fatalf("no refusal diagnostic:\n%s", r.said())
+	}
+}
+
+// TestCLIInstallRejectsAbandon ports restore.bats' "CLI: --abandon on other verbs is refused, not
+// silently ignored". The bats row asserts only exit 2; the diagnostic is asserted here as well,
+// because exit 2 alone is also what an unknown verb returns — and this row spent a wave being N/A
+// for exactly that reason.
+func TestCLIInstallRejectsAbandon(t *testing.T) {
+	r := newCLIRig(t)
+	r.writeProduct("p1")
+	args := append([]string{"install", "p1", "--abandon"}, r.docArgs()...)
+	if rc := r.run(args...); rc != cliio.ExitUsage {
+		t.Fatalf("rc = %d, want 2\n%s", rc, r.said())
+	}
+	if !strings.Contains(r.said(), "--abandon applies to restore only") {
+		t.Fatalf("no refusal diagnostic — exit 2 alone would also be the unknown-verb answer:\n%s", r.said())
+	}
+	if r.isMember("p1") {
+		t.Fatal("the stray option was accepted and the install ran anyway")
+	}
+	if len(r.fake.RequestLog()) != 0 {
+		t.Fatalf("the refusal reached the daemon: %v", r.fake.RequestLog())
+	}
+}
+
+// TestCLIInstallRejectsToBind ports acceptance/migrate.bats' "CLI: an unrelated verb rejects
+// --to-bind rather than silently ignoring it" — the same rule for the option that names a DESTINATION
+// DIRECTORY, where silently ignoring it is how an operator believes storage moved and it did not.
+func TestCLIInstallRejectsToBind(t *testing.T) {
+	r := newCLIRig(t)
+	r.writeProduct("p1")
+	args := append([]string{"install", "p1", "--to-bind", filepath.Join(r.home, "dest")}, r.docArgs()...)
+	if rc := r.run(args...); rc != cliio.ExitUsage {
+		t.Fatalf("rc = %d, want 2\n%s", rc, r.said())
+	}
+	if !strings.Contains(r.said(), "--to-bind applies to migrate-storage only") {
+		t.Fatalf("no refusal diagnostic:\n%s", r.said())
+	}
+	if r.isMember("p1") {
+		t.Fatal("the stray option was accepted and the install ran anyway")
+	}
+	if len(r.fake.RequestLog()) != 0 {
+		t.Fatalf("the refusal reached the daemon: %v", r.fake.RequestLog())
+	}
+}
+
+// --- the rest of the dispatcher's refusal matrix ------------------------------------------------
+//
+// EVERY ARM, ASSERTED WITH ITS OWN DIAGNOSTIC. These are the refusals that stop a misplaced option
+// being silently honoured — the failure mode where `install p1 --purge` returns 0 having done
+// something other than what was written. They were all implemented and none of them was asserted:
+// deleting any one of these arms left the whole suite green, which is the state that makes a guard
+// decorative. Each case asserts the MESSAGE, not just exit 2, because exit 2 alone is also what an
+// unknown verb returns.
+func TestCLIRefusalMatrix(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"--image on a verb that is not install", []string{"start", "p1", "--image", "x@sha256:" + cliHex64}, "--image/--force-install apply to install only"},
+		{"--force-install on a verb that is not install", []string{"stop", "p1", "--force-install"}, "--image/--force-install apply to install only"},
+		{"--image over more than one product", []string{"install", "p1", "p2", "--image", "x@sha256:" + cliHex64}, "--image/--force-install take exactly one product"},
+		{"--map-foreign-to-operator on a lifecycle verb", []string{"install", "p1", "--map-foreign-to-operator"}, "--map-foreign-to-operator applies to migrate-storage only"},
+		{"an elsewhere-option on uninstall", []string{"uninstall", "p1", "--abandon"}, "apply elsewhere"},
+		{"net with an extra operand", []string{"net", "rebind", "extra"}, "net rebind takes no further operands"},
+		{"state abandon-intent with the wrong arity", []string{"state", "abandon-intent", "volume"}, "state abandon-intent needs exactly <class> <name>"},
+		{"state repair with too many identities", []string{"state", "repair", "i1", "i2"}, "state repair takes at most one identity"},
+		{"an unknown option", []string{"install", "p1", "--nonesuch"}, "unknown option"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newCLIRig(t)
+			r.writeProduct("p1")
+			args := append(append([]string(nil), tc.args...), r.docArgs()...)
+			if rc := r.run(args...); rc != cliio.ExitUsage {
+				t.Fatalf("rc = %d, want 2\n%s", rc, r.said())
+			}
+			if !strings.Contains(r.said(), tc.want) {
+				t.Fatalf("no refusal diagnostic %q — exit 2 alone is also the unknown-verb answer:\n%s", tc.want, r.said())
+			}
+			if r.isMember("p1") {
+				t.Fatal("the refused invocation ran anyway")
+			}
+			if len(r.fake.RequestLog()) != 0 {
+				t.Fatalf("the refusal reached the daemon: %v", r.fake.RequestLog())
+			}
+		})
 	}
 }

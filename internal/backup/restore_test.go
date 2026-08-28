@@ -913,6 +913,15 @@ func TestUnconfirmedRestoreCreatesAndFillsNothing(t *testing.T) {
 	// The volumes are removed first so "nothing was (re)created" is observable: with them in
 	// place from the install, an absent-volume assertion would pass or fail for reasons that
 	// have nothing to do with the confirmation gate.
+	//
+	// THAT IS EXACTLY WHY THE FROZEN ROW FAILS. Measured with the vendored bats runner:
+	// tests/acceptance/restore.bats is 20 ok / 1 not ok, and the one failure is this row — its
+	// setup() installs the product (creating both named volumes) and then removes only the
+	// CONTAINER, so `mi_rt_inspect volume ... "$VOL_STATE"` answers rc 0, never the rc 3 the row
+	// asserts. The intent in its comment ("and nothing was (re)created") is right; the assertion
+	// tests "absent" where the fixture guarantees "present". The acceptance lane is not run in CI,
+	// which is the likeliest reason it was never caught. Removing the volumes first is what makes
+	// the same assertion measure the gate it names.
 	for _, v := range r.vols {
 		r.removeVolume(v.name)
 	}

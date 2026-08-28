@@ -1712,33 +1712,97 @@ func TestAFailedAdoptionRefusesToWrite(t *testing.T) {
 
 // --- the aggregate's own refusals ---------------------------------------------------------------------
 
-// TestWorstRefusals is not a bats port: the shell's mi_ex_worst refusals live in tests/unit/exit.bats,
-// which Wave 1 claimed. It is here because THIS package now owns the aggregate, and the refusals are
-// position-dependent in a way only a direct call can reach — Batch maps a per-product usage error to
-// a failure before aggregating, so no batch can hand Worst a 2.
+// Inventory — tests/unit/exit.bats, the mi_ex_worst/mi_ex_name half.
+//
+// THESE SEVEN ROWS WERE, UNTIL THE PARITY AUDIT, CLAIMED BY NOBODY. cliio/exit_test.go noted that
+// they "are inventoried by the verbs wave"; this file said they "live in tests/unit/exit.bats,
+// which Wave 1 claimed". Each side pointed at the other in prose neither the inventory nor any
+// gate could read, so the whole aggregate contract sat outside the checked corpus. That is the
+// exact shape the audit exists to find: not a missing test, a missing CLAIM, with a real test
+// beside it making the hole invisible to anyone reading the code.
+//
+// PORTED: tests/unit/exit.bats: "batch precedence is worst-wins: all success is 0" -> TestWorstRefusals
+// PORTED: tests/unit/exit.bats: "success plus not-launched is 3" -> TestWorstRefusals
+// PORTED: tests/unit/exit.bats: "any operational failure wins over not-launched" -> TestWorstRefusals
+// PORTED: tests/unit/exit.bats: "a usage error is never aggregated, wherever it sits in the batch" -> TestWorstRefusals
+// PORTED: tests/unit/exit.bats: "an empty batch is a usage error, not a success" -> TestWorstRefusals
+// PORTED: tests/unit/exit.bats: "an unknown code is refused rather than mapped to failure, wherever it sits in the batch" -> TestWorstRefusals
+// PORTED: tests/unit/exit.bats: "every code has a human name, for reports" -> TestExitNameNamesEveryCode
+//
+// THIS package owns them because it owns the aggregate: cliio holds the four code CONSTANTS (its
+// one row), and mi_ex_worst/mi_ex_name became Worst/ExitName here.
 func TestWorstRefusals(t *testing.T) {
 	for _, tc := range []struct {
 		in   []int
 		want int
 		bad  bool
+		// The bats rows assert the MESSAGE, not merely a non-zero status: the two refusals are
+		// different bugs in the caller (a code that must not be aggregated vs. a code that is not
+		// in the contract at all), and a test that only checks "it failed" cannot tell a port that
+		// swapped them from one that did not.
+		msg string
 	}{
-		{in: []int{0, 0}, want: cliio.ExitOK},
-		{in: []int{0, 3}, want: cliio.ExitNotLaunched},
+		{in: []int{0, 0, 0}, want: cliio.ExitOK},
+		{in: []int{0, 3, 0}, want: cliio.ExitNotLaunched},
 		{in: []int{0, 3, 1}, want: cliio.ExitFail},
-		{in: []int{2, 1}, bad: true},
-		{in: []int{1, 2}, bad: true}, // the forbidden code AFTER the worst one
-		{in: []int{1, 7}, bad: true}, // an undefined code AFTER the worst one
-		{in: nil, bad: true},
+		{in: []int{1, 3}, want: cliio.ExitFail},
+		// BOTH ORDERINGS FOR EACH REFUSAL, as the bats rows spell out. The shell's refusal was
+		// once reachable only when the bad code came FIRST — the loop returned on the first 1 it
+		// saw and never validated what followed — so `mi_ex_worst 1 2` answered 1 and exited 0.
+		// The Go loop validates the whole list before aggregating; these rows are what proves it.
+		{in: []int{0, 2}, bad: true, msg: "usage errors are not batch outcomes"},
+		{in: []int{2, 1}, bad: true, msg: "usage errors are not batch outcomes"},
+		{in: []int{1, 2}, bad: true, msg: "usage errors are not batch outcomes"},
+		{in: []int{0, 7}, bad: true, msg: "not an exit code this contract defines"},
+		{in: []int{7, 1}, bad: true, msg: "not an exit code this contract defines"},
+		{in: []int{1, 7}, bad: true, msg: "not an exit code this contract defines"},
+		{in: nil, bad: true, msg: "at least one per-product outcome"},
 	} {
 		got, err := Worst(tc.in)
 		if tc.bad {
 			if err == nil {
 				t.Fatalf("Worst(%v) = %d, want a refusal", tc.in, got)
 			}
+			if !strings.Contains(err.Error(), tc.msg) {
+				t.Fatalf("Worst(%v) refused with %q, which does not name %q — the two refusals are different caller bugs",
+					tc.in, err, tc.msg)
+			}
 			continue
 		}
 		if err != nil || got != tc.want {
 			t.Fatalf("Worst(%v) = %d, %v; want %d", tc.in, got, err, tc.want)
+		}
+	}
+}
+
+// TestExitNameNamesEveryCode ports exit.bats' row about every code having a human name for reports
+// (quoted verbatim only in the machine-readable claim above, never in prose). The bats row checks
+// one code; every code is checked here because the batch report prints this string per
+// product, and a code with no name of its own would surface as another code's word — a report that
+// is wrong rather than a report that is missing.
+func TestExitNameNamesEveryCode(t *testing.T) {
+	for _, tc := range []struct {
+		code int
+		want string
+	}{
+		{cliio.ExitOK, "completed"},
+		{cliio.ExitFail, "failed"},
+		{cliio.ExitUsage, "usage error"},
+		{cliio.ExitNotLaunched, "not launched"},
+	} {
+		if got := ExitName(tc.code); !strings.Contains(got, tc.want) {
+			t.Fatalf("ExitName(%d) = %q, want it to contain %q", tc.code, got, tc.want)
+		}
+	}
+	// A code outside the contract must be reported AS unknown, carrying the number. Returning one
+	// of the four names would put a plausible word in a report about an outcome nobody defined.
+	got := ExitName(7)
+	if !strings.Contains(got, "unknown") || !strings.Contains(got, "7") {
+		t.Fatalf("ExitName(7) = %q, want it to say unknown and carry the code", got)
+	}
+	for _, name := range []string{"completed", "failed", "usage error", "not launched"} {
+		if strings.Contains(got, name) {
+			t.Fatalf("ExitName(7) = %q, which reads as %q — an undefined code must not borrow a defined code's word", got, name)
 		}
 	}
 }
@@ -1818,5 +1882,248 @@ func TestStopCommitsTheIntentBeforeItActs(t *testing.T) {
 	// And the container is untouched, which is the operator-visible half of the same fact.
 	if !r.running(c) {
 		t.Fatal("the container is not running")
+	}
+}
+
+// TestNoValueFromAProductConfReachesTheLaunch ports bringup.bats' "no value from <product>.conf
+// reaches any launch argument".
+//
+// PORTED: tests/unit/bringup.bats: "no value from <product>.conf reaches any launch argument" -> TestNoValueFromAProductConfReachesTheLaunch
+//
+// IT WAS N/A ON A STRUCTURAL ARGUMENT THAT DOES NOT HOLD. The claim was that the launch seam takes
+// only a container name and a nonce, so this package could not pass a config value into a launch
+// argument even by mistake. But an interface says nothing about what an implementation carries:
+// the real launcher carries the launch config, the manifest and the policy into LaunchProduct, so
+// the subject of this row exists here — it is simply not exercised today. "Nothing currently reads
+// it" is not a guard; it is the state a guard exists to preserve.
+//
+// WHAT THE ROW IS ABOUT. <product>.conf is written by the PRODUCT, inside its container: it is the
+// one file in this system an attacker who owns a product can choose the contents of. If any of it
+// reached the container spec, a value like `--privileged` would be a container escape authored by
+// the thing being contained. The reference plants exactly that and asserts the launch happened and
+// the value did not travel; so does this.
+func TestNoValueFromAProductConfReachesTheLaunch(t *testing.T) {
+	// TWO PLANTED VALUES, AND BOTH ARE DELIBERATE. The first is an option a container escape would
+	// be spelled with; the second is a NUMBER, product-scoped and distinctive, because the fields a
+	// value could reach are not all option-shaped — a published port is a number, and a check that
+	// only looks for a flag cannot see a port arriving from the product's own file. It must not be
+	// the manifest's own port either, or the assertion would pass on a value that is legitimately
+	// there.
+	const hostile = "--privileged"
+	const hostilePort = "65123"
+	r := newRig(t)
+	r.writeProduct("p1")
+	r.mintIdentity()
+	// The product writes its own conf, and it writes things it should never be able to use. The
+	// bytes are planted BEFORE the install so every step of bring-up sees them.
+	r.writeFile("p1.conf", "PEER="+hostile+"\nMYTHICAL_P1_PORT="+hostilePort+"\n")
+	r.mustInstall("p1")
+
+	c := r.container("p1")
+	info, err := r.c.ContainerInspect(context.Background(), c)
+	if err != nil {
+		t.Fatalf("the launch did not happen, so this test would pass for the wrong reason: %v", err)
+	}
+	// THE LAUNCH REALLY HAPPENED — without this the assertions below hold just as well for a
+	// bring-up that never ran, which is the shape the reference guards against with its alias check.
+	if !info.Running {
+		t.Fatalf("the container is not running; the assertions below would prove nothing")
+	}
+
+	// Nothing the product wrote may appear anywhere the daemon acts on: not the env, not the
+	// labels, not the image, not a mount, not a published port.
+	for _, e := range info.Env {
+		if strings.Contains(e, hostile) || strings.Contains(e, hostilePort) || strings.HasPrefix(e, "PEER=") {
+			t.Fatalf("a <product>.conf value reached the container environment: %q", e)
+		}
+	}
+	for k, v := range info.Labels {
+		if strings.Contains(k, hostile) || strings.Contains(v, hostile) ||
+			strings.Contains(k, hostilePort) || strings.Contains(v, hostilePort) {
+			t.Fatalf("a <product>.conf value reached a label: %s=%s", k, v)
+		}
+	}
+	if strings.Contains(info.Image, hostile) || strings.Contains(info.Image, hostilePort) {
+		t.Fatalf("a <product>.conf value reached the image reference: %q", info.Image)
+	}
+	for _, m := range info.Mounts {
+		if strings.Contains(m.Source, hostile) || strings.Contains(m.Destination, hostile) ||
+			strings.Contains(m.Source, hostilePort) || strings.Contains(m.Destination, hostilePort) {
+			t.Fatalf("a <product>.conf value reached a mount: %+v", m)
+		}
+	}
+	// THE NETWORK ATTACHMENT, ALIASES INCLUDED. An alias is a caller-supplied string that the daemon
+	// records and resolves; it is as much a launch argument as an env entry, and it was the half an
+	// earlier version of this test did not look at.
+	for name, ep := range info.Networks {
+		if strings.Contains(name, hostile) || strings.Contains(name, hostilePort) {
+			t.Fatalf("a <product>.conf value reached a network name: %q", name)
+		}
+		for _, a := range ep.Aliases {
+			if strings.Contains(a, hostile) || strings.Contains(a, hostilePort) {
+				t.Fatalf("a <product>.conf value reached a network alias: %q", a)
+			}
+		}
+		if strings.Contains(ep.IPAddress, hostile) || strings.Contains(ep.IPAddress, hostilePort) {
+			t.Fatalf("a <product>.conf value reached an endpoint address: %q", ep.IPAddress)
+		}
+	}
+	// AND THE PUBLISHED PORTS, which decide what of this container is reachable from the host — the
+	// single most consequential thing a hostile value could choose.
+	for _, pb := range info.Ports {
+		for _, f := range []string{pb.ContainerPort, pb.HostIP, pb.HostPort} {
+			if strings.Contains(f, hostile) || strings.Contains(f, hostilePort) {
+				t.Fatalf("a <product>.conf value reached a published port: %+v", pb)
+			}
+		}
+	}
+	// The request log is a WEAKER backstop than it looks — the fake records method and URL, not
+	// bodies — so it is here to catch a value smuggled into a PATH or query, not as the main
+	// assertion. The typed inspect above is what actually covers the create body.
+	for _, req := range r.fake.RequestLog() {
+		if strings.Contains(req, hostile) || strings.Contains(req, hostilePort) {
+			t.Fatalf("a <product>.conf value reached the daemon in %q", req)
+		}
+	}
+}
+
+// TestTheReconcilersDidNothingNoteIsWiredToStderr is the WIRING half of the reconciler's two
+// informational verdicts, and the test the round-5 gate asked for.
+//
+// internal/bringup asserts that Reconcile CALLS its Note seam. Nothing asserted that this package
+// HANDS it one — so deleting the single `Note:` assignment in bringupDeps would have made the CLI
+// silently lose an operator-facing message while both the parity audit and the whole suite stayed
+// green. A seam nothing drives is a diagnostic nobody reads, and "the fix is one assignment away
+// from being inert with every test still green" is the same hazard this file already guards for the
+// probe wrapper, two tests up.
+//
+// STDERR, NOT STDOUT: these are notes, not output, and a caller parsing this verb's stdout must
+// never receive them.
+func TestTheReconcilersDidNothingNoteIsWiredToStderr(t *testing.T) {
+	r := newRig(t)
+	r.writeProduct("p1")
+	r.mintIdentity()
+
+	s, err := openSession(r.d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ident, ierr := s.l.IdentGet()
+	if ierr != nil {
+		t.Fatal(ierr)
+	}
+	bd, berr := s.bringupDeps(nil, ident)
+	if berr != nil {
+		t.Fatal(berr)
+	}
+	if bd.Note == nil {
+		t.Fatal("the bring-up sequence is handed no Note seam — the reconciler's two did-nothing verdicts go nowhere")
+	}
+	r.reset()
+	bd.Note("note: a reconciler verdict")
+	if got := r.errb.String(); !strings.Contains(got, "note: a reconciler verdict") {
+		t.Fatalf("the note did not reach stderr: %q", got)
+	}
+	if got := r.out.String(); strings.Contains(got, "a reconciler verdict") {
+		t.Fatalf("the note reached STDOUT, which callers parse: %q", got)
+	}
+}
+
+// TestBatchRefusesAVerbItDoesNotDriveAndAnEmptyBatch. Both refusals were implemented and
+// unasserted: deleting either left the suite green.
+//
+// A VERB OUTSIDE THE FIVE IS REFUSED WITH NOTHING ATTEMPTED — never a silent no-op over the whole
+// product list, which is how a mistyped verb over three products would report success having done
+// nothing to any of them. An EMPTY batch is a usage error for the same reason: exit 0 from a batch
+// that ran nothing tells a caller everything is installed.
+func TestBatchRefusesAVerbItDoesNotDriveAndAnEmptyBatch(t *testing.T) {
+	r := newRig(t)
+	r.writeProduct("p1")
+	r.mintIdentity()
+
+	if rc := Batch(context.Background(), r.d, "uninstall", []string{"p1"}); rc != cliio.ExitUsage {
+		t.Fatalf("a non-batchable verb: rc = %d, want 2\n%s", rc, r.said())
+	}
+	if !strings.Contains(r.said(), "not a batchable verb") {
+		t.Fatalf("no diagnostic naming the verb:\n%s", r.said())
+	}
+	if r.isMember("p1") {
+		t.Fatal("the refused batch ran anyway")
+	}
+	if len(r.fake.RequestLog()) != 0 {
+		t.Fatalf("the refusal reached the daemon: %v", r.fake.RequestLog())
+	}
+	r.reset()
+	if rc := Batch(context.Background(), r.d, "install", nil); rc != cliio.ExitUsage {
+		t.Fatalf("an empty batch: rc = %d, want 2\n%s", rc, r.said())
+	}
+	if !strings.Contains(r.said(), "needs at least one product") {
+		t.Fatalf("no diagnostic for the empty batch:\n%s", r.said())
+	}
+}
+
+// TestAVolumeThatIsNotOursIsNeitherAdoptedNorRemoved is the fail-closed half of volume adoption.
+//
+// THE SUCCESS HALF IS TESTED ELSEWHERE — a volume this installation created, standing at the name we
+// would create, is adopted with its role, data class and product. THIS is the half that costs
+// something when it is wrong: a volume carrying somebody ELSE'S nonce may hold another
+// installation's data, so it must not be taken over and must not be removed.
+//
+// WHICH GATE REFUSES IS ITSELF THE FINDING, and it is why this test asserts the OUTCOME rather than
+// one diagnostic. The nonce comparison in the confirm step is written as the backstop, but it is not
+// what fires: the §6b.2 unaccounted-object gate reaches this situation FIRST, because a volume
+// labelled for this installation that the ledger does not account for is refused before any verb
+// touches anything. So the confirm-step comparison is defence in depth behind an earlier refusal —
+// reachable only if that gate ever stopped covering it — and what this test pins is the property
+// both exist for: the operation stops, the volume survives, and nothing was adopted.
+func TestAVolumeThatIsNotOursIsNeitherAdoptedNorRemoved(t *testing.T) {
+	r := newRig(t)
+	r.writeProduct("p2")
+	r.mintIdentity()
+	ident := r.ident()
+	vol := "mythical-" + ident + "-p2-memory"
+
+	// The intent is opened under OUR nonce; the volume standing at that name carries a different
+	// one — the shape a second installation, or a name reused after a crash, produces.
+	const ours, theirs = "nadoptxxxx", "nSOMEONEELSE"
+	r.editLedger(func(l *ledger.Ledger) {
+		if err := intent.Open(l, prov.ClassVolume, vol, ours, time.Now(),
+			ledger.Field{Key: "product", Value: "p2"},
+			ledger.Field{Key: "role", Value: "memory"}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	r.withLock(func(h famlock.Held, _ ledger.Store) {
+		rt, err := runtime.New(h, r.c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p, perr := engine.NewProvenance(ident, theirs)
+		if perr != nil {
+			t.Fatal(perr)
+		}
+		if err := rt.VolumeCreate(context.Background(), vol, p); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	if rc := r.install("p2"); rc == cliio.ExitOK {
+		t.Fatalf("a volume carrying another nonce was adopted\n%s", r.said())
+	}
+	// The operator is TOLD, and told something actionable — silence here would leave a refused
+	// install with no explanation of what is standing in the way.
+	if !strings.Contains(r.said(), "state repair") {
+		t.Fatalf("the refusal does not tell the operator what to do:\n%s", r.said())
+	}
+	// NEITHER ADOPTED NOR REMOVED: the volume is still there, and it is still theirs.
+	if !r.volumeExists(vol) {
+		t.Fatal("the volume was removed — it may hold another installation's data")
+	}
+	if _, err := prov.Find(r.ledgerNow(), prov.ClassVolume, vol); err == nil {
+		t.Fatal("the volume was adopted into our provenance despite carrying another nonce")
+	}
+	// AND THE INTENT IS RETAINED, so the situation is recorded rather than vanishing.
+	if _, err := intent.Find(r.ledgerNow(), prov.ClassVolume, vol); err != nil {
+		t.Fatalf("the intent was dropped, so nothing records that this is unresolved: %v", err)
 	}
 }

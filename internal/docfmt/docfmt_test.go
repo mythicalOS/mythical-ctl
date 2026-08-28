@@ -19,7 +19,7 @@ import (
 // PORTED: tests/unit/doc.bats: "a line with no = is refused rather than skipped" -> TestParseRefusals
 // PORTED: tests/unit/doc.bats: "a file without a trailing newline is refused as truncated" -> TestParseRefusals
 // PORTED: tests/unit/doc.bats: "comments and blank lines are ignored" -> TestParseWellFormed
-// PORTED: tests/unit/doc.bats: "the key-count cap is exact: 1024 keys accepted, 1025 refused, and named" -> TestKeyCountCap
+// PORTED: tests/unit/doc.bats: "the key-count cap is exact: 1024 keys accepted, 1025 refused, and names the cap" -> TestKeyCountCap
 // PORTED: tests/unit/doc.bats: "a missing file reports rc 3" -> TestSnapshotUnreadable
 // PORTED: tests/unit/doc.bats: "a 'one' key appearing twice is rejected" -> TestCardinality
 // PORTED: tests/unit/doc.bats: "a missing 'one' key is rejected, naming it" -> TestCardinality
@@ -29,12 +29,12 @@ import (
 // PORTED: tests/unit/doc.bats: "mi_doc_load's diagnostics report the label, not the raw file path" -> TestDiagnosticsUseLabel
 // PORTED: tests/unit/doc.bats: "a spec with the cardinality omitted is refused, not read as 'optional'" -> TestSchemaSelfCheck (the Go schema cannot omit Card syntactically — the zero value is One, the SAFE direction; what the row guards, a required key silently becoming optional, is structurally impossible, and the self-check pins the other spec bugs)
 // N/A: tests/unit/doc.bats: "a spec written with spaces instead of TABs is refused, not read as unknown keys" -- the Go schema is a typed map, not TAB-framed text; there is no framing to get wrong
-// N/A: tests/unit/doc.bats: "a duplicate key in the spec is refused rather than resolving to the first line" -- a Go map cannot hold a duplicate key
+// N/A: tests/unit/doc.bats: "a duplicate key in the spec is refused rather than resolving to the first" -- a Go map cannot hold a duplicate key
 // PORTED: tests/unit/doc.bats: "rolemount requires a role and an absolute path" -> TestDocTypes
 // PORTED: tests/unit/doc.bats: "docver and epoch are non-negative bounded digits" -> TestDocTypes
 // PORTED: tests/unit/doc.bats: "digestref requires <repository>@sha256:<64 hex>, exactly one @" -> TestDocTypes
 // PORTED: tests/unit/doc.bats: "digestref's repository component is constrained: lowercase, digits, . _ - / : only" -> TestDocTypes
-// PORTED: tests/unit/doc.bats: "digestref's repository component rejects empty segments: //, ::, and :/ pairs" -> TestDocTypes
+// PORTED: tests/unit/doc.bats: "digestref's repository component rejects empty segments: //, ::, and : adjacent to /" -> TestDocTypes
 // PORTED: tests/unit/doc.bats: "productdigest requires <product>:<64 hex>, exactly one colon" -> TestDocTypes
 // PORTED: tests/unit/doc.bats: "coreversion is MAJOR[.MINOR[.PATCH]], bounded numeric components" -> TestDocTypes
 // PORTED: tests/unit/doc.bats: "mi_doc_value returns the first value; mi_doc_values returns all" -> TestAccessors

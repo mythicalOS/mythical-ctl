@@ -196,6 +196,19 @@ func TestBackupRefusesAnUnsafeOutputLocation(t *testing.T) {
 	}
 }
 
+// THE FROZEN BATS ROW THIS PORTS FAILS AGAINST THE FROZEN BASH. Measured with the vendored bats
+// runner: tests/unit/backup.bats is 36 ok / 1 not ok, and the one failure is this row — its
+// `[ ! -e "$BK/ledger" ]` cannot hold, because mi_backup_run copies the ledger (lib/backup.sh:222)
+// BEFORE the volume loop that produces the refusal (:295-309), and that refusal returns with no
+// cleanup trap. The two assertions in that row are mutually exclusive: the "carries no name" string
+// exists only at :306, and reaching it requires having already executed :222.
+//
+// So the reference asserted a property it did not have. This port HAS it: the volume records are
+// validated before the output directory exists (backup.go's Run, at the volumeRecords call), and
+// that is not a coincidence of ordering — a refusal discovered after the captured ledger is on disk
+// leaves a half-written directory that looks like a backup, which is the data-loss trap this module
+// exists to prevent. Asserted here rather than relaxed to match the reference's behaviour, because
+// the reference's TEST is the better statement of intent than the reference's code.
 func TestBackupFailsClosedOnAVolumeRecordWithNoName(t *testing.T) {
 	r := newRig(t)
 	// A checksum-valid, well-formed-per-field record — class=volume, a nonce — that is

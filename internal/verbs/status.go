@@ -464,6 +464,12 @@ func observedOf(ctx context.Context, s statusSeams, container string) string {
 func outstandingOf(l *ledger.Ledger, container string) string {
 	out, err := state.Outstanding(l, container)
 	if err != nil {
+		// STATED DIVERGENCE, and it is the file's own three-arm rule applied to a place the
+		// reference missed. There, this read ran inside a command substitution ending in `|| true`
+		// — added so a failing read could not abort a diagnostic under `pipefail` — which discards
+		// the status, leaves the variable empty, and lets `${out:-none}` print `none`. So a
+		// container owing checks nobody can enumerate was reported as owing NONE: the reassuring
+		// direction, which is the one direction a diagnostic may never fail in.
 		return "UNREADABLE"
 	}
 	if len(out) == 0 {
