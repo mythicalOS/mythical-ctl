@@ -8,8 +8,10 @@
 // live holders are impossible, and the crash-inside-recovery manual-clear case ceases to
 // exist. The lock file PATH (.state/lock) and 0600 mode are unchanged; the `pid=` body is now
 // diagnostic only. Nothing on disk is shared with a bash instance — the bash was never
-// released — so no mixed-implementation locking can occur. RECOVERY.md's stale-lock section
-// retires at cutover.
+// released — so no mixed-implementation locking can occur. RECOVERY.md turned out to have no
+// stale-lock section to retire — the procedure lived in the shell, not in the published doc — so
+// the cutover ADDED one ("Another operation is in progress") saying the opposite: there is no
+// stale lock to clear, and deleting .state/lock unsticks nothing because nothing is stuck.
 //
 // AUTHORIZATION MODEL. Held is a SEALED interface: its method is unexported so no outside
 // package can implement it, and the implementing struct is unexported so `new()` cannot mint

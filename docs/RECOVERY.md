@@ -3,7 +3,7 @@
 This page is for the moment `mythical-ctl` has already told you something is wrong. Each section below
 is one state the CLI can report: what it means, what `mythical-ctl` will and will not do about it on its
 own, and the command that moves you forward. It is not a description of the code — see the comments in
-`lib/repair.sh`, `lib/ledger.sh`, `lib/intent.sh` and `lib/netref.sh` for that.
+the `verbs`, `ledger`, `intent` and `netref` packages for that.
 
 The single idea underneath all of it: **`mythical-ctl` never guesses**. When it cannot prove a fact — is
 this object mine, is this the network I meant, has this intent's object actually appeared — it stops and
@@ -70,6 +70,58 @@ step.
 **Next command.** Run `mythical-ctl restore <backup-directory>` again to resume, or `mythical-ctl restore
 --abandon` to give up on it. See "A restore stuck at a phase" below for what each recorded state means and
 what each command does about it.
+
+## The family lock could not be taken
+
+(The message says another operation is in progress. Usually that is exactly what happened — read on
+for the case where it is not.)
+
+**What it means.** Every mutating command takes one family-scoped lock — `~/.mythical/.state/lock` —
+so that two `mythical-ctl` processes cannot interleave a read-modify-write of the ledger or of
+`mythical.conf`. This command asked for that lock and did not get it.
+
+**What the CLI will and will not do.** Refuses immediately rather than queueing, naming a process id
+when it can read one. It never waits, and it never takes the lock away from whoever has it. Nothing
+has been touched, so there is no partial state to recover from.
+
+**The message says more than the CLI actually knows, in two ways.**
+
+*The pid is a hint, not a fact.* It is written into the lock file by whoever last took the lock, as
+a diagnostic; it is neither authoritative nor guaranteed fresh, so a contender can read a pid left
+by an earlier run. A pid that is not running does **not** prove the lock is free, and a pid that IS
+running is not necessarily the holder.
+
+*"In progress" is what every locking failure reports.* The refusal does not carry a reason: the same
+message covers another `mythical-ctl` holding the lock, some unrelated program holding a lock on
+that same file, a filesystem that does not implement `flock` (some network mounts), and a system out
+of lock records. The CLI does not distinguish them, because the answer to all of them is the same:
+do not proceed. So a refusal that repeats with no other `mythical-ctl` running tells you the lock
+could not be taken, and nothing more about why.
+
+**There is no stale lock to clear, ever — and deleting the file is worse than useless.** The lock is
+a kernel `flock(2)`, and a lock held by a process that dies is released by the kernel along with
+everything else that process had open: a `mythical-ctl` that is killed, crashes, or loses its
+terminal takes its lock with it. So a `.state/lock` file sitting on disk is **not** a held lock; it
+is an ordinary file the next run reuses, and the `pid=` line inside it is a diagnostic breadcrumb,
+never authority.
+
+Removing the file is not a neutral act, though. A `flock` belongs to the **inode**, not to the name:
+delete `.state/lock` while an operation genuinely is running and the next invocation creates a
+*different* file and locks that one successfully — so two mutating processes proceed at once, on the
+same ledger, which is the single thing this lock exists to prevent. There is no situation in which
+deleting it helps, and one in which it takes the protection off.
+
+**Refused instead of locked:** if `.state/lock` is not a regular file, or has more than one hard
+link, the command refuses rather than locking it — a lock target somebody else can substitute or
+alias is not a lock. This is the one case where removing that path is the answer, because what is
+there is not the installer's lock file at all: with no `mythical-ctl` running, remove or rename it
+(it holds nothing you need) and re-run. Work out how it got there — nothing this CLI does creates
+a symlink or a second hard link at that path.
+
+**Next command.** The one you were running, once the other operation finishes. If it never
+finishes — nothing else is running and the refusal repeats — investigate before you touch anything:
+find out what holds `~/.mythical/.state/lock` (`lsof` names it), and what kind of filesystem
+`~/.mythical` is on. Deleting the lock file is not one of the options; see above for why.
 
 ## A retained network intent
 
@@ -207,15 +259,14 @@ fresh migration does.
 ### The security posture: a safe location, not a race won
 
 Both trees a migration touches — the source volume's contents and the destination host tree — are
-untrusted by this command's own design (§5.1). Bash has no `openat`/`renameat`/`unlinkat`-style
-operation that stays bound to an already-open directory handle, so **every** filesystem check this
-command makes resolves a path NAME, and between that check and whatever uses the result, anyone who can
-also write the same parent directory can rename or replace what the name refers to. A re-check
-immediately before each use narrows that window; it cannot close it — there is no operation in this
-shell that is atomic with a check made a moment earlier against a name neither side of the check
-controls exclusively.
+untrusted by this command's own design (§5.1). There are no fd-relative `openat`/`renameat`/`unlinkat`
+operations in play here — operations that stay bound to an already-open directory handle — so **every**
+filesystem check this command makes resolves a path NAME, and between that check and whatever uses the
+result, anyone who can also write the same parent directory can rename or replace what the name refers
+to. A re-check immediately before each use narrows that window; it cannot close it: no operation here is
+atomic with a check made a moment earlier against a name neither side of the check controls exclusively.
 
-What **is** achievable in bash is refusing to operate in a location where that premise holds in the
+What **is** achievable is refusing to operate in a location where that premise holds in the
 first place. Before touching anything, `migrate-storage` requires the destination's parent directory to
 be owned by the operator running it and writable by no one else (not the group, not everyone) — reject
 `chmod 700 that-directory` and the command refuses outright, naming the mode it found. If no one besides
@@ -250,8 +301,8 @@ staged tree host-side (following no symlink it encounters, the same discipline t
 uses) and refuses if any symlink's target escapes the tree — the same rule the copy step itself already
 enforces, reused rather than re-implemented, so there is exactly one definition of "escapes" in this
 codebase. This shrinks the window from "the whole gap between phase 4 and phase 5" down to "the time of
-this one host-side walk", which is the smallest window bash can produce without a kernel primitive this
-shell does not have. It is not zero. Closing it fully would mean the copy step never grants the runtime
+this one host-side walk", which is the smallest window this command can produce without the
+fd-relative primitives it does not use. It is not zero. Closing it fully would mean the copy step never grants the runtime
 uid write access until after the atomic commit — which the copy contract does not support today, since
 per-file ownership is applied *as* each file is copied, not in a separate pass afterward.
 
