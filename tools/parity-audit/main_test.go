@@ -1925,3 +1925,33 @@ func TestOnlyRealGoTestNamesCount(t *testing.T) {
 	}
 	_ = dir
 }
+
+// ---------------------------------------------------------------------------------------------
+// Round 12: the DEMONSTRATED false greens. Each was constructed against the shipped audit by a
+// reviewer and made `bash check.sh parity` exit 0 while the parity evidence was false. They are
+// written as reds first, because a defect that was only argued about comes back and a defect with
+// a test does not.
+// ---------------------------------------------------------------------------------------------
+
+// DEMONSTRATION 3 — a manifest row with a third tab-separated field.
+//
+// `strings.Cut` splits on the FIRST tab, so `<file>TAB<name>TABEXTRA` parsed as a two-field row
+// whose NAME CONTAINS A TAB. A claim written to match that name resolved, the digest was re-pinned,
+// and the full parity stage passed over a corpus row that is not the shape the manifest declares.
+func TestParseManifestRefusesARowWithAnExtraField(t *testing.T) {
+	for _, tc := range []struct{ name, row, want string }{
+		{"three fields", "tests/acceptance/lifecycle.bats\tCLI: an unknown verb exits 2\tEXTRA", "3 tab-separated fields"},
+		{"a trailing empty third field", "tests/unit/a.bats\tone\t", "3 tab-separated fields"},
+		{"an empty name between two tabs", "tests/unit/a.bats\t\tone", "3 tab-separated fields"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pairs, err := parseManifest([]byte(tc.row + "\n"))
+			if err == nil {
+				t.Fatalf("a malformed row was accepted as %+v — its name carries a TAB the manifest grammar cannot express", pairs)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want a refusal naming the field count", err)
+			}
+		})
+	}
+}

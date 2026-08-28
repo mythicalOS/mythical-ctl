@@ -245,9 +245,20 @@ func parseManifest(content []byte) ([]batsPair, error) {
 		if text == "" || strings.HasPrefix(text, "#") {
 			continue
 		}
-		file, name, ok := strings.Cut(text, "\t")
-		if !ok || file == "" || name == "" {
-			return nil, fmt.Errorf("manifest:%d: not a <file>TAB<name> row: %q", line, text)
+		// SPLIT ON EVERY TAB, NOT THE FIRST ONE. `strings.Cut` splits once, so
+		// `<file>TAB<name>TABEXTRA` arrived as a two-field row whose NAME CONTAINED A TAB — and a
+		// claim written to match that name resolved against it, so a row that is not the shape this
+		// file declares passed the whole parity stage. Demonstrated end to end on this tree. The
+		// separator is a TAB precisely because no @test name may contain one (parseBats refuses
+		// that at the source), which means a third field can never be part of a name and there is
+		// nothing to interpret: the row is refused.
+		fields := strings.Split(text, "\t")
+		if len(fields) != 2 {
+			return nil, fmt.Errorf("manifest:%d: not a <file>TAB<name> row — it splits into %d tab-separated fields and a row is exactly 2. A bats test name cannot contain a TAB, so an extra field is not part of one: %q", line, len(fields), text)
+		}
+		file, name := fields[0], fields[1]
+		if file == "" || name == "" {
+			return nil, fmt.Errorf("manifest:%d: not a <file>TAB<name> row — one of its two fields is empty: %q", line, text)
 		}
 		pairs = append(pairs, batsPair{File: file, Name: name})
 	}
