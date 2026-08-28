@@ -1735,6 +1735,94 @@ func TestSourceWitnessIgnoresDeclarationsThatAreNotCode(t *testing.T) {
 	_ = dir
 }
 
+// TestTheHarnessEntryPointIsNotATest: `TestMain(m *testing.M)` is the test binary's ENTRY POINT,
+// not a test. The toolchain never registers it and `go test -list` never prints it — so the source
+// witness must not testify that a package declares a test by that name.
+//
+// WHY IT MATTERS, and it is the same hole the lane pairing was built to close, one name wide. The
+// list witness is `go test -list` STDOUT, which anything a package prints during startup lands in
+// — and TestMain is the one function that runs during a listing run. So a TestMain that prints its
+// own name supplies the list half, and a source witness that counted the declaration supplied the
+// other: both agree, and a claim resolves against a name that no test registers. Measured on Go:
+// with `func TestMain(m *testing.M) { fmt.Println("TestMain"); os.Exit(m.Run()) }`, the string
+// TestMain appears in `go test -list '.*'` output for that package. This repository already has a
+// TestMain of exactly that signature, so the surface is live, not hypothetical.
+//
+// AND THE RULE IS THE TOOLCHAIN'S, NOT THE NAME. `func TestMain(t *testing.T)` IS a real,
+// registered, runnable test — measured: it is listed by `go test -list '.*'` with nothing printing
+// it. Excluding the NAME would refuse a legitimate claim on a legitimate test, which is the
+// false-red mirror of the defect. The signature decides, exactly as cmd/go decides it.
+func TestTheHarnessEntryPointIsNotATest(t *testing.T) {
+	dir := t.TempDir()
+	write := func(pkgdir, body string) string {
+		p := filepath.Join(dir, pkgdir)
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		f := filepath.Join(p, "x_test.go")
+		if err := os.WriteFile(f, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+	entry := write("entry", strings.Join([]string{
+		`package x`,
+		``,
+		`import (`,
+		`	"fmt"`,
+		`	"os"`,
+		`	"testing"`,
+		`)`,
+		``,
+		`func TestMain(m *testing.M) {`,
+		`	fmt.Println("TestMain")`,
+		`	os.Exit(m.Run())`,
+		`}`,
+		``,
+		`func TestReal(t *testing.T) {}`,
+		``,
+	}, "\n"))
+	// The other spelling, which the toolchain DOES register as a test.
+	real := write("real", strings.Join([]string{
+		`package y`,
+		``,
+		`import "testing"`,
+		``,
+		`func TestMain(t *testing.T) {}`,
+		``,
+	}, "\n"))
+	// An alias for the testing import: the entry point is still the entry point.
+	aliased := write("aliased", strings.Join([]string{
+		`package z`,
+		``,
+		`import tt "testing"`,
+		``,
+		`func TestMain(m *tt.M) { m.Run() }`,
+		``,
+	}, "\n"))
+
+	got, err := collectLaneSource(map[string][]string{
+		"mythicalos.ai/ctl/internal/entry":   {entry},
+		"mythicalos.ai/ctl/internal/real":    {real},
+		"mythicalos.ai/ctl/internal/aliased": {aliased},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["mythicalos.ai/ctl/internal/entry"]["TestMain"] {
+		t.Fatalf("the source witness testified that a `func TestMain(m *testing.M)` entry point is a declared test — paired with the name it prints during a listing run, a claim resolves against a test that does not exist: %v", got["mythicalos.ai/ctl/internal/entry"])
+	}
+	if got["mythicalos.ai/ctl/internal/aliased"]["TestMain"] {
+		t.Fatalf("an aliased `*tt.M` entry point was counted as a declared test: %v", got["mythicalos.ai/ctl/internal/aliased"])
+	}
+	if !got["mythicalos.ai/ctl/internal/entry"]["TestReal"] {
+		t.Fatalf("an ordinary test beside the entry point was lost: %v", got["mythicalos.ai/ctl/internal/entry"])
+	}
+	if !got["mythicalos.ai/ctl/internal/real"]["TestMain"] {
+		t.Fatalf("`func TestMain(t *testing.T)` is a REGISTERED test and a claim on it is legitimate; excluding the name refuses it: %v", got["mythicalos.ai/ctl/internal/real"])
+	}
+}
+
 // TestGoFileListIsTheToolchainsOwnSelection: the source witness is built from the files GO says
 // this lane compiles, so a file the lane does not build cannot testify about it.
 func TestGoFileListIsTheToolchainsOwnSelection(t *testing.T) {

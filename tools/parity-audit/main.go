@@ -849,15 +849,62 @@ func collectLaneSource(files map[string][]string) (map[string]map[string]bool, e
 				if !ok || fn.Recv != nil || fn.Name == nil {
 					continue
 				}
+				// THE HARNESS ENTRY POINT IS NOT A TEST. `func TestMain(m *testing.M)` is where
+				// the test binary STARTS; the toolchain never registers it and `go test -list`
+				// never prints it. Counting the declaration was the one name wide enough to walk
+				// through the lane pairing: the list witness is `-list` STDOUT, TestMain is the one
+				// function that RUNS during a listing run, so a TestMain printing its own name
+				// supplied the list half while this loop supplied the other — both witnesses
+				// agreeing about a name that registers no test.
+				//
+				// THE SIGNATURE DECIDES, NOT THE NAME, and that is not a detail: `func TestMain(t
+				// *testing.T)` IS a registered, runnable test (measured — `go test -list` prints it
+				// with nothing printing it), so excluding the name would refuse a legitimate claim
+				// on a legitimate test. This is cmd/go's own rule, applied to the same AST it
+				// applies it to: a single `*T`-shaped parameter is a test, anything else named
+				// TestMain is the entry point.
+				n := fn.Name.Name
+				if n == "TestMain" && !isTestTParam(fn) {
+					continue
+				}
 				// The same grammar the testing package applies: `Test` alone, or `Test` followed
 				// by a character that is not a lower-case letter.
-				if n := fn.Name.Name; isGoTestName(n) {
+				if isGoTestName(n) {
 					out[pkg][n] = true
 				}
 			}
 		}
 	}
 	return out, nil
+}
+
+// isTestTParam reports whether fn takes exactly one parameter of the shape `*T` or `*something.T`
+// — cmd/go's own test for "this is a testing.T", written the way cmd/go writes it.
+//
+// IT CANNOT RESOLVE THE IMPORT, AND NEITHER DOES THE TOOLCHAIN: how `testing` was imported is not
+// knowable from one file's syntax alone (`import tt "testing"` makes the entry point `*tt.M`), so
+// cmd/go compares the SELECTED NAME and so does this. That leaves one honest gap in the same place
+// the toolchain leaves it: a package with its own type named `T`, taking `*mine.T`, reads as a
+// test. It is the direction that costs nothing here — such a function is a build error under
+// `go test` ("wrong signature"), so the lane never lists it and the audit never sees it.
+func isTestTParam(fn *ast.FuncDecl) bool {
+	if fn.Type == nil || fn.Type.Results != nil && len(fn.Type.Results.List) > 0 {
+		return false
+	}
+	if fn.Type.Params == nil || len(fn.Type.Params.List) != 1 || len(fn.Type.Params.List[0].Names) > 1 {
+		return false
+	}
+	ptr, ok := fn.Type.Params.List[0].Type.(*ast.StarExpr)
+	if !ok {
+		return false
+	}
+	if id, ok := ptr.X.(*ast.Ident); ok {
+		return id.Name == "T"
+	}
+	if sel, ok := ptr.X.(*ast.SelectorExpr); ok {
+		return sel.Sel != nil && sel.Sel.Name == "T"
+	}
+	return false
 }
 
 // candidatePackages is where ONE PORTED target may legitimately live: the package of the file
