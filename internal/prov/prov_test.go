@@ -641,6 +641,25 @@ func TestFirstUseStaging(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "restore is in progress") {
 			t.Fatalf("staging marker: %v", err)
 		}
+		// AND THE TWO COMMANDS IT PRESCRIBES ARE PINNED HERE, BYTE FOR BYTE. This diagnostic used
+		// to name `restore --resume`, which the CLI has never had: the option loop refuses any
+		// unknown `-*` before the verb runs, so an operator recovering an interrupted restore was
+		// handed "unknown option: --resume", exit 2. A recovery instruction that cannot be
+		// executed is worse than none, and the only thing that keeps one honest is a test that
+		// breaks when somebody renames the verb or the flag. The cmd package drives both of these
+		// strings through the real dispatcher (TestStagingDiagnosticPrescribesRunnableCommands);
+		// this half pins the words.
+		for _, cmd := range []string{
+			"'mythical-ctl restore <the same backup directory>'",
+			"'mythical-ctl restore --abandon'",
+		} {
+			if !strings.Contains(err.Error(), cmd) {
+				t.Fatalf("the in-progress-restore diagnostic does not prescribe %s:\n%v", cmd, err)
+			}
+		}
+		if strings.Contains(err.Error(), "--resume") {
+			t.Fatalf("the diagnostic prescribes a --resume flag the CLI does not have:\n%v", err)
+		}
 	}
 }
 

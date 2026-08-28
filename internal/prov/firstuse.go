@@ -119,9 +119,31 @@ func FirstUse(ctx context.Context, home string, objs Objects) error {
 	// and not inconsistent. Any presence at the path is the marker, for the same reason as the
 	// active ledger above — a restore that failed while creating it is exactly the case this
 	// branch catches.
+	// THE PRESCRIBED COMMANDS ARE THE ONES THE CLI ACTUALLY HAS. This diagnostic named a
+	// `restore --resume` flag that does not exist and never did: the option loop refuses any
+	// unknown `-*` before the verb runs, so an operator following it literally got
+	// "unknown option: --resume", exit 2 — at precisely the moment they are recovering from an
+	// interrupted restore. Resuming is RE-RUNNING the verb: `restore` classifies the machine
+	// first and, on a staging ledger that still carries a live intent, resumes from the source
+	// directory recorded INSIDE that intent rather than from the operand. The operand is still
+	// required (the verb takes exactly one, or --abandon alone), which is why the instruction
+	// names the same directory rather than pretending none is needed. Both strings are pinned by
+	// TestFirstUseStaging and re-driven through the real dispatcher by the cmd package's
+	// TestStagingDiagnosticPrescribesRunnableCommands, so renaming either breaks a test instead
+	// of an operator.
+	//
+	// NO APOSTROPHE IN THE PROSE OF THIS MESSAGE. Single quotes delimit the commands, so a
+	// possessive in the surrounding sentence closes one prescription early and swallows the next
+	// — which is not a cosmetic problem: the reader that extracts these commands and runs them
+	// then never sees the second one. Measured while writing this fix; the guard is
+	// TestStagingDiagnosticPrescribesRunnableCommands requiring at least two runnable commands.
 	if _, err := os.Lstat(filepath.Join(home, ".state", "ledger.staging")); err == nil {
 		return errors.New("prov: there is no active ledger, but a restore is in progress (.state/ledger.staging).\n" +
-			"  Resume it with 'mythical-ctl restore --resume', or abandon it with 'restore --abandon'.")
+			"  Resume it by re-running 'mythical-ctl restore <the same backup directory>' — the source\n" +
+			"  directory is recorded inside the staging ledger, so re-running continues that attempt\n" +
+			"  rather than starting a new one.\n" +
+			"  Or give it up with 'mythical-ctl restore --abandon', which removes the partial volumes\n" +
+			"  that attempt created under their recorded identity.")
 	}
 
 	if len(found) > 0 {
