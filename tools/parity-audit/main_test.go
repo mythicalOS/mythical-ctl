@@ -1204,60 +1204,71 @@ func TestQualificationUsesGosNameGrammarNotASCII(t *testing.T) {
 	}
 }
 
-// TestTwoQualificationsOfOneTargetResolveToNothing: a claim that names TWO packages for the same
-// test has said something ambiguous, and an ambiguous reference must not be answered by picking
-// either. Unioning them restores the exact hole the qualification exists to close —
-// `internal/w.TestShared (formerly internal/x.TestShared)` would survive the deletion of the
-// internal/w test as long as internal/x still has a namesake.
-func TestTwoQualificationsOfOneTargetResolveToNothing(t *testing.T) {
+// TestTheFirstOccurrenceOfATargetDecides: the claim reader stops looking after the target's first
+// whole-identifier occurrence, and that is a decision NOT to scan prose rather than a rule about it.
+//
+// Three false-green classes were found in this reader, all the same shape — it approximated a
+// grammar by scanning the whole claim, and prose has no polarity a scanner can read. Every rule
+// invented to give it one (union the qualifiers; reject contradictory ones; compare them as sets)
+// was another rule ABOUT prose waiting for a fourth shape. The region is now the first occurrence,
+// full stop.
+func TestTheFirstOccurrenceOfATargetDecides(t *testing.T) {
 	goTests := map[string]map[string]bool{
-		"mythicalos.ai/ctl/internal/w": {"TestShared": true},
+		"mythicalos.ai/ctl/internal/w": {"TestShared": true, "TestFoo": true},
 		"mythicalos.ai/ctl/internal/x": {"TestShared": true},
+		"mythicalos.ai/ctl/internal/y": {"TestFoo": true},
 	}
-	got := candidatePackages(goTests, "internal/y/y_test.go",
-		"internal/w.TestShared (formerly internal/x.TestShared)", "TestShared")
-	if len(got) != 0 {
-		t.Fatalf("two qualifications of one target were unioned into a candidate set: %v", got)
+	// BARE FIRST: local, and no later sentence can move it. This is the polarity case — a claim
+	// saying its target is local while spelling another package's qualified name.
+	local := candidatePackages(goTests, "internal/x/x_test.go",
+		"TestShared (not internal/w.TestShared; it is local)", "TestShared")
+	if !local["mythicalos.ai/ctl/internal/x"] || len(local) != 1 {
+		t.Fatalf("a bare first occurrence did not resolve locally and only locally: %v", local)
 	}
-	// THE SAME PACKAGE NAMED TWICE IS NOT AMBIGUOUS — it is one reference, written twice.
-	same := candidatePackages(goTests, "internal/y/y_test.go",
-		"internal/w.TestShared (and again internal/w.TestShared)", "TestShared")
-	if !same["mythicalos.ai/ctl/internal/w"] || len(same) != 1 {
-		t.Fatalf("one package named twice was treated as ambiguous: %v", same)
+	// QUALIFIED FIRST: that package, and no later sentence can widen or contradict it.
+	cross := candidatePackages(goTests, "internal/x/x_test.go",
+		"internal/w.TestShared (formerly internal/x.TestShared, and see internal/y too)", "TestShared")
+	if !cross["mythicalos.ai/ctl/internal/w"] || len(cross) != 1 {
+		t.Fatalf("a qualified first occurrence was widened or contradicted by later prose: %v", cross)
 	}
-	// TWO SPELLINGS OF ONE PACKAGE ARE ONE REFERENCE. A raw string comparison calls these
-	// ambiguous and fails a legitimate claim; they must be compared as RESOLVED packages.
-	spellings := candidatePackages(goTests, "internal/y/y_test.go",
-		"internal/w.TestShared (that is mythicalos.ai/ctl/internal/w.TestShared)", "TestShared")
-	if !spellings["mythicalos.ai/ctl/internal/w"] || len(spellings) != 1 {
-		t.Fatalf("two spellings of one package were treated as ambiguous: %v", spellings)
+	// PER TARGET, not per claim: two targets in one claim decide independently.
+	two := candidatePackages(goTests, "internal/x/x_test.go",
+		"internal/w.TestShared (the sibling) + TestFoo (local)", "TestFoo")
+	if !two["mythicalos.ai/ctl/internal/x"] || len(two) != 1 {
+		t.Fatalf("an unqualified target borrowed another target's package: %v", two)
 	}
 }
 
-// TestAClaimThatWritesTheTargetBothWaysResolvesToNothing: prose has no polarity, so a claim that
-// says its target is LOCAL and also spells a qualification of it has said two things, and no
-// scanner can tell which was meant.
+// TestATargetIsMatchedOnlyAsAWholeIdentifier: both boundaries, not one.
 //
-// `TestShared (not internal/w.TestShared; it is local)` is the shape: once a qualification
-// CONSTRAINS, that sentence pins resolution to internal/w — where a namesake keeps the claim green
-// after the local test it was really about is deleted. Refusing to resolve is the only honest
-// answer, and it is loud: the audit reports the claim as unresolvable.
-func TestAClaimThatWritesTheTargetBothWaysResolvesToNothing(t *testing.T) {
+// Only the right-hand boundary was checked, so `TestFoo` matched inside `NotTestFoo` — and that
+// spurious occurrence, appearing before the real one, decided the claim. A test that exercises
+// only the right boundary cannot see it.
+func TestATargetIsMatchedOnlyAsAWholeIdentifier(t *testing.T) {
 	goTests := map[string]map[string]bool{
-		"mythicalos.ai/ctl/internal/w": {"TestShared": true},
-		"mythicalos.ai/ctl/internal/x": {"TestShared": true},
+		"mythicalos.ai/ctl/internal/w": {"TestFoo": true, "TestFooBar": true},
+		"mythicalos.ai/ctl/internal/x": {},
 	}
+	// LEFT BOUNDARY, WITH THE DECOY FIRST — which is the only arrangement that can catch it now
+	// that the FIRST occurrence decides. `NotTestFoo` ends in the target's name; without the
+	// left-hand boundary test it is read as a BARE first occurrence, and the real qualified target
+	// after it is never reached, so the claim silently resolves to the claiming package instead.
+	// (With the decoy second, first-occurrence already masks the bug — a test written that way
+	// passes whether the boundary is checked or not.)
 	got := candidatePackages(goTests, "internal/x/x_test.go",
-		"TestShared (not internal/w.TestShared; it is local)", "TestShared")
-	if len(got) != 0 {
-		t.Fatalf("a claim that writes its target both bare and qualified resolved anyway: %v", got)
+		"(helper NotTestFoo) internal/w.TestFoo", "TestFoo")
+	if !got["mythicalos.ai/ctl/internal/w"] || len(got) != 1 {
+		t.Fatalf("a longer identifier ending in the target's name was read as the target: %v", got)
 	}
-	// A CLAIM THAT ONLY QUALIFIES IS NOT CONTRADICTORY — every real cross-package claim in this
-	// tree is written that way, and this must not refuse them.
-	ok := candidatePackages(goTests, "internal/x/x_test.go",
-		"internal/w.TestShared (recorded here for the audit)", "TestShared")
-	if !ok["mythicalos.ai/ctl/internal/w"] || len(ok) != 1 {
-		t.Fatalf("an ordinary qualified claim was refused: %v", ok)
+	// RIGHT BOUNDARY: `TestFooBar` is not an occurrence of `TestFoo` either.
+	got = candidatePackages(goTests, "internal/x/x_test.go", "internal/w.TestFooBar and TestFoo", "TestFoo")
+	if !got["mythicalos.ai/ctl/internal/x"] || len(got) != 1 {
+		t.Fatalf("a qualification of TestFooBar was read as one of TestFoo: %v", got)
+	}
+	// A target named nowhere in the claim resolves as unqualified — the claiming package.
+	none := candidatePackages(goTests, "internal/x/x_test.go", "no target here", "TestFoo")
+	if !none["mythicalos.ai/ctl/internal/x"] || len(none) != 1 {
+		t.Fatalf("a target absent from the detail did not fall back to the claiming package: %v", none)
 	}
 }
 

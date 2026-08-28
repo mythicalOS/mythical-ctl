@@ -1432,3 +1432,95 @@ func TestResumeDoesNotClaimPartialContentsItNeverMeasured(t *testing.T) {
 		t.Fatal("activated over a volume nothing verified")
 	}
 }
+
+// TestLinkThenVerifiedUnlinkNeverDeletesAReplacement: the link+unlink fallback must not delete a
+// file that took the source name after the link.
+//
+// ACTIVATION AND PRESERVATION WANT OPPOSITE THINGS FROM THAT UNLINK. Activation is consuming the
+// staging ledger and tidying its name away, so removing whatever is left there is the point.
+// Preservation is RESCUING bytes that failed a checksum, and the source is the well-known staging
+// path — where an operator restoring a ledger by hand, or another tool, can put something else
+// between the link and the unlink. Deleting THAT file while reporting the preservation a success
+// leaves a valid ledger at neither name.
+//
+// The fallback is driven directly: the no-replace primitive succeeds on this filesystem, so a test
+// routed through preserveMove would take the rename path and this branch would be exercised
+// nowhere.
+func TestLinkThenVerifiedUnlinkNeverDeletesAReplacement(t *testing.T) {
+	dir := t.TempDir()
+	from := filepath.Join(dir, "ledger.staging")
+	to := filepath.Join(dir, "ledger.staging.corrupt.1")
+	write(t, from, []byte("the bytes that failed their checksum\n"))
+
+	// SOMETHING ELSE TAKES THE SOURCE NAME between the link and the unlink. os.Link is called by
+	// the function under test, so the swap is arranged by making `from` a DIFFERENT inode than the
+	// one it will Lstat first — done by replacing it after that Lstat is impossible from here, so
+	// instead the same window is reproduced by handing it a source that is replaced underneath a
+	// pre-linked destination.
+	if err := os.Link(from, to); err != nil {
+		t.Skipf("this filesystem does not support hard links (%v) — the fallback is not reachable here", err)
+	}
+	replacement := checksummedLedger(ledger.Schema, "somekind\tkey=value")
+	if err := os.Remove(from); err != nil {
+		t.Fatal(err)
+	}
+	write(t, from, replacement)
+	if err := os.Remove(to); err != nil {
+		t.Fatal(err)
+	}
+
+	// Now the ordinary call: it links, and the source is stable, so this one SUCCEEDS — the
+	// control that proves the function still does its job.
+	if err := linkThenVerifiedUnlink(from, to); err != nil {
+		t.Fatalf("an ordinary fallback move failed: %v", err)
+	}
+	if exists(from) {
+		t.Fatal("the source was not unlinked on the ordinary path")
+	}
+	got, rerr := os.ReadFile(to)
+	if rerr != nil || string(got) != string(replacement) {
+		t.Fatalf("the moved bytes are wrong: %q, %v", got, rerr)
+	}
+
+	// AND THE WINDOW ITSELF, through the seam that opens it: a source whose inode changes between
+	// the link and the unlink must be LEFT ALONE.
+	from2 := filepath.Join(dir, "second.staging")
+	to2 := filepath.Join(dir, "second.staging.corrupt.1")
+	write(t, from2, []byte("evidence\n"))
+	swapErr := swapAfterLink(t, from2, to2, replacement)
+	if !errors.Is(swapErr, errActivatedWithResidue) {
+		t.Fatalf("a replaced source was not reported as a residue: %v", swapErr)
+	}
+	back, rerr2 := os.ReadFile(from2)
+	if rerr2 != nil {
+		t.Fatalf("the replacement at the source name was DELETED: %v", rerr2)
+	}
+	if string(back) != string(replacement) {
+		t.Fatal("the file at the source name is not the replacement")
+	}
+}
+
+// swapAfterLink reproduces the window by doing the fallback's own steps with a replacement dropped
+// in between, and then asking the function under test for its unlink decision about that state.
+func swapAfterLink(t *testing.T, from, to string, replacement []byte) error {
+	t.Helper()
+	before, err := os.Lstat(from)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(from, to); err != nil {
+		t.Skipf("this filesystem does not support hard links (%v)", err)
+	}
+	if err := os.Remove(from); err != nil {
+		t.Fatal(err)
+	}
+	write(t, from, replacement)
+	after, err := os.Lstat(from)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(before, after) {
+		t.Fatal("the fixture did not replace the inode — the window is not exercised")
+	}
+	return unlinkIfSame(before, from)
+}

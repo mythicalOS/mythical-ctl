@@ -560,6 +560,22 @@ func TestReadRegularFileResolvesTheNameOnce(t *testing.T) {
 			"waiting for a writer that will never come")
 	}
 
+	// A SYMLINK LOOP IN A PARENT COMPONENT ALSO ANSWERS ELOOP, and it says NOTHING about the final
+	// name. Reporting it as "this path is a symlink" would be a positive claim about a path whose
+	// resolution never got that far.
+	loopdir := filepath.Join(dir, "loop")
+	if err := os.Symlink(loopdir, loopdir); err != nil {
+		t.Fatal(err)
+	}
+	_, lerr := ReadRegularFile(filepath.Join(loopdir, "ledger"))
+	if lerr == nil {
+		t.Fatal("a path through a symlink loop was read")
+	}
+	if errors.Is(lerr, ErrNotRegular) {
+		t.Fatalf("a loop in a PARENT component was reported as a positive answer about the final\n"+
+			"component: %v", lerr)
+	}
+
 	// A DIRECTORY, and an absent path, are their own answers.
 	if _, err := ReadRegularFile(dir); !errors.Is(err, ErrNotRegular) {
 		t.Fatalf("a directory: %v", err)

@@ -816,7 +816,7 @@ func preserveCorrupt(sf string) (aside string, residue error, err error) {
 		if i > 0 {
 			to += "-" + strconv.Itoa(i)
 		}
-		merr := activateRename(sf, to)
+		merr := preserveMove(sf, to)
 		switch {
 		case merr == nil:
 			return to, nil, nil
@@ -834,6 +834,74 @@ func preserveCorrupt(sf string) (aside string, residue error, err error) {
 	}
 	return "", nil, fmt.Errorf("restore: %d preserved copies of a corrupt staging ledger already exist beside %s;\n"+
 		"  refusing to overwrite any of them. Move or remove them and run this again", candidates, sf)
+}
+
+// preserveMove is activateRename's counterpart for RESCUING a file rather than consuming one, and
+// the difference is the unlink.
+//
+// ACTIVATION AND PRESERVATION WANT OPPOSITE THINGS FROM link+unlink. Activation is installing the
+// staging ledger AS the live one and then tidying the staging name away: whatever is left at the
+// source is leftover, and removing it is the point. Preservation is rescuing bytes that failed
+// their checksum; the source name is the well-known staging path, and something else can appear
+// there between the link and the unlink — an operator restoring a ledger by hand, another tool.
+// The unlink would then delete THAT file, which may be a perfectly valid ledger, while reporting
+// the preservation a success and leaving the newcomer at neither name.
+//
+// So the unlink is performed only when the source is still the SAME INODE the link just made a
+// second name for. A file that replaced it is left exactly where it is and reported as a residue,
+// which is the honest answer: the evidence IS preserved at `to`, and something else is standing at
+// the staging name. (The identity test and the unlink are still two steps — there is no
+// unlink-if-same-inode anywhere — but the window is now bounded by two adjacent syscalls instead of
+// by a read, and a swap that lands outside it is DETECTED rather than acted on.)
+//
+// activateRename is deliberately left untouched: its fallback is correct for the operation it
+// serves, and this is a different operation.
+func preserveMove(from, to string) error {
+	err := renameNoReplace(from, to)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, fs.ErrExist):
+		// An ANSWER: the destination is occupied. Never retried through the fallback.
+		return err
+	case !noReplaceUnsupported(err):
+		return err
+	}
+	return linkThenVerifiedUnlink(from, to)
+}
+
+// linkThenVerifiedUnlink is preservation's fallback for a filesystem whose no-replace rename is
+// refused: link, then remove the source ONLY IF it is still the same inode the link named twice.
+//
+// It is its own function so it can be driven directly. The primitive succeeds on the filesystems
+// this project is developed on, so a test that went through preserveMove would take the rename
+// path and skip — and the branch that must never delete somebody else's file would be exercised
+// nowhere.
+func linkThenVerifiedUnlink(from, to string) error {
+	before, serr := os.Lstat(from)
+	if serr != nil {
+		return serr
+	}
+	if err := os.Link(from, to); err != nil {
+		return err
+	}
+	return unlinkIfSame(before, from)
+}
+
+// unlinkIfSame removes `from` ONLY IF it is still the inode `before` describes. A file that
+// replaced it is left exactly where it is and reported as a residue — the honest answer, because
+// the evidence IS preserved at the other name and something else is standing at this one.
+//
+// The identity test and the unlink are still two steps: there is no unlink-if-same-inode call
+// anywhere. What changes is that the window is now bounded by two adjacent syscalls instead of by a
+// link, and a swap that lands outside it is DETECTED rather than acted on.
+func unlinkIfSame(before os.FileInfo, from string) error {
+	after, aerr := os.Lstat(from)
+	if aerr != nil || !os.SameFile(before, after) {
+		return fmt.Errorf("%w: the staging name no longer holds the file that was just preserved,\n"+
+			"  so it was left alone rather than deleted", errActivatedWithResidue)
+	}
+	return residueOf(os.Remove(from))
 }
 
 // reportResidue says the second half of a preservation that half-succeeded: the evidence IS at

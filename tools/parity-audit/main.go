@@ -890,43 +890,16 @@ func candidatePackages(all map[string]map[string]bool, goFile, detail, target st
 	// other way: `internal/w.TestShared`, written in internal/x, stayed green after
 	// internal/w.TestShared was DELETED, because a namesake in internal/x satisfied it. A claim
 	// that says where its target lives is answered by THAT package or by nothing.
-	quals, bare := qualifiersFor(detail, target)
-	if len(quals) > 0 {
-		// A TARGET WRITTEN BOTH QUALIFIED AND BARE IN ONE CLAIM IS CONTRADICTORY, and this is the
-		// polarity a token reader otherwise cannot have. `TestShared (not internal/w.TestShared;
-		// it is local)` says the target is local AND spells a qualification of it, and no scanner
-		// can tell which half was meant — so it resolves to NOTHING and the audit says the claim
-		// is unresolvable. That is the only honest answer to a claim that says two things.
-		if bare {
-			return out
-		}
-		// TWO DIFFERENT QUALIFICATIONS ARE AMBIGUOUS TOO. Unioning them puts the hole straight
-		// back: `internal/w.TestShared (formerly internal/x.TestShared)` would be satisfied by
-		// EITHER, so deleting the one the claim is about stays green while the other has a
-		// namesake. Same rule the bare-segment case obeys below — widening is the defect, not the
-		// fix for it.
-		//
-		// THEY ARE COMPARED AS RESOLVED PACKAGES, NOT AS STRINGS. `internal/w` and
-		// `mythicalos.ai/ctl/internal/w` are two spellings of one package, and rejecting that pair
-		// as ambiguous would fail a claim that names one package twice in two valid ways.
-		var first map[string]bool
-		for _, tok := range quals {
-			got := map[string]bool{}
-			addTo(all, bySeg, got, tok)
-			if len(got) == 0 {
-				return out
-			}
-			if first == nil {
-				first = got
-				continue
-			}
-			if !sameSet(first, got) {
-				return out
-			}
-		}
-		for p := range first {
-			out[p] = true
-		}
+	// THE TARGET'S FIRST OCCURRENCE DECIDES, and the rest of the claim is never read for it. See
+	// qualifierFor: this is a decision NOT to scan prose, which is what makes the whole family of
+	// prose-shaped false greens unreachable instead of individually ruled out.
+	if tok, ok := qualifierFor(detail, target); ok && tok != "" {
+		// A QUALIFICATION CONSTRAINS; IT DOES NOT WIDEN. An earlier version added the qualified
+		// package BESIDE the claiming file's own, which left the hole facing the other way:
+		// `internal/w.TestShared` written in internal/x stayed green after internal/w.TestShared
+		// was DELETED, because a namesake in internal/x satisfied it. A claim that says where its
+		// target lives is answered by THAT package or by nothing.
+		addTo(all, bySeg, out, tok)
 		return out
 	}
 	// UNQUALIFIED: the claiming file's own package, and nothing else.
@@ -960,52 +933,55 @@ func addTo(all map[string]map[string]bool, bySeg map[string][]string, out map[st
 	}
 }
 
-func sameSet(a, b map[string]bool) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for k := range a {
-		if !b[k] {
-			return false
-		}
-	}
-	return true
-}
-
-// qualifiersFor returns the package tokens written IMMEDIATELY BEFORE this target and a dot —
-// `<package path>.<TestName>` — and nothing else. That is the whole cross-package syntax.
+// qualifierFor returns the package token qualifying this target, read at the target's FIRST
+// OCCURRENCE in the claim and nowhere else.
 //
-// IT IS NOT A REGEXP, AND THAT IS DELIBERATE. The obvious pattern spells the name half in ASCII
-// (`Test[A-Za-z0-9_]*`), and Go test names are UNICODE: `TestAlphaÉ` would match as `TestAlpha`,
-// the target it was compared against would be the full name, and a legitimately qualified claim
-// would silently fail to resolve. The tree already owns this grammar in one place — isGoTestName
-// and identRune — so the occurrence is found by string search and its boundary judged by those.
-func qualifiersFor(detail, target string) (quals []string, bare bool) {
+// THE FIRST OCCURRENCE IS THE DESIGNATED REGION, AND NOTHING AFTER IT IS READ. Three false-green
+// classes have now been found in this reader, all the same shape: it approximated a grammar by
+// scanning prose, and prose has no polarity a scanner can see. `TestShared (not
+// internal/w.TestShared; it is local)` says the target is local and also spells a qualification of
+// it; a reader that looks at the whole claim cannot tell which half was meant, and every rule
+// invented to tell them apart is another rule ABOUT prose waiting for a fourth shape.
+//
+// So the reader stops looking. A claim states its target once, where the claim is made; whatever a
+// rationale says afterwards is commentary and is not scanned for that target at all. No sentence
+// anyone writes can then satisfy, constrain or contradict a claim — the family of findings is
+// unreachable rather than individually handled. (This is positional, not punctuational: a
+// delimiter like "up to the first parenthesis" cannot be used, because real claims in this tree
+// put a second target AFTER a parenthetical and one writes its whole target inside parentheses.)
+//
+// BOTH IDENTIFIER BOUNDARIES ARE CHECKED. Only the right-hand one was, so `TestFoo` matched inside
+// `NotTestFoo` — and that spurious "bare occurrence" made a legitimately qualified claim resolve to
+// nothing. An occurrence counts only when it is a WHOLE identifier: no identifier rune on either
+// side, except the `.` that carries a qualification.
+func qualifierFor(detail, target string) (tok string, found bool) {
 	for i := 0; i+len(target) <= len(detail); i++ {
 		if !strings.HasPrefix(detail[i:], target) {
 			continue
 		}
-		// A WHOLE IDENTIFIER. `internal/w.TestFooBar` does not qualify `TestFoo`.
 		if r, _ := utf8.DecodeRuneInString(detail[i+len(target):]); identRune(r) {
 			continue
 		}
-		// Immediately preceded by a dot, and before it a path token. `.` is not an identifier
-		// rune, so the left boundary needs no separate test.
-		tok := ""
-		if i > 0 && detail[i-1] == '.' {
-			k := i - 1
-			for k > 0 && isPathByte(detail[k-1]) {
-				k--
+		if i > 0 {
+			r, _ := utf8.DecodeLastRuneInString(detail[:i])
+			// A `.` is not an identifier rune, so a qualification passes this test; a letter,
+			// digit or underscore means the match is the TAIL of a longer identifier.
+			if identRune(r) {
+				continue
 			}
-			tok = detail[k : i-1]
 		}
-		if tok == "" {
-			bare = true
-			continue
+		// THE FIRST WHOLE-IDENTIFIER OCCURRENCE DECIDES, qualified or not. Returning here is the
+		// whole rule.
+		if i == 0 || detail[i-1] != '.' {
+			return "", true
 		}
-		quals = append(quals, tok)
+		k := i - 1
+		for k > 0 && isPathByte(detail[k-1]) {
+			k--
+		}
+		return detail[k : i-1], true
 	}
-	return quals, bare
+	return "", false
 }
 
 // isPathByte is what a package path may contain in a claim.

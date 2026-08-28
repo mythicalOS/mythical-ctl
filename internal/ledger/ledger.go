@@ -171,10 +171,19 @@ var ErrNotRegular = errors.New("not a regular file")
 func ReadRegularFile(path string) ([]byte, error) {
 	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
-		// A symlink at the final component answers ELOOP here, which is an ANSWER about the path
-		// and not a failure to look — the caller says so by testing ErrNotRegular.
+		// ELOOP DOES NOT PROVE THIS PATH IS A SYMLINK. O_NOFOLLOW answers ELOOP for a symlink at
+		// the FINAL component, but the same errno also reports too many links, or a loop, in a
+		// PARENT component — where nothing has been established about the final name at all.
+		// Mapping every ELOOP to "it is a symlink" states a positive fact about the path when the
+		// truth is that resolution failed.
+		//
+		// So the two are separated by the one call that answers exactly this question: Lstat does
+		// not follow the final component. Both outcomes are refusals and nothing destructive
+		// follows either, so asking again here costs a classification and risks nothing.
 		if errors.Is(err, syscall.ELOOP) {
-			return nil, fmt.Errorf("ledger: %s is a symlink, not a regular file: %w", path, ErrNotRegular)
+			if fi, lerr := os.Lstat(path); lerr == nil && fi.Mode()&os.ModeSymlink != 0 {
+				return nil, fmt.Errorf("ledger: %s is a symlink, not a regular file: %w", path, ErrNotRegular)
+			}
 		}
 		return nil, err
 	}
