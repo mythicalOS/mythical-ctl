@@ -268,11 +268,17 @@ func (b *Bridge) Flush(stdout, stderr io.Writer) {
 // Flush cannot know that.
 //
 // THE RESIDUAL, STATED: a LEGITIMATE rune split across two writes of one stream renders as one
-// placeholder per byte instead of as the character. Nothing in this tree splits one — every verb
-// write reaches StreamWriter through fmt.Fprint*, which writes the whole formatted string in a
-// single Write, and the tree's only io.Copy copies a file to a file. If some future writer does
-// chunk mid-rune, the result is a cosmetically degraded character, never an unsafe one and never a
-// reordering.
+// placeholder per byte instead of as the character. Nothing in this tree splits one. Every write
+// that reaches StreamWriter arrives whole — the fmt.Fprint* family, which writes the entire
+// formatted string in one Write; io.WriteString; and the two places that hand a container helper's
+// CAPTURED stderr on as a single `Write(res.Stderr)` (copyfill and probe). The tree's io.Copy calls
+// copy a file to a file, never to a verb stream, so no buffer boundary lands inside a rune. If some
+// future writer does chunk mid-rune, the result is a cosmetically degraded character, never an
+// unsafe one and never a reordering.
+//
+// Those two helper-stderr writes are worth naming for a second reason: they are untrusted bytes
+// from a subprocess going into the record, so a ledger field value is not the only way a control
+// sequence gets here. They reach the terminal through this filter like everything else.
 func sanitizeReplay(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
