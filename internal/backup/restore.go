@@ -497,9 +497,10 @@ func Activate(d Deps) error {
 		d.warn("    %s", stagingPath(d.Home))
 		d.warn("  REMOVE IT before any future restore. Nothing acts on it while an active ledger is")
 		d.warn("  present, but it sits at the well-known staging name and it is checksum-valid and")
-		d.warn("  intent-free — which is byte-for-byte the state a COMPLETED restore leaves. If the")
-		d.warn("  active ledger is ever gone (an uninstall, a repair), the next restore reads this stale")
-		d.warn("  copy as ready to activate and activates it, reinstating state the machine moved on from.")
+		d.warn("  intent-free — which is byte-for-byte the state a COMPLETED restore leaves. So on the")
+		d.warn("  next machine state where there is no active ledger at all, which is the ONLY condition")
+		d.warn("  a restore runs under, this stale copy is read as ready to activate and activated,")
+		d.warn("  reinstating the state of this moment instead of the backup that was asked for.")
 		return nil
 	case errors.Is(rerr, fs.ErrExist):
 		d.warn("restore: an active ledger appeared — refusing to overwrite it:")

@@ -77,10 +77,26 @@ func linkThenUnlink(from, to string) error {
 	if err := os.Link(from, to); err != nil {
 		return err
 	}
-	if err := os.Remove(from); err != nil {
-		return fmt.Errorf("%w: %w", errActivatedWithResidue, err)
+	return residueOf(os.Remove(from))
+}
+
+// residueOf classifies the unlink's outcome. It is a named function rather than three lines
+// inside linkThenUnlink because the ENOENT arm cannot be reached from a test any other way: it
+// requires the source to vanish BETWEEN the link and the unlink, which no single-threaded
+// fixture can arrange. A classification nothing can exercise is a classification nobody finds
+// out is wrong.
+//
+// ENOENT IS SUCCESS, NOT A RESIDUE — and getting that backwards is a wrong answer in both
+// directions at once. The source being gone is precisely the state this call set out to reach;
+// something else having removed it first changes who did it, not what is true afterwards.
+// Reporting a residue then tells the operator to go and delete a file that does not exist, and —
+// worse — attaches "the staging copy could not be removed" to an activation that is completely
+// finished, which is the module's own answer-versus-refusal rule broken by its cleanup step.
+func residueOf(unlinkErr error) error {
+	if unlinkErr == nil || errors.Is(unlinkErr, fs.ErrNotExist) {
+		return nil
 	}
-	return nil
+	return fmt.Errorf("%w: %w", errActivatedWithResidue, unlinkErr)
 }
 
 // errActivatedWithResidue marks the one outcome that is neither success nor failure: the ledger

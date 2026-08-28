@@ -398,6 +398,41 @@ func TestActivateRenameFallbackReportsAResidueRatherThanAFailure(t *testing.T) {
 	}
 }
 
+// TestResidueClassification covers the three outcomes of the fallback's unlink, including the
+// one no fixture can stage: the source vanishing between the link and the unlink.
+//
+// The ENOENT arm is the interesting one and it is a wrong answer in both directions if it is
+// missed. The source being gone IS the end state this call set out to reach; something else
+// having removed it first changes who did it, not what is true afterwards. Reporting a residue
+// there sends the operator to delete a file that is not there, and attaches "could not be
+// removed" to an activation that is complete — the module's own answer-versus-refusal rule
+// broken by its own cleanup step. Reported in round 3 of this change's review, against the
+// round-2 commit that introduced the residue signal.
+func TestResidueClassification(t *testing.T) {
+	if err := residueOf(nil); err != nil {
+		t.Fatalf("a clean unlink is not a residue: %v", err)
+	}
+	// Produced the way the caller produces it, not hand-built: os.Remove of a path that is not
+	// there is exactly what a source removed by somebody else answers.
+	gone := os.Remove(filepath.Join(t.TempDir(), "never-existed"))
+	if !errors.Is(gone, fs.ErrNotExist) {
+		t.Fatalf("the fixture did not produce a not-exist error: %v", gone)
+	}
+	if err := residueOf(gone); err != nil {
+		t.Fatalf("a source that is ALREADY GONE is the state activation was reaching for, not a "+
+			"residue to send the operator after: %v", err)
+	}
+	// And anything else still is one, carrying the reason.
+	other := &os.PathError{Op: "remove", Path: "/x", Err: fs.ErrPermission}
+	err := residueOf(other)
+	if !errors.Is(err, errActivatedWithResidue) {
+		t.Fatalf("an unlink that genuinely failed must be reported as a residue: %v", err)
+	}
+	if !errors.Is(err, fs.ErrPermission) {
+		t.Fatalf("the residue lost the reason it happened: %v", err)
+	}
+}
+
 // TestPlatformNoReplaceRenameIsAvailable is the measurement behind the fallback rather than an
 // assumption about it: on the platforms this project publishes, the kernel primitive works on a
 // temp directory, so the fallback is a genuine last resort and not the path everything takes.
