@@ -959,7 +959,13 @@ func collectInventory(root string, eligible map[string]bool) ([]claim, []malform
 	var bad []malformed
 	var strays []stray
 	scanned := 0
-	foundEligible := 0
+	// A SET, NOT A COUNTER, and the difference is a false green. Two walked paths can canonicalize
+	// onto ONE eligible key — a symlink beside the file it points at is enough — and a counter then
+	// records two hits for one file, which is exactly enough to hide a DIFFERENT selected file the
+	// walk never reached (one under a pruned directory, say). The arithmetic balances and the audit
+	// exits 0 having never read a file that compiles. A set cannot be inflated: it is a subset of
+	// `eligible` by construction, so equal sizes really do mean equal sets.
+	found := map[string]bool{}
 	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -983,8 +989,8 @@ func collectInventory(root string, eligible map[string]bool) ([]claim, []malform
 		}
 		scanned++
 		var view *astView
-		if eligible[canonPath(p)] {
-			foundEligible++
+		if canon := canonPath(p); eligible[canon] {
+			found[canon] = true
 			// A MALFORMED ELIGIBLE FILE REFUSES. It is a file the toolchain compiles, so its claims
 			// are the ones that count — and a parse error that merely skipped it would look exactly
 			// like a file with nothing in it.
@@ -1015,14 +1021,19 @@ func collectInventory(root string, eligible map[string]bool) ([]claim, []malform
 	// THE WALK AND THE SELECTION MUST MEET. If a file the toolchain named was never reached by the
 	// walk, the two halves are keyed differently or the walk is pointed elsewhere — and the symptom
 	// would be a pile of unclaimed rows with no hint of the cause. Say the cause instead.
-	if foundEligible != len(eligible) {
+	if len(found) != len(eligible) {
+		// NAME THE FILE THAT IS ACTUALLY MISSING, not an arbitrary selected one. The whole value of
+		// this message is that it points at the disagreement instead of leaving a reader to infer it
+		// from a pile of unclaimed rows.
 		var missing []string
 		for f := range eligible {
-			missing = append(missing, f)
+			if !found[f] {
+				missing = append(missing, f)
+			}
 		}
 		sort.Strings(missing)
-		return nil, nil, nil, scanned, fmt.Errorf("the inventory walk under %s reached %d of the %d files the toolchain selected — the walk and `go list` disagree about where the source is, so claims would be missing for a reason that has nothing to do with the port (selected, first by path: %s)",
-			root, foundEligible, len(eligible), missing[0])
+		return nil, nil, nil, scanned, fmt.Errorf("the inventory walk under %s reached %d of the %d files the toolchain selected — the walk and `go list` disagree about where the source is, so claims would be missing for a reason that has nothing to do with the port (%d never reached; first by path: %s)",
+			root, len(found), len(eligible), len(missing), missing[0])
 	}
 	return claims, bad, strays, scanned, nil
 }

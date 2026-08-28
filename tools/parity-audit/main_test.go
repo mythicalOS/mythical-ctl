@@ -2258,3 +2258,56 @@ func TestAPortedClaimKeepsItsCommentaryInANonSemanticField(t *testing.T) {
 		t.Fatalf("a two-token target list parsed as %v", claims[1].Targets)
 	}
 }
+
+// THE RECONCILIATION IS A SET, NOT A COUNT, and this is the false green a count allowed. Round 12,
+// found by review after the fix that introduced it.
+//
+// Two walked paths can canonicalize onto ONE selected file — a symlink beside the file it points at
+// is enough, and `canonPath` resolves both to the same key by design. A COUNTER then records two
+// hits for one file, and those two hits are exactly enough to balance a DIFFERENT selected file the
+// walk never reached. The arithmetic agrees, the guard stays silent, and the audit exits 0 having
+// never read a file the toolchain compiles — which is the same class of hole the eligibility set was
+// built to close, wearing the closing guard's own clothes.
+func TestTheWalkSelectionReconciliationCountsFilesNotVisits(t *testing.T) {
+	tinyLanes(t, 2, 1, 2)
+	root, goList := e2eTree(t)
+	xdir := filepath.Join(root, "internal", "x")
+	// A claim-free selected source file, and a symlink beside it: two walk entries, one canonical
+	// path, and the symlink is NOT itself in the toolchain's selection.
+	if err := os.WriteFile(filepath.Join(xdir, "helper.go"), lines(`package x`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(xdir, "helper.go"), filepath.Join(xdir, "alias.go")); err != nil {
+		t.Skipf("this filesystem does not support symlinks: %v", err)
+	}
+	// ...and a selected file under a directory the walk deliberately prunes, which must be noticed.
+	//
+	// UNDER third_party AND NOT dist, DELIBERATELY: it has to sort AFTER the files that ARE reached,
+	// so that a message naming an arbitrary selected file names a DIFFERENT one. With the unreached
+	// file sorting first, "name the missing file" and "name any file" are indistinguishable and the
+	// assertion below passes either way — which is a test that cannot see the defect it is for.
+	gen := filepath.Join(root, "third_party", "gen")
+	if err := os.MkdirAll(gen, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(gen, "g_test.go"), lines(`package gen`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(goFilesPath(root), lines(
+		"mythicalos.ai/ctl/internal/x\t"+xdir+"\thelper.go\tx_test.go\t",
+		"mythicalos.ai/ctl/third_party/gen\t"+gen+"\t\tg_test.go\t",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := e2eRun(root, goList)
+	if err == nil {
+		t.Fatal("a selected file was never walked and the extra visit to a symlinked one balanced the books: the audit exited 0 having never read a file the toolchain compiles")
+	}
+	if !strings.Contains(err.Error(), "the toolchain selected") {
+		t.Fatalf("err = %v, want the walk/selection disagreement named", err)
+	}
+	// ...and the message names the file that is actually missing, not an arbitrary selected one.
+	if !strings.Contains(err.Error(), "g_test.go") {
+		t.Fatalf("err = %v, want the UNREACHED file named", err)
+	}
+}
