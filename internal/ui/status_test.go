@@ -1755,13 +1755,14 @@ func TestACancelledFIRSTReportIsStillPublished(t *testing.T) {
 // taken on the instruction after the run returns — not the run returning — so an escape needs that
 // SAMPLE to land before the cancel; a run that finished in time but was descheduled before the
 // sample observes the cancellation and does not replace. A sample that does land in time belongs
-// to a run that was not torn, and it replaces; if it lands after p.Run() returned as well, the
-// operator never saw what replaced. That is the whole unseen-replacement span: the five statements
-// between p.Run() returning and cancel(), with the sample inside them. What escapes is a COMPLETE
-// report the operator asked for, replacing an older complete one, which is what the refresh path
-// is specified to do (TestRunStatusRefreshRunsTheReportAgain); the code cannot differ either,
-// since the only verb this runner drives always returns 0. It is a stated residual of the runner,
-// and this test settles none of it either way.
+// to a run that was not torn, and it replaces. WHAT IT REPLACES WITH IS NOT HIDDEN: the record is
+// flushed to the real streams like every other, so the operator reads it; what they may not have
+// had is its RENDERING, in a dashboard that was closing. So what escapes is a COMPLETE report they
+// asked for standing in for an older complete one — which is what the refresh path is specified to
+// do (TestRunStatusRefreshRunsTheReportAgain) — and the code cannot differ either, since the only
+// verb this runner drives always returns 0. The span it can happen in is the five statements
+// between p.Run() returning and cancel(), with the sample inside them. It is a stated residual of
+// the runner, and this test settles none of it either way.
 //
 // So the interface is torn down here by the keystroke that tears it down for real. 'r' and 'q' are
 // queued together and this fake's loop handles them IN ORDER and runs each command synchronously,
