@@ -17,7 +17,9 @@ import (
 // claim about the past; both labels are the object's own answer about the present.
 //
 // nil authorized · ErrGone the object is already gone (nothing to do) · any other error NOT
-// authorized, and it carries the reason.
+// authorized, and it carries the reason. A refusal that no one ANSWERED — the runtime silent, this
+// installation's own identity unreadable — additionally satisfies errors.Is(err, ErrCannotAsk),
+// for the callers whose next step differs between "not ours" and "nothing was established".
 //
 // Every "no" preserves. There is no argument that flips it, and no caller may fall back to
 // deleting by name when this refuses — that is exactly the misidentification the nonce catches.
@@ -53,9 +55,9 @@ func Authority(ctx context.Context, l *ledger.Ledger, objs Objects, class Class,
 			return ErrGone
 		}
 		if lerr != nil {
-			return fmt.Errorf("prov: %q has no provenance record, and whether it still exists could not be\n"+
+			return unanswered{fmt.Errorf("prov: %q has no provenance record, and whether it still exists could not be\n"+
 				"  established either — the container runtime did not answer. Refusing rather than\n"+
-				"  authorizing anything on a question that could not be asked: %w", name, lerr)
+				"  authorizing anything on a question that could not be asked: %w", name, lerr)}
 		}
 		return fmt.Errorf("prov: %q has no provenance record — preserving it and reporting.\n"+
 			"  The installer cannot prove it created this, so it will not remove it.", name)
@@ -100,7 +102,7 @@ func Authority(ctx context.Context, l *ledger.Ledger, objs Objects, class Class,
 		return ErrGone // already gone: nothing to authorize, nothing to fear
 	}
 	if err != nil {
-		return fmt.Errorf("prov: the container runtime could not be asked who owns %q — authorizing nothing: %w", name, err)
+		return unanswered{fmt.Errorf("prov: the container runtime could not be asked who owns %q — authorizing nothing: %w", name, err)}
 	}
 	label = NormalizeLabel(label)
 	if label == "" {
@@ -111,9 +113,9 @@ func Authority(ctx context.Context, l *ledger.Ledger, objs Objects, class Class,
 	}
 	self, serr := l.IdentGet()
 	if serr != nil {
-		return fmt.Errorf("prov: this installation's own identity cannot be read, so nothing can be shown to belong\n"+
+		return unanswered{fmt.Errorf("prov: this installation's own identity cannot be read, so nothing can be shown to belong\n"+
 			"  to it — no removal is authorized. Every runtime name and every ownership claim is\n"+
-			"  scoped by that identity. Run 'mythical-ctl state repair': %w", serr)
+			"  scoped by that identity. Run 'mythical-ctl state repair': %w", serr)}
 	}
 	if label != self {
 		return fmt.Errorf("prov: %q is labelled for installation %q; this installation is %q.\n"+
@@ -127,7 +129,7 @@ func Authority(ctx context.Context, l *ledger.Ledger, objs Objects, class Class,
 		return ErrGone
 	}
 	if err != nil {
-		return fmt.Errorf("prov: the container runtime could not be asked which object %q is — authorizing nothing: %w", name, err)
+		return unanswered{fmt.Errorf("prov: the container runtime could not be asked which object %q is — authorizing nothing: %w", name, err)}
 	}
 	if NormalizeLabel(actual) != recorded {
 		return fmt.Errorf("prov: %q carries nonce %q but the ledger recorded %q — it does not match.\n"+

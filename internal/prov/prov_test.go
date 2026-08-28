@@ -80,6 +80,11 @@ type fakeObjs struct {
 	list     map[Class][]string
 	listFail map[Class]bool
 	askErr   error
+	// askErrOn narrows askErr to ONE label. Authority reads two of them in a fixed order, and the
+	// second read is unreachable while the first fails — so proving the second one's own
+	// classification needs a fake that can fail exactly it. Empty means every label fails, which
+	// is what askErr alone always meant.
+	askErrOn string
 }
 
 func newFakeObjs() *fakeObjs {
@@ -91,7 +96,7 @@ func (f *fakeObjs) put(class Class, name string, labels map[string]string) {
 }
 
 func (f *fakeObjs) Label(_ context.Context, class Class, name, label string) (string, error) {
-	if f.askErr != nil {
+	if f.askErr != nil && (f.askErrOn == "" || f.askErrOn == label) {
 		return "", f.askErr
 	}
 	m, ok := f.obj[string(class)+":"+name]
@@ -491,6 +496,108 @@ func TestAuthorityOwnIdentityUnreadable(t *testing.T) {
 	err := Authority(ctx, l, f, ClassVolume, "v1")
 	if err == nil || !strings.Contains(err.Error(), "own identity cannot be read") {
 		t.Fatalf("authority proceeded without an identity: %v", err)
+	}
+}
+
+// TestAuthorityMarksTheRefusalsNobodyAnswered: "not ours" and "nothing was established" both refuse
+// and neither authorizes anything, so most callers correctly treat them alike — but the callers
+// whose NEXT step differs need to tell them apart, and only Authority knows which it gave.
+//
+// Abandonment is the case that forced the distinction: a volume that is not ours is nothing for an
+// in-progress restore to clean up and the abandonment completes, while a volume whose ownership
+// could not be established must leave the staging ledger in place — that ledger being the only
+// record of which partial volumes exist. Folding the two either wedges an operator between a
+// survivor refusal and a cleanup that never finishes, or destroys that record on the strength of a
+// question nobody answered.
+//
+// EVERY unanswered path is asserted, not a sample: the marker is applied per return statement, so a
+// path that is missed carries no sign of it and reads, downstream, as a settled "no".
+func TestAuthorityMarksTheRefusalsNobodyAnswered(t *testing.T) {
+	ctx := context.Background()
+	down := errors.New("the container runtime did not answer")
+
+	unanswered := map[string]func() error{
+		// The runtime could not be asked WHOSE it is.
+		"the installation label could not be read": func() error {
+			l, f, _ := authorityFixture(t)
+			f.askErr, f.askErrOn = down, LabelInstall
+			return Authority(ctx, l, f, ClassVolume, "v1")
+		},
+		// ...nor WHICH object it is. Reachable only once the first read has answered.
+		"the nonce label could not be read": func() error {
+			l, f, _ := authorityFixture(t)
+			f.askErr, f.askErrOn = down, LabelNonce
+			return Authority(ctx, l, f, ClassVolume, "v1")
+		},
+		// No record, and whether the object even exists could not be established either.
+		"no record, and existence could not be established": func() error {
+			l, _ := identLedger(t)
+			f := newFakeObjs()
+			f.put(ClassVolume, "v1", map[string]string{})
+			f.askErr = down
+			return Authority(ctx, l, f, ClassVolume, "v1")
+		},
+		// The ledger cannot answer for its OWN identity, so nothing can be shown to belong to it.
+		"this installation's own identity is unreadable": func() error {
+			l := &ledger.Ledger{}
+			l.ReplaceLines([]string{
+				"identity\tid=i0000000001",
+				"identity\tid=i0000000002",
+				"object\tkey=volume:v1\tclass=volume\tname=v1\tnonce=n1\tgen=1",
+			})
+			f := newFakeObjs()
+			f.put(ClassVolume, "v1", map[string]string{LabelInstall: "i0000000001", LabelNonce: "n1"})
+			return Authority(ctx, l, f, ClassVolume, "v1")
+		},
+	}
+	for what, run := range unanswered {
+		err := run()
+		if err == nil {
+			t.Fatalf("%s: authorized a removal", what)
+		}
+		if !errors.Is(err, ErrCannotAsk) {
+			t.Fatalf("%s: a refusal nobody answered is not marked as one, so a caller that must keep\n"+
+				"state until the question CAN be answered reads it as a settled \"not ours\": %v", what, err)
+		}
+		if errors.Is(err, ErrGone) {
+			t.Fatalf("%s: an unanswered question was reported as an answer: %v", what, err)
+		}
+	}
+
+	// AND THE ANSWERED REFUSALS ARE NOT MARKED. A marker on everything is a marker on nothing: the
+	// caller that keeps its staging ledger on ErrCannotAsk would then never complete an
+	// abandonment while any foreign volume stood at one of its names.
+	answered := map[string]func() error{
+		"a foreign installation's object": func() error {
+			l, f, _ := authorityFixture(t)
+			f.obj["volume:v1"][LabelInstall] = "i9999999999"
+			return Authority(ctx, l, f, ClassVolume, "v1")
+		},
+		"an unlabelled object": func() error {
+			l, f, _ := authorityFixture(t)
+			f.obj["volume:v1"][LabelInstall] = ""
+			return Authority(ctx, l, f, ClassVolume, "v1")
+		},
+		"a reused name": func() error {
+			l, f, _ := authorityFixture(t)
+			f.obj["volume:v1"][LabelNonce] = "someone-elses"
+			return Authority(ctx, l, f, ClassVolume, "v1")
+		},
+		"a present object with no provenance record": func() error {
+			l, _ := identLedger(t)
+			f := newFakeObjs()
+			f.put(ClassVolume, "v1", map[string]string{})
+			return Authority(ctx, l, f, ClassVolume, "v1")
+		},
+	}
+	for what, run := range answered {
+		err := run()
+		if err == nil {
+			t.Fatalf("%s: authorized a removal", what)
+		}
+		if errors.Is(err, ErrCannotAsk) {
+			t.Fatalf("%s: an ANSWERED refusal is marked as one nobody answered: %v", what, err)
+		}
 	}
 }
 

@@ -75,7 +75,29 @@ var (
 	// ("nothing here accounts for that object") from a question that could not be asked. Everyone
 	// else propagates it, and every one of them refuses on it.
 	ErrMismatch = errors.New("prov: the record does not describe the object it was found under")
+	// ErrCannotAsk — Authority refused because a question was never ANSWERED, as opposed to
+	// answered "no". Both refuse and neither authorizes anything, so most callers correctly treat
+	// them alike; the sentinel exists for the callers whose NEXT step differs. Abandonment is one:
+	// a volume that is not ours is nothing to clean up and the abandonment completes, while a
+	// volume whose ownership could not be established leaves the staging ledger in place so a
+	// re-run converges. Folding those two would either wedge an operator between a survivor
+	// refusal and an abandonment that never finishes, or destroy the only record of which partial
+	// volumes exist on the strength of an unanswered question.
+	//
+	// It is JOINED into the refusal rather than wrapped around it, so the prose an operator reads
+	// is unchanged and the underlying cause (engine.ErrDaemonDown and friends) stays reachable.
+	ErrCannotAsk = errors.New("prov: the question could not be asked")
 )
+
+// unanswered marks a refusal as one nothing answered, WITHOUT altering a character of its text.
+//
+// The alternative — wrapping the message — would put a second sentence in front of prose that was
+// written to be read whole, and every test asserting that prose would have to be re-taught a fact
+// it is not about.
+type unanswered struct{ err error }
+
+func (u unanswered) Error() string   { return u.err.Error() }
+func (u unanswered) Unwrap() []error { return []error{ErrCannotAsk, u.err} }
 
 // ClassOK closes the vocabulary. Exported because the verbs name a class from operator input.
 func ClassOK(c Class) bool {

@@ -400,6 +400,23 @@ func (d Deps) restoreVolume(ctx context.Context, ch Chain, dir, ident string, v 
 		d.warn("restore: cannot create volume %q: %v", v.name, cerr)
 		return fmt.Errorf("restore: cannot create volume %q: %w", v.name, cerr)
 	}
+	// WHOSE BEFORE WHICH — and this re-inspection used to ask only WHICH.
+	//
+	// A nonce says which object; it never says whose. The backup FILE carries the recorded nonces
+	// with it, so whoever holds a copy holds a matching one — and `volume create` against an
+	// existing name SUCCEEDS without applying our labels (D56), so what is re-inspected here can be
+	// a volume belonging to ANOTHER INSTALLATION on the same daemon. A nonce match alone therefore
+	// authorized FILLING that volume with this backup's data. The object's own installation label
+	// is the evidence that says otherwise, and it is read FIRST so the refusal names the real fact:
+	// telling an operator that a foreign volume's nonce mismatched would be true and useless, and
+	// when the nonces match there would be nothing left to tell them at all.
+	//
+	// Same order and same refusals as prov.Authority and internal/bringup's provenOurs. The prose
+	// differs because the question differs: those two ask "may this be REMOVED", this one asks "is
+	// this the volume phase 2 just created" — and its answer authorizes a FILL, not a delete.
+	if oerr := d.ownedByThisRestore(ctx, ident, v.name); oerr != nil {
+		return oerr
+	}
 	actual, lerr := d.Objs.Label(ctx, prov.ClassVolume, v.name, prov.LabelNonce)
 	if lerr != nil && !errors.Is(lerr, engine.ErrAbsent) {
 		// A DAEMON THAT COULD NOT BE ASKED IS NOT A VOLUME THAT IS ABSENT. Absence is an
@@ -482,6 +499,50 @@ func orNone(s string) string {
 		return "<none>"
 	}
 	return s
+}
+
+// ownedByThisRestore answers the WHOSE half for one volume, from the volume's OWN installation
+// label, against the identity the staged ledger carries.
+//
+// EVERY NON-NIL RETURN MEANS DO NOT FILL. The three refusals are kept apart because an operator
+// acts on which one they got: "it is another installation's" is a fact about the volume, "it
+// carries no label" is the absence of any fact, and "the runtime did not answer" is not a fact
+// about the volume at all. ABSENCE IS REFUSED TOO, and deliberately: a volume that is not there a
+// moment after phase 2 created it means the object phase 2 was supposed to have made was never
+// established, so there is nothing to fill and nothing to say about it.
+func (d Deps) ownedByThisRestore(ctx context.Context, ident, name string) error {
+	owner, lerr := d.Objs.Label(ctx, prov.ClassVolume, name, prov.LabelInstall)
+	if lerr != nil {
+		if errors.Is(lerr, engine.ErrAbsent) {
+			d.warn("restore: volume %q is not there — the container runtime answered that no such object", name)
+			d.warn("  exists, a moment after this restore created it. Nothing is filled: whatever phase 2")
+			d.warn("  made is not standing at that name now, so there is nothing this restore can prove")
+			d.warn("  it owns. Re-run once the daemon is settled.")
+			return fmt.Errorf("restore: volume %q is not there after phase 2 created it: %w", name, lerr)
+		}
+		d.warn("restore: could not establish who owns volume %q — the container runtime did not answer.", name)
+		d.warn("  It is neither filled nor removed: a question nothing answered is not an answer that the")
+		d.warn("  volume is ours. The intent is retained so a re-run converges: %v", lerr)
+		return fmt.Errorf("restore: could not establish who owns volume %q: %w", name, lerr)
+	}
+	// The SHARED label rule: a label MEANING absent must read as absent here too, or a volume
+	// labelled `installation=<no value>` reads as a foreign installation's rather than as
+	// unlabelled. Both refuse, and an operator needs the right reason.
+	owner = prov.NormalizeLabel(owner)
+	if owner == "" {
+		d.warn("restore: volume %q carries NO installation label, so nothing about the object itself says", name)
+		d.warn("  this installation created it. It is neither filled nor removed: no label proves it is")
+		d.warn("  ours, and no provenance proves it is not someone else's.")
+		return fmt.Errorf("restore: volume %q carries no installation label", name)
+	}
+	if owner != ident {
+		d.warn("restore: volume %q is labelled for installation %q; this restore is %q.", name, owner, ident)
+		d.warn("  It belongs to another installation on the same daemon. The recorded nonce does not make")
+		d.warn("  it ours — the backup this restore reads supplies that nonce — so it is PRESERVED and")
+		d.warn("  reported, never filled and never removed.")
+		return fmt.Errorf("restore: volume %q belongs to installation %q, not %q", name, owner, ident)
+	}
+	return nil
 }
 
 // Activate is ONE atomic rename. Until this instant the machine has no active ledger claiming
@@ -699,21 +760,19 @@ func Abandon(ctx context.Context, d Deps) error {
 	}
 	failed := false
 	for _, v := range vols {
-		// ABSENT and "the daemon could not be asked" are NOT the same fact: absence means
-		// nothing to remove; an unreachable daemon means this loop cannot tell whether the
-		// volume is ours at all, and treating it as "gone" would silently skip a real one.
-		actual, lerr := d.Objs.Label(ctx, prov.ClassVolume, v.name, prov.LabelNonce)
-		if lerr != nil && !errors.Is(lerr, engine.ErrAbsent) {
-			d.warn("  could not determine whether %q still carries our nonce — the container runtime", v.name)
-			d.warn("  did not answer. Refusing to guess; the staging ledger is kept so a re-run can finish.")
-			failed = true
-			continue
-		}
-		if errors.Is(lerr, engine.ErrAbsent) {
-			actual = ""
-		}
+		// THE ONE DELETION-AUTHORITY QUESTION, asked here the way every other removal path in the
+		// tree asks it.
+		//
+		// This loop used to compare the recorded nonce against the volume's own and delete on a
+		// match — and A NONCE SAYS WHICH OBJECT, NEVER WHOSE. The staging ledger is read out of a
+		// BACKUP FILE, and that file carries the nonces with it, so a volume standing at the
+		// recorded name under ANOTHER INSTALLATION's label while carrying the recorded nonce was
+		// REMOVED: another installation's data destroyed on the strength of evidence the backup
+		// itself supplied. prov.Authority settles WHOSE from the object's own installation label
+		// before it compares WHICH, and every one of its "no" answers preserves.
+		aerr := prov.Authority(ctx, l, d.Objs, prov.ClassVolume, v.name)
 		switch {
-		case actual == v.nonce:
+		case aerr == nil:
 			// THE REMOVAL'S OWN STATUS IS CHECKED, NEVER MASKED. A volume this daemon refuses
 			// to remove (still mounted by a container, most often) must not be reported as
 			// removed — reporting success here is worse than a bare failure: an operator
@@ -727,8 +786,24 @@ func Abandon(ctx context.Context, d Deps) error {
 				continue
 			}
 			d.log("  removed partial volume %s.", v.name)
-		case actual != "":
-			d.warn("  PRESERVED %s — it carries nonce %q, not the recorded %q.", v.name, actual, v.nonce)
+		case errors.Is(aerr, prov.ErrGone):
+			// AN ANSWER: the volume is not there. Nothing to remove and nothing to preserve.
+		case errors.Is(aerr, prov.ErrCannotAsk):
+			// NOT "IT IS NOT OURS" — nothing was established at all, and the two must not share a
+			// branch. Whether this volume is one of the partials this restore created is exactly
+			// what could not be determined, so guessing "not ours" would leave a real partial
+			// behind AND destroy the staging ledger that is the only record of it.
+			_ = d.reported(aerr)
+			d.warn("  could not determine whether %s is this restore's to remove. The staging ledger is", v.name)
+			d.warn("  KEPT so a re-run can finish once that question can be answered.")
+			failed = true
+		default:
+			// PRESERVED, and the abandonment still COMPLETES. A volume that is not ours is not a
+			// partial this restore left behind, so there is nothing here for the staging ledger to
+			// authorize later — and holding the abandonment open on it would wedge the operator
+			// between a survivor refusal they cannot pass and a cleanup that never finishes.
+			_ = d.reported(aerr)
+			d.warn("  PRESERVED %s — see the reason above. It is not this restore's to remove.", v.name)
 		}
 	}
 	if failed {

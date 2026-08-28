@@ -576,9 +576,15 @@ func TestSameNameSurvivorIsRefused(t *testing.T) {
 	// survivor case. The volume install created (with the CORRECT nonce) must be removed
 	// first: create-over-existing does not relabel, so poisoning it without removing it would
 	// be a no-op and this test would pass for the wrong reason.
+	//
+	// THE SURVIVOR CARRIES THIS INSTALLATION'S OWN LABEL, deliberately. This test is about WHICH
+	// object, and phase 2 settles WHOSE first: a FOREIGN-labelled volume is refused one question
+	// earlier, by the installation check, and this assertion would then pass with the nonce
+	// comparison never running at all. The foreign case has its own test
+	// (TestRestoreRefusesAVolumeCarryingOurNonceUnderAnotherInstallation).
 	victim := r.vols[0].name
 	r.removeVolume(victim)
-	r.createVolume(victim, "not-our-nonce", "some-other-identity")
+	r.createVolume(victim, "not-our-nonce", r.ident)
 
 	if err := Restore(context.Background(), r.deps(), r.bk); err == nil {
 		t.Fatal("a same-name survivor was filled")
@@ -892,11 +898,16 @@ func TestAbandonRemovesMatchingVolumesBeforeTheStagingFile(t *testing.T) {
 
 func TestAbandonPreservesANonMatchingVolume(t *testing.T) {
 	r := interrupted(t)
-	// Simulate someone else's object landing at the same name in between: overwrite the
-	// volume's own label with a nonce this staging ledger did not record.
+	// Simulate a name reassigned in between: an object of THIS installation's carrying a nonce
+	// this staging ledger did not record.
+	//
+	// The identity stays OURS on purpose. Abandonment settles WHOSE before WHICH, so a
+	// foreign-labelled volume is preserved one question earlier and the nonce comparison never
+	// runs — which is a different guard, with its own test
+	// (TestAbandonPreservesAVolumeCarryingOurNonceUnderAnotherInstallation).
 	victim := r.vols[0].name
 	r.removeVolume(victim)
-	r.createVolume(victim, "somebody-elses-nonce", "somebody-elses-identity")
+	r.createVolume(victim, "somebody-elses-nonce", r.ident)
 	if err := Abandon(context.Background(), r.deps()); err != nil {
 		t.Fatalf("Abandon: %v\n%s", err, r.stderr())
 	}
@@ -1098,9 +1109,11 @@ func TestSurvivorRefusedEndToEndThenAbandonPreservesIt(t *testing.T) {
 	r := newRig(t)
 	r.backupOK()
 	r.dropLedger()
+	// OUR OWN LABEL, A DIFFERENT NONCE — the WHICH question, for the same reason
+	// TestSameNameSurvivorIsRefused stands its survivor that way.
 	victim := r.vols[0].name
 	r.removeVolume(victim)
-	r.createVolume(victim, "an-unrelated-nonce", "an-unrelated-identity")
+	r.createVolume(victim, "an-unrelated-nonce", r.ident)
 
 	if err := Restore(context.Background(), r.deps(), r.bk); err == nil {
 		t.Fatal("a same-name survivor was restored over")
@@ -1708,4 +1721,185 @@ func TestAnUnconfirmablePreservedCopyIsAFailureNotAResidue(t *testing.T) {
 	// by TestPreserveCorruptRefusesAFileThatChangedUnderIt, which drives that same default arm.
 	// It cannot be driven from here: on a filesystem whose no-replace rename works, preserveMove
 	// never reaches the fallback at all.
+}
+
+// --- WHOSE before WHICH: the installation label, on both destructive paths --------------------
+
+// labelSeam narrows the READ-ONLY runtime seam for ONE label on ONE object, and delegates
+// everything else to the production reader.
+//
+// It exists because two of the three answers this module must distinguish cannot be staged from
+// outside: a volume with NO installation label cannot be created through the runtime facade at all
+// (engine.NewProvenance refuses an empty installation, which is the point of it), and "the label
+// could not be READ" is a seam failure, not a state. Faking the whole reader would be the trap the
+// rig's own note describes — a suite that answers its questions from its own record of what it did
+// — so this overrides one (object, label) pair and passes every other question straight through.
+type labelSeam struct {
+	prov.Objects
+	class prov.Class
+	name  string
+	label string
+	val   string
+	err   error
+}
+
+func (s labelSeam) Label(ctx context.Context, class prov.Class, name, label string) (string, error) {
+	if class == s.class && name == s.name && label == s.label {
+		return s.val, s.err
+	}
+	return s.Objects.Label(ctx, class, name, label)
+}
+
+// TestRestoreRefusesAVolumeCarryingOurNonceUnderAnotherInstallation: WHOSE is settled before WHICH,
+// and phase 2's re-inspection used to ask only WHICH.
+//
+// A nonce says which object; it never says whose. The backup FILE carries the recorded nonces, so
+// anyone holding a copy of it can present a matching one, and `volume create` against an existing
+// name SUCCEEDS without applying our labels (D56) — so what phase 2 re-inspects can be a volume
+// belonging to another installation on the same daemon. Reading the nonce alone authorized FILLING
+// it with this backup's data.
+func TestRestoreRefusesAVolumeCarryingOurNonceUnderAnotherInstallation(t *testing.T) {
+	r := newRig(t)
+	r.backupOK()
+	r.dropLedger()
+	victim := r.vols[0]
+	r.removeVolume(victim.name)
+	r.createVolume(victim.name, victim.nonce, "somebody-elses-identity")
+
+	if err := Restore(context.Background(), r.deps(), r.bk); err == nil {
+		t.Fatal("a volume labelled for ANOTHER INSTALLATION was filled with this backup's data")
+	}
+	out := r.stderr()
+	mustContain(t, out, "somebody-elses-identity", "the refusal names the installation it belongs to")
+	mustContain(t, out, victim.name, "the refusal names the volume")
+	if len(r.cop.fills) != 0 {
+		t.Fatalf("another installation's volume was filled: %v", r.cop.fills)
+	}
+	got, lerr := r.objs.Label(context.Background(), prov.ClassVolume, victim.name, prov.LabelInstall)
+	if lerr != nil || got != "somebody-elses-identity" {
+		t.Fatalf("another installation's volume was relabelled or removed: %q %v", got, lerr)
+	}
+	if regularFile(livePath(r.home)) {
+		t.Fatal("a restore that could not prove it owned every volume activated")
+	}
+}
+
+// TestRestoreRefusesAVolumeWithNoInstallationLabel: an UNLABELLED volume standing at a name this
+// restore would create proves nothing either way — no label makes it ours, and no provenance makes
+// it somebody else's. It is neither filled nor removed.
+func TestRestoreRefusesAVolumeWithNoInstallationLabel(t *testing.T) {
+	r := newRig(t)
+	r.backupOK()
+	r.dropLedger()
+	victim := r.vols[0]
+	d := r.deps()
+	d.Objs = labelSeam{Objects: r.objs, class: prov.ClassVolume, name: victim.name, label: prov.LabelInstall, val: "<no value>"}
+
+	if err := Restore(context.Background(), d, r.bk); err == nil {
+		t.Fatal("a volume carrying no installation label was filled")
+	}
+	mustContain(t, r.stderr(), "NO installation label", "the refusal")
+	mustContain(t, r.stderr(), victim.name, "the refusal names the volume")
+	if len(r.cop.fills) != 0 {
+		t.Fatalf("an unattributed volume was filled: %v", r.cop.fills)
+	}
+}
+
+// TestRestoreRefusesAVolumeWhoseInstallationLabelCannotBeRead: a question that was never ANSWERED
+// is not an answer of "it is ours". Both outcomes refuse; only one of them may be told to the
+// operator as a fact about the volume.
+func TestRestoreRefusesAVolumeWhoseInstallationLabelCannotBeRead(t *testing.T) {
+	r := newRig(t)
+	r.backupOK()
+	r.dropLedger()
+	victim := r.vols[0]
+	d := r.deps()
+	d.Objs = labelSeam{Objects: r.objs, class: prov.ClassVolume, name: victim.name, label: prov.LabelInstall,
+		err: errors.New("the container runtime did not answer")}
+
+	if err := Restore(context.Background(), d, r.bk); err == nil {
+		t.Fatal("a volume whose owner was never established was filled")
+	}
+	mustContain(t, r.stderr(), "who owns", "the refusal says the question failed")
+	mustContain(t, r.stderr(), victim.name, "the refusal names the volume")
+	if len(r.cop.fills) != 0 {
+		t.Fatalf("a volume of unestablished ownership was filled: %v", r.cop.fills)
+	}
+}
+
+// TestRestoreRefusesAVolumeThatIsGoneAfterPhase2: absence a moment after phase 2 created the volume
+// is an ANSWER — and it is not an answer this loop may fill on. The object phase 2 was supposed to
+// have made was never established.
+func TestRestoreRefusesAVolumeThatIsGoneAfterPhase2(t *testing.T) {
+	r := newRig(t)
+	r.backupOK()
+	r.dropLedger()
+	victim := r.vols[0]
+	d := r.deps()
+	d.Objs = labelSeam{Objects: r.objs, class: prov.ClassVolume, name: victim.name, label: prov.LabelInstall,
+		err: fmt.Errorf("engine: %w", engine.ErrAbsent)}
+
+	if err := Restore(context.Background(), d, r.bk); err == nil {
+		t.Fatal("a volume the runtime says does not exist was filled")
+	}
+	// THE REFUSAL'S IDENTITY, not merely that something refused. Absence folded into the
+	// unlabelled branch would still refuse — and would tell the operator the volume carries no
+	// installation label, which is a claim about an object that is not there.
+	mustContain(t, r.stderr(), "is not there", "the refusal says the volume is absent")
+	mustNotContain(t, r.stderr(), "NO installation label", "an absent volume is not an unlabelled one")
+	mustContain(t, r.stderr(), victim.name, "the refusal names the volume")
+	if len(r.cop.fills) != 0 {
+		t.Fatalf("a volume that is not there was filled: %v", r.cop.fills)
+	}
+}
+
+// TestAbandonPreservesAVolumeCarryingOurNonceUnderAnotherInstallation: abandonment REMOVES, so it
+// owes the stronger half of the same rule.
+//
+// The staging ledger comes out of a backup file, and that file carries the nonces with it. A volume
+// standing at the recorded name under ANOTHER installation's label, carrying the recorded nonce, was
+// DELETED — another installation's data destroyed on the strength of a label the backup supplied.
+func TestAbandonPreservesAVolumeCarryingOurNonceUnderAnotherInstallation(t *testing.T) {
+	r := interrupted(t)
+	victim := r.vols[0]
+	r.removeVolume(victim.name)
+	r.createVolume(victim.name, victim.nonce, "somebody-elses-identity")
+
+	err := Abandon(context.Background(), r.deps())
+	out := r.stderr()
+	mustContain(t, out, "PRESERVED", "the report")
+	mustContain(t, out, victim.name, "the report names the volume")
+	mustContain(t, out, "somebody-elses-identity", "the report names the installation it belongs to")
+	if _, lerr := r.nonceOf(victim.name); lerr != nil {
+		t.Fatalf("another installation's volume was REMOVED by an abandonment: %v", lerr)
+	}
+	// Abandonment still completes: the foreign volume is not this restore's to clean up, and
+	// wedging the operator between a survivor refusal and an abandonment that never finishes is
+	// the state this module builds nothing on.
+	if err != nil {
+		t.Fatalf("abandonment did not complete over a volume that is not ours: %v\n%s", err, out)
+	}
+	if exists(stagingPath(r.home)) {
+		t.Fatal("the staging ledger survived a completed abandonment")
+	}
+}
+
+// TestAbandonKeepsTheStagingLedgerWhenOwnershipCannotBeEstablished: "could not ask" is not "not
+// ours". The first keeps the staging ledger so a re-run converges; the second completes.
+func TestAbandonKeepsTheStagingLedgerWhenOwnershipCannotBeEstablished(t *testing.T) {
+	r := interrupted(t)
+	victim := r.vols[0]
+	d := r.deps()
+	d.Objs = labelSeam{Objects: r.objs, class: prov.ClassVolume, name: victim.name, label: prov.LabelInstall,
+		err: errors.New("the container runtime did not answer")}
+
+	if err := Abandon(context.Background(), d); err == nil {
+		t.Fatal("an abandonment that could not establish ownership reported completion")
+	}
+	if !regularFile(stagingPath(r.home)) {
+		t.Fatal("the staging ledger — the only record of which partial volumes exist — was removed")
+	}
+	if _, lerr := r.nonceOf(victim.name); lerr != nil {
+		t.Fatalf("a volume of unestablished ownership was removed: %v", lerr)
+	}
 }
