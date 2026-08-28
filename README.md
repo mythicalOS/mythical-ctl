@@ -42,8 +42,9 @@ migrate-storage · backup · restore
 [releases](https://github.com/mythicalOS/mythical-ctl/releases), **check its digest against the
 published `SHA256SUMS` before you run it**, then put it on your `PATH`:
 
-It runs in a subshell so a failed check stops it, and stops it there — nothing below a failure
-runs, and `set -e` cannot take your own shell with it:
+It runs in a subshell, so a failed check stops it and stops it there — nothing below a failure
+runs, and `set -e` cannot take your own shell with it. It also does its work in a private
+directory of its own, for the reason spelled out inside:
 
 ```sh
 (
@@ -60,6 +61,16 @@ runs, and `set -e` cannot take your own shell with it:
     Linux/aarch64|Linux/arm64) plat=linux_arm64  ;;
     *) echo "no published binary for $(uname -s)/$(uname -m)"; exit 1 ;;
   esac
+
+  # A PRIVATE DIRECTORY, not the one you happen to be standing in. Everything below
+  # refers to files by NAME, and between verifying a name and installing what it
+  # points at, anyone who can write that directory can swap it — a window `sudo`
+  # widens while it prompts you for a password. mktemp -d is mode 0700 and yours, so
+  # there is nobody left to swap anything. It also stops `curl -O` from silently
+  # overwriting files you already had.
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT
+  cd "$tmp"
 
   base="https://github.com/mythicalOS/mythical-ctl/releases/download/$ver"
 
@@ -90,8 +101,9 @@ run, from which commit, produced exactly those bytes:
 gh attestation verify /usr/local/bin/mythical-ctl --repo mythicalOS/mythical-ctl
 ```
 
-(It takes a **file path**, so name the installed file — or, if you would rather check before
-installing, run it on the downloaded `mythical-ctl_<plat>` and put the `install` line after it.)
+(It takes a **file path**, so name the installed file. To check before installing instead, add the
+same line inside the block above, just before `sudo install` — the download only exists there, in
+the temporary directory the block cleans up.)
 
 The version string is not the integrity guarantee — the digest is; anyone can print a version.
 [get.mythicalos.ai](https://get.mythicalos.ai) serves a pinned release artifact from here, so a
