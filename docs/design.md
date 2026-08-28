@@ -66,8 +66,8 @@ publishers who need it without reading this repository's source.
 
 The installer creates what is missing and reads what already exists; it will not overwrite a
 configuration file you have edited, and it will not delete transcripts, logs, or any directory you
-bound. Today this is enforced where there is code to enforce it: `mi_zone` classifies every path into
-an ownership class, the layout helper creates missing directories and touches nothing else, and the
+bound. Today this is enforced where there is code to enforce it: `layout.ZoneOf` classifies every path
+into an ownership class, the layout helper creates missing directories and touches nothing else, and the
 config layer is additive by construction — it appends an absent key, refuses to change one already
 set to something else, and leaves every other byte, comment, and blank line exactly as found. Do not
 read it as a blanket guarantee over your data yet — nothing here touches a transcript or a log at all.

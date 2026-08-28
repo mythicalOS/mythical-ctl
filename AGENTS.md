@@ -47,7 +47,7 @@ checks exactly.
   non-executing reader with key allowlists and typed validation — never "simplify" a code path
   to `source` a config file, and never widen what a mounted `<product>.conf` may contain
   (`mythical.conf` stays host-only and unmounted).
-- **Data is never collateral.** `layout.Zone` classifies every path into an ownership class (the
+- **Data is never collateral.** `layout.ZoneOf` classifies every path into an ownership class (the
   published contract in `docs/CONFIG-FORMAT.md` still calls it by its original name); config
   writes are additive by construction (append absent keys, refuse to change set ones, preserve
   every other byte). Any new write path must fit those zones.

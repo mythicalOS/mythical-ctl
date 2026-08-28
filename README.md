@@ -74,8 +74,12 @@ runs, and `set -e` cannot take your own shell with it:
   [ -s expected.sha256 ] || { echo "no digest published for mythical-ctl_$plat"; exit 1; }
   shasum -a 256 -c expected.sha256      # sha256sum -c expected.sha256 on Linux
 
-  chmod +x "mythical-ctl_$plat"
-  sudo mv "mythical-ctl_$plat" /usr/local/bin/mythical-ctl
+  # install(1), not `mv`: within one filesystem `mv` is a RENAME, so even under
+  # sudo the installed file keeps the downloading user's ownership and mode —
+  # leaving a root-PATH executable that one unprivileged account can rewrite
+  # afterwards, which is exactly the guarantee the digest above was for.
+  # install COPIES, so the new file is root's, at the mode named here.
+  sudo install -m 0755 "mythical-ctl_$plat" /usr/local/bin/mythical-ctl
 )
 ```
 

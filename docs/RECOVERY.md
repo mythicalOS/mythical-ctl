@@ -81,19 +81,25 @@ so that two `mythical-ctl` processes cannot interleave a read-modify-write of th
 process id when it can read one. It never waits, and it never takes the lock away from whoever has
 it. Nothing has been touched, so there is no partial state to recover from.
 
-**There is no stale lock to clear, ever.** The lock is a kernel `flock(2)` on that file, and a lock
-held by a process that dies is released by the kernel along with everything else the process had
-open — a `mythical-ctl` that is killed, crashes, or loses its terminal takes its lock with it.
-So a `.state/lock` file sitting on disk is **not** a held lock; it is an ordinary empty-ish file that
-the next run reuses, and the `pid=` line inside it is a diagnostic breadcrumb, never authority.
-Do **not** delete it to unstick something — nothing is stuck, and the file being absent or present
-makes no difference to whether the lock can be taken. (If a reported pid is not running, the lock has
-already been released: just re-run.)
+**There is no stale lock to clear, ever — and deleting the file is worse than useless.** The lock is
+a kernel `flock(2)`, and a lock held by a process that dies is released by the kernel along with
+everything else that process had open: a `mythical-ctl` that is killed, crashes, or loses its
+terminal takes its lock with it. So a `.state/lock` file sitting on disk is **not** a held lock; it
+is an ordinary file the next run reuses, and the `pid=` line inside it is a diagnostic breadcrumb,
+never authority. If a reported pid is not running, the lock is already released — just re-run.
+
+Removing the file is not a neutral act, though. A `flock` belongs to the **inode**, not to the name:
+delete `.state/lock` while an operation genuinely is running and the next invocation creates a
+*different* file and locks that one successfully — so two mutating processes proceed at once, on the
+same ledger, which is the single thing this lock exists to prevent. There is no situation in which
+deleting it helps, and one in which it takes the protection off.
 
 **Refused instead of locked:** if `.state/lock` is not a regular file, or has more than one hard
 link, the command refuses rather than locking it — a lock target somebody else can substitute or
-alias is not a lock. Remove or rename whatever is at that path (it holds nothing you need) and
-re-run.
+alias is not a lock. This is the one case where removing that path is the answer, because what is
+there is not the installer's lock file at all: with no `mythical-ctl` running, remove or rename it
+(it holds nothing you need) and re-run. Work out how it got there — nothing this CLI does creates
+a symlink or a second hard link at that path.
 
 **Next command.** The one you were running, once the other operation finishes.
 
