@@ -1604,3 +1604,31 @@ func TestRecoverRefusesToConfirmWithoutAnImageIdentity(t *testing.T) {
 		})
 	}
 }
+
+// TestRunConfirmsWithTheImageItRead is the counterpart of the two refusals above: the ordinary path
+// must still record the image identity, and record the one the runtime actually reported. A fix
+// that refused every bring-up, or one that wrote a constant, would satisfy the refusal tests and
+// fail here.
+func TestRunConfirmsWithTheImageItRead(t *testing.T) {
+	ctx := context.Background()
+	l, objs, mut, pr, st, d := fixture(t)
+	lau := &fakeLauncher{objs: objs, st: st, nets: []Attachment{attach(net1, "", al1)}}
+	mut.onStart = func() {
+		objs.nets[c1] = []Attachment{attach(net1, "10.0.0.2", al1)}
+		st.up(c1)
+	}
+	pr.resolveTo[net1+"/"+al1] = "10.0.0.2"
+	lau.after = func() { objs.image[c1] = "sha256:the-one-the-runtime-reported" }
+
+	if err := Run(ctx, l, d, lau, c1, net1, al1, Running); err != nil {
+		t.Fatalf("an ordinary bring-up failed: %v", err)
+	}
+	rec, ferr := prov.Find(l, prov.ClassContainer, c1)
+	if ferr != nil {
+		t.Fatalf("an ordinary bring-up confirmed no provenance: %v", ferr)
+	}
+	id, ok := ledger.FieldOf(rec, "id")
+	if !ok || id != "sha256:the-one-the-runtime-reported" {
+		t.Fatalf("the provenance record carries id %q (present=%v), not the image the runtime reported", id, ok)
+	}
+}
