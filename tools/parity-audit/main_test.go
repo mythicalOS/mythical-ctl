@@ -1311,15 +1311,22 @@ func TestSourceWitnessIgnoresDeclarationsThatAreNotCode(t *testing.T) {
 // on a function that exists in source, can be printed into a `go test -list` stream, and is never
 // executed: a parity hole satisfying both witnesses at once.
 func TestOnlyRealGoTestNamesCount(t *testing.T) {
-	for _, yes := range []string{"Test", "TestX", "Test_foo", "Test9", "TestABC_def"} {
-		if goTestID.FindString(yes) != yes {
+	// UNICODE, not ASCII. Go identifiers are Unicode and the testing package's rule is about a
+	// rune's CATEGORY, so an ASCII-only pattern truncates `TestAlphaÉ` to `TestAlpha` — and a claim
+	// on the former would then be satisfied by the latter, which is a different test.
+	for _, yes := range []string{"Test", "TestX", "Test_foo", "Test9", "TestABC_def", "TestÉ", "TestAlphaÉ"} {
+		if !isGoTestName(yes) {
 			t.Errorf("%q is a real test name and was not recognised", yes)
 		}
 	}
-	for _, no := range []string{"Testfoo", "Testing", "TestingNotATest"} {
-		if goTestID.FindString(no) == no {
+	for _, no := range []string{"Testfoo", "Testing", "TestingNotATest", "Testé", "NotATest", "Tes"} {
+		if isGoTestName(no) {
 			t.Errorf("%q is NOT a test Go would run, and was accepted", no)
 		}
+	}
+	// ...and extraction keeps the WHOLE identifier rather than its ASCII prefix.
+	if got := testNamesIn("-> TestAlphaÉ (and TestBeta)"); len(got) != 2 || got[0] != "TestAlphaÉ" || got[1] != "TestBeta" {
+		t.Fatalf("testNamesIn truncated or dropped a target: %q", got)
 	}
 	// The list reader applies it too...
 	got := parseGoTestList(lines(

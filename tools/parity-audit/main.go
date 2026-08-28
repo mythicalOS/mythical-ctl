@@ -50,6 +50,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // ---------------------------------------------------------------------------------------------
@@ -326,13 +328,40 @@ var (
 	invCommentLine = regexp.MustCompile(`^[ \t]*(//|/\*|\*)`)
 	invPorted      = regexp.MustCompile(`^[ \t]*// PORTED:[ \t]+(\S+):[ \t]+"(.+)"[ \t]+->[ \t]+(.*\S)[ \t]*$`)
 	invNA          = regexp.MustCompile(`^[ \t]*// N/A:[ \t]+(\S+):[ \t]+"(.+)"[ \t]+--[ \t]+(.*\S)[ \t]*$`)
-	// GO'S OWN TEST-NAME GRAMMAR, not "starts with Test". The testing package requires the character
-	// AFTER `Test` to be something other than a lower-case letter, so `func Testfoo()` is never run —
-	// Go ignores it silently. A pattern that accepted it would let a PORTED claim rest on a function
-	// that exists in source, can be printed into a list, and is never executed: a parity hole
-	// satisfying both witnesses at once.
-	goTestID = regexp.MustCompile(`\bTest([A-Z0-9_][A-Za-z0-9_]*)?\b`)
+	// Go IDENTIFIERS, extracted; whether one is a TEST name is decided by isGoTestName below rather
+	// than by this pattern. Go identifiers are Unicode — a letter or underscore, then letters,
+	// digits and underscores — and an ASCII-only class silently TRUNCATES one that is not, so
+	// `TestAlphaÉ` would be read as `TestAlpha` and a claim on the former satisfied by the latter.
+	goIdent = regexp.MustCompile(`\b[\p{L}_][\p{L}\p{Nd}_]*`)
 )
+
+// isGoTestName applies the testing package's OWN rule, in Go rather than in a regular expression
+// because the rule is about a rune's Unicode category and RE2 cannot subtract one class from
+// another: a test is `Test` followed by nothing, or by a rune that is not a lower-case letter. So
+// `func Testfoo()` is not a test — Go never runs it and says nothing about it — while `Test_x`,
+// `Test9` and `TestÉ` all are.
+func isGoTestName(s string) bool {
+	rest, ok := strings.CutPrefix(s, "Test")
+	if !ok {
+		return false
+	}
+	if rest == "" {
+		return true
+	}
+	r, _ := utf8.DecodeRuneInString(rest)
+	return !unicode.IsLower(r)
+}
+
+// testNamesIn returns the Go test names appearing in a claim's target expression.
+func testNamesIn(expr string) []string {
+	var out []string
+	for _, id := range goIdent.FindAllString(expr, -1) {
+		if isGoTestName(id) {
+			out = append(out, id)
+		}
+	}
+	return out
+}
 
 // minNAReason is a substance floor, not a style rule. "N/A -- n/a" satisfies a syntax check and
 // argues nothing; the protocol requires a real reason, and a reason shorter than this cannot be
@@ -456,7 +485,7 @@ func parseInventory(rel string, content []byte) ([]claim, []malformed, []stray, 
 		claimable := !openedInRaw && !openedInBlock && invAny.MatchString(text)
 		if claimable {
 			if m := invPorted.FindStringSubmatch(text); m != nil {
-				targets := goTestID.FindAllString(m[3], -1)
+				targets := testNamesIn(m[3])
 				if len(targets) == 0 {
 					bad = append(bad, malformed{rel, line, text})
 					continue
@@ -667,7 +696,7 @@ func parseGoTestList(content []byte) map[string]map[string]bool {
 	var cur []string
 	for sc.Scan() {
 		t := strings.TrimRight(sc.Text(), "\r")
-		if m := goTestID.FindString(t); m == t && t != "" {
+		if isGoTestName(t) && goIdent.FindString(t) == t {
 			cur = append(cur, t)
 			continue
 		}
@@ -744,7 +773,7 @@ func collectSourceTestFuncs(root string) (map[string]map[string]bool, error) {
 			}
 			// The same grammar the testing package applies: `Test` alone, or `Test` followed by a
 			// character that is not a lower-case letter.
-			if n := fn.Name.Name; goTestID.FindString(n) == n {
+			if n := fn.Name.Name; isGoTestName(n) {
 				out[dir][n] = true
 			}
 		}
