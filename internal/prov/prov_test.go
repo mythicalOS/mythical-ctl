@@ -656,18 +656,31 @@ func checksummedLedger(schema string, rows ...string) string {
 // ledger whose checksum fails authorizes neither, so both prescriptions named an outcome that
 // could not happen. The two modules must give ONE answer about one path.
 func TestFirstUseStaging(t *testing.T) {
+	// THE TWO PROMISES ARE INDEPENDENT, and collapsing them into one boolean is how a message that
+	// keeps one and breaks the other slips through. `resumes` is the claim that re-running
+	// CONTINUES the attempt from a directory recorded in the file; `abandonRemoves` is the claim
+	// that abandoning REMOVES the partial volumes that attempt created. A state can offer the
+	// second without the first.
 	for _, tc := range []struct {
-		name     string
-		body     string
-		wants    []string
-		promises bool // does this state genuinely offer resume AND abandon?
+		name           string
+		body           string
+		wants          []string
+		resumes        bool
+		abandonRemoves bool
 	}{
-		{"a valid staging ledger", checksummedLedger(ledger.Schema, "restore\tkey=restore\tphase=2"),
-			[]string{"restore is in progress"}, true},
+		{"a valid ledger with a resumable intent",
+			checksummedLedger(ledger.Schema, "restore\tkey=restore\tphase=2\tsource=/backups/one"),
+			[]string{"restore is in progress"}, true, true},
+		{"a valid ledger whose intent names no source",
+			checksummedLedger(ledger.Schema, "restore\tkey=restore\tphase=2"),
+			[]string{"NO source directory", "Re-running cannot continue it", "'mythical-ctl restore --abandon'"}, false, true},
+		{"a valid ledger with no intent at all — a COMPLETED restore",
+			checksummedLedger(ledger.Schema, "identity\tid=i0123456789"),
+			[]string{"COMPLETED restore", "ready to be", "activate it"}, false, false},
 		{"one that does not validate", "an interrupted restore left this\n",
-			[]string{"does NOT validate", "neither resumed nor abandoned", "'mythical-ctl restore --abandon'"}, false},
+			[]string{"does NOT validate", "neither resumed nor abandoned", "'mythical-ctl restore --abandon'"}, false, false},
 		{"one a newer build wrote", checksummedLedger("2", "restore\tkey=restore"),
-			[]string{"NEWER", "checksum-VALID", "Upgrade mythical-ctl"}, false},
+			[]string{"NEWER", "checksum-VALID", "Upgrade mythical-ctl"}, false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			home := homeWith(t, func(h string) {
@@ -687,13 +700,16 @@ func TestFirstUseStaging(t *testing.T) {
 			// blocking — so the command may appear. What may not appear is either promise that
 			// state cannot keep: that re-running RESUMES the attempt, and that abandoning REMOVES
 			// the partial volumes.
-			for _, promise := range []string{
-				"'mythical-ctl restore <the same backup directory>'",
-				"removes the partial volumes",
+			for _, promise := range []struct {
+				claim string
+				want  bool
+			}{
+				{"the source\n  directory is recorded inside the staging ledger", tc.resumes},
+				{"removes the partial volumes", tc.abandonRemoves},
 			} {
-				if got := strings.Contains(err.Error(), promise); got != tc.promises {
+				if got := strings.Contains(err.Error(), promise.claim); got != promise.want {
 					t.Fatalf("promises %q = %v, want %v — a prescription is a claim about what the named\n"+
-						"verb will DO, and this state cannot deliver it:\n%v", promise, got, tc.promises, err)
+						"verb will DO, and this state cannot deliver it:\n%v", promise.claim, got, promise.want, err)
 				}
 			}
 			if strings.Contains(err.Error(), "--resume") {

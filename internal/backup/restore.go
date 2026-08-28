@@ -767,6 +767,32 @@ func Abandon(ctx context.Context, d Deps) error {
 // were kept, and reporting it as plain success would leave a second copy at the well-known name
 // unmentioned. Both callers say the two things separately.
 func preserveCorrupt(sf string) (aside string, residue error, err error) {
+	// THE VERDICT AND THE MOVE MUST BE ABOUT THE SAME BYTES. CurrentState judged the file some
+	// instructions ago; this renames whatever occupies the path NOW. Between the two, a manual
+	// restore, a scheduled job or another tool can put a VALID — or newer-schema — ledger there,
+	// and it would then be moved aside and reported corrupt, which is precisely the destruction of
+	// an intact record this whole classification exists to prevent, arriving by a different route.
+	// The no-replace primitive below protects the DESTINATION; nothing about it protects the
+	// identity of the source.
+	//
+	// So the bytes are re-read and re-judged HERE, immediately before the move, and only a file
+	// that is corrupt AT THIS MOMENT is preserved. A file that now validates is left exactly where
+	// it is and the caller is told it changed.
+	//
+	// THE RESIDUAL WINDOW IS REAL AND IS STATED RATHER THAN CLAIMED CLOSED: no filesystem offers
+	// rename-if-contents-match, so a swap between this read and the rename below cannot be
+	// excluded. What it buys is that the report is only ever made about bytes this function
+	// actually read, and a swap that happens before the read is DETECTED instead of mis-reported.
+	if data, rerr := os.ReadFile(sf); rerr != nil {
+		return "", nil, fmt.Errorf("restore: the staging ledger could not be re-read before moving it aside, so\n"+
+			"  whether the file about to be moved is the one that failed its checksum could not be\n"+
+			"  established. Nothing is moved: %w", rerr)
+	} else if _, verr := ledger.ReadBytes(data); !errors.Is(verr, ledger.ErrCorrupt) {
+		return "", nil, fmt.Errorf("restore: the staging ledger no longer fails its checksum — it CHANGED between being\n" +
+			"  classified and being moved aside. Nothing is moved and nothing is removed: this file is\n" +
+			"  not the one that was judged, and moving it would destroy a record nobody found fault\n" +
+			"  with. Run the command again to classify what is there now.")
+	}
 	// A BOUND, so a directory that somehow answers EEXIST forever cannot spin. 128 is far past
 	// any real collision count: it takes 128 distinct preserved corruptions beside one staging
 	// ledger, none of them ever cleaned up.

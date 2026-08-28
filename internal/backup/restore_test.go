@@ -294,6 +294,51 @@ func TestPreservingCorruptEvidenceNeverOverwritesEarlierEvidence(t *testing.T) {
 	}
 }
 
+// TestPreserveCorruptRefusesAFileThatChangedUnderIt: the verdict and the move must be about the
+// same bytes.
+//
+// CurrentState judges the file, and preserveCorrupt renames whatever occupies the path afterwards.
+// A manual restore, a scheduled job or another tool putting a VALID ledger there in between would
+// have that intact ledger moved aside and reported corrupt — the destruction of a record nobody
+// found fault with, which is the exact outcome the corrupt classification exists to prevent,
+// reached by a different route. (The family lock excludes other copies of this tool; it does not
+// exclude an operator with an editor, which is the case the activation path already defends
+// against by name.)
+func TestPreserveCorruptRefusesAFileThatChangedUnderIt(t *testing.T) {
+	for _, tc := range []struct{ name, body string }{
+		{"it now validates", string(checksummedLedger(ledger.Schema, "somekind\tkey=value"))},
+		{"a newer build wrote it", string(checksummedLedger("2", "somekind\tkey=value"))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			sf := filepath.Join(dir, "ledger.staging")
+			write(t, sf, []byte(tc.body))
+
+			aside, residue, err := preserveCorrupt(sf)
+			if err == nil {
+				t.Fatalf("a ledger that does NOT fail its checksum was moved aside as corrupt (to %q)", aside)
+			}
+			if residue != nil {
+				t.Fatalf("a refusal reported a residue: %v", residue)
+			}
+			if !strings.Contains(err.Error(), "CHANGED between being") {
+				t.Fatalf("the refusal does not say why:\n%v", err)
+			}
+			// THE FILE IS THE ASSERTION: it is still at its own name, byte-identical.
+			got, rerr := os.ReadFile(sf)
+			if rerr != nil {
+				t.Fatalf("the ledger is no longer at its own name: %v", rerr)
+			}
+			if string(got) != tc.body {
+				t.Fatal("the ledger was rewritten")
+			}
+			if m, _ := filepath.Glob(sf + ".corrupt.*"); len(m) != 0 {
+				t.Fatalf("an intact ledger was preserved as corrupt evidence: %v", m)
+			}
+		})
+	}
+}
+
 // TestPreserveCorruptTakesOnlyAFreeName is the property one layer down, and it is the one a
 // same-name test cannot establish on its own: the move is a NO-REPLACE move, so a destination
 // occupied by ANYTHING — a regular file, a directory, a dangling symlink — is left exactly as it

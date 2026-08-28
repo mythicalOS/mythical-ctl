@@ -57,45 +57,70 @@ func TestCLIVerbsAreReal(t *testing.T) {
 var stagingShapes = []struct {
 	name string
 	make func(t *testing.T, p string)
-	// resumable — does FirstUse call this an in-progress restore, and therefore prescribe the
-	// resume and abandon commands? Exactly one shape may.
-	resumable bool
+	// inProgress — does FirstUse call this an in-progress restore?
+	inProgress bool
+	// prescribesRestoreDir — does it tell the operator to run `restore <directory>`? These are
+	// NOT the same question, and one boolean for both is how a wrong prescription hides: a
+	// COMPLETED restore is not in progress yet is re-run to ACTIVATE it, while an intent with no
+	// recorded source IS in progress and cannot be re-run at all.
+	prescribesRestoreDir bool
 }{
 	{"a valid staging ledger", func(t *testing.T, p string) {
 		t.Helper()
 		// A CHECKSUM-VALID ledger, because that is the only shape for which resume-or-abandon is
 		// a true promise. The earlier version of this table used INVALID bytes here and called
 		// them resumable — which is exactly the defect it was supposed to be guarding.
+		// WITH A SOURCE. The first version of this fixture omitted `source=`, which is the exact
+		// ledger the restore verb refuses ("names no source directory") — so the shape called
+		// "resumable" here was one that cannot be resumed, and the promise contract below could
+		// not see it because that answer was not in the disproof set.
+		body := "#mythical-ctl-ledger schema=" + ledger.Schema +
+			"\nrestore\tkey=restore\tphase=2\tsource=/backups/one\n"
+		body += "#sha256=" + cliio.SHA256Hex([]byte(body)) + "\n"
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}, true, true},
+	{"a valid staging ledger whose intent names no source", func(t *testing.T, p string) {
+		t.Helper()
 		body := "#mythical-ctl-ledger schema=" + ledger.Schema + "\nrestore\tkey=restore\tphase=2\n"
 		body += "#sha256=" + cliio.SHA256Hex([]byte(body)) + "\n"
 		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
 			t.Fatal(err)
 		}
-	}, true},
+	}, true, false},
+	{"a completed restore, staged and ready to activate", func(t *testing.T, p string) {
+		t.Helper()
+		body := "#mythical-ctl-ledger schema=" + ledger.Schema + "\nidentity\tid=i0123456789\n"
+		body += "#sha256=" + cliio.SHA256Hex([]byte(body)) + "\n"
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}, false, true},
 	{"a staging ledger that does not validate", func(t *testing.T, p string) {
 		t.Helper()
 		if err := os.WriteFile(p, []byte("an interrupted restore left this\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-	}, false},
+	}, false, false},
 	{"a directory", func(t *testing.T, p string) {
 		t.Helper()
 		if err := os.Mkdir(p, 0o755); err != nil {
 			t.Fatal(err)
 		}
-	}, false},
+	}, false, false},
 	{"a dangling symlink", func(t *testing.T, p string) {
 		t.Helper()
 		if err := os.Symlink(p+".gone", p); err != nil {
 			t.Fatal(err)
 		}
-	}, false},
+	}, false, false},
 	{"a named pipe", func(t *testing.T, p string) {
 		t.Helper()
 		if err := syscall.Mkfifo(p, 0o600); err != nil {
 			t.Fatal(err)
 		}
-	}, false},
+	}, false, false},
 }
 
 // contradictions are the refusals that mean THE VERB CANNOT ACT ON THE STATE THE DIAGNOSTIC
@@ -119,9 +144,19 @@ var contradictions = []string{
 // resumable, and accepted both commands merely because neither was a usage error. In reality both
 // classify those bytes as corrupt, move them aside and refuse — no resume, and no volume removal —
 // so the diagnostic promised two outcomes that could not happen and the test could not tell.
-var promises = []struct{ claim, disproof string }{
-	{"the source\n  directory is recorded inside the staging ledger", "does not validate"},
-	{"removes the partial volumes", "authorizes no cleanup"},
+var promises = []struct {
+	claim     string
+	disproofs []string
+}{
+	{"the source\n  directory is recorded inside the staging ledger", []string{
+		"does not validate",
+		// THE ANSWER THE FIRST VERSION OF THIS SET MISSED, and the one its own fixture produced:
+		// a checksum-valid ledger whose intent carries no `source=` refuses here, so a diagnostic
+		// promising that the directory is recorded inside it is contradicted by the verb.
+		"names no source directory",
+		"carries no restore intent to resume",
+	}},
+	{"removes the partial volumes", []string{"authorizes no cleanup"}},
 }
 
 // TestStagingDiagnosticPrescribesRunnableCommands closes the gap that let the in-progress-restore
@@ -158,9 +193,9 @@ func TestStagingDiagnosticPrescribesRunnableCommands(t *testing.T) {
 			if err == nil {
 				t.Fatalf("%s at the staging path was classified as a first install", shape.name)
 			}
-			if strings.Contains(err.Error(), "restore is in progress") != shape.resumable {
+			if strings.Contains(err.Error(), "restore is in progress") != shape.inProgress {
 				t.Fatalf("%s was%s called an in-progress restore:\n%v", shape.name,
-					map[bool]string{true: "", false: " not"}[shape.resumable], err)
+					map[bool]string{true: "", false: " not"}[shape.inProgress], err)
 			}
 
 			// The placeholders the prose is allowed to contain, and what each stands for. An
@@ -225,10 +260,15 @@ func TestStagingDiagnosticPrescribesRunnableCommands(t *testing.T) {
 				// staging ledger does not validate", is an ordinary operational failure — exit 1,
 				// nothing wrong on the surface, and the promise simply was not true.
 				for _, pr := range promises {
-					if strings.Contains(err.Error(), pr.claim) && strings.Contains(one.said(), pr.disproof) {
-						t.Fatalf("with %s at the staging path the diagnostic promises %q, and running %q answers\n"+
-							"%q — the promise is not one this state can keep:\n%s",
-							shape.name, pr.claim, m[0], pr.disproof, one.said())
+					if !strings.Contains(err.Error(), pr.claim) {
+						continue
+					}
+					for _, d := range pr.disproofs {
+						if strings.Contains(one.said(), d) {
+							t.Fatalf("with %s at the staging path the diagnostic promises %q, and running %q answers\n"+
+								"%q — the promise is not one this state can keep:\n%s",
+								shape.name, pr.claim, m[0], d, one.said())
+						}
 					}
 				}
 				ran = append(ran, args[0]+" "+strings.Join(args[1:], " "))
@@ -240,17 +280,15 @@ func TestStagingDiagnosticPrescribesRunnableCommands(t *testing.T) {
 			// having its prescription merely not blow up.
 			joined := strings.Join(ran, "\n")
 			resume := "restore " + placeholders["<the same backup directory>"]
-			if got := strings.Contains(joined, resume); got != shape.resumable {
+			if got := strings.Contains(joined, resume); got != shape.prescribesRestoreDir {
 				t.Fatalf("with %s at the staging path, prescribes %q = %v, want %v:\n%s",
-					shape.name, resume, got, shape.resumable, joined)
+					shape.name, resume, got, shape.prescribesRestoreDir, joined)
 			}
-			if shape.resumable && !strings.Contains(joined, "restore --abandon") {
-				t.Fatalf("the resumable diagnostic no longer prescribes the abandon; it prescribes:\n%s", joined)
-			}
-			// A NON-RESUMABLE STATE STILL PRESCRIBES SOMETHING RUNNABLE — the abandon (which
-			// preserves the evidence and names what blocks) or a repair. A diagnostic that
-			// prescribes nothing has already been refused above.
-			if !shape.resumable && !strings.Contains(joined, "restore --abandon") && !strings.Contains(joined, "state repair") {
+			// EVERY STATE PRESCRIBES SOMETHING RUNNABLE — a re-run, the abandon (which for a
+			// corrupt ledger preserves the evidence and names what blocks), or a repair. A
+			// diagnostic that prescribes nothing has already been refused above.
+			if !strings.Contains(joined, "restore --abandon") &&
+				!strings.Contains(joined, "state repair") && !shape.prescribesRestoreDir {
 				t.Fatalf("with %s at the staging path the diagnostic prescribes no recovery:\n%s", shape.name, joined)
 			}
 		})

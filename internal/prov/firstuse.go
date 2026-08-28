@@ -255,15 +255,10 @@ func stagingDiagnostic(path string) error {
 			"  whether a restore can be resumed was never established (.state/ledger.staging).\n"+
 			"  Refusing rather than prescribing a recovery for a state nobody could determine: %w", rerr)
 	}
-	_, verr := ledger.ReadBytes(data)
+	l, verr := ledger.ReadBytes(data)
 	switch {
 	case verr == nil:
-		return errors.New("prov: there is no active ledger, but a restore is in progress (.state/ledger.staging).\n" +
-			"  Resume it by re-running 'mythical-ctl restore <the same backup directory>' — the source\n" +
-			"  directory is recorded inside the staging ledger, so re-running continues that attempt\n" +
-			"  rather than starting a new one.\n" +
-			"  Or give it up with 'mythical-ctl restore --abandon', which removes the partial volumes\n" +
-			"  that attempt created under their recorded identity.")
+		return resumability(l)
 	case errors.Is(verr, ledger.ErrCorrupt):
 		// NEITHER PROMISE IS AVAILABLE HERE, so neither is made. What --abandon really does for
 		// this state is preserve the evidence and NAME what may be blocking; that is worth
@@ -285,6 +280,53 @@ func stagingDiagnostic(path string) error {
 	}
 	return fmt.Errorf("prov: there is no active ledger, and the restore staging ledger could not be judged, so\n"+
 		"  whether a restore can be resumed was never established (.state/ledger.staging): %w", verr)
+}
+
+// resumability says which of the THREE states a checksum-valid staging ledger is in, because
+// "it validates" is not "it can be resumed" and prescribing a resume for the other two promises an
+// outcome the verb will not produce.
+//
+// internal/backup dispatches on exactly this and nothing else:
+//   - an intent naming a SOURCE          → the phases are re-run from that recorded directory;
+//   - an intent naming NO source         → the verb REFUSES ("names no source directory");
+//   - NO intent (phase 5 completed)      → the verb ACTIVATES; it does not continue anything.
+//
+// The middle case was the measured one: a checksum-valid ledger whose intent carries no `source=`
+// got "the source directory is recorded inside the staging ledger, so re-running continues that
+// attempt" — a sentence stating a fact the file contradicts, followed by a command that refuses for
+// exactly that reason.
+//
+// NO APOSTROPHE IN THE PROSE OF THESE MESSAGES — single quotes delimit the commands, and a
+// possessive closes one prescription early and swallows the next.
+func resumability(l *ledger.Ledger) error {
+	rec, ferr := l.Find(RestoreIntentKind, "key", "restore")
+	if ferr != nil {
+		// NO LIVE INTENT. Phase 5 completed, so what is left is activation — which is what
+		// re-running the verb does. It does not continue an attempt, and saying so would be a
+		// different false promise from the one this function exists to remove.
+		return errors.New("prov: there is no active ledger, but a COMPLETED restore is staged and ready to be\n" +
+			"  activated (.state/ledger.staging).\n" +
+			"  Re-run 'mythical-ctl restore <the same backup directory>' to activate it — every volume\n" +
+			"  already verified, so this installs the restored ledger and nothing else.\n" +
+			"  Or give it up with 'mythical-ctl restore --abandon'.")
+	}
+	if src, ok := ledger.FieldOf(rec, "source"); !ok || src == "" {
+		// AN INTENT THAT NAMES NOTHING TO RESUME FROM. Re-running cannot continue it: the verb
+		// reads the source out of this record and refuses when it is empty. Abandoning still works
+		// — the volume records are what that path needs.
+		return errors.New("prov: there is no active ledger, and a restore is in progress, but its staging ledger\n" +
+			"  records NO source directory to resume from (.state/ledger.staging).\n" +
+			"  Re-running cannot continue it: the verb takes the directory out of that record, not off\n" +
+			"  the command line, and refuses when it is empty.\n" +
+			"  Give it up with 'mythical-ctl restore --abandon', which removes the partial volumes that\n" +
+			"  attempt created under their recorded identity, or run 'mythical-ctl state repair'.")
+	}
+	return errors.New("prov: there is no active ledger, but a restore is in progress (.state/ledger.staging).\n" +
+		"  Resume it by re-running 'mythical-ctl restore <the same backup directory>' — the source\n" +
+		"  directory is recorded inside the staging ledger, so re-running continues that attempt\n" +
+		"  rather than starting a new one.\n" +
+		"  Or give it up with 'mythical-ctl restore --abandon', which removes the partial volumes\n" +
+		"  that attempt created under their recorded identity.")
 }
 
 // hostToolOnly reports whether <rel> — ONE home-relative component — is a real directory holding

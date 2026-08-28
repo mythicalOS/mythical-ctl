@@ -1731,15 +1731,27 @@ func TestTheImageRefusalRemedyMatchesWhatTheFailureEstablished(t *testing.T) {
 			[]string{"NOT established", "Ask it before re-running"},
 			[]string{"STILL STANDS", "GONE from that name"}, false},
 		{"the runtime answered with some other failure", errors.New("inspect: 500 Internal Server Error"),
-			[]string{"STILL STANDS", "remove it with the container"},
-			[]string{"GONE from that name"}, false},
+			// A 5xx establishes NEITHER presence nor absence. The first version of this fix said
+			// "STILL STANDS" here and this test codified it.
+			[]string{"NOT established", "inspection\n  failed"},
+			[]string{"GONE from that name", "STILL STANDS"}, false},
+		{"the inspection answered and reported NO image", nil,
+			// The one branch where presence IS established: the inspect succeeded.
+			[]string{"STILL STANDS", "the inspection answered"},
+			[]string{"GONE from that name", "NOT established"}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			// --- Run ---
 			l, objs, mut, pr, st, d := fixture(t)
 			lau := &fakeLauncher{objs: objs, st: st, nets: []Attachment{attach(net1, "", al1)}}
 			pr.resolveTo[net1+"/"+al1] = "10.0.0.2"
-			lau.after = func() { objs.imageErr[c1] = tc.err }
+			lau.after = func() {
+				if tc.err == nil {
+					objs.image[c1] = "" // the inspect succeeds and reports no image
+					return
+				}
+				objs.imageErr[c1] = tc.err
+			}
 			err := Run(ctx, l, d, lau, c1, net1, al1, Running)
 			if err == nil {
 				t.Fatal("a bring-up confirmed provenance with no image identity")
@@ -1761,7 +1773,11 @@ func TestTheImageRefusalRemedyMatchesWhatTheFailureEstablished(t *testing.T) {
 			// --- Recover ---
 			l2, objs2, _, _, st2, d2 := fixture(t)
 			crashedAfterCreate(t, l2, objs2, st2, state.Running, net1, []Attachment{attach(net1, "", al1)})
-			objs2.imageErr[c1] = tc.err
+			if tc.err == nil {
+				objs2.image[c1] = ""
+			} else {
+				objs2.imageErr[c1] = tc.err
+			}
 			before := strings.Join(l2.Lines(), "\n")
 			rerr := Recover(ctx, l2, d2, c1, net1, al1)
 			if rerr == nil {

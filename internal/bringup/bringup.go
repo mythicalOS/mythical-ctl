@@ -249,12 +249,20 @@ func imageRemedy(ierr error) string {
 		// write-ahead intent is the record a recovery or a re-run reads.
 		return "\n  The container is GONE from that name — the runtime answered that no such object exists.\n" +
 			"  There is nothing to remove; the write-ahead intent is what a recovery reads."
+	case ierr == nil:
+		// THE INSPECT SUCCEEDED and reported no image, so the container demonstrably EXISTS —
+		// this is the one branch in which presence is established rather than assumed.
+		return "\n  The container was created and STILL STANDS at that name (the inspection answered): remove\n" +
+			"  it with the container runtime before re-running, or run 'mythical-ctl state repair'."
 	case errors.Is(ierr, engine.ErrDaemonDown):
 		return "\n  Whether the container is still standing at that name was NOT established — the container\n" +
 			"  runtime did not answer. Ask it before re-running."
 	}
-	return "\n  The container was created and STILL STANDS at that name: remove it with the container\n" +
-		"  runtime before re-running, or run 'mythical-ctl state repair'."
+	// ANY OTHER INSPECTION FAILURE — a 5xx, a malformed reply — establishes NEITHER presence nor
+	// absence. Telling an operator to go and remove a container on the strength of it is the same
+	// unestablished claim as reporting a failed removal as "still there".
+	return "\n  Whether the container is still standing at that name was NOT established — the inspection\n" +
+		"  failed without saying the object is absent. Ask the container runtime before re-running."
 }
 
 // imageRefusal is the one refusal both confirmation sites make about the image identity.

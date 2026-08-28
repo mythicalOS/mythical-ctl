@@ -39,6 +39,17 @@ const (
 	kindImage  = "image"
 )
 
+// RestoreIntentKind is the ledger record kind the restore intent lives under.
+//
+// IT LIVES HERE, NOT IN internal/backup, BECAUSE TWO MODULES ASK ABOUT THE SAME RECORD.
+// internal/backup owns the restore verb, but this package's first-use classifier has to ask the
+// same question — whether a staging ledger carries a live restore intent, and whether that intent
+// names a source — in order to prescribe a recovery the verb can actually perform. prov cannot
+// import backup (backup imports prov), so the alternative is the literal written twice in two
+// packages with nothing to notice when one of them changes. The dependency already runs this way,
+// so the constant goes to the end both can see.
+const RestoreIntentKind = "restore"
+
 // Class is a provenance class — the closed set of object kinds this installer creates and may
 // therefore be authority over. `probe` is a container by every runtime question and its own class
 // by every provenance question, which is exactly why it is spelled separately here.

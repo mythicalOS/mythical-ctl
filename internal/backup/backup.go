@@ -58,7 +58,7 @@ import (
 // restoreKind is the ledger record kind the restore intent lives under — its own kind, so no
 // ordinary reader of `object` records can ever meet it, and clearing it is a record-drop of
 // exactly one row.
-const restoreKind = "restore"
+const restoreKind = prov.RestoreIntentKind
 
 // kindObject is the provenance record kind this module walks. It is spelled here rather than
 // imported because internal/prov keeps it unexported; the volume loops read the same rows
