@@ -7,11 +7,11 @@
 # MCTL_BIN unset this script BUILDS one — `go build ./cmd/mythical-ctl` into a
 # temporary directory — rather than falling back to a fixed path in the tree.
 #
-# The fallback used to be bin/mythical-ctl, and every CI job passed MCTL_BIN, so
-# the default path was never exercised: it could have named anything at all and
-# the lane would still be green. Building is the only default that cannot rot,
-# and CI now runs this script ONCE WITH MCTL_BIN ABSENT precisely so the default
-# stays proven.
+# The fallback used to be a fixed path in the tree, and every CI job passed
+# MCTL_BIN, so the default was never exercised: it could have named anything at
+# all and the lane would still be green. Building is the only default that
+# cannot rot, and CI now runs this script ONCE WITH MCTL_BIN ABSENT precisely so
+# the default stays proven.
 
 set -euo pipefail
 

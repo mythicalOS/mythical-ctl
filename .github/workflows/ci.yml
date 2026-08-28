@@ -297,9 +297,9 @@ jobs:
       # MCTL_BIN is deliberately ABSENT here, so this run takes tests/smoke.sh's
       # OWN default path — which builds the binary it tests. Every job that ever
       # ran this script passed MCTL_BIN, which meant the default was never once
-      # exercised: before the cutover it named bin/mythical-ctl and could have
-      # named anything at all without a single lane going red. A default nothing
-      # runs is not a default, so one lane runs it with nothing set.
+      # exercised: before the cutover it named a fixed path in the tree and could
+      # have named anything at all without a single lane going red. A default
+      # nothing runs is not a default, so one lane runs it with nothing set.
       - name: Smoke (the script's own default — MCTL_BIN deliberately unset)
         run: ./tests/smoke.sh
 

@@ -2,7 +2,7 @@
 
 The reference detail behind the [README](../README.md): the layout and its ownership rules, the
 config-file model, the authenticated-document trust chain, exactly what backup/uninstall/status do,
-and why the install sequence is deliberately not a one-liner.
+and what a published release is held to.
 
 `mythical-ctl` is **product-agnostic** by design: everything specific to a product — image reference,
 ports, volumes, environment — arrives from a manifest that product ships, never from logic baked in
@@ -10,8 +10,8 @@ here. Products contribute a manifest describing themselves, and nothing more.
 
 ## One place for everything you edit
 
-The layout is implemented in `lib/layout.sh`; the CLI mounts each product's configuration and volumes
-into its container per that product's manifest.
+The layout is implemented in the `layout` package; the CLI mounts each product's configuration and
+volumes into its container per that product's manifest.
 
 ```
 ~/.mythical/
@@ -106,38 +106,44 @@ the installer stops rather than install unverified bytes. A product with no publ
 reported as not launched and is not installed. The bootstrap script *itself* is authenticated by TLS
 to a known origin, not by a separate signature — a deliberate, stated limit of this model.
 
-## Why this is not a one-liner
+## What you download, and how you check it
 
-`curl … | bash` cannot reject a redirect. Without `-L`, curl does not *follow* a redirect — but it
-does not fail on one either: `-f` acts on 4xx and 5xx, so a `3xx` response is transferred like any
-other and **its body goes straight into your shell**. Anyone who controls a redirect controls that
-body. `--max-redirs 0` bounds following, not status handling.
+A release publishes four static binaries — `mythical-ctl_{darwin,linux}_{amd64,arm64}` — and a
+`SHA256SUMS` file naming each one's digest. **Verify the digest before the first execution.** The
+version string is not the integrity guarantee: anyone can print a version. The digest is
+content-addressed, and every binary additionally carries a signed build-provenance attestation
+tying those exact bytes to the workflow run and commit that produced them.
 
-Downloading first makes the status checkable before anything executes. It is one extra line, and it
-is the difference between "we verify everything" and "we verify everything after the first thing
-already ran". `wget` is not supported either: no flag constrains every hop of a redirect chain, so an
-`https → http → https` chain is undetectable.
-
-(Bash specifically, not POSIX `sh`: the CLI uses `set -o pipefail` and other bash features. Bash is
-present by default on macOS and every mainstream Linux distribution; where it is not — Alpine, some
-minimal images — it is a one-package install.)
+That is also why the artifacts are built reproducibly (below): a published checksum is only worth
+something if a stranger can re-derive it from the source rather than take it on trust.
 
 ## Development
 
-`lib/` holds the shipped shell libraries; `tests/harness/` holds test-only helpers (a fake container
-runtime and filesystem-snapshot assertions) that shipped code never sources. Tests are hermetic, so a
-green suite proves logic, not Docker behaviour.
+The CLI is one Go module. `internal/` holds a package per module — layout, conf, trust, engine,
+runtime, verbs and the rest — with tests beside the code they test. The engine tests run against a
+hermetic fake rather than a daemon, so a green suite proves logic, not Docker behaviour;
+`bash check.sh acceptance` re-measures those behaviours against a real daemon and is opt-in.
 
-A release does **not** publish `bin/mythical-ctl` as it sits in the tree. `tools/bundle.sh` inlines
-`lib/*.sh` into the entrypoint's `mctl:modules` region and publishes a single self-contained file,
-because the installed layout is exactly one file — one artifact, one digest, one attestation. The
-bundle is byte-reproducible from a given tree, so a published checksum is one anyone can re-derive:
+Every check lives in `check.sh`, which CI and a person run identically — spelling the commands out
+in a workflow as well guarantees the two drift, and the direction is always the same: the release
+lane ends up laxer than the pull-request lane.
 
 ```sh
-tools/bundle.sh dist/mythical-ctl
-shellcheck dist/mythical-ctl
-MCTL_BIN="$PWD/dist/mythical-ctl" ./tests/smoke.sh
+bash check.sh go        # gofmt, build, vet, the reference-boundary gate, the whole test suite
+bash check.sh parity    # every test of the retired bash suite is still accounted for
+bash check.sh release   # build the published matrix twice, require identical bytes
+./tests/smoke.sh        # the CLI contract, against a binary it builds (or MCTL_BIN=<path>)
 ```
+
+`check.sh release` is the reproducibility claim being exercised rather than asserted: it builds
+all four artifacts, then builds them again from a copy of the source at a different absolute path
+with a cold build cache, and requires every byte to match. `tools/release-verify` grades the
+result from the FILES rather than from the commands that made them.
+
+`check.sh parity` is the evidence that retiring the previous shell implementation lost nothing:
+`tests/parity-manifest.tsv` records all 1,178 tests of the suite that specified it, and the audit
+requires each one to be claimed exactly once by a `PORTED:` or argued `N/A:` inventory line in the
+Go tree, with every `PORTED` target resolving to a test that really runs.
 
 ## Siblings
 

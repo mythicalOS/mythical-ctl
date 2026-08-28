@@ -8,12 +8,12 @@
 <h1 align="center">mythical-ctl</h1>
 
 <p align="center">
-  <strong>One installer and lifecycle CLI for the mythicalOS family of local-first containers — pure bash, no runtime required.</strong>
+  <strong>One installer and lifecycle CLI for the mythicalOS family of local-first containers — a single static binary, no runtime required.</strong>
 </p>
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache_2.0-blue.svg" alt="License: Apache-2.0"></a>
-  <img src="https://img.shields.io/badge/shell-bash-4EAA25.svg?logo=gnubash&logoColor=white" alt="bash">
+  <img src="https://img.shields.io/badge/built_with-Go-00ADD8.svg?logo=go&logoColor=white" alt="Go">
   <a href="https://mythicalos.ai"><img src="https://img.shields.io/badge/part_of-mythicalOS-0F6B66.svg" alt="Part of mythicalOS"></a>
 </p>
 
@@ -38,28 +38,37 @@ migrate-storage · backup · restore
 
 ## Install
 
-The bootstrap below is served by [get.mythicalos.ai](https://get.mythicalos.ai). It downloads to a
-temp file and **checks the HTTP status before executing anything** — deliberately not a
-`curl … | bash` one-liner, because that form can't reject a redirect into your shell. The full
-reasoning is in [`docs/design.md`](docs/design.md#why-this-is-not-a-one-liner).
+`mythical-ctl` is a single static binary. Download the one for your platform from the
+[releases](https://github.com/mythicalOS/mythical-ctl/releases), **check its digest against the
+published `SHA256SUMS` before you run it**, then put it on your `PATH`:
 
 ```sh
-(
-  tmp=$(mktemp) || exit 1
-  trap 'rm -f "$tmp"' EXIT
-  code=$(curl -fsS --proto '=https' --max-redirs 0 -o "$tmp" -w '%{http_code}' \
-              https://get.mythicalos.ai/brokkr) \
-    || { echo "download failed — refusing to run it"; exit 1; }
-  [ "$code" = 200 ] || { echo "unexpected HTTP $code — refusing to run it"; exit 1; }
-  bash "$tmp"
-)
+ver=v0.0.0            # the release you want
+plat=darwin_arm64     # darwin_amd64 · darwin_arm64 · linux_amd64 · linux_arm64
+base="https://github.com/mythicalOS/mythical-ctl/releases/download/$ver"
+
+curl -fsSL --proto '=https' -o mythical-ctl  "$base/mythical-ctl_$plat"
+curl -fsSL --proto '=https' -o SHA256SUMS    "$base/SHA256SUMS"
+
+# Verify BEFORE the first execution. Compare the digest of what you downloaded
+# against the line for that artifact; anything but a match, stop.
+shasum -a 256 mythical-ctl | awk '{print $1}'      # sha256sum on Linux
+grep "mythical-ctl_$plat\$" SHA256SUMS
+
+chmod +x mythical-ctl && mv mythical-ctl /usr/local/bin/
 ```
+
+The version string is not the integrity guarantee — the digest is. Every published binary also
+carries a signed GitHub build-provenance attestation, so `gh attestation verify mythical-ctl
+--repo mythicalOS/mythical-ctl` will tell you which workflow run, from which commit, produced
+exactly those bytes. [get.mythicalos.ai](https://get.mythicalos.ai) serves a pinned release
+artifact from here, so a product's own getting-started page can hand you the same bytes.
 
 Product images are pinned by content digest (`@sha256:…`) and verified by the container runtime on
 pull; if the bytes don't match, the install stops rather than run unverified bytes.
 
-**Requirements:** bash. The lifecycle verbs additionally need a container runtime (rootful Docker
-Engine 28+ or Docker Desktop); installing needs `curl` and `mktemp`.
+**Requirements:** a container runtime (rootful Docker Engine 28+ or Docker Desktop); nothing
+else — the CLI is a static binary with no language runtime and no shared-library dependency.
 
 ## Your data is never collateral
 
@@ -75,22 +84,20 @@ and trust-chain contracts are in [`docs/CONFIG-FORMAT.md`](docs/CONFIG-FORMAT.md
 
 ## Develop
 
-The test runner is a git submodule — **clone with submodules**, or the unit tests can't run:
+Every check this tree gets lives in one script, run identically by CI and by a person:
 
 ```sh
-git clone --recurse-submodules https://github.com/mythicalOS/mythical-ctl.git
-# already cloned: git submodule update --init
+bash check.sh go        # gofmt, build, vet, the reference-boundary gate, the whole test suite
+bash check.sh parity    # every test of the retired bash suite is still accounted for
+bash check.sh release   # build the published matrix twice, require identical bytes
+bash check.sh           # all three
+./tests/smoke.sh        # CLI contract, against a binary it builds (or MCTL_BIN=<path>)
 ```
 
-```sh
-shellcheck -x bin/* lib/*.sh tests/*.sh tests/harness/* tools/*.sh   # lint
-./tests/smoke.sh                                                     # entrypoint smoke
-third_party/bats-core/bin/bats tests/unit                                 # unit tests
-```
-
-Tests are hermetic (a fake container runtime) — a green suite proves logic, not Docker behaviour. A
-release publishes a single bundled file (`tools/bundle.sh`), byte-reproducible from the tree. See
-[`docs/design.md`](docs/design.md#development) for the release-artifact check.
+Tests are hermetic (a fake container engine) — a green suite proves logic, not Docker behaviour;
+`bash check.sh acceptance` re-measures the daemon behaviours against a real one, and is opt-in.
+A release publishes four static binaries plus `SHA256SUMS`, byte-reproducible from the tree. See
+[`docs/design.md`](docs/design.md#development) for what the release lane checks.
 
 ## License
 
