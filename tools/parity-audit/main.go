@@ -502,12 +502,81 @@ type stray struct {
 	Region     string // the WHOLE contiguous comment region, for the row-name search
 	ClaimWords bool   // the region carries PORTED:/N/A: somewhere
 	InComment  bool   // the mention is in a comment (the only place a claim can be written)
+	// OffLane — the file is not one the toolchain compiles for ANY audited lane, so nothing in it
+	// can ever be a claim, however well it is written. Carried so auditCoverage can say WHICH of
+	// the two invisibilities this is: written where the parser does not look, or written in a file
+	// the parser is not allowed to read.
+	OffLane bool
+}
+
+// astView is what go/parser says about ONE file's comments: the lines on which a `//` LINE COMMENT
+// begins, and every line any comment covers. For a file the toolchain selected it is the AUTHORITY
+// on both questions, replacing the hand lexer that used to answer them from raw bytes.
+//
+// WHY THE PARSER AND NOT THE BYTES. Round 12 demonstrated the consequence of reading claims out of
+// a filesystem walk: a real claim moved into cmd/mythical-ctl/testdata/broken.go — a file preceded
+// by the line `this is not valid Go` — was CREDITED, and the full parity stage exited 0. Valid Go
+// behind `//go:build never` did the same. Both are files no lane compiles, so no claim in either
+// can describe anything that runs. The hand lexer could not tell, because it was reading text.
+type astView struct {
+	lineComment map[int]bool
+	anyComment  map[int]bool
+}
+
+// parseGoComments parses one Go file and reports its comment geography.
+//
+// A PARSE FAILURE IS RETURNED, NEVER SWALLOWED. A file the toolchain compiles but this program
+// cannot read is a file whose claims nobody is checking — and skipping it looks exactly like a file
+// that had no claims, which is the shape of every false green in this program's history.
+func parseGoComments(rel string, content []byte) (*astView, error) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, rel, content, parser.ParseComments|parser.SkipObjectResolution)
+	if err != nil {
+		return nil, fmt.Errorf("parsing %s for its inventory comments: %w", rel, err)
+	}
+	v := &astView{lineComment: map[int]bool{}, anyComment: map[int]bool{}}
+	for _, g := range f.Comments {
+		for _, c := range g.List {
+			start := fset.Position(c.Slash).Line
+			end := fset.Position(c.End()).Line
+			for l := start; l <= end; l++ {
+				v.anyComment[l] = true
+			}
+			// A CLAIM IS A `//` LINE COMMENT AND NOTHING ELSE, which is the grammar the protocol
+			// already had: invAny anchors on `^[ \t]*//`. A line INSIDE a /* */ block that reads
+			// `// PORTED: ...` is therefore not a claim — it is reported as one the parser cannot
+			// read, exactly as before.
+			if strings.HasPrefix(c.Text, "//") {
+				v.lineComment[start] = true
+			}
+		}
+	}
+	return v, nil
+}
+
+// shifted returns the view with every line number moved by d. Test scaffolding only: a fixture
+// written as bare inventory lines needs a `package` clause to be parseable at all, and the
+// assertions read the FIXTURE's line numbers, not the scaffolded ones.
+func (v *astView) shifted(d int) *astView {
+	out := &astView{lineComment: map[int]bool{}, anyComment: map[int]bool{}}
+	for l := range v.lineComment {
+		out.lineComment[l+d] = true
+	}
+	for l := range v.anyComment {
+		out.anyComment[l+d] = true
+	}
+	return out
 }
 
 // parseInventory reads one Go file's claims. Anything that opens like an inventory line but does
 // not parse is returned as malformed rather than skipped — a claim the audit cannot read is a
 // claim nobody is checking, which is the same as no claim at all but looks like coverage.
-func parseInventory(rel string, content []byte) ([]claim, []malformed, []stray, error) {
+//
+// VIEW NIL MEANS THE FILE IS NOT TOOLCHAIN-SELECTED, and then it may carry NO claims at all: every
+// claim-shaped line falls through to the stray path and is reported as invisible. Such a file need
+// not even be valid Go (testdata routinely is not), which is why the lexer still answers the
+// comment question for it — the parser cannot.
+func parseInventory(rel string, content []byte, view *astView) ([]claim, []malformed, []stray, error) {
 	var claims []claim
 	var bad []malformed
 	var strays []stray
@@ -536,14 +605,24 @@ func parseInventory(rel string, content []byte) ([]claim, []malformed, []stray, 
 		// multiline raw string is inert data, not a claim — counting it would let a fixture satisfy
 		// a row nothing actually covers. Block depth is tracked for the same reason in reverse: a
 		// continuation line inside /* */ opens with nothing and must still count as a comment.
-		openedInBlock, openedInRaw := inBlock, inRaw
-		inBlock, inRaw = lexAfter(inBlock, inRaw, text)
-		isComment := openedInBlock || inBlock || invCommentLine.MatchString(text)
+		//
+		// THE PARSER ANSWERS BOTH QUESTIONS WHERE IT CAN. For a toolchain-selected file the AST says
+		// which lines are comments and which of them OPEN a `//` comment, so no byte-level
+		// approximation decides whether a claim is a claim. The lexer stays for the files the parser
+		// cannot read — the ineligible ones, which may not be valid Go — and there it only ever
+		// widens the stray window, never admits a claim.
+		var isComment, claimable bool
+		if view != nil {
+			isComment = view.anyComment[line]
+			claimable = view.lineComment[line] && invAny.MatchString(text)
+		} else {
+			openedInBlock := inBlock
+			inBlock, inRaw = lexAfter(inBlock, inRaw, text)
+			isComment = openedInBlock || inBlock || invCommentLine.MatchString(text)
+		}
 		if !isComment {
 			region, regionFiles, regionClaim = nil, nil, false
 		}
-
-		claimable := !openedInRaw && !openedInBlock && invAny.MatchString(text)
 		if claimable {
 			if m := invPorted.FindStringSubmatch(text); m != nil {
 				targets := testNamesIn(m[3])
@@ -617,7 +696,7 @@ func parseInventory(rel string, content []byte) ([]claim, []malformed, []stray, 
 		}
 		if !isComment {
 			for _, p := range paths {
-				strays = append(strays, stray{rel, line, p, text, text, claimWords, false})
+				strays = append(strays, stray{rel, line, p, text, text, claimWords, false, view == nil})
 			}
 			continue
 		}
@@ -630,7 +709,7 @@ func parseInventory(rel string, content []byte) ([]claim, []malformed, []stray, 
 				continue
 			}
 			seenHere[sp.file] = true
-			strays = append(strays, stray{rel, sp.line, sp.file, sp.text, joined, regionClaim, true})
+			strays = append(strays, stray{rel, sp.line, sp.file, sp.text, joined, regionClaim, true, view == nil})
 		}
 	}
 	if err := sc.Err(); err != nil {
@@ -706,11 +785,38 @@ func lexAfter(inBlock, inRaw bool, line string) (bool, bool) {
 // build output. Neither can carry a claim, and walking them only creates ways to be wrong.
 var skipDirs = map[string]bool{".git": true, "third_party": true, "dist": true, "node_modules": true}
 
-func collectInventory(root string) ([]claim, []malformed, []stray, int, error) {
+// canonPath is the ONE spelling of a path both halves of the eligibility question can be asked in.
+// `go list` prints absolute directories; the inventory walk produces paths relative to -root; and
+// on macOS a temporary directory reaches the walk through a symlink and the toolchain through its
+// target. Comparing any two of those as written is a silent miss, and a silent miss here means
+// every claim in a file becomes invisible — the loudest possible failure for the quietest reason.
+func canonPath(p string) string {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return filepath.Clean(p)
+	}
+	if r, rerr := filepath.EvalSymlinks(abs); rerr == nil {
+		return r
+	}
+	return abs
+}
+
+// collectInventory reads the whole tree, but only ELIGIBLE files may carry claims.
+//
+// ELIGIBILITY IS THE TOOLCHAIN'S OWN FILE SELECTION, not a rule this program invents: the union,
+// across the audited lanes, of the files `go list` says each package compiles. A file under
+// testdata, or excluded by a build constraint, is in no lane's selection — so nothing in it runs,
+// nothing in it can describe what runs, and a claim in it is credited to nobody.
+//
+// THE INELIGIBLE FILES ARE STILL READ, and that is deliberate. A claim moved into one of them is
+// not merely uncredited (which shows up as an unclaimed row somewhere else, naming the wrong file);
+// it is REPORTED where it sits, so the message names the file somebody actually has to fix.
+func collectInventory(root string, eligible map[string]bool) ([]claim, []malformed, []stray, int, error) {
 	var claims []claim
 	var bad []malformed
 	var strays []stray
 	scanned := 0
+	foundEligible := 0
 	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -733,7 +839,19 @@ func collectInventory(root string) ([]claim, []malformed, []stray, int, error) {
 			return rerr
 		}
 		scanned++
-		c, b, st, perr := parseInventory(filepath.ToSlash(rel), content)
+		var view *astView
+		if eligible[canonPath(p)] {
+			foundEligible++
+			// A MALFORMED ELIGIBLE FILE REFUSES. It is a file the toolchain compiles, so its claims
+			// are the ones that count — and a parse error that merely skipped it would look exactly
+			// like a file with nothing in it.
+			v, verr := parseGoComments(filepath.ToSlash(rel), content)
+			if verr != nil {
+				return verr
+			}
+			view = v
+		}
+		c, b, st, perr := parseInventory(filepath.ToSlash(rel), content, view)
 		if perr != nil {
 			return perr
 		}
@@ -742,7 +860,28 @@ func collectInventory(root string) ([]claim, []malformed, []stray, int, error) {
 		strays = append(strays, st...)
 		return nil
 	})
-	return claims, bad, strays, scanned, err
+	if err != nil {
+		return nil, nil, nil, scanned, err
+	}
+	// The scan's own liveness, and it comes FIRST because it is the more basic answer: an empty tree
+	// would otherwise be reported as a disagreement between the walk and `go list`, which sends the
+	// reader looking for a keying bug that is not there.
+	if scanned == 0 {
+		return nil, nil, nil, scanned, fmt.Errorf("scanned 0 Go files under %s — the inventory scan is pointed at the wrong tree", root)
+	}
+	// THE WALK AND THE SELECTION MUST MEET. If a file the toolchain named was never reached by the
+	// walk, the two halves are keyed differently or the walk is pointed elsewhere — and the symptom
+	// would be a pile of unclaimed rows with no hint of the cause. Say the cause instead.
+	if foundEligible != len(eligible) {
+		var missing []string
+		for f := range eligible {
+			missing = append(missing, f)
+		}
+		sort.Strings(missing)
+		return nil, nil, nil, scanned, fmt.Errorf("the inventory walk under %s reached %d of the %d files the toolchain selected — the walk and `go list` disagree about where the source is, so claims would be missing for a reason that has nothing to do with the port (selected, first by path: %s)",
+			root, foundEligible, len(eligible), missing[0])
+	}
+	return claims, bad, strays, scanned, nil
 }
 
 // parseGoTestList reads `go test -list '.*' ./...` output, KEYED BY PACKAGE. Only bare Test
@@ -804,13 +943,23 @@ type testLane struct {
 	src map[string]map[string]bool
 }
 
-// parseGoFileList reads `go list -f '{{.ImportPath}}\t{{.Dir}}\t{{join .TestGoFiles " "}}\t{{join
-// .XTestGoFiles " "}}'` output and returns, per package import path, the absolute paths of the test
-// files THAT LANE COMPILES. TestGoFiles and XTestGoFiles are the in-package and external test files
-// go itself selected after applying build constraints — which is the whole point: the selection is
-// made by the toolchain for the lane, not re-derived here from a walk that ignores tags.
-func parseGoFileList(content []byte) (map[string][]string, error) {
-	out := map[string][]string{}
+// pkgFiles is what one lane compiles for one package: its ordinary source, and the files that can
+// DECLARE tests. The two are kept apart because they answer different questions — every file here
+// may carry a CLAIM (it is compiled, so it is real), but only a `_test.go` file can declare a test,
+// and a `func TestX` in ordinary source is an exported function the toolchain never registers.
+type pkgFiles struct {
+	Dir  string
+	Go   []string // GoFiles — compiled into the package itself
+	Test []string // TestGoFiles + XTestGoFiles — the in-package and external test files
+}
+
+// parseGoFileList reads `go list -f '{{.ImportPath}}\t{{.Dir}}\t{{join .GoFiles " "}}\t{{join
+// .TestGoFiles " "}}\t{{join .XTestGoFiles " "}}'` output and returns, per package import path, the
+// absolute paths of the files THAT LANE COMPILES. They are the files go itself selected after
+// applying build constraints — which is the whole point: the selection is made by the toolchain for
+// the lane, not re-derived here from a walk that ignores tags.
+func parseGoFileList(content []byte) (map[string]pkgFiles, error) {
+	out := map[string]pkgFiles{}
 	sc := bufio.NewScanner(bytes.NewReader(content))
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	for sc.Scan() {
@@ -819,18 +968,28 @@ func parseGoFileList(content []byte) (map[string][]string, error) {
 			continue
 		}
 		f := strings.Split(t, "\t")
-		if len(f) != 4 {
-			return nil, fmt.Errorf("go-files line is not the 4 tab-separated fields this reader expects: %q", t)
+		if len(f) != 5 {
+			return nil, fmt.Errorf("go-files line is not the 5 tab-separated fields this reader expects: %q", t)
 		}
 		pkg, dir := f[0], f[1]
 		if pkg == "" || dir == "" {
 			return nil, fmt.Errorf("go-files line names no package or no directory: %q", t)
 		}
-		for _, group := range f[2:] {
+		e := pkgFiles{Dir: dir}
+		for _, name := range strings.Fields(f[2]) {
+			e.Go = append(e.Go, filepath.Join(dir, name))
+		}
+		for _, group := range f[3:] {
 			for _, name := range strings.Fields(group) {
-				out[pkg] = append(out[pkg], filepath.Join(dir, name))
+				e.Test = append(e.Test, filepath.Join(dir, name))
 			}
 		}
+		// A PACKAGE WITH NO FILES CONTRIBUTES NO ENTRY. It declares nothing and compiles nothing, so
+		// inventing an empty entry for it would only make the liveness checks below harder to trip.
+		if len(e.Go) == 0 && len(e.Test) == 0 {
+			continue
+		}
+		out[pkg] = e
 	}
 	return out, sc.Err()
 }
@@ -841,14 +1000,20 @@ func parseGoFileList(content []byte) (map[string][]string, error) {
 // which counted a declaration written inside a block comment or a raw string as source evidence —
 // the same class of defect the inventory scanner had, in the tool that was fixing it. go/parser
 // knows what is code, and a file that does not parse is a hard error rather than a silent zero.
-func collectLaneSource(files map[string][]string) (map[string]map[string]bool, error) {
+func collectLaneSource(files map[string]pkgFiles) (map[string]map[string]bool, error) {
 	out := map[string]map[string]bool{}
 	fset := token.NewFileSet()
-	for pkg, paths := range files {
+	for pkg, pf := range files {
+		// ONLY A TEST FILE CAN DECLARE A TEST. A package with none contributes no witness entry —
+		// an invented empty one would keep `len(src) == 0` from ever tripping, and that check is
+		// what notices a lane whose source half arrived empty.
+		if len(pf.Test) == 0 {
+			continue
+		}
 		if out[pkg] == nil {
 			out[pkg] = map[string]bool{}
 		}
-		for _, p := range paths {
+		for _, p := range pf.Test {
 			f, perr := parser.ParseFile(fset, p, nil, parser.SkipObjectResolution)
 			if perr != nil {
 				return nil, fmt.Errorf("parsing %s for its test declarations: %w", p, perr)
@@ -1323,6 +1488,17 @@ func auditCoverage(r *report, pairs []batsPair, claims []claim, bad []malformed,
 				break
 			}
 			reported[where{s.GoFile, s.GoLine}] = true
+			if s.OffLane {
+				// A DIFFERENT INVISIBILITY, AND IT NEEDS ITS OWN SENTENCE. This claim may be
+				// perfectly written; the FILE is the problem. No lane compiles it — it is under
+				// testdata, or a build constraint excludes it — so nothing in it runs and nothing
+				// in it can testify about what runs. Demonstrated: a real claim moved into
+				// `<pkg>/testdata/broken.go`, behind a line that is not Go at all, was credited and
+				// the whole parity stage exited 0.
+				r.fail("%s:%d: this file is in NO audited lane's file selection (under testdata, or excluded by a build constraint), so nothing in it compiles and a claim in it describes nothing that runs — yet it names %s (%s). Move the claim to the test file that actually covers the row: %s",
+					s.GoFile, s.GoLine, cand, why, strings.TrimSpace(s.Text))
+				break
+			}
 			r.fail("%s:%d: this names %s where the inventory parser does not read it (%s) — a claim here is invisible to every gate, so it can contradict the real one forever. Put it at the start of its own comment line, or reword it so it neither uses the claim syntax nor carries a row name: %s",
 				s.GoFile, s.GoLine, cand, why, strings.TrimSpace(s.Text))
 			break
@@ -1452,7 +1628,7 @@ func main() {
 		failFirst = flag.Int("max-problems", 0, "print at most this many problems (0 = all)")
 	)
 	flag.Var(&goLists, "go-list", "file holding `go test -list` output; repeatable (once per build-tag lane)")
-	flag.Var(&goFiles, "go-files", "file holding `go list -f '{{.ImportPath}}\\t{{.Dir}}\\t{{join .TestGoFiles \" \"}}\\t{{join .XTestGoFiles \" \"}}'` output for the SAME lane, in the SAME order as --go-list")
+	flag.Var(&goFiles, "go-files", "file holding `go list -f '{{.ImportPath}}\\t{{.Dir}}\\t{{join .GoFiles \" \"}}\\t{{join .TestGoFiles \" \"}}\\t{{join .XTestGoFiles \" \"}}'` output for the SAME lane, in the SAME order as --go-list")
 	flag.Parse()
 
 	if err := run(*root, *manifest, *writeMan, goLists, goFiles, *failFirst); err != nil {
@@ -1548,16 +1724,6 @@ func run(root, manifestRel string, writeMan bool, goLists, goFiles []string, max
 		fmt.Printf("corpus: bats trees absent (post-cutover) — auditing against the committed %s\n", manifestRel)
 	}
 
-	claims, bad, strays, scanned, err := collectInventory(root)
-	if err != nil {
-		return err
-	}
-	// The scan's own liveness. Zero Go files means the walk is pointed somewhere with no source in
-	// it, and every claim below would be missing for a reason that has nothing to do with the port.
-	if scanned == 0 {
-		return fmt.Errorf("scanned 0 Go files under %s — the inventory scan is pointed at the wrong tree", root)
-	}
-
 	// THE TWO WITNESSES ARRIVE PAIRED, ONE PAIR PER LANE, and the pairing is checked rather than
 	// assumed: an unpaired list would silently reintroduce the very independence the pairing
 	// removes — a lane whose source half is empty resolves nothing, and one whose list half is
@@ -1569,6 +1735,11 @@ func run(root, manifestRel string, writeMan bool, goLists, goFiles []string, max
 			len(goLists), len(goFiles))
 	}
 	var testLanes []testLane
+	// EVERY FILE THE TOOLCHAIN COMPILES, ACROSS EVERY LANE. This is the set a claim may be written
+	// in; nothing outside it is read as a claim, whatever it says. Union rather than intersection
+	// because the acceptance lane genuinely compiles a file the default lane does not, and a claim
+	// in it is legitimate.
+	eligible := map[string]bool{}
 	names := 0
 	for i, p := range goLists {
 		content, err := os.ReadFile(p)
@@ -1582,6 +1753,14 @@ func run(root, manifestRel string, writeMan bool, goLists, goFiles []string, max
 		files, perr := parseGoFileList(fcontent)
 		if perr != nil {
 			return fmt.Errorf("reading %s: %w", goFiles[i], perr)
+		}
+		for _, pf := range files {
+			for _, f := range pf.Go {
+				eligible[canonPath(f)] = true
+			}
+			for _, f := range pf.Test {
+				eligible[canonPath(f)] = true
+			}
 		}
 		src, serr := collectLaneSource(files)
 		if serr != nil {
@@ -1610,6 +1789,15 @@ func run(root, manifestRel string, writeMan bool, goLists, goFiles []string, max
 	if names == 0 {
 		return fmt.Errorf("no Go test names were loaded (pass --go-list <file> with `go test -list '.*' ./...` output) — PORTED targets cannot be resolved")
 	}
+	// THE CLAIM-BEARING SET NEEDS NO SEPARATE LIVENESS CHECK, and saying so is worth more than a
+	// check that cannot fire: every lane has already been refused unless its compiled TEST files
+	// declare something (the `len(src) == 0` check above), and a compiled test file is by
+	// construction a member of `eligible`. An empty selection is therefore unreachable from here.
+	claims, bad, strays, scanned, err := collectInventory(root, eligible)
+	if err != nil {
+		return err
+	}
+
 	goTests := map[string]map[string]bool{}
 	for _, ln := range testLanes {
 		for pkg, ns := range ln.list {

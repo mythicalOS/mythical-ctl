@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,6 +22,32 @@ import (
 // discipline is self-proving rather than a rule somebody has to remember.
 
 func lines(l ...string) []byte { return []byte(strings.Join(l, "\n") + "\n") }
+
+// invFixture parses an inventory fixture THE WAY THE REAL AUDIT DOES — through go/parser, as a file
+// the toolchain selected. A fixture written as bare inventory lines is not a compilable Go file, so
+// it is given the `package` clause it needs and the resulting line numbers are shifted back: the
+// assertions read the FIXTURE's lines, not the scaffolding's.
+//
+// It exists so no test can accidentally exercise a claim path the shipped audit no longer has. A
+// fixture that is not valid Go fails HERE, loudly, rather than quietly taking the ineligible-file
+// branch and proving nothing.
+func invFixture(t *testing.T, rel string, content []byte) ([]claim, []malformed, []stray) {
+	t.Helper()
+	src, shift := content, 0
+	if !strings.HasPrefix(string(content), "package ") {
+		src = append([]byte("package x\n"), content...)
+		shift = 1
+	}
+	v, err := parseGoComments(rel, src)
+	if err != nil {
+		t.Fatalf("the fixture is not valid Go, so it could never be a toolchain-selected file: %v", err)
+	}
+	c, b, st, perr := parseInventory(rel, content, v.shifted(-shift))
+	if perr != nil {
+		t.Fatal(perr)
+	}
+	return c, b, st
+}
 
 // ---------------------------------------------------------------------------------------------
 // The bats parser and the manifest round trip
@@ -101,7 +128,7 @@ func TestParseManifestRefusesARowWithNoTab(t *testing.T) {
 // ---------------------------------------------------------------------------------------------
 
 func TestParseInventory(t *testing.T) {
-	claims, bad, _, err := parseInventory("internal/x/x_test.go", lines(
+	claims, bad, _ := invFixture(t, "internal/x/x_test.go", lines(
 		`package x`,
 		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
 		`// N/A:    tests/unit/a.bats: "two" -- structurally impossible in Go: no such seam exists`,
@@ -109,9 +136,6 @@ func TestParseInventory(t *testing.T) {
 		`// PORTED: tests/unit/a.bats: "four" -> TestFive, TestSix`,
 		`func f() { _ = "// PORTED: tests/unit/a.bats: \"nope\" -> TestNope" }`,
 	))
-	if err != nil {
-		t.Fatalf("parseInventory: %v", err)
-	}
 	if len(bad) != 0 {
 		t.Fatalf("unexpected malformed lines: %+v", bad)
 	}
@@ -151,10 +175,7 @@ func TestParseInventoryReportsMalformed(t *testing.T) {
 		{"defers with a TODO", `// N/A: tests/unit/a.bats: "one" -- TODO: needs the copy seam, which is not built here`},
 		{"unquoted name", `// PORTED: tests/unit/a.bats: one -> TestOne`},
 	} {
-		claims, bad, _, err := parseInventory("x_test.go", lines(tc.line))
-		if err != nil {
-			t.Fatalf("%s: %v", tc.name, err)
-		}
+		claims, bad, _ := invFixture(t, "x_test.go", lines(tc.line))
 		if len(bad) != 1 || len(claims) != 0 {
 			t.Fatalf("%s: %d malformed, %d claims — want 1 and 0", tc.name, len(bad), len(claims))
 		}
@@ -383,11 +404,7 @@ var (
 
 func claimsFrom(t *testing.T, l ...string) ([]claim, []malformed, []stray) {
 	t.Helper()
-	c, b, st, err := parseInventory("internal/x/x_test.go", lines(l...))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return c, b, st
+	return invFixture(t, "internal/x/x_test.go", lines(l...))
 }
 
 func hasProblem(r *report, substr string) bool {
@@ -756,7 +773,7 @@ func e2eTree(t *testing.T) (root, goList string) {
 	// The SECOND witness for the same lane: the test files go would compile for it. Written by
 	// hand here for the same reason the list is — these tests drive the grader, not the toolchain.
 	if err := os.WriteFile(goFilesPath(root), lines(
-		"mythicalos.ai/ctl/internal/x\t"+filepath.Join(root, "internal", "x")+"\tx_test.go\t",
+		"mythicalos.ai/ctl/internal/x\t"+filepath.Join(root, "internal", "x")+"\t\tx_test.go\t",
 	), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -897,15 +914,55 @@ func TestEndToEndFailsOnCountsBeforeCoverage(t *testing.T) {
 // The inventory scan's own liveness. A walk that finds no Go source would report every bats test
 // unclaimed — loud, but loud about the wrong thing, and the fix a reader would reach for is to
 // weaken the coverage check rather than to fix the path.
+//
+// THE WIRING FAILURE IT IS ABOUT is `-root` naming the wrong directory while the toolchain
+// witnesses name the right one, so the fixture moves the Go source OUT of root and leaves the
+// witnesses pointing at it: the lanes still load, still parse, still resolve — and the walk finds
+// nothing at all.
 func TestEndToEndRefusesWhenNoGoSourceIsScanned(t *testing.T) {
 	tinyLanes(t, 2, 1, 2)
 	root, goList := e2eTree(t)
-	if err := os.RemoveAll(filepath.Join(root, "internal")); err != nil {
+	away := t.TempDir()
+	if err := os.Rename(filepath.Join(root, "internal"), filepath.Join(away, "internal")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(goFilesPath(root), lines(
+		"mythicalos.ai/ctl/internal/x\t"+filepath.Join(away, "internal", "x")+"\t\tx_test.go\t",
+	), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	err := e2eRun(root, goList)
 	if err == nil || !strings.Contains(err.Error(), "scanned 0 Go files") {
 		t.Fatalf("err = %v, want a refusal naming the empty scan", err)
+	}
+}
+
+// ...and the guard one level in from it: the walk DOES find Go source, but not the files the
+// toolchain named. Keyed differently, pruned, or moved — whatever the cause, every claim in the
+// missing files becomes invisible, and the symptom is a pile of unclaimed rows that names nothing.
+// The fixture puts a selected package under a directory the walk deliberately prunes.
+func TestEndToEndRefusesWhenASelectedFileIsNeverWalked(t *testing.T) {
+	tinyLanes(t, 2, 1, 2)
+	root, goList := e2eTree(t)
+	gen := filepath.Join(root, "dist", "gen")
+	if err := os.MkdirAll(gen, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(gen, "g_test.go"), lines(`package gen`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(goFilesPath(root), lines(
+		"mythicalos.ai/ctl/internal/x\t"+filepath.Join(root, "internal", "x")+"\t\tx_test.go\t",
+		"mythicalos.ai/ctl/dist/gen\t"+gen+"\t\tg_test.go\t",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := e2eRun(root, goList)
+	if err == nil {
+		t.Fatal("a file the toolchain selected was never reached by the walk and the audit said nothing")
+	}
+	if !strings.Contains(err.Error(), "the toolchain selected") {
+		t.Fatalf("err = %v, want the walk/selection disagreement named", err)
 	}
 }
 
@@ -969,7 +1026,9 @@ func TestStrayDetectionDoesNotFireOnCodeThatQuotesARowName(t *testing.T) {
 		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
 		`// PORTED: tests/unit/a.bats: "two" -> TestTwo`,
 		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
+		`var owners = map[batsPair]int{`,
 		"\t{\"tests/unit/a.bats\", \"two\"}: 22,",
+		`}`,
 	)
 	r := &report{}
 	auditCoverage(r, tiny, c, b, st, oneLane(), noPreDeclared)
@@ -986,7 +1045,10 @@ func TestStrayDetectionFiresOnClaimSyntaxEvenOutsideAComment(t *testing.T) {
 		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
 		`// PORTED: tests/unit/a.bats: "two" -> TestTwo`,
 		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
+		`func f() {`,
 		"\texample := \"PORTED: tests/unit/b.bats: ...\"",
+		"\t_ = example",
+		`}`,
 	)
 	r := &report{}
 	auditCoverage(r, tiny, c, b, st, oneLane(), noPreDeclared)
@@ -1079,14 +1141,11 @@ func TestAuditCoverageCatchesAClaimInABlockCommentContinuation(t *testing.T) {
 // row nothing actually covers. Lexical context is tracked now — and the row it names is reported as
 // a claim the parser cannot read, rather than silently accepted or silently dropped.
 func TestParseInventoryDoesNotCountAClaimInsideARawString(t *testing.T) {
-	claims, _, st, err := parseInventory("internal/x/x_test.go", lines(
+	claims, _, st := invFixture(t, "internal/x/x_test.go", lines(
 		"const fixture = `",
 		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
 		"`",
 	))
-	if err != nil {
-		t.Fatal(err)
-	}
 	if len(claims) != 0 {
 		t.Fatalf("a claim inside a raw string was counted as coverage: %+v", claims)
 	}
@@ -1704,7 +1763,7 @@ func TestSourceWitnessIgnoresDeclarationsThatAreNotCode(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(pkg, "x_test.go"), []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	files := map[string][]string{"mythicalos.ai/ctl/internal/x": {filepath.Join(pkg, "x_test.go")}}
+	files := map[string]pkgFiles{"mythicalos.ai/ctl/internal/x": {Dir: pkg, Test: []string{filepath.Join(pkg, "x_test.go")}}}
 	got, err := collectLaneSource(files)
 	if err != nil {
 		t.Fatal(err)
@@ -1726,7 +1785,7 @@ func TestSourceWitnessIgnoresDeclarationsThatAreNotCode(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(pkg, "broken_test.go"), []byte("package x\nfunc ("), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	files["mythicalos.ai/ctl/internal/x"] = append(files["mythicalos.ai/ctl/internal/x"], filepath.Join(pkg, "broken_test.go"))
+	files["mythicalos.ai/ctl/internal/x"] = pkgFiles{Dir: pkg, Test: append(files["mythicalos.ai/ctl/internal/x"].Test, filepath.Join(pkg, "broken_test.go"))}
 	if _, err := collectLaneSource(files); err == nil {
 		t.Fatal("an unparseable _test.go was skipped rather than refused")
 	} else if !strings.Contains(err.Error(), "broken_test.go") {
@@ -1801,10 +1860,10 @@ func TestTheHarnessEntryPointIsNotATest(t *testing.T) {
 		``,
 	}, "\n"))
 
-	got, err := collectLaneSource(map[string][]string{
-		"mythicalos.ai/ctl/internal/entry":   {entry},
-		"mythicalos.ai/ctl/internal/real":    {real},
-		"mythicalos.ai/ctl/internal/aliased": {aliased},
+	got, err := collectLaneSource(map[string]pkgFiles{
+		"mythicalos.ai/ctl/internal/entry":   {Dir: filepath.Dir(entry), Test: []string{entry}},
+		"mythicalos.ai/ctl/internal/real":    {Dir: filepath.Dir(real), Test: []string{real}},
+		"mythicalos.ai/ctl/internal/aliased": {Dir: filepath.Dir(aliased), Test: []string{aliased}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1827,8 +1886,8 @@ func TestTheHarnessEntryPointIsNotATest(t *testing.T) {
 // this lane compiles, so a file the lane does not build cannot testify about it.
 func TestGoFileListIsTheToolchainsOwnSelection(t *testing.T) {
 	got, err := parseGoFileList([]byte(
-		"mythicalos.ai/ctl/internal/x\t/abs/internal/x\ta_test.go b_test.go\tx_ext_test.go\n" +
-			"mythicalos.ai/ctl/internal/y\t/abs/internal/y\t\t\n"))
+		"mythicalos.ai/ctl/internal/x\t/abs/internal/x\tx.go\ta_test.go b_test.go\tx_ext_test.go\n" +
+			"mythicalos.ai/ctl/internal/y\t/abs/internal/y\t\t\t\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1837,19 +1896,29 @@ func TestGoFileListIsTheToolchainsOwnSelection(t *testing.T) {
 		filepath.Join("/abs/internal/x", "b_test.go"),
 		filepath.Join("/abs/internal/x", "x_ext_test.go"),
 	}
-	if fmt.Sprint(got["mythicalos.ai/ctl/internal/x"]) != fmt.Sprint(want) {
-		t.Fatalf("in-package and external test files: got %v, want %v", got["mythicalos.ai/ctl/internal/x"], want)
+	if fmt.Sprint(got["mythicalos.ai/ctl/internal/x"].Test) != fmt.Sprint(want) {
+		t.Fatalf("in-package and external test files: got %v, want %v", got["mythicalos.ai/ctl/internal/x"].Test, want)
 	}
-	// A package with no test files contributes no entry — it declares nothing and must not be
+	// ORDINARY SOURCE IS CARRIED TOO, and separately. It cannot DECLARE a test, but it is compiled
+	// — so it is a file a claim may legitimately be written in, and the eligibility set needs it.
+	if fmt.Sprint(got["mythicalos.ai/ctl/internal/x"].Go) != fmt.Sprint([]string{filepath.Join("/abs/internal/x", "x.go")}) {
+		t.Fatalf("GoFiles: got %v", got["mythicalos.ai/ctl/internal/x"].Go)
+	}
+	// A package with NO files at all contributes no entry — it declares nothing and must not be
 	// invented as an empty witness that quietly satisfies nothing.
 	if _, ok := got["mythicalos.ai/ctl/internal/y"]; ok {
-		t.Fatalf("a package with no test files produced an entry: %v", got)
+		t.Fatalf("a package with no files produced an entry: %v", got)
 	}
 	// A MALFORMED LINE IS REFUSED, never partially read: silently dropping a package would empty
 	// that lane's source witness for it, and every claim on it would then fail for a reason that
 	// has nothing to do with the port.
 	if _, err := parseGoFileList([]byte("only\ttwo\n")); err == nil {
 		t.Fatal("a line with the wrong field count was accepted")
+	}
+	// FOUR FIELDS WAS THE OLD SHAPE, and it must not be silently accepted as if GoFiles were empty:
+	// that would make every ordinary source file ineligible and every claim in one invisible.
+	if _, err := parseGoFileList([]byte("p\t/abs/p\ta_test.go\tx_ext_test.go\n")); err == nil {
+		t.Fatal("the pre-GoFiles four-field shape was accepted")
 	}
 }
 
@@ -1916,7 +1985,7 @@ func TestOnlyRealGoTestNamesCount(t *testing.T) {
 		t.Fatal(err)
 	}
 	const xpkg = "mythicalos.ai/ctl/internal/x"
-	sf, err := collectLaneSource(map[string][]string{xpkg: {filepath.Join(pkg, "x_test.go")}})
+	sf, err := collectLaneSource(map[string]pkgFiles{xpkg: {Dir: pkg, Test: []string{filepath.Join(pkg, "x_test.go")}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1953,5 +2022,140 @@ func TestParseManifestRefusesARowWithAnExtraField(t *testing.T) {
 				t.Fatalf("err = %v, want a refusal naming the field count", err)
 			}
 		})
+	}
+}
+
+// DEMONSTRATION 2 — a claim in a file the toolchain never compiles was credited.
+//
+// The reviewer moved a real claim into `cmd/mythical-ctl/testdata/broken.go`, preceded by the line
+// `this is not valid Go`, and the audit credited it: `go test -list ./...` ignores testdata, but the
+// inventory scan was a raw filesystem walk that reads bytes. Valid Go behind `//go:build never` did
+// the same. Claim discovery must come from TOOLCHAIN-SELECTED package files.
+func TestEndToEndRefusesAClaimInAFileNoLaneCompiles(t *testing.T) {
+	for _, tc := range []struct{ name, rel, prelude string }{
+		{"under testdata, and not even valid Go", "internal/x/testdata/broken.go", "this is not valid Go\n"},
+		{"valid Go, excluded by a build constraint", "internal/x/never_test.go", "//go:build never\n\npackage x\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tinyLanes(t, 2, 1, 2)
+			root, goList := e2eTree(t)
+			// Take the claim OUT of the file the lane compiles...
+			p := filepath.Join(root, "internal", "x", "x_test.go")
+			b, err := os.ReadFile(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			naLine := `// N/A: tests/unit/a.bats: "two" -- bash-only: a source-time hazard Go does not have` + "\n"
+			cut := strings.Replace(string(b), naLine, "", 1)
+			if cut == string(b) {
+				t.Fatal("fixture did not change — the test is not testing what it says")
+			}
+			if err := os.WriteFile(p, []byte(cut), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			// ...and put it somewhere no lane's file selection can reach.
+			q := filepath.Join(root, filepath.FromSlash(tc.rel))
+			if err := os.MkdirAll(filepath.Dir(q), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(q, []byte(tc.prelude+naLine), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			err, stderr := e2eRunCapturingProblems(t, root, goList)
+			if err == nil {
+				t.Fatal("the audit EXITED CLEAN crediting a claim from a file no lane compiles")
+			}
+			if !strings.Contains(stderr, `"two" is claimed by NO inventory line`) {
+				t.Fatalf("the row was not reported unclaimed; audit said:\n%s", stderr)
+			}
+			// ...and the claim is reported WHERE IT SITS. Leaving only the unclaimed row would name
+			// the wrong file: a reader would go looking in the test file that no longer holds the
+			// claim, not in the one that does.
+			if !strings.Contains(stderr, "in NO audited lane's file selection") {
+				t.Fatalf("the off-lane claim was not reported at its own location; audit said:\n%s", stderr)
+			}
+		})
+	}
+}
+
+// e2eRunCapturingProblems runs the audit and returns its error TOGETHER with everything it printed
+// to stderr, which is where the full problem list goes. The error value carries only the FIRST
+// problem after a sort, and a case that must assert one specific problem cannot depend on the sort
+// order having put it there.
+func e2eRunCapturingProblems(t *testing.T, root, goList string) (error, string) {
+	t.Helper()
+	old := os.Stderr
+	rd, wr, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = wr
+	done := make(chan string, 1)
+	go func() {
+		var b strings.Builder
+		_, _ = io.Copy(&b, rd)
+		done <- b.String()
+	}()
+	runErr := e2eRun(root, goList)
+	_ = wr.Close()
+	os.Stderr = old
+	out := <-done
+	_ = rd.Close()
+	return runErr, out
+}
+
+// A MALFORMED ELIGIBLE FILE REFUSES, and it is a different file class from the one above. This
+// file IS in the toolchain's selection — it compiles — so its claims are the ones that count. A
+// parse error that merely skipped it would be indistinguishable from a file that had no claims,
+// which is the shape of every false green found in this program.
+//
+// It is separate from collectLaneSource's own refusal on purpose: that one only ever parses
+// _test.go files, so a broken ORDINARY source file in the selection would slip past it.
+func TestEndToEndRefusesAMalformedFileTheToolchainSelected(t *testing.T) {
+	tinyLanes(t, 2, 1, 2)
+	root, goList := e2eTree(t)
+	if err := os.WriteFile(filepath.Join(root, "internal", "x", "helper.go"), []byte("package x\nfunc ("), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(goFilesPath(root), lines(
+		"mythicalos.ai/ctl/internal/x\t"+filepath.Join(root, "internal", "x")+"\thelper.go\tx_test.go\t",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := e2eRun(root, goList)
+	if err == nil {
+		t.Fatal("a file the toolchain compiles could not be parsed and the audit read it as having no claims")
+	}
+	if !strings.Contains(err.Error(), "helper.go") || !strings.Contains(err.Error(), "inventory comments") {
+		t.Fatalf("err = %v, want a refusal naming the unparseable selected file", err)
+	}
+}
+
+// A LANE WHOSE COMPILED FILES DECLARE NO TESTS IS REFUSED, and the refusal has to survive the
+// widening that let ORDINARY source into the file selection. The source half of target resolution
+// is built from `_test.go` files only — an ordinary `.go` file can carry a claim but can never
+// DECLARE a test, because the toolchain does not register one from it. So a lane that compiles
+// plenty of source and no test files has an empty source witness, and every PORTED target in it
+// would then rest on the list half alone: exactly the independence the lane pairing removes.
+//
+// Before the widening the emptiness was automatic. Now a package with source but no tests must be
+// deliberately left OUT of the witness, or `len(src) == 0` never trips again and the lane is
+// accepted with nothing to check against.
+func TestALaneWhoseCompiledFilesDeclareNoTestsIsRefused(t *testing.T) {
+	tinyLanes(t, 2, 1, 2)
+	root, goList := e2eTree(t)
+	// The same file, moved from the TestGoFiles column into the GoFiles column: compiled, so
+	// eligible to carry a claim — and unable to declare a test.
+	if err := os.WriteFile(goFilesPath(root), lines(
+		"mythicalos.ai/ctl/internal/x\t"+filepath.Join(root, "internal", "x")+"\tx_test.go\t\t",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := e2eRun(root, goList)
+	if err == nil {
+		t.Fatal("a lane whose compiled files declare no tests was accepted — its half of the pairing checks nothing")
+	}
+	if !strings.Contains(err.Error(), "names no compiled test files") {
+		t.Fatalf("err = %v, want the empty source witness to be what refuses", err)
 	}
 }

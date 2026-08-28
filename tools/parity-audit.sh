@@ -53,7 +53,7 @@ GOFLAGS='' GOENV=off go test -tags acceptance -list '.*' ./... > "$TMP/list-acce
 # TestClaimed, and an active init() that merely PRINTS "TestClaimed". TestGoFiles/XTestGoFiles are
 # the files go itself compiles for THIS lane after applying its tags, so the source half can no
 # longer testify about a file the lane does not build.
-FILE_TMPL='{{.ImportPath}}	{{.Dir}}	{{join .TestGoFiles " "}}	{{join .XTestGoFiles " "}}'
+FILE_TMPL='{{.ImportPath}}	{{.Dir}}	{{join .GoFiles " "}}	{{join .TestGoFiles " "}}	{{join .XTestGoFiles " "}}'
 GOFLAGS='' GOENV=off go list -f "$FILE_TMPL" ./... > "$TMP/files-default.txt"
 GOFLAGS='' GOENV=off go list -tags acceptance -f "$FILE_TMPL" ./... > "$TMP/files-acceptance.txt"
 
