@@ -2311,3 +2311,33 @@ func TestTheWalkSelectionReconciliationCountsFilesNotVisits(t *testing.T) {
 		t.Fatalf("err = %v, want the UNREACHED file named", err)
 	}
 }
+
+// THE ROW NAME ENDS AT THE FIRST CLOSING QUOTE. With a greedy capture the boundary was settled by
+// backtracking against the REST of the line, so a quoted phrase in the commentary offered the
+// engine a second `" -> ` to close on and the row name it produced swallowed the target column.
+// Three claims in this tree carry a quoted phrase in their commentary, so the shape is live.
+//
+// It was never a false green — no @test name in this corpus contains a quote, so the misparse
+// always failed corpus membership — but that is the CORPUS holding the parser up. The boundary is
+// structural now, and this pins it.
+func TestTheRowNameEndsAtTheFirstQuoteNotAtWhicheverOneBacktracksBest(t *testing.T) {
+	claims, bad, _ := invFixture(t, "internal/x/x_test.go", lines(
+		`// PORTED: tests/unit/a.bats: "one" -> TestOne -- the "b" case, and see "c" -> TestTwo`,
+		`// N/A: tests/unit/a.bats: "two" -- bash-only, and the "c" spelling has no Go analogue at all`,
+	))
+	if len(bad) != 0 {
+		t.Fatalf("a claim with a quoted phrase in its commentary was refused: %+v", bad)
+	}
+	if len(claims) != 2 {
+		t.Fatalf("parsed %d claims, want 2: %+v", len(claims), claims)
+	}
+	if claims[0].Pair.Name != "one" {
+		t.Fatalf("the PORTED row name ran past the first closing quote: %q", claims[0].Pair.Name)
+	}
+	if len(claims[0].Targets) != 1 || claims[0].Targets[0].Name != "TestOne" {
+		t.Fatalf("the target column was not the one after the FIRST arrow: %+v", claims[0].Targets)
+	}
+	if claims[1].Pair.Name != "two" {
+		t.Fatalf("the N/A row name ran past the first closing quote: %q", claims[1].Pair.Name)
+	}
+}

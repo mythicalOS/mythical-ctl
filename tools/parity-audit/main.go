@@ -360,8 +360,16 @@ var (
 	// The claim-syntax signal below has no such restriction: PORTED:/N/A: beside a REAL corpus path
 	// is never innocent, wherever it sits.
 	invCommentLine = regexp.MustCompile(`^[ \t]*(//|/\*|\*)`)
-	invPorted      = regexp.MustCompile(`^[ \t]*// PORTED:[ \t]+(\S+):[ \t]+"(.+)"[ \t]+->[ \t]+(.*\S)[ \t]*$`)
-	invNA          = regexp.MustCompile(`^[ \t]*// N/A:[ \t]+(\S+):[ \t]+"(.+)"[ \t]+--[ \t]+(.*\S)[ \t]*$`)
+	// THE ROW NAME ENDS AT THE FIRST CLOSING QUOTE, and that is structural rather than a
+	// consequence of backtracking. With a greedy `(.+)` the boundary was decided by whatever came
+	// LATER on the line: a quoted phrase in the commentary offered the engine a second, further
+	// `" -> ` to close on, and the row name it produced ran through the target column. It always
+	// failed corpus membership afterwards — no @test name in this corpus contains a quote, verified
+	// — so it was loud rather than a false green. But that is a property of the CORPUS holding the
+	// parser up, not of the parser, and a rule that depends on data nobody re-checks is one bad day
+	// from being wrong. A row name cannot contain a quote, so the pattern says so.
+	invPorted = regexp.MustCompile(`^[ \t]*// PORTED:[ \t]+(\S+):[ \t]+"([^"]+)"[ \t]+->[ \t]+(.*\S)[ \t]*$`)
+	invNA     = regexp.MustCompile(`^[ \t]*// N/A:[ \t]+(\S+):[ \t]+"([^"]+)"[ \t]+--[ \t]+(.*\S)[ \t]*$`)
 )
 
 // isGoTestName applies the testing package's OWN rule, in Go rather than in a regular expression
