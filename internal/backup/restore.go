@@ -778,14 +778,27 @@ func Abandon(ctx context.Context, d Deps) error {
 			// removed — reporting success here is worse than a bare failure: an operator
 			// reading "removed" has no reason to look again, while the volume and its record,
 			// about to be destroyed below, are both still live.
-			if rerr := d.RT.VolumeRemove(ctx, v.name); rerr != nil {
+			//
+			// AND "GONE" IS AN ANSWER, NOT A REFUSAL. A partial volume can disappear between the
+			// authority question and this call — an operator, a reaper, another tool. A 404 comes
+			// from a daemon that IS answering and says the object is not there, so the cleanup's
+			// goal has been reached. Reading it as "could not remove" kept the staging ledger for a
+			// volume the runtime says does not exist, and nothing could ever clear it: every later
+			// attempt gets the same 404, leaving the machine permanently unable to finish OR
+			// restart a restore.
+			switch rerr := d.RT.VolumeRemove(ctx, v.name); {
+			case rerr == nil:
+				d.log("  removed partial volume %s.", v.name)
+			case errors.Is(rerr, engine.ErrAbsent):
+				// NOT "removed": absence was established and nothing was removed.
+				d.log("  partial volume %s was already gone.", v.name)
+			default:
 				d.warn("  COULD NOT remove partial volume %s (it may still be in use) — the staging ledger", v.name)
 				d.warn("  is kept: deleting it while this volume is still labelled with our nonce would leave")
 				d.warn("  it as an unrecorded survivor no future restore could prove is its own.")
 				failed = true
 				continue
 			}
-			d.log("  removed partial volume %s.", v.name)
 		case errors.Is(aerr, prov.ErrGone):
 			// AN ANSWER: the volume is not there. Nothing to remove and nothing to preserve.
 		case errors.Is(aerr, prov.ErrCannotAsk):

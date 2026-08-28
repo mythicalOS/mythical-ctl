@@ -1159,3 +1159,95 @@ func TestUninstallRetiresARecordForAContainerTheRuntimeSaysIsGone(t *testing.T) 
 		t.Fatalf("desired state survived for a container the runtime says is gone: %v", err)
 	}
 }
+
+// --- "gone" is an ANSWER, on every removal this verb performs ---------------------------------
+//
+// The container case was fixed first (TestUninstallRetiresARecordForAContainerTheRuntimeSaysIsGone).
+// The same 404 reaches four more DELETE call sites, and every one of them read it as a failed
+// removal — keeping a record for an object the runtime says does not exist, and, on the family
+// paths, holding back the ledger reset forever: every later attempt gets the same 404, so nothing
+// can ever clear it.
+
+// TestPurgeRetiresARecordForAVolumeTheRuntimeSaysIsGone: a 404 from VolumeRemove is the goal
+// reached. Keeping the provenance record for a volume that does not exist leaves a record no run
+// can ever retire, and reports a purge as failed when the volume is gone.
+func TestPurgeRetiresARecordForAVolumeTheRuntimeSaysIsGone(t *testing.T) {
+	r := newRig(t)
+	r.writeProduct("p1")
+	r.mintIdentity()
+	r.mustInstall("p1")
+	vol := "mythical-" + r.ident() + "-p1-state"
+	// THE WINDOW ITSELF: every INSPECT still answers, so prov.Authority proves the volume ours,
+	// and the DELETE alone 404s — an object removed by something else in between. Removing it up
+	// front would make Authority answer ErrGone and the removal would never be attempted, and the
+	// test would pass down a different branch.
+	r.fake.RemoveMissing = vol
+	r.confirm("yes")
+	r.reset()
+
+	if rc := r.uninstall("p1", true); rc != cliio.ExitOK {
+		t.Fatalf("rc = %d, want 0 — a volume the runtime says is gone is not a failed removal\n%s", rc, r.said())
+	}
+	if !r.tombstoned(prov.ClassVolume, vol) {
+		t.Fatal("the record for a volume the runtime says is gone was kept — no later run can ever retire it")
+	}
+	// AND IT MUST NOT CLAIM A REMOVAL IT DID NOT PERFORM. On a 404 the operation established
+	// absence and removed nothing.
+	r.mustNotSay("removed volume " + vol)
+}
+
+// TestFamilyUninstallForgetsAContainerTheRuntimeSaysIsGone: on the family path the cost is larger
+// than a stale record — `preserved` holds back the ledger RESET, so a container the runtime says
+// does not exist wedges the whole uninstall permanently.
+func TestFamilyUninstallForgetsAContainerTheRuntimeSaysIsGone(t *testing.T) {
+	r := newRig(t)
+	r.writeProduct("p1")
+	r.mintIdentity()
+	r.mustInstall("p1")
+	c := r.container("p1")
+	r.fake.RemoveMissing = c
+	r.confirm("yes")
+	r.reset()
+
+	if rc := r.uninstallFamily(false); rc != cliio.ExitOK {
+		t.Fatalf("rc = %d, want 0 — a container the runtime says is gone is not a preserved object\n%s", rc, r.said())
+	}
+	r.mustHaveNoIdentity("the ledger was NOT reset over a container the runtime says does not exist")
+	r.mustNotSay("removed container " + c)
+}
+
+// TestFamilyPurgeCompletesOverAVolumeTheRuntimeSaysIsGone: same wedge, reached through --purge.
+func TestFamilyPurgeCompletesOverAVolumeTheRuntimeSaysIsGone(t *testing.T) {
+	r := newRig(t)
+	r.writeProduct("p1")
+	r.mintIdentity()
+	r.mustInstall("p1")
+	vol := "mythical-" + r.ident() + "-p1-state"
+	r.fake.RemoveMissing = vol
+	r.confirm("yes")
+	r.reset()
+
+	if rc := r.uninstallFamily(true); rc != cliio.ExitOK {
+		t.Fatalf("rc = %d, want 0 — a volume the runtime says is gone is not a preserved object\n%s", rc, r.said())
+	}
+	r.mustHaveNoIdentity("the ledger was NOT reset over a volume the runtime says does not exist")
+	r.mustNotSay("removed volume " + vol)
+}
+
+// TestFamilyUninstallCompletesOverANetworkTheRuntimeSaysIsGone: and the third class.
+func TestFamilyUninstallCompletesOverANetworkTheRuntimeSaysIsGone(t *testing.T) {
+	r := newRig(t)
+	r.writeProduct("p1")
+	r.mintIdentity()
+	r.mustInstall("p1")
+	net := r.networkName()
+	r.fake.RemoveMissing = net
+	r.confirm("yes")
+	r.reset()
+
+	if rc := r.uninstallFamily(false); rc != cliio.ExitOK {
+		t.Fatalf("rc = %d, want 0 — a network the runtime says is gone is not a preserved object\n%s", rc, r.said())
+	}
+	r.mustHaveNoIdentity("the ledger was NOT reset over a network the runtime says does not exist")
+	r.mustNotSay("removed network " + net)
+}

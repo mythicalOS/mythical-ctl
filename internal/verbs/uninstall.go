@@ -335,13 +335,28 @@ func (s *session) purgeVolume(ctx context.Context, name, role, class string) (bo
 	aerr := prov.Authority(ctx, s.l, prov.Engine(d.Engine), prov.ClassVolume, name)
 	switch {
 	case aerr == nil:
-		if rerr := s.rt.VolumeRemove(ctx, name); rerr != nil {
+		// AN ErrAbsent REMOVAL IS THE GOAL REACHED, NOT A FAILURE — the same three-way answer
+		// removeProductContainer already draws from this call, and the same fact: a 404 comes from
+		// a daemon that IS answering and says the object is gone. The volume vanished between the
+		// authority question and this call, which is a race with an operator or another tool.
+		// Reading it as "could not remove" kept live provenance for a volume the runtime says does
+		// not exist — a record nothing can ever retire, because every later attempt gets the same
+		// 404 — and reported a purge as failed when its goal had been reached.
+		rerr := s.rt.VolumeRemove(ctx, name)
+		gone := errors.Is(rerr, engine.ErrAbsent)
+		if rerr != nil && !gone {
 			d.warnErr(rerr)
 			d.warn("  could NOT remove volume %s — its record is kept, so it stays removable later.", name)
 			return false, nil
 		}
 		if err := prov.Tombstone(s.l, prov.ClassVolume, name); err != nil {
 			return false, err
+		}
+		if gone {
+			// NOT "removed": on a 404 this call established absence and removed nothing, and an
+			// operator reading "removed" is being told this verb did something it did not do.
+			d.say("uninstall", "  volume %s was already gone; its record is tombstoned.", name)
+			return true, nil
 		}
 		d.say("uninstall", "  removed volume %s (role %s, %s).", name, role, class)
 		return true, nil
@@ -566,13 +581,21 @@ func (s *session) familyContainers(ctx context.Context, objs [][]ledger.Field) (
 		switch {
 		case aerr == nil:
 			_ = s.rt.ContainerStop(ctx, name)
-			if rerr := s.rt.ContainerRemove(ctx, name); rerr != nil {
+			// "GONE" IS AN ANSWER HERE TOO, and on this path it costs more than a stale record:
+			// `preserved` holds back the ledger RESET, so a container the runtime says does not
+			// exist wedged the whole family uninstall permanently — every re-run gets the same 404.
+			switch rerr := s.rt.ContainerRemove(ctx, name); {
+			case rerr == nil:
+				d.say("uninstall", "  removed container %s.", name)
+			case errors.Is(rerr, engine.ErrAbsent):
+				// NOT "removed": absence was established, nothing was removed.
+				d.say("uninstall", "  container %s was already gone.", name)
+			default:
 				d.warnErr(rerr)
 				d.warn("  could NOT remove container %s — it is left alone and its record is kept.", name)
 				preserved = true
 				continue
 			}
-			d.say("uninstall", "  removed container %s.", name)
 		case errors.Is(aerr, prov.ErrGone):
 			// Already gone: nothing to preserve.
 		default:
@@ -619,13 +642,18 @@ func (s *session) familyVolumes(ctx context.Context, objs [][]ledger.Field, purg
 		aerr := prov.Authority(ctx, s.l, prov.Engine(d.Engine), prov.ClassVolume, name)
 		switch {
 		case aerr == nil:
-			if rerr := s.rt.VolumeRemove(ctx, name); rerr != nil {
+			switch rerr := s.rt.VolumeRemove(ctx, name); {
+			case rerr == nil:
+				d.say("uninstall", "  removed volume %s (%s).", name, volClass(rec))
+			case errors.Is(rerr, engine.ErrAbsent):
+				// The goal reached, not a preserved object — see familyContainers.
+				d.say("uninstall", "  volume %s (%s) was already gone.", name, volClass(rec))
+			default:
 				d.warnErr(rerr)
 				d.warn("  could NOT remove volume %s — its record is kept.", name)
 				preserved = true
 				continue
 			}
-			d.say("uninstall", "  removed volume %s (%s).", name, volClass(rec))
 		case errors.Is(aerr, prov.ErrGone):
 			// Already gone: nothing to remove, nothing to preserve.
 		default:
@@ -658,13 +686,18 @@ func (s *session) familyNetworks(ctx context.Context, objs [][]ledger.Field) boo
 		aerr := prov.Authority(ctx, s.l, prov.Engine(d.Engine), prov.ClassNetwork, name)
 		switch {
 		case aerr == nil:
-			if rerr := s.rt.NetworkRemove(ctx, name); rerr != nil {
+			switch rerr := s.rt.NetworkRemove(ctx, name); {
+			case rerr == nil:
+				d.say("uninstall", "  removed network %s.", name)
+			case errors.Is(rerr, engine.ErrAbsent):
+				// The goal reached, not a preserved object — see familyContainers.
+				d.say("uninstall", "  network %s was already gone.", name)
+			default:
 				d.warnErr(rerr)
 				d.warn("  could NOT remove network %s — its record is kept.", name)
 				preserved = true
 				continue
 			}
-			d.say("uninstall", "  removed network %s.", name)
 		case errors.Is(aerr, prov.ErrGone):
 			// Already gone.
 		default:

@@ -1903,3 +1903,31 @@ func TestAbandonKeepsTheStagingLedgerWhenOwnershipCannotBeEstablished(t *testing
 		t.Fatalf("a volume of unestablished ownership was removed: %v", lerr)
 	}
 }
+
+// TestAbandonCompletesOverAVolumeTheRuntimeSaysIsGone: a 404 from the removal is the goal reached,
+// not a refusal.
+//
+// A partial volume can disappear between the authority question and the DELETE — an operator, a
+// reaper, another tool. Reading that 404 as "could not remove" kept the staging ledger for a volume
+// the runtime had just said does not exist, and nothing could ever clear it: every later attempt
+// gets the same 404, so the machine is left permanently unable to finish OR restart a restore.
+func TestAbandonCompletesOverAVolumeTheRuntimeSaysIsGone(t *testing.T) {
+	r := interrupted(t)
+	victim := r.vols[0].name
+	// THE WINDOW ITSELF, not the state after it: every INSPECT still answers (so authority proves
+	// the volume ours and the removal IS attempted) and the DELETE alone 404s. Removing the volume
+	// up front would make authority answer ErrGone and the removal would never run — a different
+	// branch entirely.
+	r.fake.RemoveMissing = victim
+
+	if err := Abandon(context.Background(), r.deps()); err != nil {
+		t.Fatalf("a volume the runtime says is gone was reported as a failed removal: %v\n%s", err, r.stderr())
+	}
+	if exists(stagingPath(r.home)) {
+		t.Fatal("the staging ledger was kept for a volume the runtime says does not exist — every later " +
+			"attempt gets the same answer, so nothing can ever clear it")
+	}
+	// AND NO REMOVAL IS CLAIMED THAT DID NOT HAPPEN. On a 404 the operation established absence
+	// and removed nothing.
+	mustNotContain(t, r.stdout()+r.stderr(), "removed partial volume "+victim, "the report")
+}

@@ -151,11 +151,12 @@ type fakeNetwork struct {
 //   - InspectMissing makes inspects of ONE named object 404 while everything else answers —
 //     an object that vanished, which is a fact a later run may act on; with
 //     InspectMissingAfter, it survives its first N inspections first.
-//   - RemoveMissing makes the container DELETE for ONE named object 404 while every INSPECT of it
-//     still answers. That is the one window InspectMissing cannot reach: an object a verb has
-//     just proved is its own, removed by something else before the verb gets to the removal. The
-//     daemon answers 404 there, and a caller that reads that as "the removal failed" keeps a
-//     record for an object the runtime says does not exist.
+//   - RemoveMissing makes the DELETE for ONE named object 404 — container, volume or network,
+//     whichever class carries that name — while every INSPECT of it still answers. That is the one
+//     window InspectMissing cannot reach: an object a verb has just proved is its own, removed by
+//     something else before the verb gets to the removal. The daemon answers 404 there, and a
+//     caller that reads that as "the removal failed" keeps a record for an object the runtime says
+//     does not exist.
 type Fake struct {
 	mu   sync.Mutex
 	cond *sync.Cond // signals helper completion to blocked waiters (waitContainer)
@@ -1155,7 +1156,7 @@ func (f *Fake) inspectVolume(w http.ResponseWriter, seg string) {
 func (f *Fake) removeVolume(w http.ResponseWriter, seg string) {
 	name := pathName(seg)
 	v, exists := f.volumes[name]
-	if !exists {
+	if !exists || (f.RemoveMissing != "" && name == f.RemoveMissing) {
 		fail(w, 404, "no such volume: %s", name)
 		return
 	}
@@ -1266,7 +1267,7 @@ func (f *Fake) inspectNetwork(w http.ResponseWriter, seg string) {
 func (f *Fake) removeNetwork(w http.ResponseWriter, seg string) {
 	ref := pathName(seg)
 	n := f.findNetwork(ref)
-	if n == nil {
+	if n == nil || (f.RemoveMissing != "" && ref == f.RemoveMissing) {
 		fail(w, 404, "network %s not found", ref)
 		return
 	}
