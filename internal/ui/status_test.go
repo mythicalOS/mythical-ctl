@@ -1777,10 +1777,10 @@ func TestACancelledFIRSTReportIsStillPublished(t *testing.T) {
 // handled. Synchronous, in-order command execution is exactly the guarantee this test needs and
 // the real runtime does not give; the fake gives it. What is under test is the runner's own
 // arbitration, and the fake is the seam that lets that arbitration be reached with everything
-// pending at once. The report is then held on its own context, which runStatus
-// cancels one instruction AFTER it bars the launch gate and closes uiDone — so when the runner
-// finally asks whether to run again, the refresh and both teardown signals are all waiting for it.
-// That is the arrangement the guard exists for, now reached by construction instead of by luck.
+// pending at once. The report is then held on its own context, which runStatus cancels one
+// instruction AFTER it bars the launch gate and closes uiDone — so when the runner finally asks
+// whether to run again, the refresh and both teardown signals are all waiting for it. That is the
+// arrangement the guard exists for, now reached by construction instead of by luck.
 //
 // IT REPEATS BECAUSE THE BRANCH IS PICKED AT RANDOM, not because one attempt is unreliable. With
 // all three of the runner's channels ready a correct implementation returns down whichever one it
