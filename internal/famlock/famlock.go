@@ -49,8 +49,23 @@ type held struct {
 func (h *held) sealedFamlockToken() *held { return h }
 
 // ErrBusy wraps the holder's pid (best-effort, diagnostic only) when the lock is held
-// elsewhere.
+// elsewhere. It is an ANSWER: the question was asked and the answer is "somebody else has it".
 var ErrBusy = errors.New("another mythical-ctl operation is in progress")
+
+// ErrLockFailed is the REFUSAL, and it is deliberately a different error from ErrBusy.
+//
+// AN ANSWER AND AN INABILITY TO ANSWER MUST NOT WEAR THE SAME WORDS — the invariant this whole
+// tree is built on. `flock` fails for reasons that have nothing to do with contention: ENOTSUP or
+// EOPNOTSUPP on a filesystem that does not implement it (some network mounts), ENOLCK when the
+// system's lock table is exhausted, EBADF, EINTR. Every one of those used to be reported as
+// "another operation is in progress ... try again when it finishes", which is FALSE and, worse,
+// actionable in the wrong direction: no other operation exists, so the operator retries for as
+// long as they are willing to. A stale `pid=` body left in the lock file from an earlier run made
+// the false answer more convincing still, by naming a process to go and wait for.
+//
+// Both refuse, and neither proceeds — the safety outcome is identical, which is exactly why this
+// went unnoticed. What differs is what the operator is told to DO about it.
+var ErrLockFailed = errors.New("the family lock could not be acquired")
 
 // Acquire takes the family lock for home. It creates .state/ if missing — on a fresh machine
 // no verb has made the layout yet, and mis-reporting a missing directory as lock contention
@@ -90,19 +105,36 @@ func Acquire(home string) (Held, error) {
 		f.Close()
 		return nil, fmt.Errorf("lock: %q has %d links — refusing a hardlinked lock target", path, sys.Nlink)
 	}
-	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		holder := readHolderPID(f)
-		f.Close()
-		if holder != "" {
-			return nil, fmt.Errorf("%w (pid %s) — try again when it finishes", ErrBusy, holder)
+	if err := flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		// CONTENTION IS EXACTLY TWO ERRNOS, and nothing else may borrow their message.
+		// LOCK_NB reports an already-held lock as EWOULDBLOCK, which is EAGAIN on every platform
+		// this builds for; both are named because the pair is the contract, not the numeric
+		// identity. The pid is read ONLY on this branch: it is a hint about a holder, and there is
+		// no holder to hint at when the call never got as far as asking.
+		if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) {
+			holder := readHolderPID(f)
+			f.Close()
+			if holder != "" {
+				return nil, fmt.Errorf("%w (pid %s) — try again when it finishes", ErrBusy, holder)
+			}
+			return nil, fmt.Errorf("%w — try again when it finishes", ErrBusy)
 		}
-		return nil, fmt.Errorf("%w — try again when it finishes", ErrBusy)
+		f.Close()
+		return nil, fmt.Errorf("%w: locking %q failed (%v). This does NOT mean another operation "+
+			"holds it — the lock could not be taken at all, so retrying will not help by itself. "+
+			"Check what kind of filesystem %s is on; some do not implement file locking", ErrLockFailed, path, err, home)
 	}
 	// Ours. Stamp the diagnostic body (never authorization — the flock is that).
 	_ = f.Truncate(0)
 	_, _ = f.WriteAt([]byte(fmt.Sprintf("pid=%d\n", os.Getpid())), 0)
 	return &held{home: home, f: f}, nil
 }
+
+// flock is unix.Flock, indirected ONLY so a test can produce the operational failures that no
+// portable test can provoke for real — a filesystem without lock support, or an exhausted system
+// lock table. Nothing in the package reassigns it; the seam exists because the alternative is an
+// unexercised branch in the one place that decides whether the operator is told to wait.
+var flock = unix.Flock
 
 func readHolderPID(f *os.File) string {
 	buf := make([]byte, 64)

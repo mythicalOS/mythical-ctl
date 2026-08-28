@@ -73,8 +73,9 @@ what each command does about it.
 
 ## The family lock could not be taken
 
-(The message says another operation is in progress. Usually that is exactly what happened — read on
-for the case where it is not.)
+(There are two different messages here, and which one you got matters. "Another operation is in
+progress" means the lock was asked for and somebody else has it. "The family lock could not be
+acquired" means the question could not be asked at all — read on.)
 
 **What it means.** Every mutating command takes one family-scoped lock — `~/.mythical/.state/lock` —
 so that two `mythical-ctl` processes cannot interleave a read-modify-write of the ledger or of
@@ -91,12 +92,16 @@ a diagnostic; it is neither authoritative nor guaranteed fresh, so a contender c
 by an earlier run. A pid that is not running does **not** prove the lock is free, and a pid that IS
 running is not necessarily the holder.
 
-*"In progress" is what every locking failure reports.* The refusal does not carry a reason: the same
-message covers another `mythical-ctl` holding the lock, some unrelated program holding a lock on
-that same file, a filesystem that does not implement `flock` (some network mounts), and a system out
-of lock records. The CLI does not distinguish them, because the answer to all of them is the same:
-do not proceed. So a refusal that repeats with no other `mythical-ctl` running tells you the lock
-could not be taken, and nothing more about why.
+*"In progress" means the lock is HELD, and it is now said only then.* An answer and an inability to
+get one are separate messages, because they call for opposite actions from you. "Another operation
+is in progress" covers another `mythical-ctl` holding the lock and any unrelated program holding a
+lock on that same file — somebody has it, so waiting is the right move. Everything else — a
+filesystem that does not implement `flock` (some network mounts), a system out of lock records, and
+any other failure of the locking call — reports **"the family lock could not be acquired"** and says
+in as many words that this does *not* mean another operation holds it. Waiting will not clear that
+one; see the last paragraph for what to look at instead. No process id is offered on that message
+either, because the lock file's `pid=` line is a leftover from whoever last held it and naming it
+would point you at a process that has nothing to do with the failure.
 
 **There is no stale lock to clear, ever — and deleting the file is worse than useless.** The lock is
 a kernel `flock(2)`, and a lock held by a process that dies is released by the kernel along with
@@ -118,10 +123,12 @@ there is not the installer's lock file at all: with no `mythical-ctl` running, r
 (it holds nothing you need) and re-run. Work out how it got there — nothing this CLI does creates
 a symlink or a second hard link at that path.
 
-**Next command.** The one you were running, once the other operation finishes. If it never
-finishes — nothing else is running and the refusal repeats — investigate before you touch anything:
-find out what holds `~/.mythical/.state/lock` (`lsof` names it), and what kind of filesystem
-`~/.mythical` is on. Deleting the lock file is not one of the options; see above for why.
+**Next command.** If the message says another operation is in progress: the one you were running,
+once that operation finishes. If it never finishes — nothing else is running and the refusal
+repeats — find out what holds `~/.mythical/.state/lock` (`lsof` names it). If the message says the
+lock could not be acquired, retrying achieves nothing on its own: check what kind of filesystem
+`~/.mythical` is on, since some network mounts do not implement locking, and move the installation
+to one that does. Deleting the lock file is not one of the options in either case; see above for why.
 
 ## A retained network intent
 

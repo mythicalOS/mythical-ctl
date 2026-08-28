@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // Inventory — tests/unit/lock.bats. The ln/recovery-gate MECHANISM is replaced by flock(2)
@@ -225,6 +227,97 @@ func TestLockFileContentGrantsNothing(t *testing.T) {
 	}
 	if _, err := Acquire(home); !errors.Is(err, ErrBusy) {
 		t.Fatalf("garbage in the lock file granted a second acquire: %v", err)
+	}
+}
+
+// AN ANSWER AND AN INABILITY TO ANSWER MUST NOT WEAR THE SAME WORDS. "Another operation is in
+// progress" is a claim about the world: somebody else holds the lock, so waiting is the right
+// move. A `flock` that fails because the filesystem does not implement locking, or because the
+// system's lock table is exhausted, is not that claim — nobody holds anything and waiting is
+// futile. Reporting the second as the first is a silent wrong answer that is ACTIONABLE IN THE
+// WRONG DIRECTION: the operator is told to retry, and no amount of retrying will ever work.
+//
+// A stale `pid=` body makes it worse, and that is asserted here too: the lock file survives every
+// run, so a pid from an earlier operation is sitting in it. Reading it on this branch would name a
+// process for the operator to go and wait for, dressing a refusal the CLI could not even ask about
+// in the most convincing evidence it has.
+//
+// The seam exists because neither errno can be provoked portably: no temporary directory in a test
+// is on a filesystem without lock support, and exhausting the system lock table is not something a
+// unit test may do to the machine it runs on.
+func TestOperationalFlockFailuresAreNotReportedAsContention(t *testing.T) {
+	home := t.TempDir()
+	// A pid body from an earlier run, exactly as one would really be left behind.
+	if err := os.MkdirAll(filepath.Join(home, ".state"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".state", "lock"), []byte("pid=4242\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	real := flock
+	defer func() { flock = real }()
+
+	for _, tc := range []struct {
+		name string
+		errn error
+	}{
+		{"a filesystem that does not implement flock", unix.ENOTSUP},
+		{"a filesystem that reports the other spelling", unix.EOPNOTSUPP},
+		{"an exhausted system lock table", unix.ENOLCK},
+		{"a bad descriptor", unix.EBADF},
+		{"an interrupted call", unix.EINTR},
+	} {
+		flock = func(int, int) error { return tc.errn }
+		h, err := Acquire(home)
+		if h != nil {
+			t.Fatalf("%s: a token was minted without the lock", tc.name)
+		}
+		if err == nil {
+			t.Fatalf("%s: the failure was swallowed", tc.name)
+		}
+		if errors.Is(err, ErrBusy) {
+			t.Fatalf("%s: reported as contention — %q. Nothing holds the lock; the question could not be asked, and the operator is being told to wait for an operation that does not exist", tc.name, err)
+		}
+		if !errors.Is(err, ErrLockFailed) {
+			t.Fatalf("%s: not classified as an inability to acquire: %v", tc.name, err)
+		}
+		if !strings.Contains(err.Error(), "does NOT mean another operation holds it") {
+			t.Fatalf("%s: the message does not say the lock could not be taken at all: %v", tc.name, err)
+		}
+		// The stale pid must not be recruited as evidence for an answer that was never obtained.
+		if strings.Contains(err.Error(), "4242") {
+			t.Fatalf("%s: a stale pid body was reported as the holder: %v", tc.name, err)
+		}
+		if strings.Contains(err.Error(), "try again when it finishes") {
+			t.Fatalf("%s: told the operator to wait: %v", tc.name, err)
+		}
+	}
+
+	// CONTENTION STILL READS AS CONTENTION. Both spellings of the "would block" errno map to
+	// ErrBusy, and nothing else does — a fix that made every failure a refusal would be the same
+	// defect pointing the other way, and just as quiet.
+	for _, errn := range []error{unix.EWOULDBLOCK, unix.EAGAIN} {
+		flock = func(int, int) error { return errn }
+		if _, err := Acquire(home); !errors.Is(err, ErrBusy) {
+			t.Fatalf("a would-block from flock was not reported as contention: %v", err)
+		} else if errors.Is(err, ErrLockFailed) {
+			t.Fatalf("contention was also classified as an inability to acquire: %v", err)
+		} else if !strings.Contains(err.Error(), "4242") {
+			t.Fatalf("the holder pid hint was dropped from a real contention refusal: %v", err)
+		}
+	}
+
+	// And the seam is not load-bearing in production: with the real flock restored, a genuinely
+	// held lock still reports contention through the same path.
+	flock = real
+	held, err := Acquire(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer Release(held)
+	if _, err := Acquire(home); !errors.Is(err, ErrBusy) || errors.Is(err, ErrLockFailed) {
+		t.Fatalf("a really-held lock was not reported as contention: %v", err)
 	}
 }
 
