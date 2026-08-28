@@ -479,6 +479,23 @@ func parseOpts(args []string, stderr io.Writer) (opts, int) {
 				return "", false
 			}
 			i++
+			// AN EMPTY VALUE IS A USAGE ERROR, NOT AN UNSET OPTION. Every "applies to X only"
+			// refusal in this dispatcher — and opts.misplaced, which is most of them — asks
+			// whether a string option is non-empty, because that is what the frozen dispatcher's
+			// `[ -z "$image" ]` asks. So `--image ''` makes the option INVISIBLE to the whole
+			// matrix: measured, `state repair --image ''` ran the repair, `status --image ''`
+			// printed the report and exited 0, and `install p1 --to-bind ''` installed — each
+			// with an option the operator wrote and the verb never honoured, which is the exact
+			// thing the matrix exists to prevent. The same holds for the document locators, where
+			// an empty value silently selects the default path instead of the one written.
+			//
+			// Refusing HERE fixes every one of them at once, and it cannot be bypassed the way a
+			// per-verb check can: nothing downstream has to remember. It is a STATED DIVERGENCE
+			// (the reference accepted an empty value and ignored it) that only ever refuses more.
+			if args[i] == "" {
+				fmt.Fprintf(stderr, "mythical-ctl: option %s was given an empty value\n", a)
+				return "", false
+			}
 			return args[i], true
 		}
 		switch a {

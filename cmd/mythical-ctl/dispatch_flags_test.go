@@ -262,3 +262,81 @@ func TestBuiltBinaryDistinguishesUsageFromFailure(t *testing.T) {
 		t.Fatalf("a well-formed verb that cannot proceed exits %d, want 1 (operational failure)\n%s", rc, said)
 	}
 }
+
+// --- an empty value does not make an option invisible ----------------------------------------
+//
+// EVERY REFUSAL IN THIS DISPATCHER ASKS `!= ""`, so an option given an empty value was not
+// merely accepted — it was NOT THERE as far as the matrix could tell. Measured before the fix:
+//
+//	state repair --image ''      rc=1   the repair RAN
+//	net rebind --to-bind ''      rc=1   the rebind was ENTERED
+//	status --image ''            rc=0   the report was PRINTED
+//	install p1 --to-bind ''      rc=1   the install was ENTERED
+//
+// This is not a hole in one verb's matrix; it is a hole under all of them, including the two
+// this change added. It is closed at the parser, which is the only place nothing downstream has
+// to remember.
+
+// valueTaking is every option that consumes the next argument.
+var valueTaking = []string{"--index", "--policy", "--manifest-dir", "--image", "--to-bind"}
+
+func TestEmptyOptionValueIsAUsageError(t *testing.T) {
+	r := newCLIRig(t).confirming()
+	r.writeProduct("p1")
+	// One invocation per (verb, option): the point is that NO verb's matrix can be slipped past,
+	// so the assertion is made against the whole verb surface rather than the two new arms.
+	verbs := [][]string{
+		{"state", "repair", "insta"},
+		{"state", "abandon-intent", "network", "net1"},
+		{"net", "rebind"},
+		{"status"},
+		{"install", "p1"},
+		{"uninstall", "p1"},
+		{"backup", t.TempDir()},
+		{"restore", t.TempDir()},
+		{"migrate-storage", "p1", "state"},
+	}
+	for _, verb := range verbs {
+		for _, opt := range valueTaking {
+			args := append(append([]string{}, verb...), opt, "")
+			t.Run(strings.Join(args, "_"), func(t *testing.T) {
+				if rc := r.run(args...); rc != cliio.ExitUsage {
+					t.Fatalf("rc = %d, want %d (usage) — an empty value made %s invisible to the matrix\n%s",
+						rc, cliio.ExitUsage, opt, r.said())
+				}
+				if !strings.Contains(r.said(), "empty value") {
+					t.Fatalf("exit 2 for some other reason than the empty value:\n%s", r.said())
+				}
+			})
+		}
+	}
+	// The control: the SAME options with a real value are not usage errors on a verb that takes
+	// them. Without it, a parser that refused every value-taking option outright would pass.
+	for _, opt := range []string{"--index", "--policy", "--manifest-dir"} {
+		if rc := r.run("status", opt, filepath.Join(r.home, "index")); rc == cliio.ExitUsage {
+			t.Fatalf("status %s <path> is a usage error, so the assertions above prove nothing:\n%s", opt, r.said())
+		}
+	}
+}
+
+// TestBuiltBinaryRefusesAnEmptyOptionValue re-measures the same contract as a PROCESS EXIT
+// STATUS, for the reason given above runBuilt: 2 and 1 are a contract callers depend on, and
+// before the fix these invocations returned 1 (the verb ran and failed) rather than 2.
+func TestBuiltBinaryRefusesAnEmptyOptionValue(t *testing.T) {
+	r := newCLIRig(t)
+	for _, args := range [][]string{
+		{"state", "repair", "--image", ""},
+		{"net", "rebind", "--to-bind", ""},
+		{"status", "--image", ""},
+	} {
+		t.Run(strings.Join(args, "_"), func(t *testing.T) {
+			rc, said := runBuilt(t, r, args...)
+			if rc != 2 {
+				t.Fatalf("exit status %d, want 2 — the empty value made the option invisible\n%s", rc, said)
+			}
+			if !strings.Contains(said, "empty value") {
+				t.Fatalf("exit 2 for some other reason than the empty value:\n%s", said)
+			}
+		})
+	}
+}

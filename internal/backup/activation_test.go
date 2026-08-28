@@ -6,7 +6,9 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -180,9 +182,57 @@ func TestActivateRefusesANonRegularLiveLedger(t *testing.T) {
 	}
 }
 
-// TestActivateRenameIsNoReplace exercises the primitive itself, which is the only place the
-// TOCTOU is actually closed: the check above narrows the window, the rename is what makes the
-// window unable to destroy anything.
+// TestCurrentStateRefusesAPathItCannotExamine covers the FOURTH fact `[ -f ]` folds into one
+// false, and the only one the fixtures above cannot reach: every one of them makes Lstat
+// SUCCEED. A path whose parent cannot be searched makes it FAIL with something that is not
+// ENOENT — and "I could not look" read as "there is nothing here" is the same defect at its
+// purest, because a transient EIO or a permission change becomes a fresh restore that creates
+// and fills volumes on a machine nobody established was empty.
+//
+// The parent is made unsearchable rather than the file unreadable: Lstat asks about the entry,
+// not its contents, so only the DIRECTORY's execute bit can stop it.
+//
+// ONE CALL SITE, DELIBERATELY. Both ledger paths live in the same directory, so nothing can make
+// the staging path unexaminable while leaving the active one a clean ENOENT — a "staging" case
+// here would refuse at the ACTIVE path and assert nothing about the staging one, which is worse
+// than no case at all. The branch is covered once, in the one implementation both call sites
+// share; that the staging call site really is that implementation is a separate fact, and it is
+// what TestCurrentStateRefusesANonRegularStagingLedger holds.
+func TestCurrentStateRefusesAPathItCannotExamine(t *testing.T) {
+	r := newRig(t)
+	r.dropLedger()
+	stateDir := filepath.Dir(livePath(r.home))
+	if err := os.Chmod(stateDir, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	// RESTORED WHATEVER HAPPENS: t.TempDir cannot remove a directory it cannot search, and
+	// neither can the family lock's own release.
+	t.Cleanup(func() { _ = os.Chmod(stateDir, 0o700) })
+	// The premise is MEASURED, not assumed. A user who bypasses the mode bit (root, or a
+	// filesystem that does not enforce it) leaves Lstat succeeding, and the assertion below would
+	// then be about a different branch entirely — a test that passes for the wrong reason.
+	if _, err := os.Lstat(livePath(r.home)); err == nil || errors.Is(err, fs.ErrNotExist) {
+		t.Skipf("this user can still examine %s (%v) — the unreadable-path branch is not reachable here",
+			livePath(r.home), err)
+	}
+	r.reset()
+
+	s, err := CurrentState(r.deps())
+	if err == nil {
+		t.Fatalf("a path that could not be examined was classified %q — a failed question was read as an answer", s)
+	}
+	if s == StateNone {
+		t.Fatalf("a path that could not be examined answered %q", s)
+	}
+	mustContain(t, r.stderr(), "could not be examined", "the refusal")
+	mustContain(t, r.stderr(), "absence cannot be established", "the reason")
+}
+
+// TestActivateRenameIsNoReplace exercises the primitive itself. It proves NO-REPLACE and ONLY
+// no-replace: every destination here is already occupied when activateRename is called, so an
+// implementation that did Lstat-then-os.Rename would satisfy every assertion below while still
+// destroying a ledger that appeared between those two calls. ATOMICITY is a separate property
+// and is proved separately, by TestActivateRenameIsAtomicAgainstAConcurrentWriter.
 func TestActivateRenameIsNoReplace(t *testing.T) {
 	for _, tc := range append(nonRegular, struct {
 		name string
@@ -371,5 +421,84 @@ func TestActivateReportsWhatIsAtTheOccupiedName(t *testing.T) {
 	mustContain(t, r.stderr(), "a named pipe", "what is at the name")
 	if strings.Count(r.stderr(), livePath(r.home)) == 0 {
 		t.Fatalf("the refusal does not name the path:\n%s", r.stderr())
+	}
+}
+
+// TestActivateRenameIsAtomicAgainstAConcurrentWriter proves the property the test above cannot:
+// that the destination check and the move are ONE step, with no window between them.
+//
+// WHY A RACE AND NOT A HOOK. The defect being guarded against is a check whose answer stops
+// being true before the move acts on it. Any single-threaded test occupies the destination
+// before the call or leaves it free throughout, and both are satisfied by a check-then-rename —
+// which is exactly the implementation this change replaced. The only thing that separates the
+// two is another writer arriving inside the window, so this test puts one there.
+//
+// N racers each hold their OWN source file and all aim at ONE destination. The contract admits
+// exactly one outcome: precisely one succeeds, every other gets an exists refusal, and the
+// destination holds that one winner's bytes — never a mixture, never a later racer's file
+// written over an earlier racer's.
+//
+// IT CANNOT BE FLAKY-RED. With a genuine no-replace rename the kernel serializes the racers and
+// the assertion holds on every round by construction. A check-then-rename fails it as soon as
+// two racers observe the destination free, which over this many rounds is not a close call — a
+// round in which no interleaving happens is a round that merely fails to catch the defect, never
+// one that reports a defect that is not there.
+func TestActivateRenameIsAtomicAgainstAConcurrentWriter(t *testing.T) {
+	const racers, rounds = 8, 60
+	for round := 0; round < rounds; round++ {
+		dir := t.TempDir()
+		to := filepath.Join(dir, "live")
+		var wg sync.WaitGroup
+		results := make([]error, racers)
+		start := make(chan struct{})
+		for i := 0; i < racers; i++ {
+			from := filepath.Join(dir, "staging-"+strconv.Itoa(i))
+			if err := os.WriteFile(from, []byte("racer-"+strconv.Itoa(i)+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			wg.Add(1)
+			go func(i int, from string) {
+				defer wg.Done()
+				<-start
+				results[i] = activateRename(from, to)
+			}(i, from)
+		}
+		close(start)
+		wg.Wait()
+
+		won := -1
+		for i, err := range results {
+			switch {
+			case err == nil:
+				if won >= 0 {
+					t.Fatalf("round %d: racers %d and %d BOTH activated onto one destination — the "+
+						"destination check and the move are not one step", round, won, i)
+				}
+				won = i
+			case errors.Is(err, fs.ErrExist):
+			default:
+				t.Fatalf("round %d: racer %d failed for a reason other than an occupied destination: %v", round, i, err)
+			}
+		}
+		if won < 0 {
+			t.Fatalf("round %d: every racer was refused; nothing was activated", round)
+		}
+		body, rerr := os.ReadFile(to)
+		if rerr != nil {
+			t.Fatalf("round %d: %v", round, rerr)
+		}
+		if want := "racer-" + strconv.Itoa(won) + "\n"; string(body) != want {
+			t.Fatalf("round %d: the destination holds %q but racer %d is the one that reported success — "+
+				"a later racer overwrote the winner", round, string(body), won)
+		}
+		// And every loser still has its own source: a refused activation consumes nothing.
+		for i, err := range results {
+			if err == nil {
+				continue
+			}
+			if !regularFile(filepath.Join(dir, "staging-"+strconv.Itoa(i))) {
+				t.Fatalf("round %d: racer %d was refused but its source is gone", round, i)
+			}
+		}
 	}
 }
