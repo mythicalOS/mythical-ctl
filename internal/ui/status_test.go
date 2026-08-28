@@ -1723,35 +1723,48 @@ func TestACancelledFIRSTReportIsStillPublished(t *testing.T) {
 	}
 }
 
-// TestRunStatusDoesNotRunTheReportAfterTheInterfaceIsGone. A refresh already QUEUED when the
-// dashboard closes must not start a run with nothing to show it on.
+// TestRunStatusDoesNotRunTheReportAfterTheInterfaceIsGone. A refresh already GRANTED when the
+// dashboard closes must not open a new generation with nothing to show it on.
 //
 // THE ORDERING IS BUILT HERE, NOT HOPED FOR, and that difference is the whole test. An earlier
 // version sent the refresh key and killed the interface in the same breath and then demanded
-// exactly one run — a demand the runner never made and could not keep. Send only ENQUEUES; the
-// message loop that would have to drop the keystroke chooses between "the interface is gone" and
-// "there is a message" with a select over two ready channels, which is a coin toss, here and in
-// the real runtime, whose event loop and Send this fake copies statement for statement. Measured
-// on this code over 20000 attempts under -race, with the runner's own decision instrumented: the
-// queued keystroke was handled 49.6% of the time, and ALL 14 of the second runs that resulted were
-// decided with the interface STILL LIVE — stopped() false and the launch gate open — while the
-// other 9913 times the guard correctly refused. Not one run started after the interface was gone.
+// exactly one run — a demand the runner never made and could not keep. Send does not DELIVER; it
+// hands the message to a loop that is choosing between "the interface is gone" and "there is a
+// message" with a select whose two cases are both ready, i.e. by coin toss. Measured over 20000
+// attempts under -race, with the runner's own refresh decision instrumented: the keystroke was
+// handled 49.6% of the time; the refresh arm was reached 9927 times; it REFUSED 9913 of those and
+// granted 14 — and all 14 were granted with stopped() false and the launch gate open, i.e. with
+// the interface demonstrably still live. Not one refresh was granted after the interface was gone.
 // A refresh a live interface delivered IS a refresh, and running the report again is the right
-// answer to it. So the old test failed correct behaviour, about once in a thousand attempts idle
-// and considerably more often under load, and called it a refresh outliving the interface.
+// answer to it — the same answer TestRunStatusRefreshRunsTheReportAgain asserts positively. So the
+// old test failed correct behaviour, about once in a thousand attempts idle and considerably more
+// often under load, and called it a refresh outliving the interface.
+//
+// WHAT THAT MEASUREMENT DOES NOT SAY, because the distinction is the whole of the residual: a
+// refresh GRANTED an instant before the teardown can still ENTER the report after it, since the
+// decision necessarily precedes the call. That window cannot be closed by holding the gate across
+// the launch — main takes the same lock on its way to the cancel that ends the report — and it is
+// the identical window the launch gate documents for the FIRST run. What lands in it is read-only
+// work whose record is then discarded as interrupted, not a second report reaching the operator.
+// It is a stated residual of the runner, not something this test settles either way.
 //
 // So the interface is torn down here by the keystroke that tears it down for real. 'r' and 'q' are
-// queued together and one loop handles them IN ORDER, so 'r's command — which is what puts the
-// request in the runner's queue — has already run when 'q' returns tea.Quit and ends the loop. The
-// report is then held on its own context, which runStatus cancels one instruction AFTER it bars
-// the launch gate and closes uiDone. When the runner finally asks whether to run again, the
-// refresh and both teardown signals are all pending at once: the arrangement the guard exists for,
-// now reached by construction instead of by luck.
+// queued together and this fake's loop handles them IN ORDER and runs each command synchronously,
+// so 'r's command — which is what puts the request in the runner's queue — has already run when
+// 'q' returns tea.Quit and ends the loop. THAT ORDERING IS THE FAKE'S, DELIBERATELY, AND IS NOT A
+// CLAIM ABOUT A TERMINAL: the real runtime's message channel is unbuffered and it dispatches
+// commands on their own goroutines, so it orders neither of those things. What is under test is
+// the runner's own arbitration, and the fake is the seam that lets that arbitration be reached
+// with everything pending at once. The report is then held on its own context, which runStatus
+// cancels one instruction AFTER it bars the launch gate and closes uiDone — so when the runner
+// finally asks whether to run again, the refresh and both teardown signals are all waiting for it.
+// That is the arrangement the guard exists for, now reached by construction instead of by luck.
 //
 // IT REPEATS BECAUSE THE BRANCH IS PICKED AT RANDOM, not because one attempt is unreliable. With
 // all three of the runner's channels ready a correct implementation returns down whichever one it
 // picks, so every attempt passes; a runner that acted on the refresh without re-asking takes that
-// branch about one time in three, and 200 attempts leave it (2/3)^200 of hiding.
+// branch about one time in three, and 200 attempts leave it (2/3)^200 of hiding. Measured: that
+// mutation dies on 40 of 40 runs, by attempt 10 at the latest. The old shape killed it 18 of 40.
 func TestRunStatusDoesNotRunTheReportAfterTheInterfaceIsGone(t *testing.T) {
 	for attempt := 0; attempt < 200; attempt++ {
 		p := newFakeStatusProgram()
@@ -1767,8 +1780,9 @@ func TestRunStatusDoesNotRunTheReportAfterTheInterfaceIsGone(t *testing.T) {
 			}
 			asked, askedGen, askedDone = true, m.Generation(), m.Done()
 			mu.Unlock()
-			// The first run is under way and the dashboard is up. Ask for a refresh, then close
-			// the dashboard. Both are queued before either is handled, and handled in that order.
+			// The first generation is open and unfinished and the dashboard is up. Ask for a
+			// refresh, then close the dashboard. Both are queued before either is handled, and
+			// this fake handles them in that order.
 			p.Send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
 			p.Send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
 		}
@@ -1789,8 +1803,9 @@ func TestRunStatusDoesNotRunTheReportAfterTheInterfaceIsGone(t *testing.T) {
 		n, gen, done := runs, askedGen, askedDone
 		mu.Unlock()
 		if gen != 1 || done {
-			t.Fatalf("attempt %d: the refresh was asked for at generation %d with done=%v — it has\n"+
-				"  to be asked while the FIRST run is still going or this test arranges nothing",
+			t.Fatalf("attempt %d: the refresh was asked for at generation %d with done=%v — it has to\n"+
+				"  be asked while the FIRST generation is open and unfinished, or the runner never\n"+
+				"  reaches the arm this is about and the test arranges nothing",
 				attempt, gen, done)
 		}
 		if n != 1 {
