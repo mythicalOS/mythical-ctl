@@ -40,6 +40,9 @@ import (
 	"crypto/sha256"
 	"flag"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io/fs"
 	"os"
 	"path"
@@ -486,8 +489,16 @@ func parseInventory(rel string, content []byte) ([]claim, []malformed, []stray, 
 		// THE WHOLE REGION IS THE UNIT, not the line, and round 7 is why: a quoted row name can be
 		// split across lines too (the opening quote on one, the closing on the next), so extracting
 		// quoted STRINGS could not see it. The region's text is searched for row names instead,
-		// which covers every way a claim can be broken up at once — across quotes, across the path,
-		// across the claim words.
+		// which covers a claim broken at any of the places one is naturally broken — after the claim
+		// words, inside the path, around the quotes.
+		//
+		// STATED RESIDUAL, and it is a real limit rather than a gap worth closing: a row name or the
+		// claim words BROKEN MID-TOKEN across lines ("POR" / "TED:") defeat both signals, because
+		// the region is searched as text and nothing joins a word to its continuation. Closing that
+		// would mean reconstructing prose, and the result would fire on ordinary comments. This
+		// guard is aimed at a claim somebody WROTE and a later reader would read as a claim, not at
+		// one deliberately obfuscated by a committer who also controls the review — that person can
+		// simply delete the row from the manifest, which the digest pin catches instead.
 		//
 		// EVERY path on the line, not the first: a mention of a file the corpus does not hold,
 		// earlier on the same line, would otherwise shadow a real one after it. Bare `<name>.bats`
@@ -674,10 +685,6 @@ func parseGoTestList(content []byte) map[string]map[string]bool {
 	return out
 }
 
-// goTestFuncDecl matches a Go test function DECLARATION in source. Deliberately anchored and
-// deliberately narrow: `func TestX(t *testing.T)` and nothing else.
-var goTestFuncDecl = regexp.MustCompile(`^func (Test[A-Za-z0-9_]*)\(`)
-
 // collectSourceTestFuncs reads the test functions each package DIRECTORY declares, from source.
 //
 // WHY SOURCE AS WELL AS `go test -list`. That command's stdout is unstructured text: anything a
@@ -685,9 +692,19 @@ var goTestFuncDecl = regexp.MustCompile(`^func (Test[A-Za-z0-9_]*)\(`)
 // printed by a TestMain would be read back as a test that exists — and a PORTED claim on it would
 // stay green with the test gone. Requiring BOTH is what closes it: the list proves the package
 // compiles and registers its tests, the source proves the named function is really declared there.
-// Neither alone is sufficient and neither can be forged by the other's blind spot.
+//
+// THROUGH THE GO PARSER, NOT A LINE MATCH. An earlier version matched `^func Test…(` textually,
+// which counted a declaration written inside a block comment or a raw string as source evidence —
+// the same class of defect the inventory scanner had, in the tool that was fixing it. go/parser
+// knows what is code, and a file that does not parse is a hard error rather than a silent zero.
+//
+// BUILD CONSTRAINTS ARE DELIBERATELY NOT APPLIED. A test behind a tag this run did not enable is
+// still a real test somebody can run, and the LIST half already decides whether it is reachable in
+// a lane the audit actually drives (the audit passes both the default and the acceptance lane). A
+// declaration parsed here that no lane registers still fails, because the list is the other witness.
 func collectSourceTestFuncs(root string) (map[string]map[string]bool, error) {
 	out := map[string]map[string]bool{}
+	fset := token.NewFileSet()
 	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -701,26 +718,30 @@ func collectSourceTestFuncs(root string) (map[string]map[string]bool, error) {
 		if !strings.HasSuffix(d.Name(), "_test.go") {
 			return nil
 		}
-		content, rerr := os.ReadFile(p)
-		if rerr != nil {
-			return rerr
-		}
 		rel, rerr := filepath.Rel(root, p)
 		if rerr != nil {
 			return rerr
+		}
+		f, perr := parser.ParseFile(fset, p, nil, parser.SkipObjectResolution)
+		if perr != nil {
+			return fmt.Errorf("parsing %s for its test declarations: %w", rel, perr)
 		}
 		dir := path.Dir(filepath.ToSlash(rel))
 		if out[dir] == nil {
 			out[dir] = map[string]bool{}
 		}
-		sc := bufio.NewScanner(bytes.NewReader(content))
-		sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-		for sc.Scan() {
-			if m := goTestFuncDecl.FindStringSubmatch(sc.Text()); m != nil {
-				out[dir][m[1]] = true
+		for _, decl := range f.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			// A METHOD IS NOT A TEST. `func (r *rig) TestX()` is never run by the testing package,
+			// so a receiver disqualifies the declaration however the name reads.
+			if !ok || fn.Recv != nil || fn.Name == nil {
+				continue
+			}
+			if strings.HasPrefix(fn.Name.Name, "Test") {
+				out[dir][fn.Name.Name] = true
 			}
 		}
-		return sc.Err()
+		return nil
 	})
 	return out, err
 }

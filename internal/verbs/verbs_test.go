@@ -1903,13 +1903,20 @@ func TestStopCommitsTheIntentBeforeItActs(t *testing.T) {
 // the thing being contained. The reference plants exactly that and asserts the launch happened and
 // the value did not travel; so does this.
 func TestNoValueFromAProductConfReachesTheLaunch(t *testing.T) {
+	// TWO PLANTED VALUES, AND BOTH ARE DELIBERATE. The first is an option a container escape would
+	// be spelled with; the second is a NUMBER, product-scoped and distinctive, because the fields a
+	// value could reach are not all option-shaped — a published port is a number, and a check that
+	// only looks for a flag cannot see a port arriving from the product's own file. It must not be
+	// the manifest's own port either, or the assertion would pass on a value that is legitimately
+	// there.
 	const hostile = "--privileged"
+	const hostilePort = "65123"
 	r := newRig(t)
 	r.writeProduct("p1")
 	r.mintIdentity()
-	// The product writes its own conf, and it writes something it should never be able to use. The
+	// The product writes its own conf, and it writes things it should never be able to use. The
 	// bytes are planted BEFORE the install so every step of bring-up sees them.
-	r.writeFile("p1.conf", "PEER="+hostile+"\nMYTHICAL_BROKKR_PORT=7480\n")
+	r.writeFile("p1.conf", "PEER="+hostile+"\nMYTHICAL_P1_PORT="+hostilePort+"\n")
 	r.mustInstall("p1")
 
 	c := r.container("p1")
@@ -1926,20 +1933,22 @@ func TestNoValueFromAProductConfReachesTheLaunch(t *testing.T) {
 	// Nothing the product wrote may appear anywhere the daemon acts on: not the env, not the
 	// labels, not the image, not a mount, not a published port.
 	for _, e := range info.Env {
-		if strings.Contains(e, hostile) || strings.HasPrefix(e, "PEER=") {
+		if strings.Contains(e, hostile) || strings.Contains(e, hostilePort) || strings.HasPrefix(e, "PEER=") {
 			t.Fatalf("a <product>.conf value reached the container environment: %q", e)
 		}
 	}
 	for k, v := range info.Labels {
-		if strings.Contains(k, hostile) || strings.Contains(v, hostile) {
+		if strings.Contains(k, hostile) || strings.Contains(v, hostile) ||
+			strings.Contains(k, hostilePort) || strings.Contains(v, hostilePort) {
 			t.Fatalf("a <product>.conf value reached a label: %s=%s", k, v)
 		}
 	}
-	if strings.Contains(info.Image, hostile) {
+	if strings.Contains(info.Image, hostile) || strings.Contains(info.Image, hostilePort) {
 		t.Fatalf("a <product>.conf value reached the image reference: %q", info.Image)
 	}
 	for _, m := range info.Mounts {
-		if strings.Contains(m.Source, hostile) || strings.Contains(m.Destination, hostile) {
+		if strings.Contains(m.Source, hostile) || strings.Contains(m.Destination, hostile) ||
+			strings.Contains(m.Source, hostilePort) || strings.Contains(m.Destination, hostilePort) {
 			t.Fatalf("a <product>.conf value reached a mount: %+v", m)
 		}
 	}
@@ -1947,15 +1956,15 @@ func TestNoValueFromAProductConfReachesTheLaunch(t *testing.T) {
 	// records and resolves; it is as much a launch argument as an env entry, and it was the half an
 	// earlier version of this test did not look at.
 	for name, ep := range info.Networks {
-		if strings.Contains(name, hostile) {
+		if strings.Contains(name, hostile) || strings.Contains(name, hostilePort) {
 			t.Fatalf("a <product>.conf value reached a network name: %q", name)
 		}
 		for _, a := range ep.Aliases {
-			if strings.Contains(a, hostile) {
+			if strings.Contains(a, hostile) || strings.Contains(a, hostilePort) {
 				t.Fatalf("a <product>.conf value reached a network alias: %q", a)
 			}
 		}
-		if strings.Contains(ep.IPAddress, hostile) {
+		if strings.Contains(ep.IPAddress, hostile) || strings.Contains(ep.IPAddress, hostilePort) {
 			t.Fatalf("a <product>.conf value reached an endpoint address: %q", ep.IPAddress)
 		}
 	}
@@ -1963,7 +1972,7 @@ func TestNoValueFromAProductConfReachesTheLaunch(t *testing.T) {
 	// single most consequential thing a hostile value could choose.
 	for _, pb := range info.Ports {
 		for _, f := range []string{pb.ContainerPort, pb.HostIP, pb.HostPort} {
-			if strings.Contains(f, hostile) {
+			if strings.Contains(f, hostile) || strings.Contains(f, hostilePort) {
 				t.Fatalf("a <product>.conf value reached a published port: %+v", pb)
 			}
 		}
@@ -1972,7 +1981,7 @@ func TestNoValueFromAProductConfReachesTheLaunch(t *testing.T) {
 	// bodies — so it is here to catch a value smuggled into a PATH or query, not as the main
 	// assertion. The typed inspect above is what actually covers the create body.
 	for _, req := range r.fake.RequestLog() {
-		if strings.Contains(req, hostile) {
+		if strings.Contains(req, hostile) || strings.Contains(req, hostilePort) {
 			t.Fatalf("a <product>.conf value reached the daemon in %q", req)
 		}
 	}

@@ -1238,3 +1238,63 @@ func TestAmbiguousBasenamesAreAttributedToTheFileThatHoldsTheRow(t *testing.T) {
 		}
 	}
 }
+
+// THE SOURCE WITNESS READS CODE, NOT TEXT. A declaration written inside a block comment or a raw
+// string is not a declaration — and counting it would put, inside the tool that audits for exactly
+// this mistake, the mistake it audits for.
+func TestSourceWitnessIgnoresDeclarationsThatAreNotCode(t *testing.T) {
+	dir := t.TempDir()
+	pkg := filepath.Join(dir, "internal", "x")
+	if err := os.MkdirAll(pkg, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := strings.Join([]string{
+		`package x`,
+		``,
+		`import "testing"`,
+		``,
+		`/*`,
+		`func TestInAComment(t *testing.T) {}`,
+		`*/`,
+		``,
+		"const s = `",
+		`func TestInARawString(t *testing.T) {}`,
+		"`",
+		``,
+		`type rig struct{}`,
+		``,
+		`func (r rig) TestAMethod(t *testing.T) {}`,
+		``,
+		`func TestReal(t *testing.T) { _ = s }`,
+		``,
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(pkg, "x_test.go"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := collectSourceTestFuncs(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := got["internal/x"]
+	if !names["TestReal"] {
+		t.Fatalf("the real declaration was missed: %v", names)
+	}
+	for _, no := range []string{"TestInAComment", "TestInARawString", "TestAMethod"} {
+		if names[no] {
+			t.Errorf("%s counted as a source declaration: %v", no, names)
+		}
+	}
+
+	// A FILE THAT DOES NOT PARSE IS A HARD ERROR, never a silent zero. Swallowing it would leave the
+	// package with no source witness at all, and every claim on it would then fail for a reason that
+	// has nothing to do with the port — or, worse, the package's map would be empty and a reader
+	// would go looking for deleted tests that are all still there.
+	if err := os.WriteFile(filepath.Join(pkg, "broken_test.go"), []byte("package x\nfunc ("), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := collectSourceTestFuncs(dir); err == nil {
+		t.Fatal("an unparseable _test.go was skipped rather than refused")
+	} else if !strings.Contains(err.Error(), "broken_test.go") {
+		t.Fatalf("the refusal does not name the file: %v", err)
+	}
+}
