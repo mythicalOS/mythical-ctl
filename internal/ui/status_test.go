@@ -1723,8 +1723,10 @@ func TestACancelledFIRSTReportIsStillPublished(t *testing.T) {
 	}
 }
 
-// TestRunStatusDoesNotRunTheReportAfterTheInterfaceIsGone. A refresh already GRANTED when the
-// dashboard closes must not open a new generation with nothing to show it on.
+// TestRunStatusDoesNotRunTheReportAfterTheInterfaceIsGone. A refresh already QUEUED when the
+// dashboard closes must not be GRANTED once it is gone — the runner re-asks, and opening a new
+// generation with nothing to show it on is the answer it must not give. (Queued and granted are
+// two different moments throughout this comment, and the residual below lives between them.)
 //
 // THE ORDERING IS BUILT HERE, NOT HOPED FOR, and that difference is the whole test. An earlier
 // version sent the refresh key and killed the interface in the same breath and then demanded
@@ -1743,19 +1745,31 @@ func TestACancelledFIRSTReportIsStillPublished(t *testing.T) {
 // WHAT THAT MEASUREMENT DOES NOT SAY, because the distinction is the whole of the residual: a
 // refresh GRANTED an instant before the teardown can still ENTER the report after it, since the
 // decision necessarily precedes the call. That window cannot be closed by holding the gate across
-// the launch — main takes the same lock on its way to the cancel that ends the report — and it is
-// the identical window the launch gate documents for the FIRST run. What lands in it is read-only
-// work whose record is then discarded as interrupted, not a second report reaching the operator.
-// It is a stated residual of the runner, not something this test settles either way.
+// the launch — the teardown takes that same lock on its way to the cancel that ends the report, so
+// a report that waits on its context would wait on a cancel that can never arrive — and it is the
+// identical window the launch gate documents for the FIRST run.
+//
+// WHAT THE OUTCOME GUARD GIVES BACK IS NARROWER THAN "it is discarded", and the narrow version is
+// the true one: an INTERRUPTED run never replaces a completed one, so a run torn off in that
+// window cannot reach the operator as the report. A run that both starts AND FINISHES inside it is
+// not torn, samples vctx.Err() as nil, and does replace — the escape is between close(uiDone) and
+// the cancel three instructions later. What escapes is therefore a COMPLETE report the operator
+// asked for, replacing an older complete one, which is what the refresh path is specified to do
+// (TestRunStatusRefreshRunsTheReportAgain); the code cannot differ either, since the only verb
+// this runner drives always returns 0. It is a stated residual of the runner, and this test
+// settles none of it either way.
 //
 // So the interface is torn down here by the keystroke that tears it down for real. 'r' and 'q' are
 // queued together and this fake's loop handles them IN ORDER and runs each command synchronously,
 // so 'r's command — which is what puts the request in the runner's queue — has already run when
-// 'q' returns tea.Quit and ends the loop. THAT ORDERING IS THE FAKE'S, DELIBERATELY, AND IS NOT A
-// CLAIM ABOUT A TERMINAL: the real runtime's message channel is unbuffered and it dispatches
-// commands on their own goroutines, so it orders neither of those things. What is under test is
-// the runner's own arbitration, and the fake is the seam that lets that arbitration be reached
-// with everything pending at once. The report is then held on its own context, which runStatus
+// 'q' returns tea.Quit and ends the loop. THE SYNCHRONOUS HALF OF THAT IS THE FAKE'S, DELIBERATELY,
+// AND IS NOT A CLAIM ABOUT A TERMINAL. The real runtime does order the two KEY MESSAGES — one input
+// loop decodes and sends them serially over an unbuffered channel, so 'q' cannot be sent until 'r'
+// has been taken — but it dispatches each command on its own goroutine, so 'r's hook is NOT
+// guaranteed to have run before 'q' is handled. That is exactly the guarantee this test needs and
+// the real runtime does not give; the fake gives it. What is under test is the runner's own
+// arbitration, and the fake is the seam that lets that arbitration be reached with everything
+// pending at once. The report is then held on its own context, which runStatus
 // cancels one instruction AFTER it bars the launch gate and closes uiDone — so when the runner
 // finally asks whether to run again, the refresh and both teardown signals are all waiting for it.
 // That is the arrangement the guard exists for, now reached by construction instead of by luck.
