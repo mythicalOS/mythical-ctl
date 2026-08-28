@@ -902,12 +902,13 @@ func candidatePackages(all map[string]map[string]bool, goFile, detail, target st
 		addTo(all, bySeg, out, tok)
 		return out
 	}
-	// UNQUALIFIED: the claiming file's own package, and nothing else.
-	own := path.Dir(filepath.ToSlash(goFile))
-	for p := range all {
-		if p == own || strings.HasSuffix(p, "/"+own) {
-			out[p] = true
-		}
+	// UNQUALIFIED: the claiming file's own package, and nothing else. Resolved by the SAME rule as
+	// a qualifier — the directory a claim is written in is a package-path token like any other, and
+	// it is matched as a suffix for the same reason (this tool is not told the module path). It was
+	// the branch WITHOUT the uniqueness rule for longer than the qualifier one, and it carries
+	// nearly every claim in the tree.
+	if p, ok := resolvePathToken(all, path.Dir(filepath.ToSlash(goFile))); ok {
+		out[p] = true
 	}
 	return out
 }
@@ -921,16 +922,50 @@ func addTo(all map[string]map[string]bool, bySeg map[string][]string, out map[st
 		return
 	}
 	if strings.Contains(tok, "/") {
-		for p := range all {
-			if p == tok || strings.HasSuffix(p, "/"+tok) {
-				out[p] = true
-			}
+		if p, ok := resolvePathToken(all, tok); ok {
+			out[p] = true
 		}
 		return
 	}
 	if ps := bySeg[tok]; len(ps) == 1 {
 		out[ps[0]] = true
 	}
+}
+
+// resolvePathToken resolves ONE package-path token to AT MOST ONE package: an exact match on the
+// whole import path wins outright, otherwise a path suffix is accepted only when exactly one
+// package has it, and anything else resolves to NOTHING.
+//
+// A SUFFIX IS NOT AN IDENTITY, AND FOR A WHILE THIS TREATED IT AS ONE. The multi-segment branch
+// added EVERY package ending in the token, so with `internal/w` and `nested/internal/w` both in the
+// module, `internal/w.TestShared` was answered by both: delete the test the claim is about, keep a
+// namesake in the nested package, and the audit certifying that the deleted bash tree lost nothing
+// stays green over a Go test that is gone. The bare-segment branch beside it had required
+// uniqueness from the start (`len(ps) == 1`) — the rule was already written down, one branch simply
+// did not obey it, and the unqualified own-package branch did not either.
+//
+// So it is spelled ONCE and every branch that turns a path token into a package calls it. That is
+// the point of the shape, not tidiness: three copies of a resolution rule is three places for the
+// next reader to fix two of.
+//
+// AMBIGUITY RESOLVES TO NOTHING, NEVER TO A WINNER. An unresolvable claim fails closed and the
+// message tells its author to name the package; a claim answered by whichever namesake was seen
+// last is a green that means nothing. Widening is the defect this family of findings is made of,
+// so it can never also be the fix.
+func resolvePathToken(all map[string]map[string]bool, tok string) (string, bool) {
+	if _, ok := all[tok]; ok {
+		return tok, true
+	}
+	found, n := "", 0
+	for p := range all {
+		if strings.HasSuffix(p, "/"+tok) {
+			found, n = p, n+1
+		}
+	}
+	if n == 1 {
+		return found, true
+	}
+	return "", false
 }
 
 // qualifierFor returns the package token qualifying this target, read at the target's FIRST

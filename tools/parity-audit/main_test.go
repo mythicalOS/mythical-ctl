@@ -1315,6 +1315,114 @@ func TestAQualificationConstrainsRatherThanWidens(t *testing.T) {
 	}
 }
 
+// TestAnAmbiguousQualifierResolvesToNothing: a multi-segment qualifier was matched as a PATH
+// SUFFIX against every known package, and a suffix can name MORE THAN ONE. `internal/w` is a
+// suffix of both mythicalos.ai/ctl/internal/w and mythicalos.ai/ctl/nested/internal/w, so the
+// claim `internal/w.TestShared` was answered by BOTH — delete the test the claim is actually
+// about and a namesake in the nested package keeps the audit green. That is exactly the false
+// green a BARE segment has always been refused for: the single-segment branch requires the token
+// to name one package and one only, and the multi-segment branch did not.
+//
+// The rule is the same one, spelled once: an exact match on the whole import path wins outright;
+// otherwise a suffix is accepted only when it is UNIQUE; ambiguity resolves to NOTHING, so the
+// claim becomes unresolvable and the audit fails closed rather than picking a winner.
+func TestAnAmbiguousQualifierResolvesToNothing(t *testing.T) {
+	// internal/w no longer declares TestShared — it was deleted. The nested namesake does.
+	goTests := map[string]map[string]bool{
+		"mythicalos.ai/ctl/internal/w":        {"TestOther": true},
+		"mythicalos.ai/ctl/nested/internal/w": {"TestShared": true},
+		"mythicalos.ai/ctl/internal/x":        {"TestOne": true},
+	}
+	got := candidatePackages(goTests, "internal/x/x_test.go", "internal/w.TestShared", "TestShared")
+	if got["mythicalos.ai/ctl/nested/internal/w"] {
+		t.Fatalf("the qualifier internal/w resolved against nested/internal/w: a suffix that names two packages let a namesake answer a claim about a DELETED test: %v", got)
+	}
+	if len(got) != 0 {
+		t.Fatalf("an ambiguous qualifier must resolve to NOTHING so the claim fails closed; it resolved to %v", got)
+	}
+
+	// AND THE AUDIT SAYS SO END TO END: the claim must FAIL, not be satisfied by the namesake.
+	c, b, st := claimsFrom(t,
+		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
+		`// PORTED: tests/unit/a.bats: "two" -> internal/w.TestShared`,
+		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
+	)
+	pkgs := map[string]map[string]bool{
+		"mythicalos.ai/ctl/internal/w":        {"TestOther": true},
+		"mythicalos.ai/ctl/nested/internal/w": {"TestShared": true},
+		"mythicalos.ai/ctl/internal/x":        {"TestOne": true, "TestThree": true},
+	}
+	r := &report{}
+	auditCoverage(r, tiny, c, b, st, []testLane{{name: "default", list: pkgs, src: pkgs}}, noPreDeclared)
+	if !hasProblem(r, "TestShared") {
+		t.Fatalf("the audit stayed green after internal/w.TestShared was deleted, because a namesake in nested/internal/w answered the qualifier: %v", r.Problems)
+	}
+
+	// THE UNAMBIGUOUS CASES STILL RESOLVE. The rule is a uniqueness requirement, not a narrowing:
+	// widening is the defect here and refusing everything is not the fix for it.
+	if u := candidatePackages(goTests, "internal/x/x_test.go", "internal/x.TestOne", "TestOne"); !u["mythicalos.ai/ctl/internal/x"] || len(u) != 1 {
+		t.Fatalf("a UNIQUE suffix qualifier stopped resolving: %v", u)
+	}
+	// AN EXACT MATCH ON THE WHOLE PATH WINS OUTRIGHT, even where it is also a suffix of another
+	// package. Without that, a token that names one package exactly would be refused as ambiguous.
+	exact := map[string]map[string]bool{
+		"internal/w":        {"TestShared": true},
+		"nested/internal/w": {"TestShared": true},
+	}
+	if e := candidatePackages(exact, "internal/x/x_test.go", "internal/w.TestShared", "TestShared"); !e["internal/w"] || len(e) != 1 {
+		t.Fatalf("an exact match on the whole package path did not win outright over a suffix match: %v", e)
+	}
+}
+
+// TestAnAmbiguousOwnPackageResolvesToNothing: THE SAME SUFFIX AMBIGUITY ON THE BRANCH THAT CARRIES
+// NEARLY EVERY CLAIM IN THE TREE — the unqualified one. An unqualified claim resolves against "the
+// claiming file's own package", derived from the file's directory (`internal/x`) and matched
+// against import paths as a suffix, because this tool does not know the module path. With a nested
+// `nested/internal/x` in the module that suffix names two packages, and a namesake there answers a
+// claim whose own package no longer declares the target — the audit certifies a test that is gone.
+//
+// This is the same defect as the qualifier one and it is fixed by the same rule, which is why both
+// branches now call one resolver: fixing one of them and not the other is how this class recurs.
+func TestAnAmbiguousOwnPackageResolvesToNothing(t *testing.T) {
+	// internal/x no longer declares TestOne — it was deleted. The nested namesake does.
+	goTests := map[string]map[string]bool{
+		"mythicalos.ai/ctl/internal/x":        {"TestOther": true},
+		"mythicalos.ai/ctl/nested/internal/x": {"TestOne": true},
+	}
+	got := candidatePackages(goTests, "internal/x/x_test.go", "TestOne", "TestOne")
+	if got["mythicalos.ai/ctl/nested/internal/x"] {
+		t.Fatalf("an unqualified claim in internal/x resolved against nested/internal/x: a namesake in a nested package answered a claim about a DELETED test: %v", got)
+	}
+	if len(got) != 0 {
+		t.Fatalf("an ambiguous own package must resolve to NOTHING so the claim fails closed; it resolved to %v", got)
+	}
+
+	// AND THE AUDIT SAYS SO END TO END.
+	c, b, st := claimsFrom(t,
+		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
+		`// PORTED: tests/unit/a.bats: "two" -> TestTwo`,
+		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
+	)
+	pkgs := map[string]map[string]bool{
+		"mythicalos.ai/ctl/internal/x":        {"TestTwo": true, "TestThree": true},
+		"mythicalos.ai/ctl/nested/internal/x": {"TestOne": true},
+	}
+	r := &report{}
+	auditCoverage(r, tiny, c, b, st, []testLane{{name: "default", list: pkgs, src: pkgs}}, noPreDeclared)
+	if !hasProblem(r, "TestOne") {
+		t.Fatalf("the audit stayed green after internal/x.TestOne was deleted, because a namesake in nested/internal/x answered the unqualified claim: %v", r.Problems)
+	}
+
+	// AN UNAMBIGUOUS OWN PACKAGE STILL RESOLVES.
+	plain := map[string]map[string]bool{
+		"mythicalos.ai/ctl/internal/x": {"TestOne": true},
+		"mythicalos.ai/ctl/internal/w": {"TestOne": true},
+	}
+	if u := candidatePackages(plain, "internal/x/x_test.go", "TestOne", "TestOne"); !u["mythicalos.ai/ctl/internal/x"] || len(u) != 1 {
+		t.Fatalf("an unambiguous own package stopped resolving: %v", u)
+	}
+}
+
 // THE DIGEST PIN IS THE POST-CUTOVER GUARD, and this is the failure it exists for: with the bats
 // trees gone there is nothing to regenerate from, so a row could be REPLACED — an original
 // requirement deleted, an invented one of the same shape put in its place, and a claim written
