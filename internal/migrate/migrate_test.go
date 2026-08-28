@@ -2006,3 +2006,69 @@ func TestTheAmbiguityIsExplainedEvenWhenTheConfirmationIsShortCircuited(t *testi
 		}
 	}
 }
+
+// TestPhase7CompletesOverAContainerSomethingElseRemoved: a 404 from the removal is the goal
+// reached, not a stalled phase.
+//
+// The old container vanishes between phase 7's authority question and its DELETE — an operator, a
+// reaper, another tool. The daemon answers 404, which says the object is not there: the name is
+// free and the replacement can be built, which is the entire point of the removal. Reading it as
+// "could not remove the old container" abandoned the phase at the WORST possible moment — after
+// the old container was gone and before the replacement existed — which is exactly the
+// no-container-at-all outcome the Prepare/Create split was built to prevent. And it told the
+// operator to "resolve the removal failure" for a container that does not exist, while claiming
+// its record was "kept so it stays removable": there is nothing there to remove.
+func TestPhase7CompletesOverAContainerSomethingElseRemoved(t *testing.T) {
+	f := newFx(t)
+	canon := f.canonDest()
+	if err := os.Mkdir(canon, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sid, _ := Identity(canon)
+	f.seed(record{Phase: 7, Dest: canon, Nonce: "nz", Staging: StagingPath(canon, "nz"),
+		StageID: sid, Attempt: "started", Desired: "running"})
+	// THE WINDOW ITSELF: authority still answers (the container is proved ours and the removal IS
+	// attempted), the DELETE alone 404s, and the container is genuinely gone afterwards. Dropping
+	// it before the phase runs would send this down the prov.ErrGone branch instead, where no
+	// removal is ever attempted — a different path that cannot see this defect.
+	f.mut.rmGone = true
+	// OBSERVED AT REBUILD TIME, because the replacement records itself at the SAME name: a check
+	// after the phase would read the NEW container's record and call the old one retired however
+	// the phase behaved.
+	var recordGone, tombstoned bool
+	f.bld.hook = func() {
+		_, ferr := prov.Find(f.l, prov.ClassContainer, f.container)
+		recordGone = errors.Is(ferr, ledger.ErrAbsentRecord)
+		_, terr := prov.TombstoneFind(f.l, prov.ClassContainer, f.container)
+		tombstoned = terr == nil
+	}
+
+	if err := Run(ctx(), f.l, f.d, testProduct, testRole, canon, 7); err != nil {
+		t.Fatalf("phase 7 abandoned the migration over a container the runtime says is gone, with the\n"+
+			"old container already taken away and no replacement built — the product is left with\n"+
+			"no container at all: %v", err)
+	}
+
+	// THE REPLACEMENT WAS BUILT, at the name the 404 proved was free.
+	if len(f.bld.rebuilt) != 1 {
+		t.Fatalf("the replacement was not built: %v", f.bld.rebuilt)
+	}
+	// AND THE OLD RECORD WAS CONSUMED BEFORE THE REPLACEMENT WAS BUILT: the object is gone, so its
+	// live provenance must not survive to be read as authority over the new container.
+	if !recordGone || !tombstoned {
+		t.Fatalf("at rebuild time: record gone=%v tombstoned=%v — a container the runtime says does not\n"+
+			"exist kept its live record", recordGone, tombstoned)
+	}
+	// NO REMOVAL IS CLAIMED THAT DID NOT HAPPEN. This phase established absence; something else
+	// performed the removal.
+	if len(f.mut.removed) != 0 {
+		t.Fatalf("this phase recorded a removal it did not perform: %v", f.mut.removed)
+	}
+	out := f.log.String() + f.warn.String()
+	if !strings.Contains(out, "was already gone") {
+		t.Fatalf("the report does not say the old container was already gone:\n%s", out)
+	}
+	if strings.Contains(out, "could not remove the old container") {
+		t.Fatalf("a removal that answered 404 was reported as a failure:\n%s", out)
+	}
+}

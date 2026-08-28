@@ -116,6 +116,14 @@ type fakeMut struct {
 	rmErr    error
 	onStop   func()
 	onRemove func()
+	// rmGone models THE REMOVAL RACE, which rmErr cannot: the DELETE answers 404 because something
+	// ELSE removed the container between the authority question and this call. Two facts follow,
+	// and a knob that carried only one of them would let a test pass for the wrong reason. The
+	// object is genuinely gone afterwards — so onRemove fires, exactly as on a successful removal,
+	// and a resumed phase sees the world as it really is rather than a container the fake still
+	// claims is standing. And THIS CALL REMOVED NOTHING — so the name is NOT appended to `removed`,
+	// which is what lets a test tell "the migration removed it" apart from "it was already gone".
+	rmGone bool
 }
 
 func (f *fakeMut) ContainerStop(_ context.Context, id string) error {
@@ -130,6 +138,13 @@ func (f *fakeMut) ContainerStop(_ context.Context, id string) error {
 }
 
 func (f *fakeMut) ContainerRemove(_ context.Context, id string) error {
+	if f.rmGone {
+		// Gone from the runtime, and not by this call.
+		if f.onRemove != nil {
+			f.onRemove()
+		}
+		return fmt.Errorf("engine: %w: No such container: %s", engine.ErrAbsent, id)
+	}
 	if f.rmErr != nil {
 		return f.rmErr
 	}

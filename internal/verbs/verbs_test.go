@@ -2127,3 +2127,95 @@ func TestAVolumeThatIsNotOursIsNeitherAdoptedNorRemoved(t *testing.T) {
 		t.Fatalf("the intent was dropped, so nothing records that this is unresolved: %v", err)
 	}
 }
+
+// --- "gone" is an ANSWER at the replacement's removal too ---------------------------------------
+//
+// replaceContainer is the last DELETE in this package that still read engine.ErrAbsent as a failed
+// removal. A 404 there is the goal reached — the name is free, which is the entire purpose of the
+// step — and reading it as a refusal produced two separate wrong outcomes, both measured below:
+// the verb acted on an object the daemon had just said does not exist, and it then told the
+// operator their installation was intact when it was gone.
+
+// startedBetweenRemovalAndCreate reports whether a start was issued on `name` AFTER the removal and
+// BEFORE anything was created.
+//
+// The window is what makes this answerable at all. A bare count of starts on that name cannot
+// distinguish the defect from the ordinary bring-up that follows it: the replacement carries the
+// SAME name and is legitimately started at the end of a successful recreate, so "at least one
+// start" is true both before and after the fix. What is only ever true of the defect is a start
+// sitting between the DELETE and the create — an act on an object whose absence the daemon had
+// just established.
+func startedBetweenRemovalAndCreate(reqs []string, name string) bool {
+	del := -1
+	for i, q := range reqs {
+		if strings.HasPrefix(q, "DELETE ") && strings.HasSuffix(q, "/containers/"+name) {
+			del = i
+		}
+	}
+	if del < 0 {
+		return false
+	}
+	end := len(reqs)
+	for i := del + 1; i < len(reqs); i++ {
+		if strings.HasPrefix(reqs[i], "POST ") && strings.HasSuffix(reqs[i], "/containers/create") {
+			end = i
+			break
+		}
+	}
+	for i := del + 1; i < end; i++ {
+		if strings.HasPrefix(reqs[i], "POST ") && strings.HasSuffix(reqs[i], "/containers/"+name+"/start") {
+			return true
+		}
+	}
+	return false
+}
+
+// TestRecreateProceedsOverAContainerSomethingElseRemoved: the container vanishes between the
+// authority question and the DELETE, so the DELETE answers 404 and the name is free — which is
+// precisely what this step exists to achieve.
+//
+// RemoveVanishes, not RemoveMissing, is what stands this: the container is genuinely gone after the
+// 404, exactly as it is in the world this models. RemoveMissing keeps it present for every INSPECT,
+// which is right for a verb that only removes, but here the replacement would then collide with an
+// object the daemon had just said does not exist — and the test would be reporting the fake's
+// contradiction rather than this code's behaviour.
+func TestRecreateProceedsOverAContainerSomethingElseRemoved(t *testing.T) {
+	r := newRig(t)
+	r.writeProduct("p1")
+	r.mintIdentity()
+	r.mustInstall("p1")
+	c := r.container("p1")
+	r.fake.RemoveVanishes = c
+	mark := len(r.fake.RequestLog())
+	r.reset()
+
+	if rc := r.recreate("p1"); rc != cliio.ExitOK {
+		t.Fatalf("rc = %d, want 0 — a 404 from the removal means the name is FREE, which is the whole\n"+
+			"goal of the replacement step, and the recreate refused on it\n%s", rc, r.said())
+	}
+	reqs := r.fake.RequestLog()[mark:]
+
+	// (1) NOTHING IS DONE TO AN OBJECT THE DAEMON JUST SAID IS ABSENT. The old code restored the
+	// container it had stopped, on a best-effort basis, without noticing that the answer it was
+	// reacting to was "there is no such container".
+	if startedBetweenRemovalAndCreate(reqs, c) {
+		t.Fatalf("a start was issued on %s between the removal that answered 404 and the create —\n"+
+			"the daemon had just established that no such container exists\n%v", c, reqs)
+	}
+
+	// (2) THE REPLACEMENT ACTUALLY STANDS. The refusal left the product with NO container at all:
+	// something else removed the old one, and the verb then declined to build its replacement.
+	if !r.running(c) {
+		t.Fatalf("no replacement is running at %s — the old container was taken away and this verb\n"+
+			"refused to build the one meant to take its place\n%s", c, r.said())
+	}
+
+	// (3) AND THE REPORT IS TRUE. "It is left in place ... rather than taking your installation
+	// down" was false in both halves at the moment it was printed: the container was gone, and the
+	// installation WAS down. An operator who reads that has no reason to look.
+	r.mustNotSay("could not remove the existing container")
+	r.mustNotSay("left in place")
+	// The one surprising fact in the sequence is stated instead: a third party is moving these
+	// objects, and this verb removed nothing.
+	r.mustSay("was already gone")
+}

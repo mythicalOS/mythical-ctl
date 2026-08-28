@@ -1082,7 +1082,25 @@ func runPhase7(ctx context.Context, l *ledger.Ledger, d Deps, r record, containe
 	defer rep.Discard()
 	switch aerr := prov.Authority(ctx, l, d.Prov, prov.ClassContainer, container); {
 	case aerr == nil:
-		if rerr := d.Mut.ContainerRemove(ctx, container); rerr != nil {
+		// "GONE" IS AN ANSWER, AND IT IS THE ONE THIS REMOVAL WANTED. A 404 comes from a daemon
+		// that IS answering: nothing stands at that name, so the name is free and the replacement
+		// can be built — which is the only reason this phase removes anything at all.
+		//
+		// Reading it as a failure abandoned the migration at the one moment the Prepare/Create
+		// split exists to make impossible: the old container already taken away, the replacement
+		// not yet built, the product left with NO container. It also told the operator that the
+		// record was "kept so it stays removable" and to resolve a removal failure — about an
+		// object that does not exist, where there is nothing to remove and nothing to resolve.
+		switch rerr := d.Mut.ContainerRemove(ctx, container); {
+		case rerr == nil:
+		case errors.Is(rerr, engine.ErrAbsent):
+			// NOT "removed": this phase established absence and took nothing away. The tombstone
+			// below is still exactly right — the object IS gone, so its live record must not
+			// survive — and it is the same answer purgeVolume draws from the same 404.
+			d.logf("migrate: the old container %s was already gone — something else removed it between the\n"+
+				"  check and the removal, so this migration took nothing away. The name is free, so the\n"+
+				"  replacement is created there.", container)
+		default:
 			return fmt.Errorf("migrate: could not remove the old container %q. Its record is kept so it stays\n"+
 				"  removable; the migration stays at phase 7 and can be resumed: %w", container, rerr)
 		}

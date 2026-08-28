@@ -930,7 +930,26 @@ func (s *session) replaceContainer(ctx context.Context, container, verb string) 
 			"  %w", container, verb, aerr)
 	}
 	_ = s.rt.ContainerStop(ctx, container)
-	if rmErr := s.rt.ContainerRemove(ctx, container); rmErr != nil {
+	// "GONE" IS AN ANSWER, AND HERE IT IS THE ANSWER THIS STEP WAS ASKING FOR. A 404 comes from a
+	// daemon that IS answering and says nothing stands at that name — which is the removal's whole
+	// purpose: the name is free for the replacement. The container vanished between the authority
+	// question and this call, a race with an operator or another tool.
+	//
+	// Reading it as a failed removal did two wrong things at once, and the second is the worse one.
+	// It START-ed a container the daemon had just said does not exist. And it then reported "it is
+	// left in place (a restart was attempted) rather than taking your installation down" — a
+	// sentence whose every clause was false at the moment it was printed. The container was NOT
+	// left in place; it was gone. The restart could not have restored anything. And the
+	// installation WAS down — this refusal is precisely what kept its replacement from being
+	// built. An operator told their installation is intact has no reason to look again.
+	switch rmErr := s.rt.ContainerRemove(ctx, container); {
+	case rmErr == nil:
+	case errors.Is(rmErr, engine.ErrAbsent):
+		// NOT "removed": absence was established and this verb took nothing away. Saying so is the
+		// only report of the one surprising fact in the sequence — something else is moving these
+		// objects — and it keeps the verb from claiming an action it did not perform.
+		s.d.say(verb, "  container %s was already gone; the name is free, so the replacement is created there.", container)
+	default:
 		// Restore the container we just stopped (best effort) and fail rather than proceed.
 		_ = s.rt.ContainerStart(ctx, container)
 		return fmt.Errorf("verbs: could not remove the existing container %q to replace it. It is\n"+

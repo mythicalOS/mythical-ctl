@@ -157,6 +157,15 @@ type fakeNetwork struct {
 //     something else before the verb gets to the removal. The daemon answers 404 there, and a
 //     caller that reads that as "the removal failed" keeps a record for an object the runtime says
 //     does not exist.
+//   - RemoveVanishes is RemoveMissing for the callers that CREATE SOMETHING AFTERWARDS, and it
+//     differs in the one way that matters to them: the container is genuinely REMOVED as well as
+//     404'd, so the name it stood at is free. RemoveMissing deliberately keeps the object present
+//     for every INSPECT, which is right for a verb that only removes — but a replacement path that
+//     survived the 404 would then collide with an object the daemon had just said does not exist,
+//     and the test would be reporting the fake's contradiction rather than the code's behaviour.
+//     What this stands is the real sequence: authority proves the container ours, something else
+//     removes it, and OUR DELETE arrives second — 404, and the name free. Container only: nothing
+//     re-creates a volume or a network inside a removal window.
 type Fake struct {
 	mu   sync.Mutex
 	cond *sync.Cond // signals helper completion to blocked waiters (waitContainer)
@@ -174,6 +183,7 @@ type Fake struct {
 	InspectMissing        string
 	InspectMissingAfter   int
 	RemoveMissing         string
+	RemoveVanishes        string
 	inspectMissingCount   int
 	ServerVersionValue    string
 	Rootless              bool
@@ -1030,6 +1040,17 @@ func (f *Fake) attachContainer(w http.ResponseWriter, r *http.Request, seg strin
 func (f *Fake) removeContainer(w http.ResponseWriter, r *http.Request, seg string) {
 	name := pathName(seg)
 	c := f.findContainer(name)
+	if c != nil && f.RemoveVanishes != "" && name == f.RemoveVanishes {
+		// SOMETHING ELSE GOT THERE FIRST. The container is taken away and this DELETE answers
+		// 404 — the object is gone and this call is not what removed it, which is exactly the
+		// state a replacement path must be able to proceed from.
+		c.state = "exited"
+		c.awaitingStdin = false
+		f.cond.Broadcast()
+		delete(f.containers, c.name)
+		fail(w, 404, "No such container: %s", name)
+		return
+	}
 	if c == nil || (f.RemoveMissing != "" && name == f.RemoveMissing) {
 		fail(w, 404, "No such container: %s", name)
 		return
