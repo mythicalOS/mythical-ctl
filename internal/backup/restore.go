@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -43,14 +44,28 @@ const (
 // "no intent", because this function only DISPATCHES. The one place that fold would be unsafe
 // — activation, which acts on "the intent is genuinely gone" — asks the question again and
 // distinguishes the three (see Activate).
+//
+// THE TWO PRESENCE QUESTIONS ARE NOT FOLDED, and that is the opposite rule for the opposite
+// reason. StateNone is not a dispatch detail — it AUTHORIZES every destructive branch of the
+// verb (create volumes, fill them, install a ledger at the active name), so it must mean
+// "nothing is there", not "the thing that is there is not a regular file" and not "I could not
+// look". See ledgerPresence.
 func CurrentState(d Deps) (State, error) {
 	if err := d.check(); err != nil {
 		return "", err
 	}
-	if regularFile(livePath(d.Home)) {
+	live, err := d.ledgerPresence(livePath(d.Home), "the active installer state ledger")
+	if err != nil {
+		return "", err
+	}
+	if live {
 		return StateActive, nil
 	}
-	if !regularFile(stagingPath(d.Home)) {
+	stagingThere, err := d.ledgerPresence(stagingPath(d.Home), "the staging ledger")
+	if err != nil {
+		return "", err
+	}
+	if !stagingThere {
 		return StateNone, nil
 	}
 	st, err := ledger.OpenStaging(d.Lock)
@@ -459,17 +474,115 @@ func Activate(d Deps) error {
 		d.warn("  ledger that still records an unfinished restore: %v", ferr)
 		return fmt.Errorf("restore: the restore-intent read failed: %w", ferr)
 	}
+	// THE PRESENCE TEST AND THE MOVE ARE ONE OPERATION, not a check followed by a rename. A
+	// `[ -f ]` that answers "absent" about a dangling symlink, and a rename that REPLACES
+	// whatever it lands on, together make phase 6 destroy a node the verb concluded was not
+	// there — and a regular ledger that appears in the window between the two is destroyed the
+	// same way, by a rename that was authorized by a fact that stopped being true. activateRename
+	// is one atomic no-replace step: the kernel decides, once, and installs the ledger only onto
+	// a name nothing occupies. See activate.go.
 	lf := livePath(d.Home)
-	if regularFile(lf) {
-		d.warn("restore: an active ledger appeared — refusing to overwrite it")
-		return errors.New("restore: an active ledger appeared")
-	}
-	if rerr := os.Rename(stagingPath(d.Home), lf); rerr != nil {
+	rerr := activateRename(stagingPath(d.Home), lf)
+	switch {
+	case rerr == nil:
+	case errors.Is(rerr, errActivatedWithResidue):
+		// NEITHER SUCCESS NOR FAILURE, AND IT MUST NOT BE REPORTED AS EITHER. The ledger is at
+		// the active name and the installation IS live; only the staging copy is left over.
+		// Calling this "activation failed" would send an operator to re-run a restore that has
+		// already happened.
+		d.log("restore: activated. The installation is live again.")
+		d.warn("%v", rerr)
+		d.warn("  The installation IS restored and live — this is not a failed activation. What is left")
+		d.warn("  is a leftover copy of the same ledger at %s, which no verb acts on while", stagingPath(d.Home))
+		d.warn("  an active ledger is present. Remove it when convenient.")
+		return nil
+	case errors.Is(rerr, fs.ErrExist):
+		d.warn("restore: an active ledger appeared — refusing to overwrite it:")
+		d.warn("    %s — %s", lf, whatIsAt(lf))
+		d.warn("  Activation is an atomic no-replace move: it installs the restored ledger only onto a")
+		d.warn("  name nothing occupies. Anything standing there — a live ledger, a dangling symlink, a")
+		d.warn("  device node — is something this verb cannot prove is not a live installation's")
+		d.warn("  provenance, so it is preserved and the staging ledger is kept.")
+		return fmt.Errorf("restore: an active ledger appeared: %w", rerr)
+	default:
 		d.warn("restore: activation failed: %v", rerr)
 		return fmt.Errorf("restore: activation failed: %w", rerr)
 	}
 	d.log("restore: activated. The installation is live again.")
 	return nil
+}
+
+// ledgerPresence answers "is there a ledger at this well-known path", and REFUSES rather than
+// answering when it cannot tell.
+//
+// fs.ErrNotExist IS THE ONLY ABSENCE. The reference's `[ -f "$p" ]` — os.Stat plus IsRegular —
+// is false for four distinct facts: nothing is there, a DANGLING symlink is there, a FIFO or a
+// directory is there, and the path could not be examined at all. Only the first is an absence,
+// and the caller acts on absence by creating volumes, filling them, and moving a ledger onto
+// that exact name. Reading the other three as an absence is therefore how this verb concludes a
+// machine is empty and then writes over what is standing at the name it just declared free.
+//
+// Lstat, not Stat, is what makes a dangling symlink visible at all: Stat follows the link and
+// answers ENOENT — byte-identical to "nothing is there" — for a link that plainly IS there.
+//
+// A SYMLINK TO A REAL LEDGER IS ALSO A REFUSAL, not an answer of "active". This installer never
+// creates one, so its presence means something else put it there, and "follow it and treat what
+// it points at as our ledger" is a decision this function has no basis to make. Refusing is the
+// same posture internal/ledger's own reader already takes at the same paths.
+func (d Deps) ledgerPresence(path, what string) (bool, error) {
+	fi, err := os.Lstat(path)
+	switch {
+	case err == nil && fi.Mode().IsRegular():
+		return true, nil
+	case err == nil:
+		d.warn("restore: %s is present but is not a regular file:", what)
+		d.warn("    %s — %s", path, whatIsAt(path))
+		d.warn("  Something is there, so this is not 'no ledger'. It is a state this verb cannot")
+		d.warn("  classify, and every branch that follows from 'no ledger' creates volumes and ends by")
+		d.warn("  installing a ledger at that exact name. Refusing rather than treating it as absent.")
+		d.warn("  Run 'mythical-ctl state repair'.")
+		return false, fmt.Errorf("restore: %s is present but is not a regular file: %s", what, path)
+	case errors.Is(err, fs.ErrNotExist):
+		return false, nil
+	default:
+		d.warn("restore: %s could not be examined, so absence cannot be established:", what)
+		d.warn("    %s: %v", path, err)
+		d.warn("  Refusing rather than reading a failed question as 'there is nothing here'.")
+		return false, fmt.Errorf("restore: %s could not be examined (%s): %w", what, path, err)
+	}
+}
+
+// whatIsAt names what is standing at a path, for a refusal that has already been decided. It is
+// DIAGNOSIS ONLY — nothing branches on it — so its own failure is reported rather than being a
+// second refusal.
+func whatIsAt(p string) string {
+	fi, err := os.Lstat(p)
+	if err != nil {
+		return fmt.Sprintf("it could not be examined: %v", err)
+	}
+	m := fi.Mode()
+	switch {
+	case m.IsRegular():
+		return "a regular file"
+	case m.IsDir():
+		return "a directory"
+	case m&fs.ModeSymlink != 0:
+		target, rerr := os.Readlink(p)
+		if rerr != nil {
+			return "a symlink"
+		}
+		if _, serr := os.Stat(p); errors.Is(serr, fs.ErrNotExist) {
+			return fmt.Sprintf("a DANGLING symlink to %q", target)
+		}
+		return fmt.Sprintf("a symlink to %q", target)
+	case m&fs.ModeNamedPipe != 0:
+		return "a named pipe"
+	case m&fs.ModeSocket != 0:
+		return "a socket"
+	case m&fs.ModeDevice != 0:
+		return "a device node"
+	}
+	return "of type " + m.Type().String()
 }
 
 // Abandon removes the volumes THIS restore created and then the staging ledger.
