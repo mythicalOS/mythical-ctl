@@ -908,6 +908,112 @@ func TestStreamWriterRecordIsByteExact(t *testing.T) {
 	}
 }
 
+// THE REPLAY MUST NOT HAND THE TERMINAL A CONTROL SEQUENCE TO EXECUTE. The record carries verb
+// output, verb output carries ledger field values, and the ledger's field grammar refuses only TAB
+// and LF in a value — so ESC, BEL, CR and U+202E are all legal, checksum-valid field content. They
+// are harmless inside the pane, which sanitises what it draws, and were NOT harmless in the final
+// replay: that lands straight on the operator's terminal after the frame comes down, which is
+// where the operator reads the result of the operation.
+//
+// AND IT MUST NOT MANGLE THE RECORD DOING IT. A sanitiser that touched LF would relocate every
+// line break in the replay — a different and worse defect than the one it fixes — so the newlines,
+// the stream each chunk belongs to, and their order are all asserted here beside the replacement.
+func TestFlushDoesNotReplayTerminalControlBytes(t *testing.T) {
+	b := NewBridge(context.Background(), blackHole{})
+	out := b.Writer(false)
+	errw := b.Writer(true)
+
+	// Interleaved streams, and a hostile value inside an otherwise ordinary line.
+	fmt.Fprint(out, "state: \x1b[31mrunning\x1b[0m\n")
+	fmt.Fprint(errw, "mythical-ctl: refused\u202e\n")
+	fmt.Fprint(out, "bell:\a and a carriage return:\r overwrite\n")
+	fmt.Fprint(errw, "\ufeffbom-led line\n")
+	fmt.Fprint(out, "no trailing newline")
+
+	var o, e bytes.Buffer
+	b.Flush(&o, &e)
+
+	for _, bad := range []string{"\x1b", "\a", "\r", "\u202e", "\ufeff"} {
+		if strings.Contains(o.String(), bad) || strings.Contains(e.String(), bad) {
+			t.Fatalf("the replay handed %q to the terminal: stdout %q stderr %q", bad, o.String(), e.String())
+		}
+	}
+	// The lines themselves are intact, on their own streams, in order, with every newline where
+	// the verb put it and no newline the verb did not write.
+	wantOut := "state: \ufffd[31mrunning\ufffd[0m\nbell:\ufffd and a carriage return:\ufffd overwrite\nno trailing newline"
+	if o.String() != wantOut {
+		t.Fatalf("stdout replay %q, want %q", o.String(), wantOut)
+	}
+	wantErr := "mythical-ctl: refused\ufffd\n\ufffdbom-led line\n"
+	if e.String() != wantErr {
+		t.Fatalf("stderr replay %q, want %q", e.String(), wantErr)
+	}
+	// The RECORD is untouched — it is what the verb wrote, and the filtering is a property of
+	// putting it on a terminal, not of keeping it.
+	var raw strings.Builder
+	for _, c := range b.Record() {
+		raw.WriteString(c.text)
+	}
+	if !strings.Contains(raw.String(), "\x1b[31m") {
+		t.Fatalf("the record itself was rewritten: %q", raw.String())
+	}
+}
+
+// A RUNE SPLIT ACROSS TWO WRITES, on interleaved streams. The record takes the raw bytes of every
+// Write, so a multi-byte rune can straddle two chunks with a chunk of the OTHER stream between
+// them. Judging each chunk alone is wrong in both directions: a legitimate rune arrives as two
+// invalid fragments and is replaced twice, and — the reason this is a security test and not a
+// cosmetic one — a bidi override arrives as two innocent-looking fragments that pass through and
+// are reassembled by the terminal into exactly the override the filter exists to stop.
+func TestFlushJoinsARuneSplitAcrossChunksBeforeJudgingIt(t *testing.T) {
+	b := NewBridge(context.Background(), blackHole{})
+	out := b.Writer(false)
+	errw := b.Writer(true)
+
+	override := []byte("\u202e") // 3 bytes: e2 80 ae
+	legit := []byte("\u00e9")    // 2 bytes: c3 a9
+
+	out.Write([]byte("ok "))
+	out.Write(override[:1]) // stdout holds a fragment...
+	errw.Write(legit[:1])   // ...while stderr splits one of its own...
+	out.Write(override[1:]) // ...and stdout's rest arrives after it.
+	errw.Write(legit[1:])
+	out.Write([]byte(" done\n"))
+	errw.Write([]byte(" rejoined\n"))
+	errw.Write([]byte("caf\u00e9\n"))
+
+	var o, e bytes.Buffer
+	b.Flush(&o, &e)
+
+	if strings.Contains(o.String(), "\u202e") {
+		t.Fatalf("a bidi override split across two writes was reassembled by the TERMINAL: %q", o.String())
+	}
+	if o.String() != "ok \ufffd done\n" {
+		t.Fatalf("stdout replay %q, want the split override replaced exactly once", o.String())
+	}
+	if e.String() != "\u00e9 rejoined\ncaf\u00e9\n" {
+		t.Fatalf("stderr replay %q — a legitimate rune split across two writes was mangled", e.String())
+	}
+}
+
+// A STREAM THAT ENDS PART-WAY THROUGH A RUNE loses nothing to the hold: the bytes held for a
+// remainder that never came are still accounted for, as the placeholder they are.
+func TestFlushReleasesATruncatedTailAtTheEnd(t *testing.T) {
+	b := NewBridge(context.Background(), blackHole{})
+	out := b.Writer(false)
+	out.Write([]byte("tail:"))
+	out.Write([]byte("\u202e")[:2]) // a truncated sequence, and nothing follows it
+
+	var o, e bytes.Buffer
+	b.Flush(&o, &e)
+	if o.String() != "tail:\ufffd\ufffd" {
+		t.Fatalf("stdout replay %q — held bytes were dropped or emitted raw", o.String())
+	}
+	if e.Len() != 0 {
+		t.Fatalf("stderr %q", e.String())
+	}
+}
+
 // TestProgressRecordMatchesThePlainPathByte for byte: the plain default is
 // fmt.Fprintln(d.out(), ev.Detail).
 func TestProgressRecordMatchesThePlainPathByte(t *testing.T) {

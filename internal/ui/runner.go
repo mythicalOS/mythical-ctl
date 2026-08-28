@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -191,21 +193,44 @@ func (b *Bridge) appendRecord(stderr bool, text string) {
 	b.mu.Unlock()
 }
 
-// Record is the operation's durable output, in order. Exposed for tests; the runner replays it
-// through Flush.
+// Record is the operation's durable output, in order — the RAW bytes, unfiltered. Exposed for
+// tests; the runner replays it through Flush, which is where the terminal-hostile runes are made
+// harmless. Keeping the record raw is deliberate: it is the record of what the verb actually
+// wrote, and the filtering is a property of putting it on a terminal.
 func (b *Bridge) Record() []recordChunk {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return append([]recordChunk(nil), b.record...)
 }
 
-// Flush writes the record to the real streams, VERBATIM — every chunk, in order, on the stream it
-// was written to, with nothing added.
+// Flush writes the record to the real streams — every chunk, in order, on the stream it was
+// written to, with nothing added and nothing reordered.
 //
 // This is what makes the interface's output MATCH THE PLAIN PATH's rather than merely resemble it.
 // Nothing is appended: a verb that wrote no trailing newline gets no trailing newline here either.
 // The confirmation PROMPTS are deliberately not part of the record — they were asked and answered on
 // screen, and reprinting a question after it has been answered would read as if it were still open.
+//
+// THE ONE THING IT DOES CHANGE is a rune the terminal would INTERPRET rather than print. The replay
+// happens after the frame comes down, straight onto the operator's terminal, so an ESC, a BEL, a
+// carriage return or a bidi override travelling in the record is executed there — and the record
+// carries verb output, which carries ledger field values. The ledger's field grammar refuses only
+// TAB and LF in a value; every escape byte is a legal, checksum-valid field. So a value chosen by
+// whoever wrote it could repaint the line, hide what follows, or reverse a refusal into an
+// acceptance in the one place the operator reads the result.
+//
+// THIS IS WHERE IT BELONGS, not at the call sites. Five paths share this method — the lifecycle
+// runner, the status runner, and the tests standing in for them — and none of them owns it. A
+// sanitising flush written at one call site would protect that path while reading as though it
+// protected all of them, and would put two sibling runners out of step for every report that
+// contains no control byte at all, which is all of them. Fixing it here is the only change that
+// covers every path at once, and it leaves those runners identical again.
+//
+// LF IS PRESERVED EXACTLY, because LF is the record's boundary between lines: a sanitiser that
+// touched it would relocate every line break in the replay, which is a different and worse defect
+// than the one it fixes. Everything else unicode.IsControl covers — including CR, which is the
+// overwrite-this-line vector, and TAB, which no verb in this tree emits — plus the bidi controls
+// and the BOM become U+FFFD, the same visible placeholder the pane draws for them.
 func (b *Bridge) Flush(stdout, stderr io.Writer) {
 	if stdout == nil {
 		stdout = io.Discard
@@ -213,13 +238,76 @@ func (b *Bridge) Flush(stdout, stderr io.Writer) {
 	if stderr == nil {
 		stderr = io.Discard
 	}
+	// ONE FILTER PER STREAM. The filter carries a rune split across two chunks, and stdout's
+	// chunks and stderr's interleave — a single shared filter would join the halves of a stdout
+	// rune across an intervening stderr write and mangle both.
+	var fout, ferr replayFilter
 	for _, c := range b.Record() {
-		w := stdout
+		w, f := stdout, &fout
 		if c.stderr {
-			w = stderr
+			w, f = stderr, &ferr
 		}
-		_, _ = io.WriteString(w, c.text)
+		_, _ = io.WriteString(w, f.filter(c.text))
 	}
+	_, _ = io.WriteString(stdout, fout.rest())
+	_, _ = io.WriteString(stderr, ferr.rest())
+}
+
+// replayFilter is Flush's per-stream rune filter.
+//
+// IT IS STATEFUL FOR ONE REASON: a rune may be SPLIT ACROSS CHUNKS. The record takes the raw bytes
+// of every Write, and a Write can end part-way through a multi-byte rune. Judging each chunk on its
+// own would be wrong in both directions — a legitimate rune split in two would be replaced twice
+// over, and a bidi override split in two would pass through as two innocent-looking fragments that
+// the terminal reassembles into exactly the override this filter exists to stop. So a trailing
+// INCOMPLETE sequence is held until the next chunk of the same stream supplies the rest. Only a
+// truncated multi-byte sequence is ever held, and LF is a single ASCII byte that can never be part
+// of one — so no record boundary is ever delayed or moved.
+type replayFilter struct{ carry []byte }
+
+func (f *replayFilter) filter(s string) string {
+	p := []byte(s)
+	if len(f.carry) > 0 {
+		p = append(f.carry, p...)
+		f.carry = nil
+	}
+	var b strings.Builder
+	b.Grow(len(p))
+	for len(p) > 0 {
+		if !utf8.FullRune(p) {
+			// A PREFIX of a rune whose remaining bytes have not arrived. utf8.FullRune says false
+			// only for a truncated sequence — an invalid encoding is a full width-1 error rune — so
+			// this holds back exactly the split case and nothing else.
+			f.carry = append([]byte(nil), p...)
+			break
+		}
+		r, size := utf8.DecodeRune(p)
+		switch {
+		case r == '\n':
+			b.WriteByte('\n')
+		case r == utf8.RuneError && size == 1, terminalHostile(r):
+			// A byte that is not valid UTF-8 becomes the placeholder too. It cannot be printed as
+			// itself, and passing it through raw would let a hostile rune cross a chunk boundary in
+			// pieces. This matches what the pane already draws: ranging over a string yields
+			// U+FFFD for such a byte, so screen and replay agree.
+			b.WriteRune('\ufffd')
+		default:
+			b.Write(p[:size])
+		}
+		p = p[size:]
+	}
+	return b.String()
+}
+
+// rest releases anything still held once the stream has no more chunks. What is left is a sequence
+// whose remainder never came, so it is not a rune and is replaced rather than emitted raw.
+func (f *replayFilter) rest() string {
+	if len(f.carry) == 0 {
+		return ""
+	}
+	out := strings.Repeat("\ufffd", len(f.carry))
+	f.carry = nil
+	return out
 }
 
 // Writer returns an io.Writer that routes a stream's writes into the interface line by line, and

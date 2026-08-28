@@ -345,13 +345,26 @@ func sanitize(s string) string {
 		switch {
 		case r == '\n' || r == '\t':
 			b.WriteRune(' ')
-		case unicode.IsControl(r), isBidiControl(r), r == '\ufeff':
+		case terminalHostile(r):
 			b.WriteRune('\ufffd')
 		default:
 			b.WriteRune(r)
 		}
 	}
 	return b.String()
+}
+
+// terminalHostile reports the runes that must not reach a terminal as themselves: the control
+// characters, the bidi controls, and the BOM.
+//
+// ONE PREDICATE, TWO CALLERS, deliberately. The pane sanitises what it DRAWS (sanitize, above);
+// Bridge.Flush sanitises what it REPLAYS onto the real terminal after the pane is gone. Those are
+// different jobs with different carve-outs — the pane turns a newline into a space because it is
+// filling a cell, the replay keeps it because it is a record boundary — but they must agree on
+// WHICH RUNES ARE DANGEROUS. Two lists would drift, and the direction of the drift is always the
+// same: the copy nobody is looking at grows a hole.
+func terminalHostile(r rune) bool {
+	return unicode.IsControl(r) || isBidiControl(r) || r == '\ufeff'
 }
 
 // isBidiControl reports the Bidi_Control code points. unicode.IsControl does NOT cover them — they

@@ -1324,20 +1324,15 @@ func runStatus(ctx context.Context, base verbs.Deps, fn VerbFunc, mk func(Status
 	// operator with the report itself in their terminal rather than an erased frame, and it is
 	// what makes this view's classification a viewing aid rather than a filter.
 	//
-	// THE REPLAY IS BYTE-EXACT AND THEREFORE UNSANITISED, and that is worth stating plainly
-	// because this file sanitises everything it DRAWS. The two are different jobs: sanitising the
-	// frame stops one stray escape from corrupting a whole rendering, or a bidi override from
-	// making a refusing line read as an accepting one INSIDE the pane. The replay reproduces what
-	// the report wrote, byte for byte, exactly as `--plain`, a pipe and the frozen shell original
-	// all deliver it — so a control byte in a ledger value reaches a terminal here no more and no
-	// less than it always has.
-	//
-	// It is NOT fixed here on purpose. The escape belongs to the report's own bytes, so the one
-	// place a fix covers every path is where those bytes are produced or replayed for everyone —
-	// the verb, or Bridge.Flush, which this runner shares with the lifecycle runner and does not
-	// own. A second, sanitising flush HERE would protect one of five paths while reading as
-	// though it protected all of them, and would put this runner's replay out of step with its
-	// sibling's for every report that contains no control byte at all, which is all of them.
+	// THE REPLAY IS SANITISED, and it is sanitised in Bridge.Flush rather than here. This file
+	// sanitises everything it DRAWS, which is a different job: sanitising the frame stops one
+	// stray escape from corrupting a whole rendering INSIDE the pane. The replay lands on the real
+	// terminal after the pane is gone, so a control byte carried in a ledger value would be
+	// executed there — and this runner is one of five paths through the same Flush. Doing it at
+	// this call site would have protected one of them while reading as though it protected all
+	// five, and would have put this runner out of step with its sibling for every report that
+	// contains no control byte at all, which is all of them. So it is done once, for everyone,
+	// where the bytes are replayed. Record boundaries survive it: Flush preserves LF exactly.
 	res.b.Flush(base.Stdout, base.Stderr)
 	return res.code, runErr
 }
