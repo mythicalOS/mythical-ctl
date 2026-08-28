@@ -326,7 +326,12 @@ var (
 	invCommentLine = regexp.MustCompile(`^[ \t]*(//|/\*|\*)`)
 	invPorted      = regexp.MustCompile(`^[ \t]*// PORTED:[ \t]+(\S+):[ \t]+"(.+)"[ \t]+->[ \t]+(.*\S)[ \t]*$`)
 	invNA          = regexp.MustCompile(`^[ \t]*// N/A:[ \t]+(\S+):[ \t]+"(.+)"[ \t]+--[ \t]+(.*\S)[ \t]*$`)
-	goTestID       = regexp.MustCompile(`\bTest[A-Za-z0-9_]*`)
+	// GO'S OWN TEST-NAME GRAMMAR, not "starts with Test". The testing package requires the character
+	// AFTER `Test` to be something other than a lower-case letter, so `func Testfoo()` is never run —
+	// Go ignores it silently. A pattern that accepted it would let a PORTED claim rest on a function
+	// that exists in source, can be printed into a list, and is never executed: a parity hole
+	// satisfying both witnesses at once.
+	goTestID = regexp.MustCompile(`\bTest([A-Z0-9_][A-Za-z0-9_]*)?\b`)
 )
 
 // minNAReason is a substance floor, not a style rule. "N/A -- n/a" satisfies a syntax check and
@@ -737,8 +742,10 @@ func collectSourceTestFuncs(root string) (map[string]map[string]bool, error) {
 			if !ok || fn.Recv != nil || fn.Name == nil {
 				continue
 			}
-			if strings.HasPrefix(fn.Name.Name, "Test") {
-				out[dir][fn.Name.Name] = true
+			// The same grammar the testing package applies: `Test` alone, or `Test` followed by a
+			// character that is not a lower-case letter.
+			if n := fn.Name.Name; goTestID.FindString(n) == n {
+				out[dir][n] = true
 			}
 		}
 		return nil

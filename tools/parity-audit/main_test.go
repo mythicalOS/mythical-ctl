@@ -197,6 +197,9 @@ func TestParseGoTestList(t *testing.T) {
 		`ExampleThing`,
 		`ok  	mythicalos.ai/ctl/internal/x	0.004s`,
 		`TestShared`,
+		`TestOnlyHere`,
+		// NOT a test Go would run: the character after `Test` is lower-case. It is here because an
+		// earlier fixture treated it as one, which is the same mistake the grammar fix corrects.
 		`TestingNotATest`,
 		`ok  	mythicalos.ai/ctl/internal/y	0.002s`,
 		`?   	mythicalos.ai/ctl/internal/z	[no test files]`,
@@ -205,11 +208,14 @@ func TestParseGoTestList(t *testing.T) {
 	if !got[x]["TestOne"] || !got[x]["TestShared"] {
 		t.Fatalf("package x: %v", got[x])
 	}
-	if got[x]["TestingNotATest"] {
+	if got[x]["TestOnlyHere"] {
 		t.Fatalf("a later package's name leaked into an earlier one: %v", got[x])
 	}
-	if !got[y]["TestShared"] || !got[y]["TestingNotATest"] || got[y]["TestOne"] {
+	if !got[y]["TestShared"] || !got[y]["TestOnlyHere"] || got[y]["TestOne"] {
 		t.Fatalf("package y: %v", got[y])
+	}
+	if got[y]["TestingNotATest"] {
+		t.Fatalf("a name Go would never run was read as a test: %v", got[y])
 	}
 	if got[x]["BenchmarkThing"] || got[x]["ExampleThing"] {
 		t.Fatalf("picked up something that is not a test: %v", got[x])
@@ -1296,5 +1302,57 @@ func TestSourceWitnessIgnoresDeclarationsThatAreNotCode(t *testing.T) {
 		t.Fatal("an unparseable _test.go was skipped rather than refused")
 	} else if !strings.Contains(err.Error(), "broken_test.go") {
 		t.Fatalf("the refusal does not name the file: %v", err)
+	}
+}
+
+// GO'S TEST-NAME GRAMMAR, applied at all three places a name is read. `func Testfoo()` is NOT a
+// test — the testing package requires the character after `Test` to be something other than a
+// lower-case letter, and it ignores the rest in silence. Accepting it would let a PORTED claim rest
+// on a function that exists in source, can be printed into a `go test -list` stream, and is never
+// executed: a parity hole satisfying both witnesses at once.
+func TestOnlyRealGoTestNamesCount(t *testing.T) {
+	for _, yes := range []string{"Test", "TestX", "Test_foo", "Test9", "TestABC_def"} {
+		if goTestID.FindString(yes) != yes {
+			t.Errorf("%q is a real test name and was not recognised", yes)
+		}
+	}
+	for _, no := range []string{"Testfoo", "Testing", "TestingNotATest"} {
+		if goTestID.FindString(no) == no {
+			t.Errorf("%q is NOT a test Go would run, and was accepted", no)
+		}
+	}
+	// The list reader applies it too...
+	got := parseGoTestList(lines(
+		`TestReal`,
+		`Testfoo`,
+		`ok  	mythicalos.ai/ctl/internal/x	0.001s`,
+	))
+	x := got["mythicalos.ai/ctl/internal/x"]
+	if !x["TestReal"] {
+		t.Fatalf("the real name was dropped: %v", x)
+	}
+	if x["Testfoo"] {
+		t.Fatalf("a printed non-test was read as a registered test: %v", x)
+	}
+	// ...and so does the source witness.
+	dir := t.TempDir()
+	pkg := filepath.Join(dir, "internal", "x")
+	if err := os.MkdirAll(pkg, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	src := strings.Join([]string{
+		`package x`, ``, `import "testing"`, ``,
+		`func TestReal(t *testing.T) {}`,
+		`func Testfoo(t *testing.T) {}`, ``,
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(pkg, "x_test.go"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sf, err := collectSourceTestFuncs(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sf["internal/x"]["TestReal"] || sf["internal/x"]["Testfoo"] {
+		t.Fatalf("the source witness does not apply Go's grammar: %v", sf["internal/x"])
 	}
 }

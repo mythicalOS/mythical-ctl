@@ -2061,3 +2061,69 @@ func TestBatchRefusesAVerbItDoesNotDriveAndAnEmptyBatch(t *testing.T) {
 		t.Fatalf("no diagnostic for the empty batch:\n%s", r.said())
 	}
 }
+
+// TestAVolumeThatIsNotOursIsNeitherAdoptedNorRemoved is the fail-closed half of volume adoption.
+//
+// THE SUCCESS HALF IS TESTED ELSEWHERE — a volume this installation created, standing at the name we
+// would create, is adopted with its role, data class and product. THIS is the half that costs
+// something when it is wrong: a volume carrying somebody ELSE'S nonce may hold another
+// installation's data, so it must not be taken over and must not be removed.
+//
+// WHICH GATE REFUSES IS ITSELF THE FINDING, and it is why this test asserts the OUTCOME rather than
+// one diagnostic. The nonce comparison in the confirm step is written as the backstop, but it is not
+// what fires: the §6b.2 unaccounted-object gate reaches this situation FIRST, because a volume
+// labelled for this installation that the ledger does not account for is refused before any verb
+// touches anything. So the confirm-step comparison is defence in depth behind an earlier refusal —
+// reachable only if that gate ever stopped covering it — and what this test pins is the property
+// both exist for: the operation stops, the volume survives, and nothing was adopted.
+func TestAVolumeThatIsNotOursIsNeitherAdoptedNorRemoved(t *testing.T) {
+	r := newRig(t)
+	r.writeProduct("p2")
+	r.mintIdentity()
+	ident := r.ident()
+	vol := "mythical-" + ident + "-p2-memory"
+
+	// The intent is opened under OUR nonce; the volume standing at that name carries a different
+	// one — the shape a second installation, or a name reused after a crash, produces.
+	const ours, theirs = "nadoptxxxx", "nSOMEONEELSE"
+	r.editLedger(func(l *ledger.Ledger) {
+		if err := intent.Open(l, prov.ClassVolume, vol, ours, time.Now(),
+			ledger.Field{Key: "product", Value: "p2"},
+			ledger.Field{Key: "role", Value: "memory"}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	r.withLock(func(h famlock.Held, _ ledger.Store) {
+		rt, err := runtime.New(h, r.c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p, perr := engine.NewProvenance(ident, theirs)
+		if perr != nil {
+			t.Fatal(perr)
+		}
+		if err := rt.VolumeCreate(context.Background(), vol, p); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	if rc := r.install("p2"); rc == cliio.ExitOK {
+		t.Fatalf("a volume carrying another nonce was adopted\n%s", r.said())
+	}
+	// The operator is TOLD, and told something actionable — silence here would leave a refused
+	// install with no explanation of what is standing in the way.
+	if !strings.Contains(r.said(), "state repair") {
+		t.Fatalf("the refusal does not tell the operator what to do:\n%s", r.said())
+	}
+	// NEITHER ADOPTED NOR REMOVED: the volume is still there, and it is still theirs.
+	if !r.volumeExists(vol) {
+		t.Fatal("the volume was removed — it may hold another installation's data")
+	}
+	if _, err := prov.Find(r.ledgerNow(), prov.ClassVolume, vol); err == nil {
+		t.Fatal("the volume was adopted into our provenance despite carrying another nonce")
+	}
+	// AND THE INTENT IS RETAINED, so the situation is recorded rather than vanishing.
+	if _, err := intent.Find(r.ledgerNow(), prov.ClassVolume, vol); err != nil {
+		t.Fatalf("the intent was dropped, so nothing records that this is unresolved: %v", err)
+	}
+}
