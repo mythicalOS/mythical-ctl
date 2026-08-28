@@ -77,16 +77,24 @@ what each command does about it.
 so that two `mythical-ctl` processes cannot interleave a read-modify-write of the ledger or of
 `mythical.conf`. Something else holds it right now.
 
-**What the CLI will and will not do.** Refuses immediately rather than queueing, naming the holding
+**What the CLI will and will not do.** Refuses immediately rather than queueing, naming a holding
 process id when it can read one. It never waits, and it never takes the lock away from whoever has
 it. Nothing has been touched, so there is no partial state to recover from.
+
+**Read that pid as a hint, not as a fact.** It is written into the lock file by whoever last took
+the lock, as a diagnostic, and it is neither authoritative nor guaranteed fresh: a contender can
+read a pid left by an earlier run. A pid that is not running therefore does **not** prove the lock
+is free — and this message is also what you get if the lock could not be taken for a reason that is
+not contention at all (a filesystem that does not support `flock`, or one that has run out of lock
+records). If it persists with no other `mythical-ctl` running anywhere on the machine, suspect the
+filesystem `~/.mythical` is on rather than a phantom process.
 
 **There is no stale lock to clear, ever — and deleting the file is worse than useless.** The lock is
 a kernel `flock(2)`, and a lock held by a process that dies is released by the kernel along with
 everything else that process had open: a `mythical-ctl` that is killed, crashes, or loses its
 terminal takes its lock with it. So a `.state/lock` file sitting on disk is **not** a held lock; it
 is an ordinary file the next run reuses, and the `pid=` line inside it is a diagnostic breadcrumb,
-never authority. If a reported pid is not running, the lock is already released — just re-run.
+never authority.
 
 Removing the file is not a neutral act, though. A `flock` belongs to the **inode**, not to the name:
 delete `.state/lock` while an operation genuinely is running and the next invocation creates a

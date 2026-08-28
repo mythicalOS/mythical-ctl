@@ -90,8 +90,8 @@ run, from which commit, produced exactly those bytes:
 gh attestation verify /usr/local/bin/mythical-ctl --repo mythicalOS/mythical-ctl
 ```
 
-(It takes a **file path**, so name the installed file — or run it on `mythical-ctl_<plat>` in the
-download directory, before the `mv`.)
+(It takes a **file path**, so name the installed file — or, if you would rather check before
+installing, run it on the downloaded `mythical-ctl_<plat>` and put the `install` line after it.)
 
 The version string is not the integrity guarantee — the digest is; anyone can print a version.
 [get.mythicalos.ai](https://get.mythicalos.ai) serves a pinned release artifact from here, so a

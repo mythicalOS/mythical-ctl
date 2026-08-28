@@ -104,7 +104,7 @@ check_exit_code 'unknown command exits 2'       2 "$CTL" not-a-real-command
 # on a binary whose --version fails, which truncates the report and drops the
 # summary — a run that tested less than it says, in silence.
 version_rc=0
-"$CTL" --version > "$WORK/version.out" 2>/dev/null || version_rc=$?
+"$CTL" --version > "$WORK/version.out" 2> "$WORK/version.err" || version_rc=$?
 version_line="$(head -n 1 "$WORK/version.out")"
 printf '%s\n' "$version_line" > "$WORK/version.want"
 if [ "$version_rc" -eq 0 ] && cmp -s "$WORK/version.out" "$WORK/version.want" \
@@ -115,20 +115,26 @@ else
   fail=$((fail + 1))
 fi
 
-# `-v` is --version's TWIN: same exit status, and the same BYTES — compared with
-# cmp on the captured files, not with `[ "$a" = "$b" ]` on two command
-# substitutions. Command substitution strips every trailing newline, so the
-# variable form reports two outputs identical when one of them ends in a blank
-# line the other does not have; and it cannot hold a NUL at all. It is the short
-# form people actually type, and a divergence in it is invisible to every other
-# check in this file.
+# `-v` is --version's TWIN: same exit status, and the same BYTES ON BOTH STREAMS
+# — compared with cmp on captured files, not with `[ "$a" = "$b" ]` on two
+# command substitutions. Command substitution strips every trailing newline, so
+# the variable form calls two outputs identical when one ends in a blank line the
+# other does not have; and it cannot hold a NUL at all. STDERR IS COMPARED TOO,
+# not discarded: in the frozen reference these were one `case` branch, so a
+# warning that appears on one and not the other is a divergence, and discarding
+# the stream is how it would go unseen. It is the short form people actually
+# type, and a difference in it is invisible to every other check in this file.
 v_short_rc=0
-"$CTL" -v > "$WORK/v.out" 2>/dev/null || v_short_rc=$?
-if [ "$v_short_rc" -eq 0 ] && cmp -s "$WORK/v.out" "$WORK/version.out"; then
-  printf "  ok    -v is --version's twin, byte for byte\n"; pass=$((pass + 1))
+"$CTL" -v > "$WORK/v.out" 2> "$WORK/v.err" || v_short_rc=$?
+v_diff=''
+cmp -s "$WORK/v.out" "$WORK/version.out" || v_diff="stdout"
+cmp -s "$WORK/v.err" "$WORK/version.err" || v_diff="${v_diff:+$v_diff and }stderr"
+if [ "$v_short_rc" -eq 0 ] && [ -z "$v_diff" ]; then
+  printf "  ok    -v is --version's twin, byte for byte on both streams\n"; pass=$((pass + 1))
 else
-  printf '  FAIL  -v: rc=%d output=%q (--version gave %q)\n' \
-    "$v_short_rc" "$(cat "$WORK/v.out")" "$version_line"
+  printf '  FAIL  -v: rc=%d, differs on %s (stdout %q, stderr %q; --version gave %q / %q)\n' \
+    "$v_short_rc" "${v_diff:-nothing}" "$(cat "$WORK/v.out")" "$(cat "$WORK/v.err")" \
+    "$version_line" "$(cat "$WORK/version.err")"
   fail=$((fail + 1))
 fi
 
