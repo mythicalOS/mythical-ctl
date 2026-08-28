@@ -909,9 +909,20 @@ func candidatePackages(all map[string]map[string]bool, goFile, detail, target st
 	// that says where its target lives is answered by THAT package or by nothing.
 	quals := qualifiersFor(detail, target)
 	if len(quals) > 0 {
-		for _, tok := range quals {
-			add(tok)
+		// TWO DIFFERENT QUALIFICATIONS OF ONE TARGET ARE AMBIGUOUS, AND AMBIGUITY RESOLVES TO
+		// NOTHING. Unioning them puts the hole straight back: `internal/w.TestShared (formerly
+		// internal/x.TestShared)` would be satisfied by EITHER package, so deleting the one the
+		// claim is actually about stays green as long as the other still has a namesake. This is
+		// the same rule the bare-segment case already obeys a few lines down — an ambiguous
+		// reference must not widen the candidate set, because widening is the defect and not the
+		// fix for it. The audit then reports the claim as unresolvable, which is loud and correct.
+		first := quals[0]
+		for _, tok := range quals[1:] {
+			if tok != first {
+				return out
+			}
 		}
+		add(first)
 		return out
 	}
 	// UNQUALIFIED: the claiming file's own package, and nothing else.

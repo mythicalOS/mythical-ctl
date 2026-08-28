@@ -1204,6 +1204,29 @@ func TestQualificationUsesGosNameGrammarNotASCII(t *testing.T) {
 	}
 }
 
+// TestTwoQualificationsOfOneTargetResolveToNothing: a claim that names TWO packages for the same
+// test has said something ambiguous, and an ambiguous reference must not be answered by picking
+// either. Unioning them restores the exact hole the qualification exists to close —
+// `internal/w.TestShared (formerly internal/x.TestShared)` would survive the deletion of the
+// internal/w test as long as internal/x still has a namesake.
+func TestTwoQualificationsOfOneTargetResolveToNothing(t *testing.T) {
+	goTests := map[string]map[string]bool{
+		"mythicalos.ai/ctl/internal/w": {"TestShared": true},
+		"mythicalos.ai/ctl/internal/x": {"TestShared": true},
+	}
+	got := candidatePackages(goTests, "internal/y/y_test.go",
+		"internal/w.TestShared (formerly internal/x.TestShared)", "TestShared")
+	if len(got) != 0 {
+		t.Fatalf("two qualifications of one target were unioned into a candidate set: %v", got)
+	}
+	// THE SAME PACKAGE NAMED TWICE IS NOT AMBIGUOUS — it is one reference, written twice.
+	same := candidatePackages(goTests, "internal/y/y_test.go",
+		"internal/w.TestShared (and again internal/w.TestShared)", "TestShared")
+	if !same["mythicalos.ai/ctl/internal/w"] || len(same) != 1 {
+		t.Fatalf("one package named twice was treated as ambiguous: %v", same)
+	}
+}
+
 // TestAQualificationConstrainsRatherThanWidens: saying where a target lives must NARROW resolution
 // to that package, not add it beside the local one.
 //

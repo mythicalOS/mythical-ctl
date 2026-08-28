@@ -300,6 +300,17 @@ func stagingDiagnostic(path string) error {
 // possessive closes one prescription early and swallows the next.
 func resumability(l *ledger.Ledger) error {
 	rec, ferr := l.Find(RestoreIntentKind, "key", "restore")
+	if ferr != nil && !errors.Is(ferr, ledger.ErrAbsentRecord) {
+		// THE INTENT READ FAILED — two rows answering for the same key, or a selector this format
+		// cannot hold. That is NOT "the intent is gone", and the difference decides which command
+		// is prescribed: internal/backup's Activate asks this question again at the point of
+		// action and REFUSES on exactly this error, so telling an operator the restore is
+		// completed and ready to activate promises an outcome the verb will not produce.
+		return fmt.Errorf("prov: there is no active ledger, and whether the staged restore is finished could not be\n"+
+			"  established — the restore-intent record does not read cleanly (.state/ledger.staging).\n"+
+			"  No recovery is prescribed for a state nobody could determine, and nothing here acts on\n"+
+			"  it. Run 'mythical-ctl state repair': %w", ferr)
+	}
 	if ferr != nil {
 		// NO LIVE INTENT. Phase 5 completed, so what is left is activation — which is what
 		// re-running the verb does. It does not continue an attempt, and saying so would be a

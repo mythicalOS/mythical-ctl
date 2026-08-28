@@ -783,6 +783,21 @@ func preserveCorrupt(sf string) (aside string, residue error, err error) {
 	// rename-if-contents-match, so a swap between this read and the rename below cannot be
 	// excluded. What it buys is that the report is only ever made about bytes this function
 	// actually read, and a swap that happens before the read is DETECTED instead of mis-reported.
+	// PRESENT-AND-REGULAR BEFORE IT IS READ, which is internal/ledger's own discipline at the same
+	// paths and was missing from the first version of this re-read. os.ReadFile on a FIFO swapped
+	// in here BLOCKS FOREVER; on a symlink it follows the link and judges the TARGET, while the
+	// rename below moves the LINK — so the "preserved evidence" would be a symlink and the bytes
+	// that failed their checksum would still be wherever they were.
+	if fi, lerr := os.Lstat(sf); lerr != nil {
+		return "", nil, fmt.Errorf("restore: the staging ledger could not be examined before moving it aside, so\n"+
+			"  whether the file about to be moved is the one that failed its checksum could not be\n"+
+			"  established. Nothing is moved: %w", lerr)
+	} else if !fi.Mode().IsRegular() {
+		return "", nil, fmt.Errorf("restore: what stands at the staging ledger path is no longer a regular file (%s) — it\n"+
+			"  CHANGED between being classified and being moved aside. Nothing is moved and nothing is\n"+
+			"  removed: reading it could block or follow a link, and moving it would preserve the wrong\n"+
+			"  thing. Run the command again to classify what is there now", whatIsAt(sf))
+	}
 	if data, rerr := os.ReadFile(sf); rerr != nil {
 		return "", nil, fmt.Errorf("restore: the staging ledger could not be re-read before moving it aside, so\n"+
 			"  whether the file about to be moved is the one that failed its checksum could not be\n"+

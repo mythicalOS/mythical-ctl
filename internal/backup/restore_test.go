@@ -10,6 +10,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"mythicalos.ai/ctl/internal/cliio"
 	"mythicalos.ai/ctl/internal/engine"
@@ -334,6 +335,49 @@ func TestPreserveCorruptRefusesAFileThatChangedUnderIt(t *testing.T) {
 			}
 			if m, _ := filepath.Glob(sf + ".corrupt.*"); len(m) != 0 {
 				t.Fatalf("an intact ledger was preserved as corrupt evidence: %v", m)
+			}
+		})
+	}
+}
+
+// TestPreserveCorruptRefusesANonRegularSourceBeforeReadingIt: the re-read must judge a REGULAR
+// FILE, which is internal/ledger's own discipline at these paths and was missing from the first
+// version of the re-judge. os.ReadFile on a FIFO swapped in here BLOCKS FOREVER; on a symlink it
+// follows the link and judges the TARGET while the rename moves the LINK — so the preserved
+// "evidence" would be a symlink and the bytes that failed their checksum would still be elsewhere.
+func TestPreserveCorruptRefusesANonRegularSourceBeforeReadingIt(t *testing.T) {
+	for _, tc := range nonRegular {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			sf := filepath.Join(dir, "ledger.staging")
+			tc.make(t, sf)
+			before := whatIsAt(sf)
+
+			// A DEADLINE, because the defect under test is a BLOCKING read: without the regular-file
+			// check a FIFO makes this call never return, and a test that hangs is not a test that
+			// fails. This goroutine is the only way to tell those apart.
+			done := make(chan error, 1)
+			go func() {
+				_, _, err := preserveCorrupt(sf)
+				done <- err
+			}()
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatalf("a %s at the staging path was moved aside as corrupt evidence", tc.name)
+				}
+				if !strings.Contains(err.Error(), "no longer a regular file") {
+					t.Fatalf("the refusal does not say what is wrong with the path:\n%v", err)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatalf("preserveCorrupt did not return for a %s — it read the path without checking\n"+
+					"that it is a regular file, and a FIFO makes that read block forever", tc.name)
+			}
+			if after := whatIsAt(sf); after != before {
+				t.Fatalf("the %s was moved: %q -> %q", tc.name, before, after)
+			}
+			if m, _ := filepath.Glob(sf + ".corrupt.*"); len(m) != 0 {
+				t.Fatalf("something that is not a regular file was preserved as evidence: %v", m)
 			}
 		})
 	}

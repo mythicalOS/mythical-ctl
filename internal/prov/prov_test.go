@@ -719,6 +719,35 @@ func TestFirstUseStaging(t *testing.T) {
 	}
 }
 
+// TestFirstUseStagingAmbiguousIntent: an intent read that FAILED is not "the intent is gone".
+//
+// Two rows answering for the same key make Find return an ambiguity error, and folding that into
+// "no intent" reported the staged restore as COMPLETED and ready to activate — while
+// internal/backup Activate asks the same question at the point of action and REFUSES on exactly
+// that error. The diagnostic would be promising an outcome the verb will not produce.
+func TestFirstUseStagingAmbiguousIntent(t *testing.T) {
+	home := homeWith(t, func(h string) {
+		mustWrite(t, filepath.Join(h, ".state", "ledger.staging"), checksummedLedger(ledger.Schema,
+			"restore\tkey=restore\tphase=2\tsource=/backups/one",
+			"restore\tkey=restore\tphase=2\tsource=/backups/two"))
+	})
+	err := FirstUse(context.Background(), home, newFakeObjs())
+	if err == nil || errors.Is(err, ErrNotFirstUse) {
+		t.Fatalf("an unreadable restore intent was read as an answer: %v", err)
+	}
+	if !strings.Contains(err.Error(), "could not be\n  established") {
+		t.Fatalf("the refusal does not say the question failed:\n%v", err)
+	}
+	if strings.Contains(err.Error(), "COMPLETED restore") {
+		t.Fatalf("an ambiguous intent was reported as a completed restore:\n%v", err)
+	}
+	for _, cmd := range resumePrescriptions {
+		if strings.Contains(err.Error(), cmd) {
+			t.Fatalf("a recovery was prescribed for a state nobody could determine: %s\n%v", cmd, err)
+		}
+	}
+}
+
 // TestFirstUseStagingUnreadable: a staging file that cannot be READ says nothing about whether a
 // restore can be resumed, so no recovery is prescribed for it.
 func TestFirstUseStagingUnreadable(t *testing.T) {

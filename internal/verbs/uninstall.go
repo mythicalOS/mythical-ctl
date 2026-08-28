@@ -221,24 +221,35 @@ func (s *session) confirmProductPurge(product string, objs [][]ledger.Field) boo
 // uninstall continues with the rest; only a ledger edit that could not be made stops it.
 func (s *session) removeProductContainer(ctx context.Context, product, c string) (bool, error) {
 	d := s.d
-	// BOTH LEDGER EDITS ARE MADE ON A CLONE, AND THE CLONE IS ADOPTED ONLY AT THE END.
+	// THE STAGED-CLONE PATTERN, and the comment on stopAfterPartialRemoval is why it is needed:
+	// it claimed "the failing edit itself mutates nothing — so what is persisted is exactly the
+	// work that succeeded", which is true of each editor ALONE and false of the two TOGETHER.
+	// AUTHORITY IS ASKED FIRST BECAUSE IT IS A READ AND ITS REFUSALS ARE ABOUT ONE OBJECT.
 	//
-	// They used to run one after the other against the LIVE ledger, and each editor is individually
-	// atomic — but the PAIR was not, and the pair is what has to be. state.Forget refuses when two
-	// contradicting desired rows answer for this container; by then prov.Tombstone had already
-	// consumed the provenance record. stopAfterPartialRemoval then PERSISTS what is in memory, so
-	// the container and its provenance disappear while the contradictory desired state SURVIVES —
-	// a ledger that says nothing owns this name and also says what state it should be in.
+	// The first version of this fix built the clone before this question, which quietly changed
+	// what an operator gets: a damaged ledger then HARD-STOPPED the whole uninstall even in the
+	// cases where authority would have refused this one container and the verb would have gone on
+	// to the volumes. The two refusals have different scopes on purpose — "this container is not
+	// ours" is about one object, "the ledger cannot record removals" is about all of them — and
+	// ordering a whole-verb stop ahead of a per-object one is a change nobody asked for.
+	aerr := prov.Authority(ctx, s.l, prov.Engine(d.Engine), prov.ClassContainer, c)
+	switch {
+	case aerr == nil, errors.Is(aerr, prov.ErrGone):
+	default:
+		d.warnErr(aerr)
+		d.warn("verbs: the container for %q is preserved (see above). Continuing with the rest.", product)
+		return false, nil
+	}
+	// BOTH EDITS ON A CLONE, STILL BEFORE THE RUNTIME IS TOUCHED. They used to run one after the
+	// other against the LIVE ledger, and each editor is individually atomic — but the PAIR was
+	// not, and the pair is what has to be. state.Forget refuses when two contradicting desired
+	// rows answer for this container; by then prov.Tombstone had already consumed the provenance
+	// record, and stopAfterPartialRemoval PERSISTED what was in memory: the container and its
+	// provenance gone while the contradictory desired state SURVIVED.
 	//
-	// That is the partial-mutation-before-refusal the staged-clone pattern exists to prevent, and
-	// this tree already had the pattern (internal/bringup's staged, ledger.Clone/Adopt). The
-	// comment on stopAfterPartialRemoval claimed "the failing edit itself mutates nothing — so what
-	// is persisted is exactly the work that succeeded"; that is true of each editor alone and false
-	// of the two together, which is exactly the gap a per-editor argument cannot see.
-	//
-	// THE EDITS ARE COMPUTED BEFORE THE RUNTIME REMOVAL and adopted after it, which also means a
-	// ledger that cannot record the removal REFUSES BEFORE the container is touched, rather than
-	// removing it and then discovering that nothing can be written down.
+	// Computing them here also means a ledger that cannot record the removal REFUSES BEFORE the
+	// container is removed, rather than removing it and then discovering nothing can be written
+	// down.
 	cp := s.l.Clone()
 	if err := prov.Tombstone(cp, prov.ClassContainer, c); err != nil {
 		return false, err
@@ -246,7 +257,6 @@ func (s *session) removeProductContainer(ctx context.Context, product, c string)
 	if err := state.Forget(cp, c); err != nil {
 		return false, err
 	}
-	aerr := prov.Authority(ctx, s.l, prov.Engine(d.Engine), prov.ClassContainer, c)
 	switch {
 	case aerr == nil:
 		_ = s.rt.ContainerStop(ctx, c)
@@ -259,12 +269,9 @@ func (s *session) removeProductContainer(ctx context.Context, product, c string)
 			d.warn("  removable later; nothing is tombstoned for a removal that did not happen.")
 			return false, nil
 		}
-	case errors.Is(aerr, prov.ErrGone):
-		// Already gone: nothing to remove and nothing to preserve, so the record is retired.
 	default:
-		d.warnErr(aerr)
-		d.warn("verbs: the container for %q is preserved (see above). Continuing with the rest.", product)
-		return false, nil
+		// Already gone (prov.ErrGone): nothing to remove and nothing to preserve, so the record is
+		// retired. Every other authority answer returned above.
 	}
 	// The removal happened (or the object was already gone): PUBLISH both edits together.
 	if err := s.l.Adopt(cp); err != nil {

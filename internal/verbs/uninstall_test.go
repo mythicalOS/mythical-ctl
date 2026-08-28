@@ -144,6 +144,43 @@ func (r *rig) standContainerWithNonce(name, nonce string) {
 	})
 }
 
+// standForeignContainer replaces this product's container with one labelled for ANOTHER
+// installation. That is deliberately not the same fixture as standContainerWithNonce: a
+// same-identity object the ledger does not account for trips the unaccounted-object GATE before any
+// verb body runs, so it can never reach the authority question. A container belonging to somebody
+// else is a NOTE at that gate and a refusal at prov.Authority, which is the path under test.
+func (r *rig) standForeignContainer(name string) {
+	r.t.Helper()
+	ctx := context.Background()
+	netID := r.ownedNetworkID()
+	r.withLock(func(h famlock.Held, _ ledger.Store) {
+		m, err := engine.NewMutator(h, r.c)
+		if err != nil {
+			r.t.Fatal(err)
+		}
+		if r.containerExists(name) {
+			if rerr := m.ContainerRemove(ctx, name); rerr != nil {
+				r.t.Fatal(rerr)
+			}
+		}
+		attach, aerr := engine.NewNetworkAttach(netID, "foreign")
+		if aerr != nil {
+			r.t.Fatal(aerr)
+		}
+		r.fake.PullImage(digestRef("foreign"))
+		spec, serr := engine.NewContainerSpec(name, digestRef("foreign"), engine.SpecOpts{
+			Network: attach,
+			Labels:  map[string]string{"installation": "iotherxxxxx", "nonce": "nforeignxxx", "product": "p1"},
+		})
+		if serr != nil {
+			r.t.Fatal(serr)
+		}
+		if _, cerr := m.ContainerCreate(ctx, spec); cerr != nil {
+			r.t.Fatal(cerr)
+		}
+	})
+}
+
 // ownedNetworkID is the id the ledger records for the network this installer created.
 func (r *rig) ownedNetworkID() string {
 	r.t.Helper()
@@ -1044,5 +1081,46 @@ func TestUninstallNeverPersistsAHalfEditedLedger(t *testing.T) {
 	// "removed it, then found nothing could be written down" into a refusal that changed nothing.
 	if _, err := r.c.ContainerInspect(context.Background(), c); err != nil {
 		t.Fatalf("the container was removed by an uninstall that could not record the removal: %v", err)
+	}
+}
+
+// TestUninstallLetsAPerObjectRefusalWinOverALedgerOne: the two refusals have different SCOPES, and
+// the order they are asked in decides which the operator gets.
+//
+// "This container is not ours" is about ONE object — the reference reports it and carries on with
+// the rest. "The ledger cannot record removals" is about ALL of them, and stopAfterPartialRemoval
+// halts the verb. Building the ledger edits before asking the authority question inverted that: a
+// damaged ledger hard-stopped the whole uninstall even where authority would have refused this one
+// container and the verb would have gone on to the volumes. Authority is a READ, so asking it first
+// costs nothing and keeps the smaller refusal smaller.
+func TestUninstallLetsAPerObjectRefusalWinOverALedgerOne(t *testing.T) {
+	r := newRig(t)
+	r.writeProduct("p1")
+	r.mintIdentity()
+	r.mustInstall("p1")
+	c := r.container("p1")
+	// BOTH problems at once: the container can no longer be proven ours, AND the ledger carries
+	// two contradicting desired rows so state.Forget would refuse.
+	r.standForeignContainer(c)
+	r.appendRows("desired\tcontainer=" + c + "\tstate=stopped\tverify=none")
+	if err := state.Forget(r.ledgerNow(), c); err == nil {
+		t.Fatal("the fixture did not make state.Forget refuse — the ordering is not exercised")
+	}
+	r.reset()
+
+	rc := r.uninstall("p1", false)
+	if rc == cliio.ExitOK {
+		t.Fatalf("an uninstall over an object it cannot account for reported success\n%s", r.said())
+	}
+	// THE PER-OBJECT REFUSAL IS WHAT IS REPORTED, and the verb went on to the volumes rather than
+	// halting on the ledger.
+	r.mustSay("is preserved (see above)")
+	r.mustSay("keeping volume")
+	if !r.containerExists(c) {
+		t.Fatal("a container that could not be proven ours was removed")
+	}
+	// And nothing was written: the clone is discarded on the authority refusal.
+	if _, err := prov.Find(r.ledgerOnDisk(), prov.ClassContainer, c); err != nil {
+		t.Fatalf("the container's provenance was tombstoned on a refusal: %v", err)
 	}
 }
