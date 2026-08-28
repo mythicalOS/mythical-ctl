@@ -2154,33 +2154,75 @@ func TestEndToEndRefusesAMalformedFileTheToolchainSelected(t *testing.T) {
 	}
 }
 
-// A LANE WHOSE COMPILED FILES DECLARE NO TESTS IS REFUSED, and the refusal has to survive the
-// widening that let ORDINARY source into the file selection. The source half of target resolution
-// is built from `_test.go` files only — an ordinary `.go` file can carry a claim but can never
-// DECLARE a test, because the toolchain does not register one from it. So a lane that compiles
-// plenty of source and no test files has an empty source witness, and every PORTED target in it
-// would then rest on the list half alone: exactly the independence the lane pairing removes.
+// A LANE THAT CAN CONFIRM NOTHING IS REFUSED, and "nothing" is counted in NAMES rather than in
+// package entries. Both witnesses manufacture an entry with no test in it — `? <pkg> [no test
+// files]` is a terminator line, so the list half records the package with an empty name set, and a
+// compiled `_test.go` holding only its `package` clause did the same on the source side. A lane in
+// exactly that state registered no test and declared no test, and passed both checks; the guard's
+// own comment said it could not. Found by cross-model review, round 3.
 //
-// Before the widening the emptiness was automatic. Now a package with source but no tests must be
-// deliberately left OUT of the witness, or `len(src) == 0` never trips again and the lane is
-// accepted with nothing to check against.
-func TestALaneWhoseCompiledFilesDeclareNoTestsIsRefused(t *testing.T) {
-	tinyLanes(t, 2, 1, 2)
-	root, goList := e2eTree(t)
-	// The same file, moved from the TestGoFiles column into the GoFiles column: compiled, so
-	// eligible to carry a claim — and unable to declare a test.
-	if err := os.WriteFile(goFilesPath(root), lines(
-		"mythicalos.ai/ctl/internal/x\t"+filepath.Join(root, "internal", "x")+"\tx_test.go\t\t",
-	), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	err := e2eRun(root, goList)
-	if err == nil {
-		t.Fatal("a lane whose compiled files declare no tests was accepted — its half of the pairing checks nothing")
-	}
-	if !strings.Contains(err.Error(), "names no compiled test files") {
-		t.Fatalf("err = %v, want the empty source witness to be what refuses", err)
-	}
+// WHY THE GUARD MATTERS: target resolution requires BOTH halves to agree WITHIN one lane. A lane
+// that has arrived empty for a wiring reason cannot confirm anything, so the other lane silently
+// answers for it — and the pairing that the whole two-witness design rests on is gone with nothing
+// saying so.
+//
+// THREE SHAPES, because each defeats a different one of the two counts.
+func TestALaneThatCanConfirmNothingIsRefused(t *testing.T) {
+	xdirOf := func(root string) string { return filepath.Join(root, "internal", "x") }
+
+	t.Run("no compiled test files at all", func(t *testing.T) {
+		tinyLanes(t, 2, 1, 2)
+		root, goList := e2eTree(t)
+		// The same file, moved from the TestGoFiles column into the GoFiles column: compiled, so
+		// eligible to carry a claim — and unable to declare a test.
+		if err := os.WriteFile(goFilesPath(root), lines(
+			"mythicalos.ai/ctl/internal/x\t"+xdirOf(root)+"\tx_test.go\t\t",
+		), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		err := e2eRun(root, goList)
+		if err == nil || !strings.Contains(err.Error(), "DECLARE no test") {
+			t.Fatalf("err = %v, want the empty source witness to be what refuses", err)
+		}
+	})
+
+	t.Run("a compiled test file that declares no test", func(t *testing.T) {
+		tinyLanes(t, 2, 1, 2)
+		root, goList := e2eTree(t)
+		// THE SHAPE A PACKAGE-ENTRY COUNT CANNOT SEE: the lane really does compile a _test.go, so
+		// an entry exists for its package — and the file declares nothing, so the entry is empty.
+		if err := os.WriteFile(filepath.Join(xdirOf(root), "empty_test.go"), lines(`package x`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(goFilesPath(root), lines(
+			"mythicalos.ai/ctl/internal/x\t"+xdirOf(root)+"\tx_test.go\tempty_test.go\t",
+		), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		err := e2eRun(root, goList)
+		if err == nil {
+			t.Fatal("a lane whose only compiled test file declares no test was accepted: it can confirm no target, and the other lane answers for it")
+		}
+		if !strings.Contains(err.Error(), "DECLARE no test") {
+			t.Fatalf("err = %v, want the empty source witness to be what refuses", err)
+		}
+	})
+
+	t.Run("a listing that registers no test name", func(t *testing.T) {
+		tinyLanes(t, 2, 1, 2)
+		root, goList := e2eTree(t)
+		// THE SAME SHAPE ON THE LIST HALF: a terminator line alone creates the package entry.
+		if err := os.WriteFile(goList, lines("?   \tmythicalos.ai/ctl/internal/x\t[no test files]"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		err := e2eRun(root, goList)
+		if err == nil {
+			t.Fatal("a lane whose listing registers no test name was accepted: `? pkg [no test files]` is a package entry with nothing in it")
+		}
+		if !strings.Contains(err.Error(), "lists no test names") {
+			t.Fatalf("err = %v, want the empty list witness to be what refuses", err)
+		}
+	})
 }
 
 // DEMONSTRATION 1 — the target column was free prose, and prose has no polarity.

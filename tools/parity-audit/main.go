@@ -1166,15 +1166,17 @@ func collectLaneSource(files map[string]pkgFiles) (map[string]map[string]bool, e
 	out := map[string]map[string]bool{}
 	fset := token.NewFileSet()
 	for pkg, pf := range files {
-		// ONLY A TEST FILE CAN DECLARE A TEST. A package with none contributes no witness entry —
-		// an invented empty one would keep `len(src) == 0` from ever tripping, and that check is
-		// what notices a lane whose source half arrived empty.
-		if len(pf.Test) == 0 {
-			continue
-		}
-		if out[pkg] == nil {
-			out[pkg] = map[string]bool{}
-		}
+		// ONLY A TEST FILE CAN DECLARE A TEST, and only a package that ACTUALLY DECLARES ONE gets an
+		// entry. An entry created up front — for a package with no test files, or with a test file
+		// that declares nothing — is an empty witness, and an empty witness is indistinguishable
+		// from a real one at every read (`src[p][t]` is false either way) while making the lane look
+		// populated to anything that counts entries. It is created below, on the first declaration.
+		//
+		// DELIBERATELY REDUNDANT WITH THE `laneDeclared` COUNT IN run(), AND SAY SO. Either one alone
+		// closes the hole they were added for, so each is an EQUIVALENT mutation on its own and no
+		// test can distinguish them; only reverting BOTH reddens. That is recorded here rather than
+		// left for a later reader to discover by deleting one — the pair is two readers of the same
+		// fact (this lane can confirm nothing), and the cheaper of the two to get wrong is this one.
 		for _, p := range pf.Test {
 			f, perr := parser.ParseFile(fset, p, nil, parser.SkipObjectResolution)
 			if perr != nil {
@@ -1208,6 +1210,9 @@ func collectLaneSource(files map[string]pkgFiles) (map[string]map[string]bool, e
 				// The same grammar the testing package applies: `Test` alone, or `Test` followed
 				// by a character that is not a lower-case letter.
 				if isGoTestName(n) {
+					if out[pkg] == nil {
+						out[pkg] = map[string]bool{}
+					}
 					out[pkg][n] = true
 				}
 			}
@@ -1825,16 +1830,30 @@ func run(root, manifestRel string, writeMan bool, goLists, goFiles []string, max
 		// EACH LANE'S OWN LIVENESS, not the union's. A lane that registers nothing, or whose
 		// compiled test files declare nothing, resolves no target — and a union check would hide
 		// that behind the other lane.
-		if len(ln.list) == 0 {
-			return fmt.Errorf("%s lists no packages — `go test -list` produced nothing for this lane", p)
-		}
-		if len(src) == 0 {
-			return fmt.Errorf("%s names no compiled test files — the source half of target resolution has\n"+
-				"   nothing to check against for this lane", goFiles[i])
-		}
+		//
+		// COUNTED IN NAMES, NOT IN PACKAGE ENTRIES, and the difference is the whole guard. Both
+		// halves manufacture a package entry without a single test in it: `? <pkg> [no test files]`
+		// is a terminator line, so parseGoTestList records the package with an empty name set, and a
+		// compiled `_test.go` holding nothing but its `package` clause used to do the same on the
+		// source side. A lane in exactly that state — no registered test, no declared test — passed
+		// both checks, and the comment above said it could not. What a lane must have is a NAME.
+		laneListed := 0
 		for _, ns := range ln.list {
-			names += len(ns)
+			laneListed += len(ns)
 		}
+		if laneListed == 0 {
+			return fmt.Errorf("%s lists no test names — `go test -list` registered nothing for this lane, so it can\n"+
+				"   confirm no target at all and the other lane would be answering for it", p)
+		}
+		laneDeclared := 0
+		for _, ns := range src {
+			laneDeclared += len(ns)
+		}
+		if laneDeclared == 0 {
+			return fmt.Errorf("%s names compiled test files that DECLARE no test — the source half of target\n"+
+				"   resolution has nothing to check against for this lane", goFiles[i])
+		}
+		names += laneListed
 		testLanes = append(testLanes, ln)
 	}
 	// Same liveness argument one level down: an empty set of known tests would make every PORTED
