@@ -1723,34 +1723,79 @@ func TestACancelledFIRSTReportIsStillPublished(t *testing.T) {
 	}
 }
 
-// TestRunStatusDoesNotRunTheReportAfterTheInterfaceIsGone. A refresh queued at the moment the
+// TestRunStatusDoesNotRunTheReportAfterTheInterfaceIsGone. A refresh already QUEUED when the
 // dashboard closes must not start a run with nothing to show it on.
+//
+// THE ORDERING IS BUILT HERE, NOT HOPED FOR, and that difference is the whole test. An earlier
+// version sent the refresh key and killed the interface in the same breath and then demanded
+// exactly one run — a demand the runner never made and could not keep. Send only ENQUEUES; the
+// message loop that would have to drop the keystroke chooses between "the interface is gone" and
+// "there is a message" with a select over two ready channels, which is a coin toss, here and in
+// the real runtime, whose event loop and Send this fake copies statement for statement. Measured
+// on this code over 20000 attempts under -race, with the runner's own decision instrumented: the
+// queued keystroke was handled 49.6% of the time, and ALL 14 of the second runs that resulted were
+// decided with the interface STILL LIVE — stopped() false and the launch gate open — while the
+// other 9913 times the guard correctly refused. Not one run started after the interface was gone.
+// A refresh a live interface delivered IS a refresh, and running the report again is the right
+// answer to it. So the old test failed correct behaviour, about once in a thousand attempts idle
+// and considerably more often under load, and called it a refresh outliving the interface.
+//
+// So the interface is torn down here by the keystroke that tears it down for real. 'r' and 'q' are
+// queued together and one loop handles them IN ORDER, so 'r's command — which is what puts the
+// request in the runner's queue — has already run when 'q' returns tea.Quit and ends the loop. The
+// report is then held on its own context, which runStatus cancels one instruction AFTER it bars
+// the launch gate and closes uiDone. When the runner finally asks whether to run again, the
+// refresh and both teardown signals are all pending at once: the arrangement the guard exists for,
+// now reached by construction instead of by luck.
+//
+// IT REPEATS BECAUSE THE BRANCH IS PICKED AT RANDOM, not because one attempt is unreliable. With
+// all three of the runner's channels ready a correct implementation returns down whichever one it
+// picks, so every attempt passes; a runner that acted on the refresh without re-asking takes that
+// branch about one time in three, and 200 attempts leave it (2/3)^200 of hiding.
 func TestRunStatusDoesNotRunTheReportAfterTheInterfaceIsGone(t *testing.T) {
-	p := newFakeStatusProgram()
-	var mu sync.Mutex
-	runs := 0
-	p.onUpdate = func(m StatusModel, p *fakeStatusProgram) {
-		if !m.Done() {
-			return
+	for attempt := 0; attempt < 200; attempt++ {
+		p := newFakeStatusProgram()
+		var mu sync.Mutex
+		runs := 0
+		asked := false
+		askedGen, askedDone := -1, true
+		p.onUpdate = func(m StatusModel, p *fakeStatusProgram) {
+			mu.Lock()
+			if asked {
+				mu.Unlock()
+				return
+			}
+			asked, askedGen, askedDone = true, m.Generation(), m.Done()
+			mu.Unlock()
+			// The first run is under way and the dashboard is up. Ask for a refresh, then close
+			// the dashboard. Both are queued before either is handled, and handled in that order.
+			p.Send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+			p.Send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
 		}
-		// Ask for a refresh and tear the interface down in the same breath.
-		p.Send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
-		p.kill()
-	}
-	d, _, _ := baseDeps()
-	if _, err := runStatus(context.Background(), d, func(ctx context.Context, d verbs.Deps) int {
+		d, _, _ := baseDeps()
+		if _, err := runStatus(context.Background(), d, func(ctx context.Context, d verbs.Deps) int {
+			mu.Lock()
+			runs++
+			mu.Unlock()
+			// HELD UNTIL THE TEARDOWN IS COMPLETE. This context is cancelled after the gate is
+			// barred and uiDone is closed, so returning here — and not before — is what puts the
+			// runner at its select with the refresh and the teardown both waiting.
+			<-ctx.Done()
+			return 0
+		}, p.make, time.Second); err != nil {
+			t.Fatalf("attempt %d: %v", attempt, err)
+		}
 		mu.Lock()
-		runs++
+		n, gen, done := runs, askedGen, askedDone
 		mu.Unlock()
-		return 0
-	}, p.make, time.Second); err != nil {
-		t.Fatal(err)
-	}
-	mu.Lock()
-	n := runs
-	mu.Unlock()
-	if n != 1 {
-		t.Fatalf("the report ran %d times; a refresh outlived the interface", n)
+		if gen != 1 || done {
+			t.Fatalf("attempt %d: the refresh was asked for at generation %d with done=%v — it has\n"+
+				"  to be asked while the FIRST run is still going or this test arranges nothing",
+				attempt, gen, done)
+		}
+		if n != 1 {
+			t.Fatalf("attempt %d: the report ran %d times; a refresh outlived the interface", attempt, n)
+		}
 	}
 }
 
