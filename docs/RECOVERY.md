@@ -71,23 +71,31 @@ step.
 --abandon` to give up on it. See "A restore stuck at a phase" below for what each recorded state means and
 what each command does about it.
 
-## Another operation is in progress
+## The family lock could not be taken
+
+(The message says another operation is in progress. Usually that is exactly what happened — read on
+for the case where it is not.)
 
 **What it means.** Every mutating command takes one family-scoped lock — `~/.mythical/.state/lock` —
 so that two `mythical-ctl` processes cannot interleave a read-modify-write of the ledger or of
-`mythical.conf`. Something else holds it right now.
+`mythical.conf`. This command asked for that lock and did not get it.
 
-**What the CLI will and will not do.** Refuses immediately rather than queueing, naming a holding
-process id when it can read one. It never waits, and it never takes the lock away from whoever has
-it. Nothing has been touched, so there is no partial state to recover from.
+**What the CLI will and will not do.** Refuses immediately rather than queueing, naming a process id
+when it can read one. It never waits, and it never takes the lock away from whoever has it. Nothing
+has been touched, so there is no partial state to recover from.
 
-**Read that pid as a hint, not as a fact.** It is written into the lock file by whoever last took
-the lock, as a diagnostic, and it is neither authoritative nor guaranteed fresh: a contender can
-read a pid left by an earlier run. A pid that is not running therefore does **not** prove the lock
-is free — and this message is also what you get if the lock could not be taken for a reason that is
-not contention at all (a filesystem that does not support `flock`, or one that has run out of lock
-records). If it persists with no other `mythical-ctl` running anywhere on the machine, suspect the
-filesystem `~/.mythical` is on rather than a phantom process.
+**The message says more than the CLI actually knows, in two ways.**
+
+*The pid is a hint, not a fact.* It is written into the lock file by whoever last took the lock, as
+a diagnostic; it is neither authoritative nor guaranteed fresh, so a contender can read a pid left
+by an earlier run. A pid that is not running does **not** prove the lock is free, and a pid that IS
+running is not necessarily the holder.
+
+*"In progress" is what every locking failure reports.* The refusal covers "somebody else has it" and
+"this lock could not be taken at all" — a filesystem that does not implement `flock` (some network
+mounts), or one out of lock records — because the answer to each is the same: do not proceed. So if
+it persists with no other `mythical-ctl` running anywhere on the machine, stop looking for a phantom
+process and suspect the filesystem `~/.mythical` is on.
 
 **There is no stale lock to clear, ever — and deleting the file is worse than useless.** The lock is
 a kernel `flock(2)`, and a lock held by a process that dies is released by the kernel along with
@@ -109,7 +117,9 @@ there is not the installer's lock file at all: with no `mythical-ctl` running, r
 (it holds nothing you need) and re-run. Work out how it got there — nothing this CLI does creates
 a symlink or a second hard link at that path.
 
-**Next command.** The one you were running, once the other operation finishes.
+**Next command.** The one you were running, once the other operation finishes. If it never
+finishes — nothing else is running and the refusal repeats — the lock is not the problem; move
+`~/.mythical` to storage that supports file locking, or ask why that one does not.
 
 ## A retained network intent
 

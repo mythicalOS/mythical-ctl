@@ -133,7 +133,7 @@ if [ "$v_short_rc" -eq 0 ] && [ -z "$v_diff" ]; then
   printf "  ok    -v is --version's twin, byte for byte on both streams\n"; pass=$((pass + 1))
 else
   printf '  FAIL  -v: rc=%d, differs on %s (stdout %q, stderr %q; --version gave %q / %q)\n' \
-    "$v_short_rc" "${v_diff:-nothing}" "$(cat "$WORK/v.out")" "$(cat "$WORK/v.err")" \
+    "$v_short_rc" "${v_diff:-the exit status alone}" "$(cat "$WORK/v.out")" "$(cat "$WORK/v.err")" \
     "$version_line" "$(cat "$WORK/version.err")"
   fail=$((fail + 1))
 fi
