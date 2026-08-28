@@ -5,11 +5,19 @@
 // behaviour the bash suite pinned is accounted for in the Go suite — so every Go test file carries
 // an inventory line per bats test it accounts for:
 //
-//	// PORTED: tests/unit/<file>.bats: "<exact test name>" -> TestGoFunc
+//	// PORTED: tests/unit/<file>.bats: "<exact test name>" -> <targets> [-- <commentary>]
 //	// N/A:    tests/unit/<file>.bats: "<exact test name>" -- <why this cannot/need not port>
 //
 // and this program checks that those lines cover the corpus EXACTLY ONCE each, and that every
 // PORTED target names a Go test that really exists.
+//
+// THE TARGET COLUMN IS A CLOSED LIST, NOT A SENTENCE. `<targets>` is one or more
+// `[<pkgpath>.]<TestName>` tokens separated by whitespace, `+` or `,`, and NOTHING else parses.
+// Anything a claim wants to SAY goes after ` -- `, where this program does not read it — which is
+// what makes a sentence beside a target unable to satisfy, qualify or contradict it. A claim in
+// a file the toolchain does not compile is not a claim at all. Both rules exist because their
+// absence was demonstrated, end to end, as a green audit over false evidence; the sections below
+// carry the demonstrations.
 //
 // WHY IT IS A PROGRAM AND NOT A REPORT. A one-time audit protects nothing after the day it runs.
 // This one is a check.sh stage (`bash check.sh parity`), in CI, so the claim is re-proved on every
