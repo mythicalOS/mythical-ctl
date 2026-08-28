@@ -492,9 +492,14 @@ func Activate(d Deps) error {
 		// already happened.
 		d.log("restore: activated. The installation is live again.")
 		d.warn("%v", rerr)
-		d.warn("  The installation IS restored and live — this is not a failed activation. What is left")
-		d.warn("  is a leftover copy of the same ledger at %s, which no verb acts on while", stagingPath(d.Home))
-		d.warn("  an active ledger is present. Remove it when convenient.")
+		d.warn("  The installation IS restored and live — this is not a failed activation, and re-running")
+		d.warn("  the restore is not what it needs. What is left is a copy of the now-active ledger at")
+		d.warn("    %s", stagingPath(d.Home))
+		d.warn("  REMOVE IT before any future restore. Nothing acts on it while an active ledger is")
+		d.warn("  present, but it sits at the well-known staging name and it is checksum-valid and")
+		d.warn("  intent-free — which is byte-for-byte the state a COMPLETED restore leaves. If the")
+		d.warn("  active ledger is ever gone (an uninstall, a repair), the next restore reads this stale")
+		d.warn("  copy as ready to activate and activates it, reinstating state the machine moved on from.")
 		return nil
 	case errors.Is(rerr, fs.ErrExist):
 		d.warn("restore: an active ledger appeared — refusing to overwrite it:")

@@ -340,6 +340,64 @@ func TestActivateRenameFallbackIsAlsoNoReplace(t *testing.T) {
 	}
 }
 
+// TestActivateRenameFallbackReportsAResidueRatherThanAFailure pins the one outcome that is
+// neither success nor failure: link(2) succeeded — so the destination IS installed and, in
+// production, the installation IS live — and only the removal of the source failed.
+//
+// REPORTING THAT AS "ACTIVATION FAILED" WOULD BE THE WRONG ANSWER IN THE DANGEROUS DIRECTION: it
+// sends an operator to re-run a restore that has already happened, on a machine whose ledger is
+// now active, where restore refuses as a recovery verb meeting a live installation. So the two
+// are distinguishable by errors.Is and the caller says different things about them.
+//
+// Only linkThenUnlink can be driven here: in production both paths live in one directory, so a
+// directory that refuses the unlink refuses the link too. The seam is exercised where it can be.
+func TestActivateRenameFallbackReportsAResidueRatherThanAFailure(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "src")
+	dst := filepath.Join(root, "dst")
+	for _, d := range []string{src, dst} {
+		if err := os.Mkdir(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	from := filepath.Join(src, "staging")
+	to := filepath.Join(dst, "live")
+	probe := filepath.Join(src, "probe")
+	for _, f := range []string{from, probe} {
+		if err := os.WriteFile(f, []byte("incoming\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Searchable and readable, NOT writable: link out of it succeeds, unlink within it does not.
+	if err := os.Chmod(src, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(src, 0o700) })
+	// MEASURED ON A REAL FILE, NOT ASSUMED, AND NOT ON A MISSING ONE — a probe that removes a
+	// path which does not exist is answered ENOENT before the directory's mode is consulted, so
+	// it reports "unlink works here" on exactly the systems where it does not. A user who
+	// bypasses the mode bit (root, or a filesystem that does not enforce it) would exercise the
+	// SUCCESS path and every assertion below would be about the wrong branch.
+	if err := os.Remove(probe); err == nil {
+		t.Skip("this user can unlink from a directory it cannot write — the residue branch is not reachable here")
+	}
+
+	err := linkThenUnlink(from, to)
+	if !errors.Is(err, errActivatedWithResidue) {
+		t.Fatalf("a failed unlink after a SUCCESSFUL link must be reported as a residue, not as a "+
+			"failed activation and not as success: %v", err)
+	}
+	if errors.Is(err, fs.ErrExist) {
+		t.Fatalf("a residue was also reported as an occupied destination: %v", err)
+	}
+	if body, rerr := os.ReadFile(to); rerr != nil || string(body) != "incoming\n" {
+		t.Fatalf("the destination was not installed: %q (%v)", string(body), rerr)
+	}
+	if !regularFile(from) {
+		t.Fatal("the residue error was returned but the source is gone")
+	}
+}
+
 // TestPlatformNoReplaceRenameIsAvailable is the measurement behind the fallback rather than an
 // assumption about it: on the platforms this project publishes, the kernel primitive works on a
 // temp directory, so the fallback is a genuine last resort and not the path everything takes.
