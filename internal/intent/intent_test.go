@@ -49,7 +49,7 @@ import (
 // PORTED: tests/unit/intent.bats: "abandonment is not possible while the daemon is unreachable" -> TestAbandonNeedsAnAnsweringDaemon
 // PORTED: tests/unit/intent.bats: "abandonment clears the intent and says it does NOT guarantee convergence" -> TestAbandonClearsTheIntent
 // PORTED: tests/unit/intent.bats: "an intent whose creation time is not a number is never aged out" -> TestAbandonRefusesUnreadableAge
-// PORTED: tests/unit/intent.bats: "a grace period that is not a number refuses rather than ageing everything out" -> TestAbandonRefusesUnreadableAge (a Duration cannot be non-numeric; the surviving half is the NEGATIVE grace, which fails open in the same direction)
+// PORTED: tests/unit/intent.bats: "a grace period that is not a number refuses rather than ageing everything out" -> TestAbandonRefusesUnreadableAge -- a Duration cannot be non-numeric; the surviving half is the NEGATIVE grace, which fails open in the same direction
 // PORTED: tests/unit/intent.bats: "a FOREIGN object carrying our nonce is not our object appearing, and does not wedge abandonment" -> TestAbandonOwnershipCases
 // PORTED: tests/unit/intent.bats: "an object of OURS carrying this nonce under another name refuses abandonment" -> TestAbandonOwnershipCases
 // PORTED: tests/unit/intent.bats: "an abandoned intent's object surfacing later is UNRECORDED SAME-IDENTITY, and stops" -> TestGateUnrecorded

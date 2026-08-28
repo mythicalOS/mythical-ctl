@@ -5,11 +5,19 @@
 // behaviour the bash suite pinned is accounted for in the Go suite — so every Go test file carries
 // an inventory line per bats test it accounts for:
 //
-//	// PORTED: tests/unit/<file>.bats: "<exact test name>" -> TestGoFunc
+//	// PORTED: tests/unit/<file>.bats: "<exact test name>" -> <targets> [-- <commentary>]
 //	// N/A:    tests/unit/<file>.bats: "<exact test name>" -- <why this cannot/need not port>
 //
 // and this program checks that those lines cover the corpus EXACTLY ONCE each, and that every
 // PORTED target names a Go test that really exists.
+//
+// THE TARGET COLUMN IS A CLOSED LIST, NOT A SENTENCE. `<targets>` is one or more
+// `[<pkgpath>.]<TestName>` tokens separated by whitespace, `+` or `,`, and NOTHING else parses.
+// Anything a claim wants to SAY goes after ` -- `, where this program does not read it — which is
+// what makes a sentence beside a target unable to satisfy, qualify or contradict it. A claim in
+// a file the toolchain does not compile is not a claim at all. Both rules exist because their
+// absence was demonstrated, end to end, as a green audit over false evidence; the sections below
+// carry the demonstrations.
 //
 // WHY IT IS A PROGRAM AND NOT A REPORT. A one-time audit protects nothing after the day it runs.
 // This one is a check.sh stage (`bash check.sh parity`), in CI, so the claim is re-proved on every
@@ -245,9 +253,20 @@ func parseManifest(content []byte) ([]batsPair, error) {
 		if text == "" || strings.HasPrefix(text, "#") {
 			continue
 		}
-		file, name, ok := strings.Cut(text, "\t")
-		if !ok || file == "" || name == "" {
-			return nil, fmt.Errorf("manifest:%d: not a <file>TAB<name> row: %q", line, text)
+		// SPLIT ON EVERY TAB, NOT THE FIRST ONE. `strings.Cut` splits once, so
+		// `<file>TAB<name>TABEXTRA` arrived as a two-field row whose NAME CONTAINED A TAB — and a
+		// claim written to match that name resolved against it, so a row that is not the shape this
+		// file declares passed the whole parity stage. Demonstrated end to end on this tree. The
+		// separator is a TAB precisely because no @test name may contain one (parseBats refuses
+		// that at the source), which means a third field can never be part of a name and there is
+		// nothing to interpret: the row is refused.
+		fields := strings.Split(text, "\t")
+		if len(fields) != 2 {
+			return nil, fmt.Errorf("manifest:%d: not a <file>TAB<name> row — it splits into %d tab-separated fields and a row is exactly 2. A bats test name cannot contain a TAB, so an extra field is not part of one: %q", line, len(fields), text)
+		}
+		file, name := fields[0], fields[1]
+		if file == "" || name == "" {
+			return nil, fmt.Errorf("manifest:%d: not a <file>TAB<name> row — one of its two fields is empty: %q", line, text)
 		}
 		pairs = append(pairs, batsPair{File: file, Name: name})
 	}
@@ -275,13 +294,28 @@ func (k claimKind) String() string {
 	return "N/A"
 }
 
+// target is ONE resolvable PORTED target: a Go test FUNCTION name, plus the package token the
+// claim wrote before it, if it wrote one. Both halves come from the token the claim spelled — never
+// from a sentence beside it, which is the whole point of the grammar below.
+type target struct {
+	Pkg  string // the package path token written before the name, or "" when the claim wrote none
+	Name string
+}
+
+func (t target) String() string {
+	if t.Pkg == "" {
+		return t.Name
+	}
+	return t.Pkg + "." + t.Name
+}
+
 type claim struct {
 	Kind    claimKind
 	Pair    batsPair
-	Detail  string // the Go target expression (PORTED) or the argument (N/A)
+	Detail  string // the raw target column (PORTED) or the argument (N/A) — for messages only
 	GoFile  string
 	GoLine  int
-	Targets []string // PORTED only: the Go test function names named by Detail
+	Targets []target // PORTED only: the targets the column NAMES, parsed as tokens
 }
 
 // The inventory grammar. Leading whitespace is tolerated (one claim in the tree sits indented
@@ -326,8 +360,16 @@ var (
 	// The claim-syntax signal below has no such restriction: PORTED:/N/A: beside a REAL corpus path
 	// is never innocent, wherever it sits.
 	invCommentLine = regexp.MustCompile(`^[ \t]*(//|/\*|\*)`)
-	invPorted      = regexp.MustCompile(`^[ \t]*// PORTED:[ \t]+(\S+):[ \t]+"(.+)"[ \t]+->[ \t]+(.*\S)[ \t]*$`)
-	invNA          = regexp.MustCompile(`^[ \t]*// N/A:[ \t]+(\S+):[ \t]+"(.+)"[ \t]+--[ \t]+(.*\S)[ \t]*$`)
+	// THE ROW NAME ENDS AT THE FIRST CLOSING QUOTE, and that is structural rather than a
+	// consequence of backtracking. With a greedy `(.+)` the boundary was decided by whatever came
+	// LATER on the line: a quoted phrase in the commentary offered the engine a second, further
+	// `" -> ` to close on, and the row name it produced ran through the target column. It always
+	// failed corpus membership afterwards — no @test name in this corpus contains a quote, verified
+	// — so it was loud rather than a false green. But that is a property of the CORPUS holding the
+	// parser up, not of the parser, and a rule that depends on data nobody re-checks is one bad day
+	// from being wrong. A row name cannot contain a quote, so the pattern says so.
+	invPorted = regexp.MustCompile(`^[ \t]*// PORTED:[ \t]+(\S+):[ \t]+"([^"]+)"[ \t]+->[ \t]+(.*\S)[ \t]*$`)
+	invNA     = regexp.MustCompile(`^[ \t]*// N/A:[ \t]+(\S+):[ \t]+"([^"]+)"[ \t]+--[ \t]+(.*\S)[ \t]*$`)
 )
 
 // isGoTestName applies the testing package's OWN rule, in Go rather than in a regular expression
@@ -402,15 +444,139 @@ func isGoIdent(s string) bool {
 	return len(ids) == 1 && ids[0] == s
 }
 
-// testNamesIn returns the Go test names appearing in a claim's target expression.
-func testNamesIn(expr string) []string {
-	var out []string
-	for _, id := range goIdentsIn(expr) {
-		if isGoTestName(id) {
-			out = append(out, id)
+// ---------------------------------------------------------------------------------------------
+// THE TARGET COLUMN IS A CLOSED, PROSE-FREE LIST. This is the smallest change that closes a whole
+// FAMILY of false greens rather than the three instances of it that were found.
+//
+// WHAT THE COLUMN USED TO BE. Free text, with every `TestFoo`-shaped identifier in it mined as a
+// target and every `pkg/path.` before one mined as a qualifier. Three demonstrations, all the same
+// shape and all made `bash check.sh parity` exit 0:
+//
+//   -> this behavior is not implemented; TestCLIUnknownVerbExitsTwo is only an unrelated
+//      neighboring test                       — a sentence DENYING the port satisfied the claim
+//   -> not internal/w.TestShared; the local TestShared is intended
+//                                             — a NEGATED qualifier resolved against what it negates
+//   -> TestOne[int] / TestOne via t.Run("...")— narrowed to `TestOne` and reported as resolved
+//
+// Prose has no polarity a scanner can read, and every rule invented to give it one (union the
+// qualifiers, reject contradictory ones, read only the first occurrence) was another rule ABOUT
+// prose waiting for a fourth shape. The reader therefore stops reading prose entirely: after `->`
+// comes a list of tokens and nothing else, and commentary moves behind the `--` delimiter the N/A
+// lines already use, where NOTHING reads it. A sentence can then neither satisfy, constrain nor
+// contradict a claim — the family is unreachable rather than individually ruled out.
+//
+// AND A NAME THIS PROGRAM CANNOT RESOLVE IS REFUSED, NEVER NARROWED. A generic instantiation and a
+// subtest spelling both name something `go test -list` does not enumerate; answering about the
+// parent function is the claim saying one thing and the resolver answering about another.
+// ---------------------------------------------------------------------------------------------
+
+// targetRune is what a target TOKEN may contain: identifier runes (Unicode letters, digits, `_`),
+// and the three bytes a package path adds. Deliberately rune-based, not an ASCII class: Go
+// identifiers are Unicode, and `TestAlphaÉ` must survive as one token rather than be cut at the É.
+func targetRune(r rune) bool { return identRune(r) || r == '.' || r == '/' || r == '-' }
+
+func isTargetSep(r rune) bool { return r == ' ' || r == '\t' || r == ',' || r == '+' }
+
+// splitNote divides the region after `->` at the first STANDALONE `--` field: everything before it
+// is the target list, everything after is commentary that nothing reads. Standalone, because `-` is
+// a legal package-path byte and a `--` glued to a token is a typo in a token, not a delimiter.
+func splitNote(region string) (list, note string, has bool) {
+	i := 0
+	for i < len(region) {
+		for i < len(region) && (region[i] == ' ' || region[i] == '\t') {
+			i++
+		}
+		start := i
+		for i < len(region) && region[i] != ' ' && region[i] != '\t' {
+			i++
+		}
+		if start == i {
+			break
+		}
+		if region[start:i] == "--" {
+			return region[:start], region[i:], true
 		}
 	}
-	return out
+	return region, "", false
+}
+
+// isPackagePathToken reports whether p can be a package path: non-empty segments separated by `/`,
+// none of them a dot-path. The RUNE set is already guaranteed by the caller.
+func isPackagePathToken(p string) bool {
+	if p == "" || strings.HasPrefix(p, "/") || strings.HasSuffix(p, "/") {
+		return false
+	}
+	for _, seg := range strings.Split(p, "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			return false
+		}
+	}
+	return true
+}
+
+// wantTarget is the one sentence every refusal below ends with, so the author is told the shape
+// rather than only that theirs was wrong.
+const wantTarget = "a target is `TestName` or `pkg/path.TestName`; put anything else — an aside, a file name, a sentence — after a ` -- ` delimiter, where it is commentary and nothing resolves it"
+
+// parseTargetToken turns ONE token into a target, or explains why it is not one.
+func parseTargetToken(tok string) (target, string) {
+	if strings.ContainsAny(tok, "[]") {
+		return target{}, fmt.Sprintf("%q is a generic instantiation, and `go test -list` enumerates the FUNCTION — so this audit could only ever resolve the function name while the claim named the instantiation, which is the claim saying one thing and the resolver answering about another. Name the function. %s", tok, wantTarget)
+	}
+	for _, r := range tok {
+		if !targetRune(r) {
+			return target{}, fmt.Sprintf("%q is not a target token. %s", tok, wantTarget)
+		}
+	}
+	pkg, name := "", tok
+	if i := strings.LastIndexByte(tok, '.'); i >= 0 {
+		pkg, name = tok[:i], tok[i+1:]
+		if pkg == "" {
+			return target{}, fmt.Sprintf("%q opens with a dot and names no package before it. %s", tok, wantTarget)
+		}
+		if !isPackagePathToken(pkg) {
+			return target{}, fmt.Sprintf("%q does not qualify a name with a package path (%q is not one). %s", tok, pkg, wantTarget)
+		}
+	}
+	if strings.Contains(name, "/") {
+		if parent, _, _ := strings.Cut(name, "/"); isGoIdent(parent) && isGoTestName(parent) {
+			return target{}, fmt.Sprintf("%q names the SUBTEST %q — `go test -list` enumerates test FUNCTIONS, and a subtest exists only while its parent runs, so this audit could only ever resolve %q and report the claim as satisfied. Deleting that subtest would leave the line green. Name the test function. %s", tok, name, parent, wantTarget)
+		}
+		return target{}, fmt.Sprintf("%q is not a target token. %s", tok, wantTarget)
+	}
+	if !isGoIdent(name) {
+		return target{}, fmt.Sprintf("%q does not end in a Go identifier. %s", tok, wantTarget)
+	}
+	if !isGoTestName(name) {
+		// ONE MESSAGE FOR BOTH READERS. A prose word landing here ("this", "not", "via") needs to
+		// hear that the COLUMN takes tokens; a near-miss like `Testfoo` needs to hear Go's actual
+		// rule. Saying both costs a clause and stops the refusal reading as a non-sequitur to
+		// whichever author hit it.
+		return target{}, fmt.Sprintf("%q is not a target token: it is not a Go TEST name — the testing package requires `Test` followed by nothing, or by a character that is not a lower-case letter, and ignores everything else in silence. %s", tok, wantTarget)
+	}
+	return target{Pkg: pkg, Name: name}, ""
+}
+
+// parseTargetColumn parses the whole region after `->`, or returns the refusal that names the token
+// which is not a target.
+func parseTargetColumn(region string) ([]target, string) {
+	list, note, has := splitNote(region)
+	if has && strings.TrimSpace(note) == "" {
+		return nil, "its ` -- ` commentary field is empty; drop the delimiter or say something after it"
+	}
+	fields := strings.FieldsFunc(list, isTargetSep)
+	if len(fields) == 0 {
+		return nil, "it names no target at all before the ` -- ` delimiter, so nothing about it is checkable. " + wantTarget
+	}
+	var out []target
+	for _, f := range fields {
+		tg, why := parseTargetToken(f)
+		if why != "" {
+			return nil, why
+		}
+		out = append(out, tg)
+	}
+	return out, ""
 }
 
 // minNAReason is a substance floor, not a style rule. "N/A -- n/a" satisfies a syntax check and
@@ -491,12 +657,81 @@ type stray struct {
 	Region     string // the WHOLE contiguous comment region, for the row-name search
 	ClaimWords bool   // the region carries PORTED:/N/A: somewhere
 	InComment  bool   // the mention is in a comment (the only place a claim can be written)
+	// OffLane — the file is not one the toolchain compiles for ANY audited lane, so nothing in it
+	// can ever be a claim, however well it is written. Carried so auditCoverage can say WHICH of
+	// the two invisibilities this is: written where the parser does not look, or written in a file
+	// the parser is not allowed to read.
+	OffLane bool
+}
+
+// astView is what go/parser says about ONE file's comments: the lines on which a `//` LINE COMMENT
+// begins, and every line any comment covers. For a file the toolchain selected it is the AUTHORITY
+// on both questions, replacing the hand lexer that used to answer them from raw bytes.
+//
+// WHY THE PARSER AND NOT THE BYTES. Round 12 demonstrated the consequence of reading claims out of
+// a filesystem walk: a real claim moved into cmd/mythical-ctl/testdata/broken.go — a file preceded
+// by the line `this is not valid Go` — was CREDITED, and the full parity stage exited 0. Valid Go
+// behind `//go:build never` did the same. Both are files no lane compiles, so no claim in either
+// can describe anything that runs. The hand lexer could not tell, because it was reading text.
+type astView struct {
+	lineComment map[int]bool
+	anyComment  map[int]bool
+}
+
+// parseGoComments parses one Go file and reports its comment geography.
+//
+// A PARSE FAILURE IS RETURNED, NEVER SWALLOWED. A file the toolchain compiles but this program
+// cannot read is a file whose claims nobody is checking — and skipping it looks exactly like a file
+// that had no claims, which is the shape of every false green in this program's history.
+func parseGoComments(rel string, content []byte) (*astView, error) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, rel, content, parser.ParseComments|parser.SkipObjectResolution)
+	if err != nil {
+		return nil, fmt.Errorf("parsing %s for its inventory comments: %w", rel, err)
+	}
+	v := &astView{lineComment: map[int]bool{}, anyComment: map[int]bool{}}
+	for _, g := range f.Comments {
+		for _, c := range g.List {
+			start := fset.Position(c.Slash).Line
+			end := fset.Position(c.End()).Line
+			for l := start; l <= end; l++ {
+				v.anyComment[l] = true
+			}
+			// A CLAIM IS A `//` LINE COMMENT AND NOTHING ELSE, which is the grammar the protocol
+			// already had: invAny anchors on `^[ \t]*//`. A line INSIDE a /* */ block that reads
+			// `// PORTED: ...` is therefore not a claim — it is reported as one the parser cannot
+			// read, exactly as before.
+			if strings.HasPrefix(c.Text, "//") {
+				v.lineComment[start] = true
+			}
+		}
+	}
+	return v, nil
+}
+
+// shifted returns the view with every line number moved by d. Test scaffolding only: a fixture
+// written as bare inventory lines needs a `package` clause to be parseable at all, and the
+// assertions read the FIXTURE's line numbers, not the scaffolded ones.
+func (v *astView) shifted(d int) *astView {
+	out := &astView{lineComment: map[int]bool{}, anyComment: map[int]bool{}}
+	for l := range v.lineComment {
+		out.lineComment[l+d] = true
+	}
+	for l := range v.anyComment {
+		out.anyComment[l+d] = true
+	}
+	return out
 }
 
 // parseInventory reads one Go file's claims. Anything that opens like an inventory line but does
 // not parse is returned as malformed rather than skipped — a claim the audit cannot read is a
 // claim nobody is checking, which is the same as no claim at all but looks like coverage.
-func parseInventory(rel string, content []byte) ([]claim, []malformed, []stray, error) {
+//
+// VIEW NIL MEANS THE FILE IS NOT TOOLCHAIN-SELECTED, and then it may carry NO claims at all: every
+// claim-shaped line falls through to the stray path and is reported as invisible. Such a file need
+// not even be valid Go (testdata routinely is not), which is why the lexer still answers the
+// comment question for it — the parser cannot.
+func parseInventory(rel string, content []byte, view *astView) ([]claim, []malformed, []stray, error) {
 	var claims []claim
 	var bad []malformed
 	var strays []stray
@@ -525,24 +760,30 @@ func parseInventory(rel string, content []byte) ([]claim, []malformed, []stray, 
 		// multiline raw string is inert data, not a claim — counting it would let a fixture satisfy
 		// a row nothing actually covers. Block depth is tracked for the same reason in reverse: a
 		// continuation line inside /* */ opens with nothing and must still count as a comment.
-		openedInBlock, openedInRaw := inBlock, inRaw
-		inBlock, inRaw = lexAfter(inBlock, inRaw, text)
-		isComment := openedInBlock || inBlock || invCommentLine.MatchString(text)
+		//
+		// THE PARSER ANSWERS BOTH QUESTIONS WHERE IT CAN. For a toolchain-selected file the AST says
+		// which lines are comments and which of them OPEN a `//` comment, so no byte-level
+		// approximation decides whether a claim is a claim. The lexer stays for the files the parser
+		// cannot read — the ineligible ones, which may not be valid Go — and there it only ever
+		// widens the stray window, never admits a claim.
+		var isComment, claimable bool
+		if view != nil {
+			isComment = view.anyComment[line]
+			claimable = view.lineComment[line] && invAny.MatchString(text)
+		} else {
+			openedInBlock := inBlock
+			inBlock, inRaw = lexAfter(inBlock, inRaw, text)
+			isComment = openedInBlock || inBlock || invCommentLine.MatchString(text)
+		}
 		if !isComment {
 			region, regionFiles, regionClaim = nil, nil, false
 		}
-
-		claimable := !openedInRaw && !openedInBlock && invAny.MatchString(text)
 		if claimable {
 			if m := invPorted.FindStringSubmatch(text); m != nil {
-				targets := testNamesIn(m[3])
-				if len(targets) == 0 {
-					bad = append(bad, malformed{rel, line, text})
-					continue
-				}
-				if sub := subtestTarget(m[3], targets); sub != "" {
+				targets, why := parseTargetColumn(m[3])
+				if why != "" {
 					bad = append(bad, malformed{rel, line,
-						fmt.Sprintf("its target names the subtest %q — `go test -list` enumerates test FUNCTIONS, and a subtest exists only while its parent runs, so this audit can only ever resolve %q and report a claim about the subtest as satisfied. Deleting that subtest would leave this line green. Name the test function. || %s", sub, sub[:strings.IndexByte(sub, '/')], text)})
+						fmt.Sprintf("its PORTED target column is not a closed list of targets: %s || %s", why, text)})
 					continue
 				}
 				claims = append(claims, claim{
@@ -606,7 +847,7 @@ func parseInventory(rel string, content []byte) ([]claim, []malformed, []stray, 
 		}
 		if !isComment {
 			for _, p := range paths {
-				strays = append(strays, stray{rel, line, p, text, text, claimWords, false})
+				strays = append(strays, stray{rel, line, p, text, text, claimWords, false, view == nil})
 			}
 			continue
 		}
@@ -619,7 +860,7 @@ func parseInventory(rel string, content []byte) ([]claim, []malformed, []stray, 
 				continue
 			}
 			seenHere[sp.file] = true
-			strays = append(strays, stray{rel, sp.line, sp.file, sp.text, joined, regionClaim, true})
+			strays = append(strays, stray{rel, sp.line, sp.file, sp.text, joined, regionClaim, true, view == nil})
 		}
 	}
 	if err := sc.Err(); err != nil {
@@ -695,11 +936,44 @@ func lexAfter(inBlock, inRaw bool, line string) (bool, bool) {
 // build output. Neither can carry a claim, and walking them only creates ways to be wrong.
 var skipDirs = map[string]bool{".git": true, "third_party": true, "dist": true, "node_modules": true}
 
-func collectInventory(root string) ([]claim, []malformed, []stray, int, error) {
+// canonPath is the ONE spelling of a path both halves of the eligibility question can be asked in.
+// `go list` prints absolute directories; the inventory walk produces paths relative to -root; and
+// on macOS a temporary directory reaches the walk through a symlink and the toolchain through its
+// target. Comparing any two of those as written is a silent miss, and a silent miss here means
+// every claim in a file becomes invisible — the loudest possible failure for the quietest reason.
+func canonPath(p string) string {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return filepath.Clean(p)
+	}
+	if r, rerr := filepath.EvalSymlinks(abs); rerr == nil {
+		return r
+	}
+	return abs
+}
+
+// collectInventory reads the whole tree, but only ELIGIBLE files may carry claims.
+//
+// ELIGIBILITY IS THE TOOLCHAIN'S OWN FILE SELECTION, not a rule this program invents: the union,
+// across the audited lanes, of the files `go list` says each package compiles. A file under
+// testdata, or excluded by a build constraint, is in no lane's selection — so nothing in it runs,
+// nothing in it can describe what runs, and a claim in it is credited to nobody.
+//
+// THE INELIGIBLE FILES ARE STILL READ, and that is deliberate. A claim moved into one of them is
+// not merely uncredited (which shows up as an unclaimed row somewhere else, naming the wrong file);
+// it is REPORTED where it sits, so the message names the file somebody actually has to fix.
+func collectInventory(root string, eligible map[string]bool) ([]claim, []malformed, []stray, int, error) {
 	var claims []claim
 	var bad []malformed
 	var strays []stray
 	scanned := 0
+	// A SET, NOT A COUNTER, and the difference is a false green. Two walked paths can canonicalize
+	// onto ONE eligible key — a symlink beside the file it points at is enough — and a counter then
+	// records two hits for one file, which is exactly enough to hide a DIFFERENT selected file the
+	// walk never reached (one under a pruned directory, say). The arithmetic balances and the audit
+	// exits 0 having never read a file that compiles. A set cannot be inflated: it is a subset of
+	// `eligible` by construction, so equal sizes really do mean equal sets.
+	found := map[string]bool{}
 	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -722,7 +996,19 @@ func collectInventory(root string) ([]claim, []malformed, []stray, int, error) {
 			return rerr
 		}
 		scanned++
-		c, b, st, perr := parseInventory(filepath.ToSlash(rel), content)
+		var view *astView
+		if canon := canonPath(p); eligible[canon] {
+			found[canon] = true
+			// A MALFORMED ELIGIBLE FILE REFUSES. It is a file the toolchain compiles, so its claims
+			// are the ones that count — and a parse error that merely skipped it would look exactly
+			// like a file with nothing in it.
+			v, verr := parseGoComments(filepath.ToSlash(rel), content)
+			if verr != nil {
+				return verr
+			}
+			view = v
+		}
+		c, b, st, perr := parseInventory(filepath.ToSlash(rel), content, view)
 		if perr != nil {
 			return perr
 		}
@@ -731,7 +1017,33 @@ func collectInventory(root string) ([]claim, []malformed, []stray, int, error) {
 		strays = append(strays, st...)
 		return nil
 	})
-	return claims, bad, strays, scanned, err
+	if err != nil {
+		return nil, nil, nil, scanned, err
+	}
+	// The scan's own liveness, and it comes FIRST because it is the more basic answer: an empty tree
+	// would otherwise be reported as a disagreement between the walk and `go list`, which sends the
+	// reader looking for a keying bug that is not there.
+	if scanned == 0 {
+		return nil, nil, nil, scanned, fmt.Errorf("scanned 0 Go files under %s — the inventory scan is pointed at the wrong tree", root)
+	}
+	// THE WALK AND THE SELECTION MUST MEET. If a file the toolchain named was never reached by the
+	// walk, the two halves are keyed differently or the walk is pointed elsewhere — and the symptom
+	// would be a pile of unclaimed rows with no hint of the cause. Say the cause instead.
+	if len(found) != len(eligible) {
+		// NAME THE FILE THAT IS ACTUALLY MISSING, not an arbitrary selected one. The whole value of
+		// this message is that it points at the disagreement instead of leaving a reader to infer it
+		// from a pile of unclaimed rows.
+		var missing []string
+		for f := range eligible {
+			if !found[f] {
+				missing = append(missing, f)
+			}
+		}
+		sort.Strings(missing)
+		return nil, nil, nil, scanned, fmt.Errorf("the inventory walk under %s reached %d of the %d files the toolchain selected — the walk and `go list` disagree about where the source is, so claims would be missing for a reason that has nothing to do with the port (%d never reached; first by path: %s)",
+			root, len(found), len(eligible), len(missing), missing[0])
+	}
+	return claims, bad, strays, scanned, nil
 }
 
 // parseGoTestList reads `go test -list '.*' ./...` output, KEYED BY PACKAGE. Only bare Test
@@ -793,13 +1105,23 @@ type testLane struct {
 	src map[string]map[string]bool
 }
 
-// parseGoFileList reads `go list -f '{{.ImportPath}}\t{{.Dir}}\t{{join .TestGoFiles " "}}\t{{join
-// .XTestGoFiles " "}}'` output and returns, per package import path, the absolute paths of the test
-// files THAT LANE COMPILES. TestGoFiles and XTestGoFiles are the in-package and external test files
-// go itself selected after applying build constraints — which is the whole point: the selection is
-// made by the toolchain for the lane, not re-derived here from a walk that ignores tags.
-func parseGoFileList(content []byte) (map[string][]string, error) {
-	out := map[string][]string{}
+// pkgFiles is what one lane compiles for one package: its ordinary source, and the files that can
+// DECLARE tests. The two are kept apart because they answer different questions — every file here
+// may carry a CLAIM (it is compiled, so it is real), but only a `_test.go` file can declare a test,
+// and a `func TestX` in ordinary source is an exported function the toolchain never registers.
+type pkgFiles struct {
+	Dir  string
+	Go   []string // GoFiles — compiled into the package itself
+	Test []string // TestGoFiles + XTestGoFiles — the in-package and external test files
+}
+
+// parseGoFileList reads `go list -f '{{.ImportPath}}\t{{.Dir}}\t{{join .GoFiles " "}}\t{{join
+// .TestGoFiles " "}}\t{{join .XTestGoFiles " "}}'` output and returns, per package import path, the
+// absolute paths of the files THAT LANE COMPILES. They are the files go itself selected after
+// applying build constraints — which is the whole point: the selection is made by the toolchain for
+// the lane, not re-derived here from a walk that ignores tags.
+func parseGoFileList(content []byte) (map[string]pkgFiles, error) {
+	out := map[string]pkgFiles{}
 	sc := bufio.NewScanner(bytes.NewReader(content))
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	for sc.Scan() {
@@ -808,18 +1130,28 @@ func parseGoFileList(content []byte) (map[string][]string, error) {
 			continue
 		}
 		f := strings.Split(t, "\t")
-		if len(f) != 4 {
-			return nil, fmt.Errorf("go-files line is not the 4 tab-separated fields this reader expects: %q", t)
+		if len(f) != 5 {
+			return nil, fmt.Errorf("go-files line is not the 5 tab-separated fields this reader expects: %q", t)
 		}
 		pkg, dir := f[0], f[1]
 		if pkg == "" || dir == "" {
 			return nil, fmt.Errorf("go-files line names no package or no directory: %q", t)
 		}
-		for _, group := range f[2:] {
+		e := pkgFiles{Dir: dir}
+		for _, name := range strings.Fields(f[2]) {
+			e.Go = append(e.Go, filepath.Join(dir, name))
+		}
+		for _, group := range f[3:] {
 			for _, name := range strings.Fields(group) {
-				out[pkg] = append(out[pkg], filepath.Join(dir, name))
+				e.Test = append(e.Test, filepath.Join(dir, name))
 			}
 		}
+		// A PACKAGE WITH NO FILES CONTRIBUTES NO ENTRY. It declares nothing and compiles nothing, so
+		// inventing an empty entry for it would only make the liveness checks below harder to trip.
+		if len(e.Go) == 0 && len(e.Test) == 0 {
+			continue
+		}
+		out[pkg] = e
 	}
 	return out, sc.Err()
 }
@@ -830,14 +1162,22 @@ func parseGoFileList(content []byte) (map[string][]string, error) {
 // which counted a declaration written inside a block comment or a raw string as source evidence —
 // the same class of defect the inventory scanner had, in the tool that was fixing it. go/parser
 // knows what is code, and a file that does not parse is a hard error rather than a silent zero.
-func collectLaneSource(files map[string][]string) (map[string]map[string]bool, error) {
+func collectLaneSource(files map[string]pkgFiles) (map[string]map[string]bool, error) {
 	out := map[string]map[string]bool{}
 	fset := token.NewFileSet()
-	for pkg, paths := range files {
-		if out[pkg] == nil {
-			out[pkg] = map[string]bool{}
-		}
-		for _, p := range paths {
+	for pkg, pf := range files {
+		// ONLY A TEST FILE CAN DECLARE A TEST, and only a package that ACTUALLY DECLARES ONE gets an
+		// entry. An entry created up front — for a package with no test files, or with a test file
+		// that declares nothing — is an empty witness, and an empty witness is indistinguishable
+		// from a real one at every read (`src[p][t]` is false either way) while making the lane look
+		// populated to anything that counts entries. It is created below, on the first declaration.
+		//
+		// DELIBERATELY REDUNDANT WITH THE `laneDeclared` COUNT IN run(), AND SAY SO. Either one alone
+		// closes the hole they were added for, so each is an EQUIVALENT mutation on its own and no
+		// test can distinguish them; only reverting BOTH reddens. That is recorded here rather than
+		// left for a later reader to discover by deleting one — the pair is two readers of the same
+		// fact (this lane can confirm nothing), and the cheaper of the two to get wrong is this one.
+		for _, p := range pf.Test {
 			f, perr := parser.ParseFile(fset, p, nil, parser.SkipObjectResolution)
 			if perr != nil {
 				return nil, fmt.Errorf("parsing %s for its test declarations: %w", p, perr)
@@ -870,6 +1210,9 @@ func collectLaneSource(files map[string][]string) (map[string]map[string]bool, e
 				// The same grammar the testing package applies: `Test` alone, or `Test` followed
 				// by a character that is not a lower-case letter.
 				if isGoTestName(n) {
+					if out[pkg] == nil {
+						out[pkg] = map[string]bool{}
+					}
 					out[pkg][n] = true
 				}
 			}
@@ -928,30 +1271,24 @@ func isTestTParam(fn *ast.FuncDecl) bool {
 // A BASENAME IS NOT A PACKAGE. `cmd/probe` and `internal/probe` must never collapse onto whichever
 // was seen last, so a multi-segment token must match a real path SUFFIX, and a bare segment matches
 // only when it is unambiguous across the whole module.
-func candidatePackages(all map[string]map[string]bool, goFile, detail, target string) map[string]bool {
+func candidatePackages(all map[string]map[string]bool, goFile string, tg target) map[string]bool {
 	bySeg := map[string][]string{}
 	for p := range all {
 		bySeg[path.Base(p)] = append(bySeg[path.Base(p)], p)
 	}
 	out := map[string]bool{}
-	// FOR THIS TARGET ONLY. A claim naming two tests may qualify one of them and not the other,
-	// and the unqualified one must not borrow the qualified one's package.
+	// FOR THIS TARGET ONLY, AND FROM ITS OWN TOKEN. A claim naming two tests may qualify one of
+	// them and not the other, and the unqualified one must not borrow the qualified one's package.
+	// The qualification is part of the token the claim spelled, so no arrangement of words
+	// anywhere else in the line can supply, widen or contradict one.
 	//
-	// A QUALIFICATION CONSTRAINS; IT DOES NOT WIDEN. The first version of this fix added the
-	// qualified package BESIDE the claiming file's own one, which left the hole open facing the
-	// other way: `internal/w.TestShared`, written in internal/x, stayed green after
-	// internal/w.TestShared was DELETED, because a namesake in internal/x satisfied it. A claim
-	// that says where its target lives is answered by THAT package or by nothing.
-	// THE TARGET'S FIRST OCCURRENCE DECIDES, and the rest of the claim is never read for it. See
-	// qualifierFor: this is a decision NOT to scan prose, which is what makes the whole family of
-	// prose-shaped false greens unreachable instead of individually ruled out.
-	if tok, ok := qualifierFor(detail, target); ok && tok != "" {
-		// A QUALIFICATION CONSTRAINS; IT DOES NOT WIDEN. An earlier version added the qualified
-		// package BESIDE the claiming file's own, which left the hole facing the other way:
-		// `internal/w.TestShared` written in internal/x stayed green after internal/w.TestShared
-		// was DELETED, because a namesake in internal/x satisfied it. A claim that says where its
-		// target lives is answered by THAT package or by nothing.
-		addTo(all, bySeg, out, tok)
+	// A QUALIFICATION CONSTRAINS; IT DOES NOT WIDEN. An earlier version added the qualified package
+	// BESIDE the claiming file's own, which left the hole facing the other way:
+	// `internal/w.TestShared`, written in internal/x, stayed green after internal/w.TestShared was
+	// DELETED, because a namesake in internal/x satisfied it. A claim that says where its target
+	// lives is answered by THAT package or by nothing.
+	if tg.Pkg != "" {
+		addTo(all, bySeg, out, tg.Pkg)
 		return out
 	}
 	// UNQUALIFIED: the claiming file's own package, and nothing else. Resolved by the SAME rule as
@@ -1018,107 +1355,6 @@ func resolvePathToken(all map[string]map[string]bool, tok string) (string, bool)
 		return found, true
 	}
 	return "", false
-}
-
-// qualifierFor returns the package token qualifying this target, read at the target's FIRST
-// OCCURRENCE in the claim and nowhere else.
-//
-// THE FIRST OCCURRENCE IS THE DESIGNATED REGION, AND NOTHING AFTER IT IS READ. Three false-green
-// classes have now been found in this reader, all the same shape: it approximated a grammar by
-// scanning prose, and prose has no polarity a scanner can see. `TestShared (not
-// internal/w.TestShared; it is local)` says the target is local and also spells a qualification of
-// it; a reader that looks at the whole claim cannot tell which half was meant, and every rule
-// invented to tell them apart is another rule ABOUT prose waiting for a fourth shape.
-//
-// So the reader stops looking. A claim states its target once, where the claim is made; whatever a
-// rationale says afterwards is commentary and is not scanned for that target at all. No sentence
-// anyone writes can then satisfy, constrain or contradict a claim — the family of findings is
-// unreachable rather than individually handled. (This is positional, not punctuational: a
-// delimiter like "up to the first parenthesis" cannot be used, because real claims in this tree
-// put a second target AFTER a parenthetical and one writes its whole target inside parentheses.)
-//
-// BOTH IDENTIFIER BOUNDARIES ARE CHECKED. Only the right-hand one was, so `TestFoo` matched inside
-// `NotTestFoo` — and that spurious "bare occurrence" made a legitimately qualified claim resolve to
-// nothing. An occurrence counts only when it is a WHOLE identifier: no identifier rune on either
-// side, except the `.` that carries a qualification.
-func qualifierFor(detail, target string) (tok string, found bool) {
-	i, ok := firstWholeOccurrence(detail, target)
-	if !ok {
-		return "", false
-	}
-	if i == 0 || detail[i-1] != '.' {
-		return "", true
-	}
-	k := i - 1
-	for k > 0 && isPathByte(detail[k-1]) {
-		k--
-	}
-	return detail[k : i-1], true
-}
-
-// firstWholeOccurrence is WHERE A CLAIM STATES ITS TARGET: the first place the target name appears
-// as a whole identifier. Written once and shared, because every reader of the target column has to
-// agree about that position — two copies of this rule would be two chances to fix one of them.
-//
-// BOTH IDENTIFIER BOUNDARIES ARE CHECKED. Only the right-hand one was, so `TestFoo` matched inside
-// `NotTestFoo` — and that spurious "bare occurrence" made a legitimately qualified claim resolve to
-// nothing. An occurrence counts only when it is a WHOLE identifier: no identifier rune on either
-// side, except the `.` that carries a qualification (a `.` is not an identifier rune, so a
-// qualification passes; a letter, digit or underscore means the match is the TAIL of a longer name).
-func firstWholeOccurrence(detail, target string) (int, bool) {
-	for i := 0; i+len(target) <= len(detail); i++ {
-		if !strings.HasPrefix(detail[i:], target) {
-			continue
-		}
-		if r, _ := utf8.DecodeRuneInString(detail[i+len(target):]); identRune(r) {
-			continue
-		}
-		if i > 0 {
-			r, _ := utf8.DecodeLastRuneInString(detail[:i])
-			if identRune(r) {
-				continue
-			}
-		}
-		return i, true
-	}
-	return 0, false
-}
-
-// subtestTarget reports the first target written as a SUBTEST reference — `TestOne/case` — or "".
-//
-// A SUBTEST IS NOT A NAME THIS PROGRAM CAN RESOLVE, AND IT MUST NOT PRETEND OTHERWISE. `go test
-// -list` enumerates test FUNCTIONS; a subtest exists only while its parent is running, so no
-// listing can testify about one. The name was therefore narrowed to its parent and reported as
-// resolved: `TestOne/deletes_the_socket` was answered by `TestOne`, and deleting the subtest the
-// inventory line actually names left the claim green. The claim said one thing and the resolver
-// answered about another — the shape every false green found in this reader has had.
-//
-// So it is REFUSED rather than narrowed, which is the fail-closed direction: the author is told to
-// name the test function, and the row stays visibly unclaimed until they do. This is not another
-// rule about what the prose in the target column means — it is the rule that a name this program
-// cannot resolve is never silently replaced by one it can.
-//
-// READ AT THE TARGET'S FIRST OCCURRENCE, like every other question asked about the target, so a
-// rationale that mentions a subtest further along is commentary and is not scanned.
-func subtestTarget(detail string, targets []string) string {
-	for _, t := range targets {
-		i, ok := firstWholeOccurrence(detail, t)
-		if !ok || detail[i+len(t):] == "" || detail[i+len(t)] != '/' {
-			continue
-		}
-		j := i + len(t)
-		for j < len(detail) && detail[j] != ' ' && detail[j] != '\t' {
-			j++
-		}
-		return detail[i:j]
-	}
-	return ""
-}
-
-// isPathByte is what a package path may contain in a claim.
-func isPathByte(b byte) bool {
-	return b >= 'A' && b <= 'Z' || b >= 'a' && b <= 'z' || b >= '0' && b <= '9' ||
-		b == '_' || b == '.' || b == '/' || b == '-'
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1312,6 +1548,17 @@ func auditCoverage(r *report, pairs []batsPair, claims []claim, bad []malformed,
 				break
 			}
 			reported[where{s.GoFile, s.GoLine}] = true
+			if s.OffLane {
+				// A DIFFERENT INVISIBILITY, AND IT NEEDS ITS OWN SENTENCE. This claim may be
+				// perfectly written; the FILE is the problem. No lane compiles it — it is under
+				// testdata, or a build constraint excludes it — so nothing in it runs and nothing
+				// in it can testify about what runs. Demonstrated: a real claim moved into
+				// `<pkg>/testdata/broken.go`, behind a line that is not Go at all, was credited and
+				// the whole parity stage exited 0.
+				r.fail("%s:%d: this file is in NO audited lane's file selection (under testdata, or excluded by a build constraint), so nothing in it compiles and a claim in it describes nothing that runs — yet it names %s (%s). Move the claim to the test file that actually covers the row: %s",
+					s.GoFile, s.GoLine, cand, why, strings.TrimSpace(s.Text))
+				break
+			}
 			r.fail("%s:%d: this names %s where the inventory parser does not read it (%s) — a claim here is invisible to every gate, so it can contradict the real one forever. Put it at the start of its own comment line, or reword it so it neither uses the claim syntax nor carries a row name: %s",
 				s.GoFile, s.GoLine, cand, why, strings.TrimSpace(s.Text))
 			break
@@ -1352,7 +1599,7 @@ func auditCoverage(r *report, pairs []batsPair, claims []claim, bad []malformed,
 			continue
 		}
 		for _, t := range c.Targets {
-			cands := candidatePackages(goTests, c.GoFile, c.Detail, t)
+			cands := candidatePackages(goTests, c.GoFile, t)
 			found := false
 			for p := range cands {
 				// BOTH WITNESSES, WITHIN ONE LANE. `go test -list` says that lane registers the
@@ -1361,7 +1608,7 @@ func auditCoverage(r *report, pairs []batsPair, claims []claim, bad []malformed,
 				// printed by one lane's init and declared in a file only another lane compiles
 				// satisfies both halves while no lane runs a test by that name.
 				for _, ln := range testLanes {
-					if ln.list[p][t] && ln.src[p][t] {
+					if ln.list[p][t.Name] && ln.src[p][t.Name] {
 						found = true
 						break
 					}
@@ -1375,7 +1622,7 @@ func auditCoverage(r *report, pairs []batsPair, claims []claim, bad []malformed,
 			}
 			var elsewhere []string
 			for p, names := range goTests {
-				if names[t] {
+				if names[t.Name] {
 					elsewhere = append(elsewhere, p)
 				}
 			}
@@ -1441,7 +1688,7 @@ func main() {
 		failFirst = flag.Int("max-problems", 0, "print at most this many problems (0 = all)")
 	)
 	flag.Var(&goLists, "go-list", "file holding `go test -list` output; repeatable (once per build-tag lane)")
-	flag.Var(&goFiles, "go-files", "file holding `go list -f '{{.ImportPath}}\\t{{.Dir}}\\t{{join .TestGoFiles \" \"}}\\t{{join .XTestGoFiles \" \"}}'` output for the SAME lane, in the SAME order as --go-list")
+	flag.Var(&goFiles, "go-files", "file holding `go list -f '{{.ImportPath}}\\t{{.Dir}}\\t{{join .GoFiles \" \"}}\\t{{join .TestGoFiles \" \"}}\\t{{join .XTestGoFiles \" \"}}'` output for the SAME lane, in the SAME order as --go-list")
 	flag.Parse()
 
 	if err := run(*root, *manifest, *writeMan, goLists, goFiles, *failFirst); err != nil {
@@ -1537,16 +1784,6 @@ func run(root, manifestRel string, writeMan bool, goLists, goFiles []string, max
 		fmt.Printf("corpus: bats trees absent (post-cutover) — auditing against the committed %s\n", manifestRel)
 	}
 
-	claims, bad, strays, scanned, err := collectInventory(root)
-	if err != nil {
-		return err
-	}
-	// The scan's own liveness. Zero Go files means the walk is pointed somewhere with no source in
-	// it, and every claim below would be missing for a reason that has nothing to do with the port.
-	if scanned == 0 {
-		return fmt.Errorf("scanned 0 Go files under %s — the inventory scan is pointed at the wrong tree", root)
-	}
-
 	// THE TWO WITNESSES ARRIVE PAIRED, ONE PAIR PER LANE, and the pairing is checked rather than
 	// assumed: an unpaired list would silently reintroduce the very independence the pairing
 	// removes — a lane whose source half is empty resolves nothing, and one whose list half is
@@ -1558,6 +1795,11 @@ func run(root, manifestRel string, writeMan bool, goLists, goFiles []string, max
 			len(goLists), len(goFiles))
 	}
 	var testLanes []testLane
+	// EVERY FILE THE TOOLCHAIN COMPILES, ACROSS EVERY LANE. This is the set a claim may be written
+	// in; nothing outside it is read as a claim, whatever it says. Union rather than intersection
+	// because the acceptance lane genuinely compiles a file the default lane does not, and a claim
+	// in it is legitimate.
+	eligible := map[string]bool{}
 	names := 0
 	for i, p := range goLists {
 		content, err := os.ReadFile(p)
@@ -1572,6 +1814,14 @@ func run(root, manifestRel string, writeMan bool, goLists, goFiles []string, max
 		if perr != nil {
 			return fmt.Errorf("reading %s: %w", goFiles[i], perr)
 		}
+		for _, pf := range files {
+			for _, f := range pf.Go {
+				eligible[canonPath(f)] = true
+			}
+			for _, f := range pf.Test {
+				eligible[canonPath(f)] = true
+			}
+		}
 		src, serr := collectLaneSource(files)
 		if serr != nil {
 			return serr
@@ -1580,16 +1830,30 @@ func run(root, manifestRel string, writeMan bool, goLists, goFiles []string, max
 		// EACH LANE'S OWN LIVENESS, not the union's. A lane that registers nothing, or whose
 		// compiled test files declare nothing, resolves no target — and a union check would hide
 		// that behind the other lane.
-		if len(ln.list) == 0 {
-			return fmt.Errorf("%s lists no packages — `go test -list` produced nothing for this lane", p)
-		}
-		if len(src) == 0 {
-			return fmt.Errorf("%s names no compiled test files — the source half of target resolution has\n"+
-				"   nothing to check against for this lane", goFiles[i])
-		}
+		//
+		// COUNTED IN NAMES, NOT IN PACKAGE ENTRIES, and the difference is the whole guard. Both
+		// halves manufacture a package entry without a single test in it: `? <pkg> [no test files]`
+		// is a terminator line, so parseGoTestList records the package with an empty name set, and a
+		// compiled `_test.go` holding nothing but its `package` clause used to do the same on the
+		// source side. A lane in exactly that state — no registered test, no declared test — passed
+		// both checks, and the comment above said it could not. What a lane must have is a NAME.
+		laneListed := 0
 		for _, ns := range ln.list {
-			names += len(ns)
+			laneListed += len(ns)
 		}
+		if laneListed == 0 {
+			return fmt.Errorf("%s lists no test names — `go test -list` registered nothing for this lane, so it can\n"+
+				"   confirm no target at all and the other lane would be answering for it", p)
+		}
+		laneDeclared := 0
+		for _, ns := range src {
+			laneDeclared += len(ns)
+		}
+		if laneDeclared == 0 {
+			return fmt.Errorf("%s names compiled test files that DECLARE no test — the source half of target\n"+
+				"   resolution has nothing to check against for this lane", goFiles[i])
+		}
+		names += laneListed
 		testLanes = append(testLanes, ln)
 	}
 	// Same liveness argument one level down: an empty set of known tests would make every PORTED
@@ -1599,6 +1863,15 @@ func run(root, manifestRel string, writeMan bool, goLists, goFiles []string, max
 	if names == 0 {
 		return fmt.Errorf("no Go test names were loaded (pass --go-list <file> with `go test -list '.*' ./...` output) — PORTED targets cannot be resolved")
 	}
+	// THE CLAIM-BEARING SET NEEDS NO SEPARATE LIVENESS CHECK, and saying so is worth more than a
+	// check that cannot fire: every lane has already been refused unless its compiled TEST files
+	// declare something (the `len(src) == 0` check above), and a compiled test file is by
+	// construction a member of `eligible`. An empty selection is therefore unreachable from here.
+	claims, bad, strays, scanned, err := collectInventory(root, eligible)
+	if err != nil {
+		return err
+	}
+
 	goTests := map[string]map[string]bool{}
 	for _, ln := range testLanes {
 		for pkg, ns := range ln.list {

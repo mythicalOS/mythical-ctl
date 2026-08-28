@@ -53,7 +53,14 @@ GOFLAGS='' GOENV=off go test -tags acceptance -list '.*' ./... > "$TMP/list-acce
 # TestClaimed, and an active init() that merely PRINTS "TestClaimed". TestGoFiles/XTestGoFiles are
 # the files go itself compiles for THIS lane after applying its tags, so the source half can no
 # longer testify about a file the lane does not build.
-FILE_TMPL='{{.ImportPath}}	{{.Dir}}	{{join .TestGoFiles " "}}	{{join .XTestGoFiles " "}}'
+#
+# GoFiles RIDES ALONG FOR A SECOND REASON, and it is the one the grader cares about more: this same
+# stream is what tells it WHICH FILES MAY CARRY A CLAIM. Claim discovery used to be a filesystem
+# walk that read bytes, so a claim moved into a testdata directory — or behind a build constraint no
+# lane satisfies — was credited to a row while describing nothing that runs. Demonstrated end to end
+# with a file that was not even valid Go. The claim-bearing set is now exactly what go compiles:
+# GoFiles + TestGoFiles + XTestGoFiles, unioned across the lanes.
+FILE_TMPL='{{.ImportPath}}	{{.Dir}}	{{join .GoFiles " "}}	{{join .TestGoFiles " "}}	{{join .XTestGoFiles " "}}'
 GOFLAGS='' GOENV=off go list -f "$FILE_TMPL" ./... > "$TMP/files-default.txt"
 GOFLAGS='' GOENV=off go list -tags acceptance -f "$FILE_TMPL" ./... > "$TMP/files-acceptance.txt"
 

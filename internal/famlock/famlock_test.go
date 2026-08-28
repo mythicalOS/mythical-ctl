@@ -17,7 +17,7 @@ import (
 // PORTED: tests/unit/lock.bats: "acquire then release round-trips and sets the token" -> TestAcquireReleaseRoundTrip
 // PORTED: tests/unit/lock.bats: "acquire creates its own .state directory on a fresh machine (never mis-reports a missing dir as contention)" -> TestAcquireCreatesStateDir
 // PORTED: tests/unit/lock.bats: "a live holder blocks a second acquire and names the holder" -> TestLiveHolderBlocksAndIsNamed
-// PORTED: tests/unit/lock.bats: "a dead holder's lock is broken and acquired" -> TestDeadHolderReleasesAutomatically (the kernel drops a dead holder's flock; no break protocol remains)
+// PORTED: tests/unit/lock.bats: "a dead holder's lock is broken and acquired" -> TestDeadHolderReleasesAutomatically -- the kernel drops a dead holder's flock; no break protocol remains
 // N/A: tests/unit/lock.bats: "an unreadable-PID lock is treated as in-progress, not broken" -- the pid body is diagnostic only; liveness is the kernel's, no record read decides anything
 // N/A: tests/unit/lock.bats: "a malformed lock record fails closed — unreadable, not parsed or broken" -- same: no record parsing grants or breaks anything
 // N/A: tests/unit/lock.bats: "a multi-record lock file fails closed — refused, never broken (one record is LIVE)" -- same: the flock, not the file body, is the lock

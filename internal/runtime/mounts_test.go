@@ -37,17 +37,17 @@ import (
 // PORTED: tests/unit/mounts.bats: "two overlapping binds are rejected when EITHER is writable" -> TestCheckPairwise
 // PORTED: tests/unit/mounts.bats: "two read-only overlapping binds are permitted" -> TestCheckPairwise
 // PORTED: tests/unit/mounts.bats: "two non-overlapping writable binds are permitted" -> TestCheckPairwise
-// PORTED: tests/unit/mounts.bats: "identical canonical sources are rejected, however they were spelled" -> TestCheckPairwise (the callers canonicalize first — two spellings of one directory arrive equal)
+// PORTED: tests/unit/mounts.bats: "identical canonical sources are rejected, however they were spelled" -> TestCheckPairwise -- the callers canonicalize first — two spellings of one directory arrive equal
 // N/A: tests/unit/mounts.bats: "a bind spec whose mode is neither ro nor rw is refused, never read as read-only" -- the mode is a bool on the typed Bind; an unrecognised third field is unrepresentable
 // N/A: tests/unit/mounts.bats: "a bind spec with a fourth field is refused, never re-cut into a mode it does not have" -- no spec string exists to re-cut
 // N/A: tests/unit/mounts.bats: "a bind spec with no mode field at all is refused rather than read as two fields" -- same: the colon-separated grammar is gone
 // N/A: tests/unit/mounts.bats: "a source path containing a colon is refused rather than emitted as an ambiguous spec" -- a mount crosses the API as one JSON field per component, so a colon moves no boundary (see runtime_invariants_test.go for the comma sibling, demonstrated live)
-// PORTED: tests/unit/mounts.bats: "the VALIDATED canonical path is what reaches the spec — never the operator's string" -> TestLaunchProductMounts (launch_test.go: the inspect shows the resolved path; the operator's spelling appears nowhere)
-// PORTED: tests/unit/mounts.bats: "mi_mount_binds applies the pairwise rule to the whole set it emits" -> TestMountsForPairwise (launch_test.go)
-// PORTED: tests/unit/mounts.bats: "the emitted bind spec is one the runtime adapter accepts, and mounts the declared path" -> TestLaunchProductMounts (launch_test.go; the cross-seam case — what MountsFor emits is what the engine mounts)
+// PORTED: tests/unit/mounts.bats: "the VALIDATED canonical path is what reaches the spec — never the operator's string" -> TestLaunchProductMounts -- launch_test.go: the inspect shows the resolved path; the operator's spelling appears nowhere
+// PORTED: tests/unit/mounts.bats: "mi_mount_binds applies the pairwise rule to the whole set it emits" -> TestMountsForPairwise -- launch_test.go
+// PORTED: tests/unit/mounts.bats: "the emitted bind spec is one the runtime adapter accepts, and mounts the declared path" -> TestLaunchProductMounts -- launch_test.go; the cross-seam case — what MountsFor emits is what the engine mounts
 // N/A: tests/unit/mounts.bats: "a bound role the manifest declares but does not PLACE is refused, never given a target" -- an unplaced role is unrepresentable: the rolemount grammar requires <role>:<absolute path>, so a manifest declaring one refuses at parse (RoleTarget still refuses a role the manifest does not declare — TestRoleTarget)
-// PORTED: tests/unit/mounts.bats: "a role the policy index does not make bindable cannot be bound by naming its key" -> TestMountsForUnbindableKeySet (launch_test.go)
-// PORTED: tests/unit/mounts.bats: "a role with no bind key falls through to a named volume rather than failing" -> TestLaunchProductMounts (launch_test.go: the unbound role rides its named volume)
+// PORTED: tests/unit/mounts.bats: "a role the policy index does not make bindable cannot be bound by naming its key" -> TestMountsForUnbindableKeySet -- launch_test.go
+// PORTED: tests/unit/mounts.bats: "a role with no bind key falls through to a named volume rather than failing" -> TestLaunchProductMounts -- launch_test.go: the unbound role rides its named volume
 // PORTED: tests/unit/mounts.bats: "the product key spec names the port and every BINDABLE role, and nothing else" -> TestProductKeys
 // PORTED: tests/unit/mounts.bats: "no bindable_role entitlement means no bind key at all" -> TestProductKeys
 // PORTED: tests/unit/mounts.bats: "the operation's spec is the core vocabulary PLUS this product's" -> TestConfSpecFor

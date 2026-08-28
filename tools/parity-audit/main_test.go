@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,6 +22,32 @@ import (
 // discipline is self-proving rather than a rule somebody has to remember.
 
 func lines(l ...string) []byte { return []byte(strings.Join(l, "\n") + "\n") }
+
+// invFixture parses an inventory fixture THE WAY THE REAL AUDIT DOES — through go/parser, as a file
+// the toolchain selected. A fixture written as bare inventory lines is not a compilable Go file, so
+// it is given the `package` clause it needs and the resulting line numbers are shifted back: the
+// assertions read the FIXTURE's lines, not the scaffolding's.
+//
+// It exists so no test can accidentally exercise a claim path the shipped audit no longer has. A
+// fixture that is not valid Go fails HERE, loudly, rather than quietly taking the ineligible-file
+// branch and proving nothing.
+func invFixture(t *testing.T, rel string, content []byte) ([]claim, []malformed, []stray) {
+	t.Helper()
+	src, shift := content, 0
+	if !strings.HasPrefix(string(content), "package ") {
+		src = append([]byte("package x\n"), content...)
+		shift = 1
+	}
+	v, err := parseGoComments(rel, src)
+	if err != nil {
+		t.Fatalf("the fixture is not valid Go, so it could never be a toolchain-selected file: %v", err)
+	}
+	c, b, st, perr := parseInventory(rel, content, v.shifted(-shift))
+	if perr != nil {
+		t.Fatal(perr)
+	}
+	return c, b, st
+}
 
 // ---------------------------------------------------------------------------------------------
 // The bats parser and the manifest round trip
@@ -101,17 +128,14 @@ func TestParseManifestRefusesARowWithNoTab(t *testing.T) {
 // ---------------------------------------------------------------------------------------------
 
 func TestParseInventory(t *testing.T) {
-	claims, bad, _, err := parseInventory("internal/x/x_test.go", lines(
+	claims, bad, _ := invFixture(t, "internal/x/x_test.go", lines(
 		`package x`,
 		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
 		`// N/A:    tests/unit/a.bats: "two" -- structurally impossible in Go: no such seam exists`,
-		"\t// PORTED: tests/unit/a.bats: \"three\" -> TestThree (an aside naming TestFour too)",
+		"\t// PORTED: tests/unit/a.bats: \"three\" -> TestThree -- an aside naming TestFour, which is commentary and binds nothing",
 		`// PORTED: tests/unit/a.bats: "four" -> TestFive, TestSix`,
 		`func f() { _ = "// PORTED: tests/unit/a.bats: \"nope\" -> TestNope" }`,
 	))
-	if err != nil {
-		t.Fatalf("parseInventory: %v", err)
-	}
 	if len(bad) != 0 {
 		t.Fatalf("unexpected malformed lines: %+v", bad)
 	}
@@ -124,9 +148,9 @@ func TestParseInventory(t *testing.T) {
 	if claims[1].Kind != claimNA {
 		t.Fatalf("claim 1 should be N/A: %+v", claims[1])
 	}
-	// An aside inside the target expression still names a real test, so it is resolved too — the
-	// alternative is a claim that mentions a function nobody checks exists.
-	if len(claims[2].Targets) != 2 || claims[2].Targets[1] != "TestFour" {
+	// AN ASIDE BINDS NOTHING. It sits behind the ` -- ` delimiter, where nothing reads it — so the
+	// TestFour it mentions is not a target, and no sentence written there can become one.
+	if len(claims[2].Targets) != 1 || claims[2].Targets[0].Name != "TestThree" {
 		t.Fatalf("claim 2 targets: %+v", claims[2].Targets)
 	}
 	if len(claims[3].Targets) != 2 {
@@ -151,10 +175,7 @@ func TestParseInventoryReportsMalformed(t *testing.T) {
 		{"defers with a TODO", `// N/A: tests/unit/a.bats: "one" -- TODO: needs the copy seam, which is not built here`},
 		{"unquoted name", `// PORTED: tests/unit/a.bats: one -> TestOne`},
 	} {
-		claims, bad, _, err := parseInventory("x_test.go", lines(tc.line))
-		if err != nil {
-			t.Fatalf("%s: %v", tc.name, err)
-		}
+		claims, bad, _ := invFixture(t, "x_test.go", lines(tc.line))
 		if len(bad) != 1 || len(claims) != 0 {
 			t.Fatalf("%s: %d malformed, %d claims — want 1 and 0", tc.name, len(bad), len(claims))
 		}
@@ -383,11 +404,7 @@ var (
 
 func claimsFrom(t *testing.T, l ...string) ([]claim, []malformed, []stray) {
 	t.Helper()
-	c, b, st, err := parseInventory("internal/x/x_test.go", lines(l...))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return c, b, st
+	return invFixture(t, "internal/x/x_test.go", lines(l...))
 }
 
 func hasProblem(r *report, substr string) bool {
@@ -525,9 +542,13 @@ func TestANonASCIIIdentifierStartCannotResolveToADifferentTest(t *testing.T) {
 	if got := goIdentsIn("ÉTestByteGate"); len(got) != 1 || got[0] != "ÉTestByteGate" {
 		t.Fatalf("goIdentsIn(%q) = %q — a leading non-ASCII rune was skipped and the ASCII tail returned as an identifier", "ÉTestByteGate", got)
 	}
-	// ...so it names NO Go test, rather than the real one it ends with.
-	if got := testNamesIn("-> ÉTestVerifyDigest"); len(got) != 0 {
-		t.Fatalf("testNamesIn(%q) = %q — a target that is not a Go test name was read as one", "-> ÉTestVerifyDigest", got)
+	// ...so the TOKEN PARSER refuses it, rather than resolving the real name it ends with.
+	if _, why := parseTargetToken("ÉTestVerifyDigest"); why == "" {
+		t.Fatal("a token that is not a Go TEST name was accepted as a target")
+	}
+	// ...and the whole-token rule cuts the other way too: a legitimate Unicode name survives intact.
+	if tg, why := parseTargetToken("TestAlphaÉ"); why != "" || tg.Name != "TestAlphaÉ" {
+		t.Fatalf("a Unicode test name was refused or truncated: %+v %s", tg, why)
 	}
 	// A run that cannot START an identifier yields nothing either, rather than its own tail: the
 	// defect being fixed is truncation, and it must not reappear at the other end.
@@ -756,7 +777,7 @@ func e2eTree(t *testing.T) (root, goList string) {
 	// The SECOND witness for the same lane: the test files go would compile for it. Written by
 	// hand here for the same reason the list is — these tests drive the grader, not the toolchain.
 	if err := os.WriteFile(goFilesPath(root), lines(
-		"mythicalos.ai/ctl/internal/x\t"+filepath.Join(root, "internal", "x")+"\tx_test.go\t",
+		"mythicalos.ai/ctl/internal/x\t"+filepath.Join(root, "internal", "x")+"\t\tx_test.go\t",
 	), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -897,15 +918,55 @@ func TestEndToEndFailsOnCountsBeforeCoverage(t *testing.T) {
 // The inventory scan's own liveness. A walk that finds no Go source would report every bats test
 // unclaimed — loud, but loud about the wrong thing, and the fix a reader would reach for is to
 // weaken the coverage check rather than to fix the path.
+//
+// THE WIRING FAILURE IT IS ABOUT is `-root` naming the wrong directory while the toolchain
+// witnesses name the right one, so the fixture moves the Go source OUT of root and leaves the
+// witnesses pointing at it: the lanes still load, still parse, still resolve — and the walk finds
+// nothing at all.
 func TestEndToEndRefusesWhenNoGoSourceIsScanned(t *testing.T) {
 	tinyLanes(t, 2, 1, 2)
 	root, goList := e2eTree(t)
-	if err := os.RemoveAll(filepath.Join(root, "internal")); err != nil {
+	away := t.TempDir()
+	if err := os.Rename(filepath.Join(root, "internal"), filepath.Join(away, "internal")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(goFilesPath(root), lines(
+		"mythicalos.ai/ctl/internal/x\t"+filepath.Join(away, "internal", "x")+"\t\tx_test.go\t",
+	), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	err := e2eRun(root, goList)
 	if err == nil || !strings.Contains(err.Error(), "scanned 0 Go files") {
 		t.Fatalf("err = %v, want a refusal naming the empty scan", err)
+	}
+}
+
+// ...and the guard one level in from it: the walk DOES find Go source, but not the files the
+// toolchain named. Keyed differently, pruned, or moved — whatever the cause, every claim in the
+// missing files becomes invisible, and the symptom is a pile of unclaimed rows that names nothing.
+// The fixture puts a selected package under a directory the walk deliberately prunes.
+func TestEndToEndRefusesWhenASelectedFileIsNeverWalked(t *testing.T) {
+	tinyLanes(t, 2, 1, 2)
+	root, goList := e2eTree(t)
+	gen := filepath.Join(root, "dist", "gen")
+	if err := os.MkdirAll(gen, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(gen, "g_test.go"), lines(`package gen`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(goFilesPath(root), lines(
+		"mythicalos.ai/ctl/internal/x\t"+filepath.Join(root, "internal", "x")+"\t\tx_test.go\t",
+		"mythicalos.ai/ctl/dist/gen\t"+gen+"\t\tg_test.go\t",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := e2eRun(root, goList)
+	if err == nil {
+		t.Fatal("a file the toolchain selected was never reached by the walk and the audit said nothing")
+	}
+	if !strings.Contains(err.Error(), "the toolchain selected") {
+		t.Fatalf("err = %v, want the walk/selection disagreement named", err)
 	}
 }
 
@@ -969,7 +1030,9 @@ func TestStrayDetectionDoesNotFireOnCodeThatQuotesARowName(t *testing.T) {
 		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
 		`// PORTED: tests/unit/a.bats: "two" -> TestTwo`,
 		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
+		`var owners = map[batsPair]int{`,
 		"\t{\"tests/unit/a.bats\", \"two\"}: 22,",
+		`}`,
 	)
 	r := &report{}
 	auditCoverage(r, tiny, c, b, st, oneLane(), noPreDeclared)
@@ -986,7 +1049,10 @@ func TestStrayDetectionFiresOnClaimSyntaxEvenOutsideAComment(t *testing.T) {
 		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
 		`// PORTED: tests/unit/a.bats: "two" -> TestTwo`,
 		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
+		`func f() {`,
 		"\texample := \"PORTED: tests/unit/b.bats: ...\"",
+		"\t_ = example",
+		`}`,
 	)
 	r := &report{}
 	auditCoverage(r, tiny, c, b, st, oneLane(), noPreDeclared)
@@ -1040,12 +1106,13 @@ func TestAuditCoverageCatchesAPortedTargetInAnotherPackage(t *testing.T) {
 
 // ...and a claim that names the other package EXPLICITLY, attached to the target, resolves.
 // `internal/w.TestElsewhere` points at one package for one test and can be read exactly one way;
-// prose that merely mentions a package cannot, which is what TestCandidatePackagesDoesNotMineProse
-// holds.
+// prose that merely mentions a package cannot, which is what
+// TestProseCannotSupplyAPackageBecauseProseIsNotRead holds. The aside rides behind the delimiter,
+// where it is commentary.
 func TestAuditCoverageAcceptsACrossPackageTargetThatNamesItsPackage(t *testing.T) {
 	c, b, st := claimsFrom(t,
 		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
-		`// PORTED: tests/unit/a.bats: "two" -> internal/w.TestElsewhere (recorded here for the audit)`,
+		`// PORTED: tests/unit/a.bats: "two" -> internal/w.TestElsewhere -- recorded here for the audit`,
 		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
 	)
 	r := &report{}
@@ -1079,14 +1146,11 @@ func TestAuditCoverageCatchesAClaimInABlockCommentContinuation(t *testing.T) {
 // row nothing actually covers. Lexical context is tracked now — and the row it names is reported as
 // a claim the parser cannot read, rather than silently accepted or silently dropped.
 func TestParseInventoryDoesNotCountAClaimInsideARawString(t *testing.T) {
-	claims, _, st, err := parseInventory("internal/x/x_test.go", lines(
+	claims, _, st := invFixture(t, "internal/x/x_test.go", lines(
 		"const fixture = `",
 		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
 		"`",
 	))
-	if err != nil {
-		t.Fatal(err)
-	}
 	if len(claims) != 0 {
 		t.Fatalf("a claim inside a raw string was counted as coverage: %+v", claims)
 	}
@@ -1129,7 +1193,7 @@ func TestCandidatePackagesDoesNotConfuseTwoPackagesSharingABasename(t *testing.T
 		"mythicalos.ai/ctl/cmd/probe":      {"TestCmd": true},
 		"mythicalos.ai/ctl/internal/x":     {"TestOne": true},
 	}
-	got := candidatePackages(goTests, "internal/x/x_test.go", "cmd/probe.TestOne", "TestOne")
+	got := candidatePackages(goTests, "internal/x/x_test.go", target{"cmd/probe", "TestOne"})
 	if !got["mythicalos.ai/ctl/cmd/probe"] {
 		t.Fatalf("a full path did not resolve: %v", got)
 	}
@@ -1138,138 +1202,154 @@ func TestCandidatePackagesDoesNotConfuseTwoPackagesSharingABasename(t *testing.T
 	}
 	// A BARE, AMBIGUOUS segment must widen nothing — an ambiguous reference is not a licence to
 	// accept either answer.
-	amb := candidatePackages(goTests, "internal/x/x_test.go", "probe.TestInternal", "TestInternal")
+	amb := candidatePackages(goTests, "internal/x/x_test.go", target{"probe", "TestInternal"})
 	if amb["mythicalos.ai/ctl/internal/probe"] || amb["mythicalos.ai/ctl/cmd/probe"] {
 		t.Fatalf("a bare ambiguous segment widened the candidate set: %v", amb)
 	}
 }
 
-// TestCandidatePackagesDoesNotMineProse: a package named in a claim's PROSE is not a reference to
-// that package, and treating it as one is a false-green generator.
-//
-// Every path-like token anywhere in a claim was offered as a candidate, so a claim that says the
-// target is NOT in some package supplied that package anyway — prose has no polarity a token regexp
-// can read. The claim then resolved against a namesake there, and kept resolving after the local
-// test it was really about was DELETED: the claim survives the deletion of the thing it claims,
-// which is the whole failure this audit exists to prevent.
-func TestCandidatePackagesDoesNotMineProse(t *testing.T) {
+// ---------------------------------------------------------------------------------------------
+// THE TARGET COLUMN IS A CLOSED TOKEN LIST. These four replace the tests that used to pin how the
+// reader MINED prose. There is no prose left to mine: the questions those tests asked — which
+// mention wins, which boundary counts, which occurrence decides — have no answers now because they
+// have no subject. What replaces them is the property that made them unnecessary.
+// ---------------------------------------------------------------------------------------------
+
+func targetsOf(t *testing.T, region string) []target {
+	t.Helper()
+	tgs, why := parseTargetColumn(region)
+	if why != "" {
+		t.Fatalf("a well-formed target column was refused: %s", why)
+	}
+	return tgs
+}
+
+func refuseColumn(t *testing.T, region, want string) {
+	t.Helper()
+	tgs, why := parseTargetColumn(region)
+	if why == "" {
+		t.Fatalf("%q was accepted as a target list: %+v", region, tgs)
+	}
+	if !strings.Contains(why, want) {
+		t.Fatalf("the refusal of %q does not name the defect (want %q): %s", region, want, why)
+	}
+}
+
+func refuseToken(t *testing.T, tok, want string) {
+	t.Helper()
+	tg, why := parseTargetToken(tok)
+	if why == "" {
+		t.Fatalf("%q was accepted as a target: %+v", tok, tg)
+	}
+	if !strings.Contains(why, want) {
+		t.Fatalf("the refusal of %q does not name the defect (want %q): %s", tok, want, why)
+	}
+}
+
+// PROSE CANNOT SUPPLY A PACKAGE, because prose is not read. Every path-like token anywhere in a
+// claim used to be offered as a candidate, so a claim saying the target is NOT in some package
+// supplied that package anyway — and the claim then resolved against a namesake there, and kept
+// resolving after the local test it was really about was DELETED. A sentence has no polarity a
+// scanner can see; the fix is not a better scanner but no scanner.
+func TestProseCannotSupplyAPackageBecauseProseIsNotRead(t *testing.T) {
 	goTests := map[string]map[string]bool{
-		"mythicalos.ai/ctl/internal/w": {"TestShared": true},
+		"mythicalos.ai/ctl/internal/w": {"TestShared": true, "TestQualified": true, "TestBare": true},
 		"mythicalos.ai/ctl/internal/x": {"TestOne": true},
 	}
-	// The claim's own package no longer declares TestShared (it was deleted); the prose merely
-	// MENTIONS internal/w, and says the target is not there.
-	got := candidatePackages(goTests, "internal/x/x_test.go", "TestShared (not internal/w; it is local)", "TestShared")
-	if got["mythicalos.ai/ctl/internal/w"] {
-		t.Fatalf("prose naming a package was read as a reference to it: %v", got)
+	// The sentence that started this is not a target column at all.
+	refuseColumn(t, "TestShared (not internal/w; it is local)", "is not a target token")
+	// Written where the grammar puts it, the same sentence binds nothing.
+	tgs := targetsOf(t, "TestShared -- not internal/w; it is local")
+	if len(tgs) != 1 || tgs[0].Pkg != "" || tgs[0].Name != "TestShared" {
+		t.Fatalf("commentary leaked into the target: %+v", tgs)
 	}
-	if !got["mythicalos.ai/ctl/internal/x"] {
-		t.Fatalf("the claiming file's own package is always a candidate: %v", got)
+	c := candidatePackages(goTests, "internal/x/x_test.go", tgs[0])
+	if c["mythicalos.ai/ctl/internal/w"] {
+		t.Fatalf("a package named in commentary was offered as a candidate: %v", c)
 	}
-	// A QUALIFICATION IS PER TARGET. A claim naming two tests may qualify one and not the other,
-	// and the unqualified one must not borrow the qualified one's package.
-	two := map[string]map[string]bool{
-		"mythicalos.ai/ctl/internal/w": {"TestQualified": true, "TestBare": true},
-		"mythicalos.ai/ctl/internal/x": {},
+	if !c["mythicalos.ai/ctl/internal/x"] || len(c) != 1 {
+		t.Fatalf("the claiming file's own package is the only candidate for an unqualified target: %v", c)
 	}
-	if c := candidatePackages(two, "internal/x/x_test.go", "internal/w.TestQualified and TestBare", "TestBare"); c["mythicalos.ai/ctl/internal/w"] {
-		t.Fatalf("an unqualified target borrowed another target's package: %v", c)
+	// A QUALIFICATION IS PER TARGET AND RIDES ITS OWN TOKEN: two targets in one column decide
+	// independently, and the unqualified one cannot borrow the qualified one's package.
+	pair := targetsOf(t, "internal/w.TestQualified + TestBare")
+	if len(pair) != 2 || pair[0].Pkg != "internal/w" || pair[1].Pkg != "" {
+		t.Fatalf("the two targets did not parse independently: %+v", pair)
 	}
-	if c := candidatePackages(two, "internal/x/x_test.go", "internal/w.TestQualified and TestBare", "TestQualified"); !c["mythicalos.ai/ctl/internal/w"] {
-		t.Fatalf("an explicitly qualified target did not resolve: %v", c)
+	if q := candidatePackages(goTests, "internal/x/x_test.go", pair[0]); !q["mythicalos.ai/ctl/internal/w"] {
+		t.Fatalf("an explicitly qualified target did not resolve: %v", q)
 	}
-}
-
-// TestQualificationUsesGosNameGrammarNotASCII: Go test names are UNICODE, and the audit already
-// owns that grammar (isGoTestName, identRune). An ASCII spelling of the name half truncates
-// `TestAlphaÉ` to `TestAlpha` — the target it is compared against is the full name, so a
-// legitimately qualified claim resolves against nothing and fails for a reason that has nothing to
-// do with the port. The same rule the other direction: a qualifier must not match a PREFIX of a
-// longer name.
-func TestQualificationUsesGosNameGrammarNotASCII(t *testing.T) {
-	goTests := map[string]map[string]bool{
-		"mythicalos.ai/ctl/internal/w": {"TestAlphaÉ": true, "TestFooBar": true},
-		"mythicalos.ai/ctl/internal/x": {},
-	}
-	if c := candidatePackages(goTests, "internal/x/x_test.go", "internal/w.TestAlphaÉ", "TestAlphaÉ"); !c["mythicalos.ai/ctl/internal/w"] {
-		t.Fatalf("a Unicode test name was not recognised as qualified: %v", c)
-	}
-	// A QUALIFIED LONGER NAME DOES NOT QUALIFY ITS PREFIX.
-	if c := candidatePackages(goTests, "internal/x/x_test.go", "internal/w.TestFooBar", "TestFoo"); c["mythicalos.ai/ctl/internal/w"] {
-		t.Fatalf("a qualification of TestFooBar was read as one of TestFoo: %v", c)
-	}
-	// A DOT WITH NO PACKAGE BEFORE IT QUALIFIES NOTHING — a sentence ending before the target.
-	if c := candidatePackages(goTests, "internal/x/x_test.go", ".TestFooBar", "TestFooBar"); len(c) != 1 || !c["mythicalos.ai/ctl/internal/x"] {
-		t.Fatalf("a bare dot supplied a package: %v", c)
+	if b := candidatePackages(goTests, "internal/x/x_test.go", pair[1]); b["mythicalos.ai/ctl/internal/w"] {
+		t.Fatalf("an unqualified target borrowed another target's package: %v", b)
 	}
 }
 
-// TestTheFirstOccurrenceOfATargetDecides: the claim reader stops looking after the target's first
-// whole-identifier occurrence, and that is a decision NOT to scan prose rather than a rule about it.
-//
-// Three false-green classes were found in this reader, all the same shape — it approximated a
-// grammar by scanning the whole claim, and prose has no polarity a scanner can read. Every rule
-// invented to give it one (union the qualifiers; reject contradictory ones; compare them as sets)
-// was another rule ABOUT prose waiting for a fourth shape. The region is now the first occurrence,
-// full stop.
-func TestTheFirstOccurrenceOfATargetDecides(t *testing.T) {
+// THE TOKEN GRAMMAR IS GO'S, NOT ASCII'S. Go identifiers are Unicode, and this program already owns
+// that rule (isGoTestName, identRune). An ASCII spelling of the name half truncates `TestAlphaÉ`,
+// and a truncated name is a DIFFERENT test — which is how a claim on a name that does not exist
+// once resolved against a real one and the audit exited 0.
+func TestTheTargetTokenGrammarIsGosNameGrammarNotASCII(t *testing.T) {
+	if tg, why := parseTargetToken("internal/w.TestAlphaÉ"); why != "" || tg.Pkg != "internal/w" || tg.Name != "TestAlphaÉ" {
+		t.Fatalf("a Unicode test name was refused or truncated: %+v (%s)", tg, why)
+	}
+	// A DOT WITH NO PACKAGE BEFORE IT is not a qualification and is not an unqualified name either
+	// — it is a token nobody meant, and it is refused rather than quietly read as one or the other.
+	refuseToken(t, ".TestFooBar", "names no package before it")
+	// A PACKAGE PATH IS NON-EMPTY SEGMENTS, never a dot-path that could climb out of the module.
+	refuseToken(t, "internal//w.TestFoo", "is not one")
+	refuseToken(t, "../w.TestFoo", "is not one")
+	// A NAME THAT GO WOULD NOT RUN is refused where it is written. `Testfoo` is not a test — the
+	// testing package ignores it in silence — so a claim resting on it rests on nothing.
+	refuseToken(t, "internal/w.Testfoo", "not a Go TEST name")
+	refuseToken(t, "internal/w.helper", "not a Go TEST name")
+}
+
+// NO SENTENCE BESIDE A TARGET CAN QUALIFY OR CONTRADICT IT. This is the property that made the
+// "which occurrence decides" question obsolete: there is one place a target's package can come
+// from — the target's own token — and the commentary field is read by nothing at all.
+func TestNoSentenceBesideATargetCanQualifyOrContradictIt(t *testing.T) {
 	goTests := map[string]map[string]bool{
 		"mythicalos.ai/ctl/internal/w": {"TestShared": true, "TestFoo": true},
 		"mythicalos.ai/ctl/internal/x": {"TestShared": true},
 		"mythicalos.ai/ctl/internal/y": {"TestFoo": true},
 	}
-	// BARE FIRST: local, and no later sentence can move it. This is the polarity case — a claim
-	// saying its target is local while spelling another package's qualified name.
-	local := candidatePackages(goTests, "internal/x/x_test.go",
-		"TestShared (not internal/w.TestShared; it is local)", "TestShared")
-	if !local["mythicalos.ai/ctl/internal/x"] || len(local) != 1 {
-		t.Fatalf("a bare first occurrence did not resolve locally and only locally: %v", local)
+	// THE POLARITY CASE: a claim saying its target is local while spelling another package's
+	// qualified name. In the target column it is refused; behind the delimiter it binds nothing.
+	refuseColumn(t, "TestShared (not internal/w.TestShared; it is local)", "is not a target token")
+	local := targetsOf(t, "TestShared -- not internal/w.TestShared; it is local")
+	if c := candidatePackages(goTests, "internal/x/x_test.go", local[0]); len(c) != 1 || !c["mythicalos.ai/ctl/internal/x"] {
+		t.Fatalf("a bare target did not resolve locally and only locally: %v", c)
 	}
-	// QUALIFIED FIRST: that package, and no later sentence can widen or contradict it.
-	cross := candidatePackages(goTests, "internal/x/x_test.go",
-		"internal/w.TestShared (formerly internal/x.TestShared, and see internal/y too)", "TestShared")
-	if !cross["mythicalos.ai/ctl/internal/w"] || len(cross) != 1 {
-		t.Fatalf("a qualified first occurrence was widened or contradicted by later prose: %v", cross)
+	// QUALIFIED: that package, and no sentence after it can widen or contradict the choice.
+	cross := targetsOf(t, "internal/w.TestShared -- formerly internal/x.TestShared, and see internal/y too")
+	if c := candidatePackages(goTests, "internal/x/x_test.go", cross[0]); len(c) != 1 || !c["mythicalos.ai/ctl/internal/w"] {
+		t.Fatalf("a qualified target was widened or contradicted by its commentary: %v", c)
 	}
-	// PER TARGET, not per claim: two targets in one claim decide independently.
-	two := candidatePackages(goTests, "internal/x/x_test.go",
-		"internal/w.TestShared (the sibling) + TestFoo (local)", "TestFoo")
-	if !two["mythicalos.ai/ctl/internal/x"] || len(two) != 1 {
-		t.Fatalf("an unqualified target borrowed another target's package: %v", two)
+	// PER TARGET, not per claim.
+	two := targetsOf(t, "internal/w.TestShared + TestFoo -- the sibling, then the local one")
+	if len(two) != 2 {
+		t.Fatalf("two targets did not parse as two: %+v", two)
+	}
+	if c := candidatePackages(goTests, "internal/x/x_test.go", two[1]); len(c) != 1 || !c["mythicalos.ai/ctl/internal/x"] {
+		t.Fatalf("an unqualified target borrowed the other target's package: %v", c)
 	}
 }
 
-// TestATargetIsMatchedOnlyAsAWholeIdentifier: both boundaries, not one.
-//
-// Only the right-hand boundary was checked, so `TestFoo` matched inside `NotTestFoo` — and that
-// spurious occurrence, appearing before the real one, decided the claim. A test that exercises
-// only the right boundary cannot see it.
-func TestATargetIsMatchedOnlyAsAWholeIdentifier(t *testing.T) {
-	goTests := map[string]map[string]bool{
-		"mythicalos.ai/ctl/internal/w": {"TestFoo": true, "TestFooBar": true},
-		"mythicalos.ai/ctl/internal/x": {},
+// A TARGET IS A WHOLE TOKEN, never an identifier found inside one. `NotTestFoo` ends in a real
+// target's name, and a reader that searched text for `TestFoo` found it there — a spurious
+// occurrence that decided the claim. As a token it is simply not a test name, and it is refused
+// where it is written.
+func TestATargetIsAWholeTokenNotAnIdentifierFoundInsideOne(t *testing.T) {
+	refuseToken(t, "NotTestFoo", "not a Go TEST name")
+	refuseColumn(t, "(helper NotTestFoo) internal/w.TestFoo", "is not a target token")
+	// ...and a LONGER name is its own target, never a qualification of its prefix.
+	if tg, why := parseTargetToken("internal/w.TestFooBar"); why != "" || tg.Name != "TestFooBar" {
+		t.Fatalf("a longer name did not parse as itself: %+v (%s)", tg, why)
 	}
-	// LEFT BOUNDARY, WITH THE DECOY FIRST — which is the only arrangement that can catch it now
-	// that the FIRST occurrence decides. `NotTestFoo` ends in the target's name; without the
-	// left-hand boundary test it is read as a BARE first occurrence, and the real qualified target
-	// after it is never reached, so the claim silently resolves to the claiming package instead.
-	// (With the decoy second, first-occurrence already masks the bug — a test written that way
-	// passes whether the boundary is checked or not.)
-	got := candidatePackages(goTests, "internal/x/x_test.go",
-		"(helper NotTestFoo) internal/w.TestFoo", "TestFoo")
-	if !got["mythicalos.ai/ctl/internal/w"] || len(got) != 1 {
-		t.Fatalf("a longer identifier ending in the target's name was read as the target: %v", got)
-	}
-	// RIGHT BOUNDARY: `TestFooBar` is not an occurrence of `TestFoo` either.
-	got = candidatePackages(goTests, "internal/x/x_test.go", "internal/w.TestFooBar and TestFoo", "TestFoo")
-	if !got["mythicalos.ai/ctl/internal/x"] || len(got) != 1 {
-		t.Fatalf("a qualification of TestFooBar was read as one of TestFoo: %v", got)
-	}
-	// A target named nowhere in the claim resolves as unqualified — the claiming package.
-	none := candidatePackages(goTests, "internal/x/x_test.go", "no target here", "TestFoo")
-	if !none["mythicalos.ai/ctl/internal/x"] || len(none) != 1 {
-		t.Fatalf("a target absent from the detail did not fall back to the claiming package: %v", none)
-	}
+	// A COLUMN THAT NAMES NO TARGET IS REFUSED, rather than resolving to whatever the claiming
+	// file's own package happens to hold.
+	refuseColumn(t, "-- only commentary, no target", "names no target at all")
+	refuseColumn(t, "TestOne --", "commentary field is empty")
 }
 
 // TestAQualificationConstrainsRatherThanWidens: saying where a target lives must NARROW resolution
@@ -1286,7 +1366,7 @@ func TestAQualificationConstrainsRatherThanWidens(t *testing.T) {
 		"mythicalos.ai/ctl/internal/w": {"TestOther": true},
 		"mythicalos.ai/ctl/internal/x": {"TestShared": true},
 	}
-	got := candidatePackages(goTests, "internal/x/x_test.go", "internal/w.TestShared", "TestShared")
+	got := candidatePackages(goTests, "internal/x/x_test.go", target{"internal/w", "TestShared"})
 	if got["mythicalos.ai/ctl/internal/x"] {
 		t.Fatalf("a claim naming internal/w was offered its own package as well: %v", got)
 	}
@@ -1333,7 +1413,7 @@ func TestAnAmbiguousQualifierResolvesToNothing(t *testing.T) {
 		"mythicalos.ai/ctl/nested/internal/w": {"TestShared": true},
 		"mythicalos.ai/ctl/internal/x":        {"TestOne": true},
 	}
-	got := candidatePackages(goTests, "internal/x/x_test.go", "internal/w.TestShared", "TestShared")
+	got := candidatePackages(goTests, "internal/x/x_test.go", target{"internal/w", "TestShared"})
 	if got["mythicalos.ai/ctl/nested/internal/w"] {
 		t.Fatalf("the qualifier internal/w resolved against nested/internal/w: a suffix that names two packages let a namesake answer a claim about a DELETED test: %v", got)
 	}
@@ -1360,7 +1440,7 @@ func TestAnAmbiguousQualifierResolvesToNothing(t *testing.T) {
 
 	// THE UNAMBIGUOUS CASES STILL RESOLVE. The rule is a uniqueness requirement, not a narrowing:
 	// widening is the defect here and refusing everything is not the fix for it.
-	if u := candidatePackages(goTests, "internal/x/x_test.go", "internal/x.TestOne", "TestOne"); !u["mythicalos.ai/ctl/internal/x"] || len(u) != 1 {
+	if u := candidatePackages(goTests, "internal/x/x_test.go", target{"internal/x", "TestOne"}); !u["mythicalos.ai/ctl/internal/x"] || len(u) != 1 {
 		t.Fatalf("a UNIQUE suffix qualifier stopped resolving: %v", u)
 	}
 	// AN EXACT MATCH ON THE WHOLE PATH WINS OUTRIGHT, even where it is also a suffix of another
@@ -1369,7 +1449,7 @@ func TestAnAmbiguousQualifierResolvesToNothing(t *testing.T) {
 		"internal/w":        {"TestShared": true},
 		"nested/internal/w": {"TestShared": true},
 	}
-	if e := candidatePackages(exact, "internal/x/x_test.go", "internal/w.TestShared", "TestShared"); !e["internal/w"] || len(e) != 1 {
+	if e := candidatePackages(exact, "internal/x/x_test.go", target{"internal/w", "TestShared"}); !e["internal/w"] || len(e) != 1 {
 		t.Fatalf("an exact match on the whole package path did not win outright over a suffix match: %v", e)
 	}
 }
@@ -1389,7 +1469,7 @@ func TestAnAmbiguousOwnPackageResolvesToNothing(t *testing.T) {
 		"mythicalos.ai/ctl/internal/x":        {"TestOther": true},
 		"mythicalos.ai/ctl/nested/internal/x": {"TestOne": true},
 	}
-	got := candidatePackages(goTests, "internal/x/x_test.go", "TestOne", "TestOne")
+	got := candidatePackages(goTests, "internal/x/x_test.go", target{"", "TestOne"})
 	if got["mythicalos.ai/ctl/nested/internal/x"] {
 		t.Fatalf("an unqualified claim in internal/x resolved against nested/internal/x: a namesake in a nested package answered a claim about a DELETED test: %v", got)
 	}
@@ -1418,7 +1498,7 @@ func TestAnAmbiguousOwnPackageResolvesToNothing(t *testing.T) {
 		"mythicalos.ai/ctl/internal/x": {"TestOne": true},
 		"mythicalos.ai/ctl/internal/w": {"TestOne": true},
 	}
-	if u := candidatePackages(plain, "internal/x/x_test.go", "TestOne", "TestOne"); !u["mythicalos.ai/ctl/internal/x"] || len(u) != 1 {
+	if u := candidatePackages(plain, "internal/x/x_test.go", target{"", "TestOne"}); !u["mythicalos.ai/ctl/internal/x"] || len(u) != 1 {
 		t.Fatalf("an unambiguous own package stopped resolving: %v", u)
 	}
 }
@@ -1704,7 +1784,7 @@ func TestSourceWitnessIgnoresDeclarationsThatAreNotCode(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(pkg, "x_test.go"), []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	files := map[string][]string{"mythicalos.ai/ctl/internal/x": {filepath.Join(pkg, "x_test.go")}}
+	files := map[string]pkgFiles{"mythicalos.ai/ctl/internal/x": {Dir: pkg, Test: []string{filepath.Join(pkg, "x_test.go")}}}
 	got, err := collectLaneSource(files)
 	if err != nil {
 		t.Fatal(err)
@@ -1726,7 +1806,7 @@ func TestSourceWitnessIgnoresDeclarationsThatAreNotCode(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(pkg, "broken_test.go"), []byte("package x\nfunc ("), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	files["mythicalos.ai/ctl/internal/x"] = append(files["mythicalos.ai/ctl/internal/x"], filepath.Join(pkg, "broken_test.go"))
+	files["mythicalos.ai/ctl/internal/x"] = pkgFiles{Dir: pkg, Test: append(files["mythicalos.ai/ctl/internal/x"].Test, filepath.Join(pkg, "broken_test.go"))}
 	if _, err := collectLaneSource(files); err == nil {
 		t.Fatal("an unparseable _test.go was skipped rather than refused")
 	} else if !strings.Contains(err.Error(), "broken_test.go") {
@@ -1801,10 +1881,10 @@ func TestTheHarnessEntryPointIsNotATest(t *testing.T) {
 		``,
 	}, "\n"))
 
-	got, err := collectLaneSource(map[string][]string{
-		"mythicalos.ai/ctl/internal/entry":   {entry},
-		"mythicalos.ai/ctl/internal/real":    {real},
-		"mythicalos.ai/ctl/internal/aliased": {aliased},
+	got, err := collectLaneSource(map[string]pkgFiles{
+		"mythicalos.ai/ctl/internal/entry":   {Dir: filepath.Dir(entry), Test: []string{entry}},
+		"mythicalos.ai/ctl/internal/real":    {Dir: filepath.Dir(real), Test: []string{real}},
+		"mythicalos.ai/ctl/internal/aliased": {Dir: filepath.Dir(aliased), Test: []string{aliased}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1827,8 +1907,8 @@ func TestTheHarnessEntryPointIsNotATest(t *testing.T) {
 // this lane compiles, so a file the lane does not build cannot testify about it.
 func TestGoFileListIsTheToolchainsOwnSelection(t *testing.T) {
 	got, err := parseGoFileList([]byte(
-		"mythicalos.ai/ctl/internal/x\t/abs/internal/x\ta_test.go b_test.go\tx_ext_test.go\n" +
-			"mythicalos.ai/ctl/internal/y\t/abs/internal/y\t\t\n"))
+		"mythicalos.ai/ctl/internal/x\t/abs/internal/x\tx.go\ta_test.go b_test.go\tx_ext_test.go\n" +
+			"mythicalos.ai/ctl/internal/y\t/abs/internal/y\t\t\t\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1837,19 +1917,29 @@ func TestGoFileListIsTheToolchainsOwnSelection(t *testing.T) {
 		filepath.Join("/abs/internal/x", "b_test.go"),
 		filepath.Join("/abs/internal/x", "x_ext_test.go"),
 	}
-	if fmt.Sprint(got["mythicalos.ai/ctl/internal/x"]) != fmt.Sprint(want) {
-		t.Fatalf("in-package and external test files: got %v, want %v", got["mythicalos.ai/ctl/internal/x"], want)
+	if fmt.Sprint(got["mythicalos.ai/ctl/internal/x"].Test) != fmt.Sprint(want) {
+		t.Fatalf("in-package and external test files: got %v, want %v", got["mythicalos.ai/ctl/internal/x"].Test, want)
 	}
-	// A package with no test files contributes no entry — it declares nothing and must not be
+	// ORDINARY SOURCE IS CARRIED TOO, and separately. It cannot DECLARE a test, but it is compiled
+	// — so it is a file a claim may legitimately be written in, and the eligibility set needs it.
+	if fmt.Sprint(got["mythicalos.ai/ctl/internal/x"].Go) != fmt.Sprint([]string{filepath.Join("/abs/internal/x", "x.go")}) {
+		t.Fatalf("GoFiles: got %v", got["mythicalos.ai/ctl/internal/x"].Go)
+	}
+	// A package with NO files at all contributes no entry — it declares nothing and must not be
 	// invented as an empty witness that quietly satisfies nothing.
 	if _, ok := got["mythicalos.ai/ctl/internal/y"]; ok {
-		t.Fatalf("a package with no test files produced an entry: %v", got)
+		t.Fatalf("a package with no files produced an entry: %v", got)
 	}
 	// A MALFORMED LINE IS REFUSED, never partially read: silently dropping a package would empty
 	// that lane's source witness for it, and every claim on it would then fail for a reason that
 	// has nothing to do with the port.
 	if _, err := parseGoFileList([]byte("only\ttwo\n")); err == nil {
 		t.Fatal("a line with the wrong field count was accepted")
+	}
+	// FOUR FIELDS WAS THE OLD SHAPE, and it must not be silently accepted as if GoFiles were empty:
+	// that would make every ordinary source file ineligible and every claim in one invisible.
+	if _, err := parseGoFileList([]byte("p\t/abs/p\ta_test.go\tx_ext_test.go\n")); err == nil {
+		t.Fatal("the pre-GoFiles four-field shape was accepted")
 	}
 }
 
@@ -1884,10 +1974,12 @@ func TestOnlyRealGoTestNamesCount(t *testing.T) {
 			t.Errorf("%q is NOT a test Go would run, and was accepted", no)
 		}
 	}
-	// ...and extraction keeps the WHOLE identifier rather than its ASCII prefix.
-	if got := testNamesIn("-> TestAlphaÉ (and TestBeta)"); len(got) != 2 || got[0] != "TestAlphaÉ" || got[1] != "TestBeta" {
-		t.Fatalf("testNamesIn truncated or dropped a target: %q", got)
+	// ...and the target-column parser applies it too, on the WHOLE token rather than its ASCII
+	// prefix: `TestAlphaÉ` is one target, and `Testfoo` is refused where it is written.
+	if tgs := targetsOf(t, "TestAlphaÉ, TestBeta"); len(tgs) != 2 || tgs[0].Name != "TestAlphaÉ" || tgs[1].Name != "TestBeta" {
+		t.Fatalf("the target column truncated or dropped a target: %+v", tgs)
 	}
+	refuseToken(t, "Testfoo", "not a Go TEST name")
 	// The list reader applies it too...
 	got := parseGoTestList(lines(
 		`TestReal`,
@@ -1916,7 +2008,7 @@ func TestOnlyRealGoTestNamesCount(t *testing.T) {
 		t.Fatal(err)
 	}
 	const xpkg = "mythicalos.ai/ctl/internal/x"
-	sf, err := collectLaneSource(map[string][]string{xpkg: {filepath.Join(pkg, "x_test.go")}})
+	sf, err := collectLaneSource(map[string]pkgFiles{xpkg: {Dir: pkg, Test: []string{filepath.Join(pkg, "x_test.go")}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1924,4 +2016,370 @@ func TestOnlyRealGoTestNamesCount(t *testing.T) {
 		t.Fatalf("the source witness does not apply Go's grammar: %v", sf[xpkg])
 	}
 	_ = dir
+}
+
+// ---------------------------------------------------------------------------------------------
+// Round 12: the DEMONSTRATED false greens. Each was constructed against the shipped audit by a
+// reviewer and made `bash check.sh parity` exit 0 while the parity evidence was false. They are
+// written as reds first, because a defect that was only argued about comes back and a defect with
+// a test does not.
+// ---------------------------------------------------------------------------------------------
+
+// DEMONSTRATION 3 — a manifest row with a third tab-separated field.
+//
+// `strings.Cut` splits on the FIRST tab, so `<file>TAB<name>TABEXTRA` parsed as a two-field row
+// whose NAME CONTAINS A TAB. A claim written to match that name resolved, the digest was re-pinned,
+// and the full parity stage passed over a corpus row that is not the shape the manifest declares.
+func TestParseManifestRefusesARowWithAnExtraField(t *testing.T) {
+	for _, tc := range []struct{ name, row, want string }{
+		{"three fields", "tests/acceptance/lifecycle.bats\tCLI: an unknown verb exits 2\tEXTRA", "3 tab-separated fields"},
+		{"a trailing empty third field", "tests/unit/a.bats\tone\t", "3 tab-separated fields"},
+		{"an empty name between two tabs", "tests/unit/a.bats\t\tone", "3 tab-separated fields"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pairs, err := parseManifest([]byte(tc.row + "\n"))
+			if err == nil {
+				t.Fatalf("a malformed row was accepted as %+v — its name carries a TAB the manifest grammar cannot express", pairs)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want a refusal naming the field count", err)
+			}
+		})
+	}
+}
+
+// DEMONSTRATION 2 — a claim in a file the toolchain never compiles was credited.
+//
+// The reviewer moved a real claim into `cmd/mythical-ctl/testdata/broken.go`, preceded by the line
+// `this is not valid Go`, and the audit credited it: `go test -list ./...` ignores testdata, but the
+// inventory scan was a raw filesystem walk that reads bytes. Valid Go behind `//go:build never` did
+// the same. Claim discovery must come from TOOLCHAIN-SELECTED package files.
+func TestEndToEndRefusesAClaimInAFileNoLaneCompiles(t *testing.T) {
+	for _, tc := range []struct{ name, rel, prelude string }{
+		{"under testdata, and not even valid Go", "internal/x/testdata/broken.go", "this is not valid Go\n"},
+		{"valid Go, excluded by a build constraint", "internal/x/never_test.go", "//go:build never\n\npackage x\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tinyLanes(t, 2, 1, 2)
+			root, goList := e2eTree(t)
+			// Take the claim OUT of the file the lane compiles...
+			p := filepath.Join(root, "internal", "x", "x_test.go")
+			b, err := os.ReadFile(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			naLine := `// N/A: tests/unit/a.bats: "two" -- bash-only: a source-time hazard Go does not have` + "\n"
+			cut := strings.Replace(string(b), naLine, "", 1)
+			if cut == string(b) {
+				t.Fatal("fixture did not change — the test is not testing what it says")
+			}
+			if err := os.WriteFile(p, []byte(cut), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			// ...and put it somewhere no lane's file selection can reach.
+			q := filepath.Join(root, filepath.FromSlash(tc.rel))
+			if err := os.MkdirAll(filepath.Dir(q), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(q, []byte(tc.prelude+naLine), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			err, stderr := e2eRunCapturingProblems(t, root, goList)
+			if err == nil {
+				t.Fatal("the audit EXITED CLEAN crediting a claim from a file no lane compiles")
+			}
+			if !strings.Contains(stderr, `"two" is claimed by NO inventory line`) {
+				t.Fatalf("the row was not reported unclaimed; audit said:\n%s", stderr)
+			}
+			// ...and the claim is reported WHERE IT SITS. Leaving only the unclaimed row would name
+			// the wrong file: a reader would go looking in the test file that no longer holds the
+			// claim, not in the one that does.
+			if !strings.Contains(stderr, "in NO audited lane's file selection") {
+				t.Fatalf("the off-lane claim was not reported at its own location; audit said:\n%s", stderr)
+			}
+		})
+	}
+}
+
+// e2eRunCapturingProblems runs the audit and returns its error TOGETHER with everything it printed
+// to stderr, which is where the full problem list goes. The error value carries only the FIRST
+// problem after a sort, and a case that must assert one specific problem cannot depend on the sort
+// order having put it there.
+func e2eRunCapturingProblems(t *testing.T, root, goList string) (error, string) {
+	t.Helper()
+	old := os.Stderr
+	rd, wr, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = wr
+	done := make(chan string, 1)
+	go func() {
+		var b strings.Builder
+		_, _ = io.Copy(&b, rd)
+		done <- b.String()
+	}()
+	runErr := e2eRun(root, goList)
+	_ = wr.Close()
+	os.Stderr = old
+	out := <-done
+	_ = rd.Close()
+	return runErr, out
+}
+
+// A MALFORMED ELIGIBLE FILE REFUSES, and it is a different file class from the one above. This
+// file IS in the toolchain's selection — it compiles — so its claims are the ones that count. A
+// parse error that merely skipped it would be indistinguishable from a file that had no claims,
+// which is the shape of every false green found in this program.
+//
+// It is separate from collectLaneSource's own refusal on purpose: that one only ever parses
+// _test.go files, so a broken ORDINARY source file in the selection would slip past it.
+func TestEndToEndRefusesAMalformedFileTheToolchainSelected(t *testing.T) {
+	tinyLanes(t, 2, 1, 2)
+	root, goList := e2eTree(t)
+	if err := os.WriteFile(filepath.Join(root, "internal", "x", "helper.go"), []byte("package x\nfunc ("), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(goFilesPath(root), lines(
+		"mythicalos.ai/ctl/internal/x\t"+filepath.Join(root, "internal", "x")+"\thelper.go\tx_test.go\t",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := e2eRun(root, goList)
+	if err == nil {
+		t.Fatal("a file the toolchain compiles could not be parsed and the audit read it as having no claims")
+	}
+	if !strings.Contains(err.Error(), "helper.go") || !strings.Contains(err.Error(), "inventory comments") {
+		t.Fatalf("err = %v, want a refusal naming the unparseable selected file", err)
+	}
+}
+
+// A LANE THAT CAN CONFIRM NOTHING IS REFUSED, and "nothing" is counted in NAMES rather than in
+// package entries. Both witnesses manufacture an entry with no test in it — `? <pkg> [no test
+// files]` is a terminator line, so the list half records the package with an empty name set, and a
+// compiled `_test.go` holding only its `package` clause did the same on the source side. A lane in
+// exactly that state registered no test and declared no test, and passed both checks; the guard's
+// own comment said it could not. Found by cross-model review, round 3.
+//
+// WHY THE GUARD MATTERS: target resolution requires BOTH halves to agree WITHIN one lane. A lane
+// that has arrived empty for a wiring reason cannot confirm anything, so the other lane silently
+// answers for it — and the pairing that the whole two-witness design rests on is gone with nothing
+// saying so.
+//
+// THREE SHAPES, because each defeats a different one of the two counts.
+func TestALaneThatCanConfirmNothingIsRefused(t *testing.T) {
+	xdirOf := func(root string) string { return filepath.Join(root, "internal", "x") }
+
+	t.Run("no compiled test files at all", func(t *testing.T) {
+		tinyLanes(t, 2, 1, 2)
+		root, goList := e2eTree(t)
+		// The same file, moved from the TestGoFiles column into the GoFiles column: compiled, so
+		// eligible to carry a claim — and unable to declare a test.
+		if err := os.WriteFile(goFilesPath(root), lines(
+			"mythicalos.ai/ctl/internal/x\t"+xdirOf(root)+"\tx_test.go\t\t",
+		), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		err := e2eRun(root, goList)
+		if err == nil || !strings.Contains(err.Error(), "DECLARE no test") {
+			t.Fatalf("err = %v, want the empty source witness to be what refuses", err)
+		}
+	})
+
+	t.Run("a compiled test file that declares no test", func(t *testing.T) {
+		tinyLanes(t, 2, 1, 2)
+		root, goList := e2eTree(t)
+		// THE SHAPE A PACKAGE-ENTRY COUNT CANNOT SEE: the lane really does compile a _test.go, so
+		// an entry exists for its package — and the file declares nothing, so the entry is empty.
+		if err := os.WriteFile(filepath.Join(xdirOf(root), "empty_test.go"), lines(`package x`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(goFilesPath(root), lines(
+			"mythicalos.ai/ctl/internal/x\t"+xdirOf(root)+"\tx_test.go\tempty_test.go\t",
+		), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		err := e2eRun(root, goList)
+		if err == nil {
+			t.Fatal("a lane whose only compiled test file declares no test was accepted: it can confirm no target, and the other lane answers for it")
+		}
+		if !strings.Contains(err.Error(), "DECLARE no test") {
+			t.Fatalf("err = %v, want the empty source witness to be what refuses", err)
+		}
+	})
+
+	t.Run("a listing that registers no test name", func(t *testing.T) {
+		tinyLanes(t, 2, 1, 2)
+		root, goList := e2eTree(t)
+		// THE SAME SHAPE ON THE LIST HALF: a terminator line alone creates the package entry.
+		if err := os.WriteFile(goList, lines("?   \tmythicalos.ai/ctl/internal/x\t[no test files]"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		err := e2eRun(root, goList)
+		if err == nil {
+			t.Fatal("a lane whose listing registers no test name was accepted: `? pkg [no test files]` is a package entry with nothing in it")
+		}
+		if !strings.Contains(err.Error(), "lists no test names") {
+			t.Fatalf("err = %v, want the empty list witness to be what refuses", err)
+		}
+	})
+}
+
+// DEMONSTRATION 1 — the target column was free prose, and prose has no polarity.
+//
+// The reviewer rewrote a REAL claim's target to a sentence DENYING the port and the audit still
+// reported all 1,178 rows covered, because a `TestFoo` mentioned anywhere in that sentence was
+// mined as the target. The same reader resolved a NEGATED package qualifier against the very
+// package the sentence said the target was not in, and silently narrowed a generic instantiation
+// and a `t.Run` subtest spelling to their parent function name.
+//
+// The class closes only one way: the region after `->` is a CLOSED, PROSE-FREE list of
+// `[<pkgpath>.]<TestName>` tokens, and anything else is a REFUSAL. Commentary moves to its own
+// non-semantic field behind the `--` delimiter the N/A lines already use.
+func TestAPortedTargetIsAClosedTokenListNotProse(t *testing.T) {
+	for _, tc := range []struct{ name, line, want string }{
+		{
+			"prose that DENIES the port, with a real test name inside it",
+			`// PORTED: tests/unit/a.bats: "one" -> this behavior is not implemented; TestOne is only an unrelated neighboring test`,
+			"is not a target token",
+		},
+		{
+			"a NEGATED qualifier, resolved against the package it negates",
+			`// PORTED: tests/unit/a.bats: "one" -> not internal/w.TestOne; the local TestOne is intended`,
+			"is not a target token",
+		},
+		{
+			"a generic instantiation, silently narrowed to the parent name",
+			`// PORTED: tests/unit/a.bats: "one" -> TestOne[int]`,
+			"generic instantiation",
+		},
+		{
+			"a t.Run subtest spelling, silently narrowed to the parent name",
+			`// PORTED: tests/unit/a.bats: "one" -> TestOne via t.Run("required subtest")`,
+			"is not a target token",
+		},
+		{
+			"an ordinary parenthetical aside — the shape every case above wears",
+			`// PORTED: tests/unit/a.bats: "one" -> TestOne (the aside that made every case above reachable)`,
+			"is not a target token",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			claims, bad, _ := invFixture(t, "internal/x/x_test.go", lines(tc.line))
+			if len(claims) != 0 {
+				t.Fatalf("the target column was read as prose and yielded %d claim(s) with targets %v — a sentence must never satisfy a claim", len(claims), claims[0].Targets)
+			}
+			if len(bad) != 1 {
+				t.Fatalf("%d malformed lines, want exactly 1", len(bad))
+			}
+			if !strings.Contains(bad[0].Text, tc.want) {
+				t.Fatalf("refusal did not name the defect (want %q): %s", tc.want, bad[0].Text)
+			}
+		})
+	}
+}
+
+// The other half of the same grammar: a claim that spells its targets as tokens and puts its
+// commentary behind `--` still parses, and the commentary is NOT scanned for targets. If it were,
+// the whole exercise would have moved the prose one field to the right.
+func TestAPortedClaimKeepsItsCommentaryInANonSemanticField(t *testing.T) {
+	claims, bad, _ := invFixture(t, "internal/x/x_test.go", lines(
+		`// PORTED: tests/unit/a.bats: "one" -> TestOne -- the aside, which names TestTwo and internal/w.TestElsewhere and must bind neither`,
+		`// PORTED: tests/unit/a.bats: "two" -> internal/w.TestElsewhere + TestTwo`,
+	))
+	if len(bad) != 0 {
+		t.Fatalf("a well-formed claim was refused: %+v", bad)
+	}
+	if len(claims) != 2 {
+		t.Fatalf("parsed %d claims, want 2", len(claims))
+	}
+	if len(claims[0].Targets) != 1 || claims[0].Targets[0].Name != "TestOne" {
+		t.Fatalf("commentary leaked into the target list: %v", claims[0].Targets)
+	}
+	if len(claims[1].Targets) != 2 {
+		t.Fatalf("a two-token target list parsed as %v", claims[1].Targets)
+	}
+}
+
+// THE RECONCILIATION IS A SET, NOT A COUNT, and this is the false green a count allowed. Round 12,
+// found by review after the fix that introduced it.
+//
+// Two walked paths can canonicalize onto ONE selected file — a symlink beside the file it points at
+// is enough, and `canonPath` resolves both to the same key by design. A COUNTER then records two
+// hits for one file, and those two hits are exactly enough to balance a DIFFERENT selected file the
+// walk never reached. The arithmetic agrees, the guard stays silent, and the audit exits 0 having
+// never read a file the toolchain compiles — which is the same class of hole the eligibility set was
+// built to close, wearing the closing guard's own clothes.
+func TestTheWalkSelectionReconciliationCountsFilesNotVisits(t *testing.T) {
+	tinyLanes(t, 2, 1, 2)
+	root, goList := e2eTree(t)
+	xdir := filepath.Join(root, "internal", "x")
+	// A claim-free selected source file, and a symlink beside it: two walk entries, one canonical
+	// path, and the symlink is NOT itself in the toolchain's selection.
+	if err := os.WriteFile(filepath.Join(xdir, "helper.go"), lines(`package x`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(xdir, "helper.go"), filepath.Join(xdir, "alias.go")); err != nil {
+		t.Skipf("this filesystem does not support symlinks: %v", err)
+	}
+	// ...and a selected file under a directory the walk deliberately prunes, which must be noticed.
+	//
+	// UNDER third_party AND NOT dist, DELIBERATELY: it has to sort AFTER the files that ARE reached,
+	// so that a message naming an arbitrary selected file names a DIFFERENT one. With the unreached
+	// file sorting first, "name the missing file" and "name any file" are indistinguishable and the
+	// assertion below passes either way — which is a test that cannot see the defect it is for.
+	gen := filepath.Join(root, "third_party", "gen")
+	if err := os.MkdirAll(gen, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(gen, "g_test.go"), lines(`package gen`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(goFilesPath(root), lines(
+		"mythicalos.ai/ctl/internal/x\t"+xdir+"\thelper.go\tx_test.go\t",
+		"mythicalos.ai/ctl/third_party/gen\t"+gen+"\t\tg_test.go\t",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := e2eRun(root, goList)
+	if err == nil {
+		t.Fatal("a selected file was never walked and the extra visit to a symlinked one balanced the books: the audit exited 0 having never read a file the toolchain compiles")
+	}
+	if !strings.Contains(err.Error(), "the toolchain selected") {
+		t.Fatalf("err = %v, want the walk/selection disagreement named", err)
+	}
+	// ...and the message names the file that is actually missing, not an arbitrary selected one.
+	if !strings.Contains(err.Error(), "g_test.go") {
+		t.Fatalf("err = %v, want the UNREACHED file named", err)
+	}
+}
+
+// THE ROW NAME ENDS AT THE FIRST CLOSING QUOTE. With a greedy capture the boundary was settled by
+// backtracking against the REST of the line, so a quoted phrase in the commentary offered the
+// engine a second `" -> ` to close on and the row name it produced swallowed the target column.
+// Three claims in this tree carry a quoted phrase in their commentary, so the shape is live.
+//
+// It was never a false green — no @test name in this corpus contains a quote, so the misparse
+// always failed corpus membership — but that is the CORPUS holding the parser up. The boundary is
+// structural now, and this pins it.
+func TestTheRowNameEndsAtTheFirstQuoteNotAtWhicheverOneBacktracksBest(t *testing.T) {
+	claims, bad, _ := invFixture(t, "internal/x/x_test.go", lines(
+		`// PORTED: tests/unit/a.bats: "one" -> TestOne -- the "b" case, and see "c" -> TestTwo`,
+		`// N/A: tests/unit/a.bats: "two" -- bash-only, and the "c" spelling has no Go analogue at all`,
+	))
+	if len(bad) != 0 {
+		t.Fatalf("a claim with a quoted phrase in its commentary was refused: %+v", bad)
+	}
+	if len(claims) != 2 {
+		t.Fatalf("parsed %d claims, want 2: %+v", len(claims), claims)
+	}
+	if claims[0].Pair.Name != "one" {
+		t.Fatalf("the PORTED row name ran past the first closing quote: %q", claims[0].Pair.Name)
+	}
+	if len(claims[0].Targets) != 1 || claims[0].Targets[0].Name != "TestOne" {
+		t.Fatalf("the target column was not the one after the FIRST arrow: %+v", claims[0].Targets)
+	}
+	if claims[1].Pair.Name != "two" {
+		t.Fatalf("the N/A row name ran past the first closing quote: %q", claims[1].Pair.Name)
+	}
 }

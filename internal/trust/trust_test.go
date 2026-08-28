@@ -16,7 +16,7 @@ import (
 // Inventory — tests/unit/trust.bats:
 // PORTED: tests/unit/trust.bats: "digest verification accepts a match and reports both sides on mismatch" -> TestVerifyDigest
 // PORTED: tests/unit/trust.bats: "digest verification refuses a malformed expectation rather than comparing strings" -> TestVerifyDigest
-// PORTED: tests/unit/trust.bats: "a missing file is a verification failure, not a pass" -> TestAcceptorRefusals ("a missing file is a refusal from the snapshot step, never a pass" — VerifyDigestData is bytes-first by design (round-1 plan gate), so absence is refused one step earlier, by Snapshot; the property is the same one and it is asserted)
+// PORTED: tests/unit/trust.bats: "a missing file is a verification failure, not a pass" -> TestAcceptorRefusals -- "a missing file is a refusal from the snapshot step, never a pass" — VerifyDigestData is bytes-first by design (round-1 plan gate), so absence is refused one step earlier, by Snapshot; the property is the same one and it is asserted
 // PORTED: tests/unit/trust.bats: "an absent floor is first use, not a rollback" -> TestFloorLifecycle
 // PORTED: tests/unit/trust.bats: "a floor round-trips through the ledger" -> TestFloorLifecycle
 // PORTED: tests/unit/trust.bats: "floors are per document id and do not bleed" -> TestFloorLifecycle
@@ -39,7 +39,7 @@ import (
 // PORTED: tests/unit/trust.bats: "an index listing a product twice is refused as ambiguous" -> TestAcceptIndex
 // PORTED: tests/unit/trust.bats: "an index whose real digest matches the recorded anchor is accepted, and its records come back" -> TestAcceptIndex
 // PORTED: tests/unit/trust.bats: "an index is refused when its real digest does not match the recorded anchor, and the message names the mismatch" -> TestAcceptIndex
-// PORTED: tests/unit/trust.bats: "D1: an ABSENT anchor is first use for mi_accept_index too, and it is rc 4" -> TestAcceptIndex (ErrNoAnchor is the rc-4 analogue)
+// PORTED: tests/unit/trust.bats: "D1: an ABSENT anchor is first use for mi_accept_index too, and it is rc 4" -> TestAcceptIndex -- ErrNoAnchor is the rc-4 analogue
 // PORTED: tests/unit/trust.bats: "D1: an anchor that cannot be READ is refused by mi_accept_index, never reported as first use" -> TestUnreadableAnchorNeverFirstUse
 // PORTED: tests/unit/trust.bats: "T2: mi_accept_index refuses an expired family index even though its digest matches the anchor" -> TestAcceptIndex
 // PORTED: tests/unit/trust.bats: "T5: _mi_index_manifest_digest returns THIS product's digest, never merely any colon-bearing entry" -> TestIndexManifestDigest
@@ -51,7 +51,7 @@ import (
 // PORTED: tests/unit/trust.bats: "with no anchor recorded, the check refuses with its own code" -> TestCheckAndCommit
 // PORTED: tests/unit/trust.bats: "a refusal for no anchor does not record a floor" -> TestCheckAndCommit
 // PORTED: tests/unit/trust.bats: "mi_trust_check_only commits nothing" -> TestCheckAndCommit
-// PORTED: tests/unit/trust.bats: "mi_trust_check still advances the floor, so this plan's callers are unaffected" -> TestCheckAndCommit (the acceptors compose CheckOnly+Commit — asserted through AcceptIndex's floor advance)
+// PORTED: tests/unit/trust.bats: "mi_trust_check still advances the floor, so this plan's callers are unaffected" -> TestCheckAndCommit -- the acceptors compose CheckOnly+Commit — asserted through AcceptIndex's floor advance
 // PORTED: tests/unit/trust.bats: "mi_trust_commit moves the floor and the anchor together" -> TestCheckAndCommit
 // PORTED: tests/unit/trust.bats: "an ABSENT anchor is first use, and it is rc 3 from the ledger that says so" -> TestAnchorLifecycle
 // PORTED: tests/unit/trust.bats: "an anchor that cannot be READ is refused, never reported as first use" -> TestUnreadableAnchorNeverFirstUse
@@ -70,16 +70,16 @@ import (
 // PORTED: tests/unit/policy.bats: "T2: mi_accept_policy refuses an expired policy even though its digest matches the index" -> TestAcceptPolicy
 //
 // Deferred chain rows owned HERE — tests/unit/manifest.bats:
-// PORTED: tests/unit/manifest.bats: "every acceptance path verifies and parses one snapshot, never the live file twice" -> TestAcceptorRefusals + TestAnchorConsultedEveryTime (the row's hazard is verifying one set of bytes and PARSING ANOTHER; in Go each check takes ONE docfmt.Snapshot and both verifies and parses that same byte slice, so the two can never diverge. An earlier rationale here waived the row on the stronger and FALSE claim that no file is ever opened twice: acceptManifest calls checkIndex, then checkPolicy which calls checkIndex again, so the index really is snapshotted twice. That is not the hazard — each snapshot is verified against the recorded anchor before it is parsed, so a file swapped between the two reads is REFUSED by the anchor rather than adopted)
+// PORTED: tests/unit/manifest.bats: "every acceptance path verifies and parses one snapshot, never the live file twice" -> TestAcceptorRefusals + TestAnchorConsultedEveryTime -- the row's hazard is verifying one set of bytes and PARSING ANOTHER; in Go each check takes ONE docfmt.Snapshot and both verifies and parses that same byte slice, so the two can never diverge. An earlier rationale here waived the row on the stronger and FALSE claim that no file is ever opened twice: acceptManifest calls checkIndex, then checkPolicy which calls checkIndex again, so the index really is snapshotted twice. That is not the hazard — each snapshot is verified against the recorded anchor before it is parsed, so a file swapped between the two reads is REFUSED by the anchor rather than adopted
 // N/A: tests/unit/manifest.bats: "a forged record blob passed where a file belongs is refused" -- structural in Go, with no test to name: every acceptor takes a PATH and re-derives the records from the bytes it reads, so there is no API that accepts a caller-supplied record blob and therefore nothing a forged one could be passed to
 // PORTED: tests/unit/manifest.bats: "the anchor is consulted on every acceptance, not cached from a previous one" -> TestAnchorConsultedEveryTime
-// PORTED: tests/unit/manifest.bats: "T5: mi_accept_manifest's own index authentication cannot be bypassed even when the policy step is stubbed" -> TestAcceptManifestChain (the door re-derives the chain itself; no caller-supplied index exists)
+// PORTED: tests/unit/manifest.bats: "T5: mi_accept_manifest's own index authentication cannot be bypassed even when the policy step is stubbed" -> TestAcceptManifestChain -- the door re-derives the chain itself; no caller-supplied index exists
 // PORTED: tests/unit/manifest.bats: "the chain accepts an untampered index, policy and manifest" -> TestAcceptManifestChain
 // PORTED: tests/unit/manifest.bats: "a manifest the index vouches for, but which declares another product, is refused" -> TestAcceptManifestChain
 // PORTED: tests/unit/manifest.bats: "tampering at any level of the chain is refused" -> TestAcceptManifestChain
 // PORTED: tests/unit/manifest.bats: "a product the index does not vouch for is refused" -> TestAcceptManifestChain
-// PORTED: tests/unit/manifest.bats: "an authentic not-launched manifest reports rc 3, not 0" -> TestAcceptManifestChain (ErrNotLaunched, manifest still returned)
-// PORTED: tests/unit/manifest.bats: "the manifest cannot supply a name — only a role" -> (owned by internal/manifest.TestSchemaRefusals; recorded here because the bats file exercises it through the door)
+// PORTED: tests/unit/manifest.bats: "an authentic not-launched manifest reports rc 3, not 0" -> TestAcceptManifestChain -- ErrNotLaunched, manifest still returned
+// PORTED: tests/unit/manifest.bats: "the manifest cannot supply a name — only a role" -> internal/manifest.TestSchemaRefusals -- owned by that package; recorded here because the bats file exercises it through the door
 // PORTED: tests/unit/manifest.bats: "an entitlement violation is refused by the door itself, not only by mi_manifest_check" -> TestAcceptManifestChain
 // PORTED: tests/unit/manifest.bats: "Fix 1: an entitlement violation leaves the version floor unchanged" -> TestFloorDiscipline
 // PORTED: tests/unit/manifest.bats: "Fix 1: an accepted-but-not-launched manifest still advances the version floor" -> TestFloorDiscipline

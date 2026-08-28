@@ -18,14 +18,14 @@ import (
 // PORTED: tests/unit/layout.bats: "the installer's own zones keep the slot's name — the carve-out is only in a product directory" -> TestZoneClassification
 // PORTED: tests/unit/layout.bats: "the three product names that CANNOT carry a slot are pinned as a known limit" -> TestReservedDirsCannotCarrySlot
 // PORTED: tests/unit/layout.bats: "a component that could not BEGIN a legal product name is not the slot" -> TestZoneClassification
-// PORTED: tests/unit/layout.bats: "the slot's uppercase refusal survives a non-C collation, end to end" -> TestSlotCaseExactness (Go strings have no ambient collation; the refusal is asserted directly)
+// PORTED: tests/unit/layout.bats: "the slot's uppercase refusal survives a non-C collation, end to end" -> TestSlotCaseExactness -- Go strings have no ambient collation; the refusal is asserted directly
 // PORTED: tests/unit/layout.bats: "the slot's leading component must satisfy the FULL product-name grammar, not just its start" -> TestProductNameGrammar
 // PORTED: tests/unit/layout.bats: "the reserved leaf is exact even under nocasematch — a case glob would not be" -> TestSlotCaseExactness
 // PORTED: tests/unit/layout.bats: "an uppercase product NAME is refused under nocasematch too — the validator is called with it off" -> TestSlotCaseExactness
 // N/A: tests/unit/layout.bats: "nocasematch reaching the CLI through BASH_ENV does not promote a path to the slot" -- shell-option machinery; Go comparison is case-exact by construction (asserted in TestSlotCaseExactness)
 // N/A: tests/unit/layout.bats: "mi_zone fails CLOSED for the slot when the name authority is not loaded" -- the authority is a compile-time link in Go; it cannot be absent
 // N/A: tests/unit/layout.bats: "only a shell FUNCTION may answer the name question — a program on PATH may not" -- Go performs no PATH resolution for the grammar
-// PORTED: tests/unit/layout.bats: "the host-tool amendment changed NO pre-existing classification" -> TestZoneClassification (the pre-amendment table is asserted in full)
+// PORTED: tests/unit/layout.bats: "the host-tool amendment changed NO pre-existing classification" -> TestZoneClassification -- the pre-amendment table is asserted in full
 // PORTED: tests/unit/layout.bats: "the host-tool slot the document publishes is the one the classifier implements" -> TestSlotMatchesPublishedDocument
 // PORTED: tests/unit/layout.bats: "mi_ensure_layout neither creates nor disturbs a host-tool slot" -> TestEnsureLeavesSlotAlone
 // (layout.bats' mi_digest known-vector row is claimed in internal/cliio/confirm_test.go, its one

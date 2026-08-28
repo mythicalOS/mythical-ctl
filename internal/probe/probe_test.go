@@ -21,15 +21,15 @@ import (
 )
 
 // Inventory — tests/unit/probe.bats:
-// PORTED: tests/unit/probe.bats: "the probe image comes from the family index, not from a constant" -> TestImageFromIndex (a *trust.Index is constructible ONLY by the trust acceptors — a constant cannot be one)
-// PORTED: tests/unit/probe.bats: "an index that does not verify yields no probe image" -> TestImageFromIndex (structural: Image takes the acceptors' sealed Index, so a refused index yields no value to pass — the acceptor refusals themselves are internal/trust.TestAcceptIndex)
+// PORTED: tests/unit/probe.bats: "the probe image comes from the family index, not from a constant" -> TestImageFromIndex -- a *trust.Index is constructible ONLY by the trust acceptors — a constant cannot be one
+// PORTED: tests/unit/probe.bats: "an index that does not verify yields no probe image" -> TestImageFromIndex + internal/trust.TestAcceptIndex -- structural: Image takes the acceptors' sealed Index, so a refused index yields no value to pass; the acceptor refusals themselves are the second target
 // PORTED: tests/unit/probe.bats: "an index that names neither pinned helper image is refused — the keys are REQUIRED" -> TestIndexRequiresHelperImages
 // PORTED: tests/unit/probe.bats: "an index naming a FLOATING tag for the probe image is refused" -> TestIndexRequiresHelperImages
 // PORTED: tests/unit/probe.bats: "an UNOBTAINABLE probe image reports unavailable — it never falls back" -> TestAvailable
 // PORTED: tests/unit/probe.bats: "a pull refusal keeps the registry's own wording" -> TestAvailable
 // PORTED: tests/unit/probe.bats: "an already-present probe image needs no pull" -> TestAvailable
 // PORTED: tests/unit/probe.bats: "selfcheck resolves the probe's OWN alias on the target network" -> TestSelfCheck
-// PORTED: tests/unit/probe.bats: "selfcheck FAILING is distinguishable from a product not running" -> TestSelfCheck (the DNS-broken verdict names the probe's own alias, no product)
+// PORTED: tests/unit/probe.bats: "selfcheck FAILING is distinguishable from a product not running" -> TestSelfCheck -- the DNS-broken verdict names the probe's own alias, no product
 // PORTED: tests/unit/probe.bats: "selfcheck asks about a PER-RUN alias it registered with the network itself" -> TestSelfCheckPerRunAlias
 // PORTED: tests/unit/probe.bats: "a selfcheck answered from the container's HOSTS FILE cannot satisfy the check" -> TestSelfCheckHostsFile
 // PORTED: tests/unit/probe.bats: "selfcheck refuses an answer that does not STATE selfcheck=ok" -> TestSelfCheckAnswerGates
@@ -38,21 +38,21 @@ import (
 // PORTED: tests/unit/probe.bats: "an answer that states its result TWICE is refused, not read as the first copy" -> TestSelfCheckAnswerGates
 // PORTED: tests/unit/probe.bats: "an out-of-contract helper status is a REPORTED failed check, not an unaccounted-for container" -> TestOutOfContractStatus
 // PORTED: tests/unit/probe.bats: "resolve returns the address for an alias" -> TestResolve
-// PORTED: tests/unit/probe.bats: "resolve reports 3 when the alias does not resolve, distinctly from a probe failure" -> TestResolve (ErrNotResolved is the rc-3 analogue)
+// PORTED: tests/unit/probe.bats: "resolve reports 3 when the alias does not resolve, distinctly from a probe failure" -> TestResolve -- ErrNotResolved is the rc-3 analogue
 // PORTED: tests/unit/probe.bats: "an answer about a DIFFERENT alias is refused, never returned as this one's address" -> TestResolveAnswerGates
 // PORTED: tests/unit/probe.bats: "an answer naming TWO aliases, or TWO addresses, is refused rather than read down to one" -> TestResolveAnswerGates
 // PORTED: tests/unit/probe.bats: "an answer carrying no address field at all is a probe failure, not a non-resolving alias" -> TestResolveAnswerGates
-// PORTED: tests/unit/probe.bats: "the probe command set is CLOSED — nothing manifest-supplied reaches it" -> internal/engine.TestConstructorRefusals (engine/client_test.go: HelperCommand outside the closed set is a constructor error; the Prober exposes no free-string command anywhere)
+// PORTED: tests/unit/probe.bats: "the probe command set is CLOSED — nothing manifest-supplied reaches it" -> internal/engine.TestConstructorRefusals -- engine/client_test.go: HelperCommand outside the closed set is a constructor error; the Prober exposes no free-string command anywhere
 // PORTED: tests/unit/probe.bats: "a probe run is recorded under write-ahead intent and cleaned up when it completes" -> TestRunAccounting
 // PORTED: tests/unit/probe.bats: "a completed probe removes ITSELF — no container survives and nothing sweeps one up" -> TestRunAccounting
 // PORTED: tests/unit/probe.bats: "a run whose container could not be accounted for afterwards KEEPS its intent AND FAILS" -> TestUnaccountedRun
 // PORTED: tests/unit/probe.bats: "an unaccountable probe container is not reported as a DNS verdict" -> TestUnaccountedRun
-// PORTED: tests/unit/probe.bats: "the probe container is NAMED and LABELLED for this installation, like any other object" -> TestRunAccounting (the intent records mythical-<ident>-probe-<nonce>; the labels ride engine.Provenance, which the sealed HelperSpec requires)
+// PORTED: tests/unit/probe.bats: "the probe container is NAMED and LABELLED for this installation, like any other object" -> TestRunAccounting -- the intent records mythical-<ident>-probe-<nonce>; the labels ride engine.Provenance, which the sealed HelperSpec requires
 // PORTED: tests/unit/probe.bats: "a leftover probe from an earlier crash is recognised by its label and cleaned up" -> TestCleanup
 // PORTED: tests/unit/probe.bats: "cleanup never touches a probe belonging to another installation" -> TestCleanup
 // PORTED: tests/unit/probe.bats: "cleanup refuses a container at OUR recorded name that is labelled for another installation" -> TestCleanupRefusals
 // PORTED: tests/unit/probe.bats: "a leftover the runtime could not be asked about is PRESERVED, never forgotten" -> TestCleanupRefusals
-// PORTED: tests/unit/probe.bats: "cleanup refuses when the installation identity cannot be read" -> TestNewRefusals (moved to the door: a Prober cannot be constructed without a valid identity, so no removal can ever run unscoped)
+// PORTED: tests/unit/probe.bats: "cleanup refuses when the installation identity cannot be read" -> TestNewRefusals -- moved to the door: a Prober cannot be constructed without a valid identity, so no removal can ever run unscoped
 // PORTED: tests/unit/probe.bats: "egress is reported as a distinct check" -> TestEgress
 // PORTED: tests/unit/probe.bats: "egress refuses a zero-exit helper that does not STATE egress=ok" -> TestEgress
 // PORTED: tests/unit/probe.bats: "egress refuses an answer that states its result more than once" -> TestEgress

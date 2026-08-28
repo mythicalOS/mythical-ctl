@@ -18,7 +18,7 @@ import (
 // PORTED: tests/unit/ledger.bats: "missing ledger returns 3 and prints nothing" -> TestMissingLedgerDistinct
 // PORTED: tests/unit/ledger.bats: "write then read round-trips records" -> TestWriteReadRoundTrip
 // PORTED: tests/unit/ledger.bats: "write is refused without the lock held (no token, no lock file)" -> TestWriteAuthorization
-// PORTED: tests/unit/ledger.bats: "write is refused when the token does not match the lock file" -> TestWriteAuthorization (store-token identity + released-token refusal — the sealed-capability port)
+// PORTED: tests/unit/ledger.bats: "write is refused when the token does not match the lock file" -> TestWriteAuthorization -- store-token identity + released-token refusal — the sealed-capability port
 // PORTED: tests/unit/ledger.bats: "a ledger truncated by its final newline fails closed" -> TestCorruptionFailsClosed
 // PORTED: tests/unit/ledger.bats: "a torn ledger fails closed" -> TestCorruptionFailsClosed
 // PORTED: tests/unit/ledger.bats: "a newer schema is refused, not parsed" -> TestSchemaGate
@@ -27,7 +27,7 @@ import (
 // PORTED: tests/unit/ledger.bats: "the writer refuses to clobber an existing corrupt ledger" -> TestWriterNeverDestroysEvidence
 // N/A: tests/unit/ledger.bats: "input records without a trailing newline still produce a readable ledger" -- the Go writer serializes its own lines; there is no stdin framing whose missing newline could fuse a record onto the checksum
 // PORTED: tests/unit/ledger.bats: "mi_ledger_get selects by kind and key" -> TestEditorFindAndField
-// PORTED: tests/unit/ledger.bats: "mi_ledger_get fails closed on a corrupt ledger (no ambient pipefail)" -> TestCorruptionFailsClosed (Read errors; no editor can run without a Ledger value)
+// PORTED: tests/unit/ledger.bats: "mi_ledger_get fails closed on a corrupt ledger (no ambient pipefail)" -> TestCorruptionFailsClosed -- Read errors; no editor can run without a Ledger value
 // N/A: tests/unit/ledger.bats: "mi_ledger_read leaves no read-snapshot temp behind" -- the Go read is one os.ReadFile into memory; no snapshot file exists to leak
 // N/A: tests/unit/ledger.bats: "ledger write fails closed when the hasher itself fails (no checksum-empty ledger)" -- the hasher is in-process crypto/sha256, not an external tool that can fail or be shimmed
 // N/A: tests/unit/ledger.bats: "ledger read fails closed when the hasher itself fails" -- same: no external hasher exists
@@ -39,7 +39,7 @@ import (
 // N/A: tests/unit/ledger.bats: "the staging path is refused UNLESS the internal marker is also set (codex gate round 1, fix 1)" -- the marker protocol guarded an env seam that does not exist; staging is a distinct sealed constructor whose caller set check.sh's boundary gate pins
 // N/A: tests/unit/ledger.bats: "the staging path is accepted once BOTH the override and the internal marker are set" -- the other half of the same override protocol, and it does not exist in Go either: staging is reached through the sealed OpenStaging constructor, not by setting two environment variables, and check.sh's boundary rule pins its only legal caller
 // PORTED: tests/unit/ledger.bats: "the staging reader/writer round-trip, without touching the real ledger" -> TestStagingRoundTripLeavesLiveAlone
-// PORTED: tests/unit/ledger.bats: "Plan 1's ledger.bats still passes unchanged: an ordinary write/read never sees the override" -> TestStagingRoundTripLeavesLiveAlone (Live and staging paths asserted distinct; an ordinary store never resolves to staging)
+// PORTED: tests/unit/ledger.bats: "Plan 1's ledger.bats still passes unchanged: an ordinary write/read never sees the override" -> TestStagingRoundTripLeavesLiveAlone -- Live and staging paths asserted distinct; an ordinary store never resolves to staging
 //
 // Inventory — tests/unit/prov.bats (Task 8 owns the editor/identity/membership rows; the
 // provenance-semantics remainder is Task 18's):
@@ -47,7 +47,7 @@ import (
 // PORTED: tests/unit/prov.bats: "the editor preserves every other record" -> TestEditorPutReplacesKeyed
 // PORTED: tests/unit/prov.bats: "a field value containing a TAB or newline is REFUSED — it would forge a field or a record" -> TestFieldGrammar
 // PORTED: tests/unit/prov.bats: "a field that is not KEY=VALUE is refused" -> TestFieldGrammar
-// PORTED: tests/unit/prov.bats: "the editor refuses without the family lock" -> TestWriteAuthorization (Go editors mutate in-memory state; Write is the single authorization door — nothing reaches disk unasserted)
+// PORTED: tests/unit/prov.bats: "the editor refuses without the family lock" -> TestWriteAuthorization -- Go editors mutate in-memory state; Write is the single authorization door — nothing reaches disk unasserted
 // PORTED: tests/unit/prov.bats: "identity is minted once and is stable" -> TestIdentity
 // PORTED: tests/unit/prov.bats: "a minted identity is a valid name component" -> TestIdentity
 // PORTED: tests/unit/prov.bats: "the minted identity contains no hyphen, so the flat name join stays unambiguous" -> TestIdentity
