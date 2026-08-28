@@ -2072,3 +2072,53 @@ func TestPhase7CompletesOverAContainerSomethingElseRemoved(t *testing.T) {
 		t.Fatalf("a removal that answered 404 was reported as a failure:\n%s", out)
 	}
 }
+
+// TestPhase7ResumesAfterA404RemovalWhoseReplacementFailed: the removal answers 404 AND the
+// replacement's create then fails — and the migration must still converge when the operator
+// re-runs it.
+//
+// THIS IS THE CLAIM THE "PERMANENT WEDGE" READING OF THIS SITE RESTS ON, and it is the one worth
+// asserting rather than assuming. A 404 leaves phase 7 in the state where a resume matters most:
+// the old container gone, its record consumed into a tombstone, and no replacement standing. Every
+// piece of evidence the next attempt could authorize itself from has been spent. What must happen
+// is that prov.Authority ASKS THE RUNTIME, finds nothing at that name, answers ErrGone, and lets
+// the phase proceed to build the replacement — because "there is no such container" is exactly the
+// state a replacement wants to start from.
+//
+// The failure it excludes is a phase that refuses on its second attempt for a container that no
+// longer exists. That refusal WOULD be permanent: no run can remove an object that is not there,
+// and no run can produce the record whose absence it is refusing over.
+func TestPhase7ResumesAfterA404RemovalWhoseReplacementFailed(t *testing.T) {
+	f := newFx(t)
+	canon := f.canonDest()
+	if err := os.Mkdir(canon, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sid, _ := Identity(canon)
+	f.seed(record{Phase: 7, Dest: canon, Nonce: "nz", Staging: StagingPath(canon, "nz"),
+		StageID: sid, Attempt: "started", Desired: "running"})
+	f.mut.rmGone = true
+	f.bld.rebuildErr = errors.New("the daemon refused the create")
+
+	if err := Run(ctx(), f.l, f.d, testProduct, testRole, canon, 7); err == nil {
+		t.Fatal("the armed create failure reported success")
+	}
+	if p, perr := Phase(f.l, testProduct, testRole); perr != nil || p != 7 {
+		t.Fatalf("the intent is at %d (%v), want 7 — the migration must stay resumable", p, perr)
+	}
+
+	// THE RETRY, exactly as an operator re-running the verb performs it. The container is still
+	// gone; only the create is no longer failing.
+	f.bld.rebuildErr = nil
+	if err := Run(ctx(), f.l, f.d, testProduct, testRole, canon, 7); err != nil {
+		t.Fatalf("the resumed phase 7 refused over a container that does not exist — a refusal no\n"+
+			"later run could ever clear, because nothing can remove an object that is not there: %v", err)
+	}
+	if len(f.bld.rebuilt) != 1 {
+		t.Fatalf("the replacement was not built on the retry: %v", f.bld.rebuilt)
+	}
+	// AND STILL NO REMOVAL IS CLAIMED, on either attempt: something else took the container away.
+	if len(f.mut.removed) != 0 {
+		t.Fatalf("a removal was recorded that this migration did not perform: %v", f.mut.removed)
+	}
+}
