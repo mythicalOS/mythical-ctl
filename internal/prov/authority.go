@@ -28,11 +28,22 @@ func Authority(ctx context.Context, l *ledger.Ledger, objs Objects, class Class,
 		return errors.New("prov: images are never removed automatically (D37) — the ledger proves acquisition, not\n" +
 			"  ownership, and the same digest may back another installation or a local build.")
 	}
+	// THE TWO REFUSALS BELOW ARE ALSO REFUSALS NOBODY ANSWERED, and they are marked as such even
+	// though only a programming error reaches them. The classification is about WHAT WAS
+	// ESTABLISHED, not about how likely the branch is: neither of these established one fact about
+	// the object, so a caller that keeps state until a question can be answered must keep it here
+	// too. Leaving them unmarked would make a caller read "the runtime seam is missing" as the
+	// settled answer "this object is not ours" — which, in restore's abandonment, deletes the only
+	// record of which partial volumes exist.
+	//
+	// The image refusal above is deliberately NOT marked: it is a settled policy answer (images are
+	// never removed automatically), not a question that failed, and re-asking it will never change
+	// it.
 	if err := classCheck(class); err != nil {
-		return err
+		return unanswered{err}
 	}
 	if objs == nil {
-		return errors.New("prov: no runtime to ask — authorizing nothing")
+		return unanswered{errors.New("prov: no runtime to ask — authorizing nothing")}
 	}
 
 	fields, err := Find(l, class, name)
@@ -63,7 +74,13 @@ func Authority(ctx context.Context, l *ledger.Ledger, objs Objects, class Class,
 			"  The installer cannot prove it created this, so it will not remove it.", name)
 	}
 	if err != nil {
-		return err
+		// ErrMismatch is an ANSWER — the selector read the row and found it describes something
+		// else — and it is a sentinel precisely so it can be told apart. Anything else is a lookup
+		// that FAILED (an ambiguous or unreadable record), which established nothing.
+		if errors.Is(err, ErrMismatch) {
+			return err
+		}
+		return unanswered{err}
 	}
 
 	// THE RECORD IS ABOUT WHAT WAS ASKED ABOUT — the third door, and the one that stays shut when

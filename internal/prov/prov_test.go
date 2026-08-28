@@ -537,6 +537,31 @@ func TestAuthorityMarksTheRefusalsNobodyAnswered(t *testing.T) {
 			f.askErr = down
 			return Authority(ctx, l, f, ClassVolume, "v1")
 		},
+		// No runtime seam at all: nothing was asked of anything. Only a programming error reaches
+		// this, and the classification is still about WHAT WAS ESTABLISHED — which is nothing.
+		"there is no runtime to ask": func() error {
+			l, _ := identLedger(t)
+			return Authority(ctx, l, nil, ClassVolume, "v1")
+		},
+		// A class that is not a provenance class: the question has no meaning, so it established
+		// nothing about any object either.
+		"the class is not a provenance class": func() error {
+			l, _ := identLedger(t)
+			return Authority(ctx, l, newFakeObjs(), Class("teapot"), "v1")
+		},
+		// The record LOOKUP failed — ambiguous or unreadable, as opposed to ErrMismatch, which is
+		// the selector's ANSWER that the row describes something else.
+		"the provenance record could not be looked up": func() error {
+			l := &ledger.Ledger{}
+			l.ReplaceLines([]string{
+				"identity\tid=i0000000001",
+				"object\tkey=volume:v1\tclass=volume\tname=v1\tnonce=n1\tgen=1",
+				"object\tkey=volume:v1\tclass=volume\tname=v1\tnonce=n2\tgen=2",
+			})
+			f := newFakeObjs()
+			f.put(ClassVolume, "v1", map[string]string{LabelInstall: "i0000000001", LabelNonce: "n1"})
+			return Authority(ctx, l, f, ClassVolume, "v1")
+		},
 		// The ledger cannot answer for its OWN identity, so nothing can be shown to belong to it.
 		"this installation's own identity is unreadable": func() error {
 			l := &ledger.Ledger{}
@@ -587,6 +612,27 @@ func TestAuthorityMarksTheRefusalsNobodyAnswered(t *testing.T) {
 			l, _ := identLedger(t)
 			f := newFakeObjs()
 			f.put(ClassVolume, "v1", map[string]string{})
+			return Authority(ctx, l, f, ClassVolume, "v1")
+		},
+		// A SETTLED POLICY, not a question that failed: images are never removed automatically, and
+		// asking again will never change that. A caller that keeps state until a question CAN be
+		// answered would keep it forever.
+		"an image": func() error {
+			l, _ := identLedger(t)
+			return Authority(ctx, l, newFakeObjs(), Class("image"), "img")
+		},
+		// The selector's own ANSWER that the row describes something else — spelled as a sentinel
+		// precisely so it can be told apart from a lookup that failed.
+		"a record that describes another object": func() error {
+			l, id := identLedger(t)
+			if perr := l.Put("object", "key", "volume:v1", []ledger.Field{
+				{Key: "key", Value: "volume:v1"}, {Key: "class", Value: "container"},
+				{Key: "name", Value: "other"}, {Key: "nonce", Value: "n1"}, {Key: "gen", Value: "1"},
+			}); perr != nil {
+				t.Fatal(perr)
+			}
+			f := newFakeObjs()
+			f.put(ClassVolume, "v1", map[string]string{LabelInstall: id, LabelNonce: "n1"})
 			return Authority(ctx, l, f, ClassVolume, "v1")
 		},
 	}
