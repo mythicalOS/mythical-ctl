@@ -28,6 +28,7 @@ import (
 	"fmt"
 
 	"mythicalos.ai/ctl/internal/cliio"
+	"mythicalos.ai/ctl/internal/engine"
 	"mythicalos.ai/ctl/internal/ledger"
 	"mythicalos.ai/ctl/internal/netref"
 	"mythicalos.ai/ctl/internal/prov"
@@ -263,7 +264,14 @@ func (s *session) removeProductContainer(ctx context.Context, product, c string)
 		// TOMBSTONE ONLY ON A REMOVAL THAT ACTUALLY SUCCEEDED. Recording a removal that did not
 		// happen strips the container's authority record while it is still running — after which
 		// nothing can ever remove it.
-		if rerr := s.rt.ContainerRemove(ctx, c); rerr != nil {
+		// AN ErrAbsent REMOVAL IS THE GOAL REACHED, NOT A FAILURE — the same three-way answer
+		// internal/bringup already draws from this call. A 404 comes from a daemon that IS
+		// answering and says the object is gone; the container vanished between the authority
+		// question and this call, which is a race with an operator or another tool, not an error.
+		// Reporting it as "could not remove" kept live provenance and desired state for a
+		// container the runtime had just said does not exist — a record nothing can ever retire,
+		// because every later attempt gets the same 404.
+		if rerr := s.rt.ContainerRemove(ctx, c); rerr != nil && !errors.Is(rerr, engine.ErrAbsent) {
 			d.warnErr(rerr)
 			d.warn("verbs: could not remove the container for %q. Its record is KEPT so it stays", product)
 			d.warn("  removable later; nothing is tombstoned for a removal that did not happen.")

@@ -1225,6 +1225,40 @@ func TestTwoQualificationsOfOneTargetResolveToNothing(t *testing.T) {
 	if !same["mythicalos.ai/ctl/internal/w"] || len(same) != 1 {
 		t.Fatalf("one package named twice was treated as ambiguous: %v", same)
 	}
+	// TWO SPELLINGS OF ONE PACKAGE ARE ONE REFERENCE. A raw string comparison calls these
+	// ambiguous and fails a legitimate claim; they must be compared as RESOLVED packages.
+	spellings := candidatePackages(goTests, "internal/y/y_test.go",
+		"internal/w.TestShared (that is mythicalos.ai/ctl/internal/w.TestShared)", "TestShared")
+	if !spellings["mythicalos.ai/ctl/internal/w"] || len(spellings) != 1 {
+		t.Fatalf("two spellings of one package were treated as ambiguous: %v", spellings)
+	}
+}
+
+// TestAClaimThatWritesTheTargetBothWaysResolvesToNothing: prose has no polarity, so a claim that
+// says its target is LOCAL and also spells a qualification of it has said two things, and no
+// scanner can tell which was meant.
+//
+// `TestShared (not internal/w.TestShared; it is local)` is the shape: once a qualification
+// CONSTRAINS, that sentence pins resolution to internal/w — where a namesake keeps the claim green
+// after the local test it was really about is deleted. Refusing to resolve is the only honest
+// answer, and it is loud: the audit reports the claim as unresolvable.
+func TestAClaimThatWritesTheTargetBothWaysResolvesToNothing(t *testing.T) {
+	goTests := map[string]map[string]bool{
+		"mythicalos.ai/ctl/internal/w": {"TestShared": true},
+		"mythicalos.ai/ctl/internal/x": {"TestShared": true},
+	}
+	got := candidatePackages(goTests, "internal/x/x_test.go",
+		"TestShared (not internal/w.TestShared; it is local)", "TestShared")
+	if len(got) != 0 {
+		t.Fatalf("a claim that writes its target both bare and qualified resolved anyway: %v", got)
+	}
+	// A CLAIM THAT ONLY QUALIFIES IS NOT CONTRADICTORY — every real cross-package claim in this
+	// tree is written that way, and this must not refuse them.
+	ok := candidatePackages(goTests, "internal/x/x_test.go",
+		"internal/w.TestShared (recorded here for the audit)", "TestShared")
+	if !ok["mythicalos.ai/ctl/internal/w"] || len(ok) != 1 {
+		t.Fatalf("an ordinary qualified claim was refused: %v", ok)
+	}
 }
 
 // TestAQualificationConstrainsRatherThanWidens: saying where a target lives must NARROW resolution

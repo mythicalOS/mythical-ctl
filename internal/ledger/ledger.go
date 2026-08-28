@@ -14,9 +14,11 @@ package ledger
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"mythicalos.ai/ctl/internal/cliio"
 	"mythicalos.ai/ctl/internal/famlock"
@@ -146,6 +148,45 @@ func readPath(path string) (*Ledger, error) {
 		return nil, fmt.Errorf("ledger: cannot read — refusing (fail closed): %w", err)
 	}
 	return ReadBytes(data)
+}
+
+// ErrNotRegular — something is at the path, and it is not a regular file. An ANSWER about the
+// path, distinct from every failure to look at it.
+var ErrNotRegular = errors.New("not a regular file")
+
+// ReadRegularFile returns the bytes of a REGULAR file, refusing anything else, WITHOUT resolving
+// the path twice.
+//
+// AN Lstat FOLLOWED BY A ReadFile IS TWO RESOLUTIONS OF ONE NAME, and the gap between them belongs
+// to anything else on the machine. Two concrete failures live in that gap, and both were measured:
+// a FIFO swapped in makes the read BLOCK FOREVER (an installer that never returns), and a symlink
+// swapped in is FOLLOWED — so the bytes judged are the target's while the name still refers to the
+// link, and a caller that then moves "the file it judged" moves the link instead.
+//
+// So the file is opened ONCE and everything is asked of that descriptor. O_NOFOLLOW refuses a
+// symlink at the final component, O_NONBLOCK means a FIFO open returns instead of waiting for a
+// writer, and the regular-file test is an fstat of the handle already held rather than a fresh
+// lookup of the name. What remains resolvable by name afterwards is the caller's own business —
+// there is no rename-if-contents-match anywhere — but the JUDGEMENT is now about one file.
+func ReadRegularFile(path string) ([]byte, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		// A symlink at the final component answers ELOOP here, which is an ANSWER about the path
+		// and not a failure to look — the caller says so by testing ErrNotRegular.
+		if errors.Is(err, syscall.ELOOP) {
+			return nil, fmt.Errorf("ledger: %s is a symlink, not a regular file: %w", path, ErrNotRegular)
+		}
+		return nil, err
+	}
+	defer f.Close()
+	fi, serr := f.Stat()
+	if serr != nil {
+		return nil, serr
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("ledger: %s is %s, not a regular file: %w", path, fi.Mode().Type(), ErrNotRegular)
+	}
+	return io.ReadAll(f)
 }
 
 // ReadBytes validates a ledger that is already in hand as BYTES — no path, no store, no write

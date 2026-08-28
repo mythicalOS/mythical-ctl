@@ -783,27 +783,25 @@ func preserveCorrupt(sf string) (aside string, residue error, err error) {
 	// rename-if-contents-match, so a swap between this read and the rename below cannot be
 	// excluded. What it buys is that the report is only ever made about bytes this function
 	// actually read, and a swap that happens before the read is DETECTED instead of mis-reported.
-	// PRESENT-AND-REGULAR BEFORE IT IS READ, which is internal/ledger's own discipline at the same
-	// paths and was missing from the first version of this re-read. os.ReadFile on a FIFO swapped
-	// in here BLOCKS FOREVER; on a symlink it follows the link and judges the TARGET, while the
-	// rename below moves the LINK — so the "preserved evidence" would be a symlink and the bytes
-	// that failed their checksum would still be wherever they were.
-	if fi, lerr := os.Lstat(sf); lerr != nil {
-		return "", nil, fmt.Errorf("restore: the staging ledger could not be examined before moving it aside, so\n"+
-			"  whether the file about to be moved is the one that failed its checksum could not be\n"+
-			"  established. Nothing is moved: %w", lerr)
-	} else if !fi.Mode().IsRegular() {
-		return "", nil, fmt.Errorf("restore: what stands at the staging ledger path is no longer a regular file (%s) — it\n"+
+	// ONE RESOLUTION OF THE NAME, NOT TWO. An Lstat followed by a ReadFile is two lookups with a
+	// gap between them: a FIFO swapped into that gap blocks the read forever, and a symlink is
+	// followed — so the bytes judged would be the target's while the rename below moves the LINK,
+	// and the "preserved evidence" would not be the bytes that failed their checksum.
+	// ledger.ReadRegularFile opens once with O_NOFOLLOW|O_NONBLOCK and fstats the handle.
+	data, rerr := ledger.ReadRegularFile(sf)
+	switch {
+	case errors.Is(rerr, ledger.ErrNotRegular):
+		return "", nil, fmt.Errorf("restore: what stands at the staging ledger path is no longer a regular file — it\n"+
 			"  CHANGED between being classified and being moved aside. Nothing is moved and nothing is\n"+
-			"  removed: reading it could block or follow a link, and moving it would preserve the wrong\n"+
-			"  thing. Run the command again to classify what is there now", whatIsAt(sf))
-	}
-	if data, rerr := os.ReadFile(sf); rerr != nil {
+			"  removed: moving it would preserve the wrong thing. Run the command again to classify\n"+
+			"  what is there now: %w", rerr)
+	case rerr != nil:
 		return "", nil, fmt.Errorf("restore: the staging ledger could not be re-read before moving it aside, so\n"+
 			"  whether the file about to be moved is the one that failed its checksum could not be\n"+
 			"  established. Nothing is moved: %w", rerr)
-	} else if _, verr := ledger.ReadBytes(data); !errors.Is(verr, ledger.ErrCorrupt) {
-		return "", nil, fmt.Errorf("restore: the staging ledger no longer fails its checksum — it CHANGED between being\n" +
+	}
+	if _, verr := ledger.ReadBytes(data); !errors.Is(verr, ledger.ErrCorrupt) {
+		return "", nil, errors.New("restore: the staging ledger no longer fails its checksum — it CHANGED between being\n" +
 			"  classified and being moved aside. Nothing is moved and nothing is removed: this file is\n" +
 			"  not the one that was judged, and moving it would destroy a record nobody found fault\n" +
 			"  with. Run the command again to classify what is there now.")

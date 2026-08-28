@@ -151,6 +151,11 @@ type fakeNetwork struct {
 //   - InspectMissing makes inspects of ONE named object 404 while everything else answers —
 //     an object that vanished, which is a fact a later run may act on; with
 //     InspectMissingAfter, it survives its first N inspections first.
+//   - RemoveMissing makes the container DELETE for ONE named object 404 while every INSPECT of it
+//     still answers. That is the one window InspectMissing cannot reach: an object a verb has
+//     just proved is its own, removed by something else before the verb gets to the removal. The
+//     daemon answers 404 there, and a caller that reads that as "the removal failed" keeps a
+//     record for an object the runtime says does not exist.
 type Fake struct {
 	mu   sync.Mutex
 	cond *sync.Cond // signals helper completion to blocked waiters (waitContainer)
@@ -167,6 +172,7 @@ type Fake struct {
 	InfoFail              bool
 	InspectMissing        string
 	InspectMissingAfter   int
+	RemoveMissing         string
 	inspectMissingCount   int
 	ServerVersionValue    string
 	Rootless              bool
@@ -1023,7 +1029,7 @@ func (f *Fake) attachContainer(w http.ResponseWriter, r *http.Request, seg strin
 func (f *Fake) removeContainer(w http.ResponseWriter, r *http.Request, seg string) {
 	name := pathName(seg)
 	c := f.findContainer(name)
-	if c == nil {
+	if c == nil || (f.RemoveMissing != "" && name == f.RemoveMissing) {
 		fail(w, 404, "No such container: %s", name)
 		return
 	}

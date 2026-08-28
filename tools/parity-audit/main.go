@@ -882,23 +882,6 @@ func candidatePackages(all map[string]map[string]bool, goFile, detail, target st
 		bySeg[path.Base(p)] = append(bySeg[path.Base(p)], p)
 	}
 	out := map[string]bool{}
-	add := func(tok string) {
-		tok = strings.Trim(tok, "/")
-		if tok == "" {
-			return
-		}
-		if strings.Contains(tok, "/") {
-			for p := range all {
-				if p == tok || strings.HasSuffix(p, "/"+tok) {
-					out[p] = true
-				}
-			}
-			return
-		}
-		if ps := bySeg[tok]; len(ps) == 1 {
-			out[ps[0]] = true
-		}
-	}
 	// FOR THIS TARGET ONLY. A claim naming two tests may qualify one of them and not the other,
 	// and the unqualified one must not borrow the qualified one's package.
 	//
@@ -907,22 +890,43 @@ func candidatePackages(all map[string]map[string]bool, goFile, detail, target st
 	// other way: `internal/w.TestShared`, written in internal/x, stayed green after
 	// internal/w.TestShared was DELETED, because a namesake in internal/x satisfied it. A claim
 	// that says where its target lives is answered by THAT package or by nothing.
-	quals := qualifiersFor(detail, target)
+	quals, bare := qualifiersFor(detail, target)
 	if len(quals) > 0 {
-		// TWO DIFFERENT QUALIFICATIONS OF ONE TARGET ARE AMBIGUOUS, AND AMBIGUITY RESOLVES TO
-		// NOTHING. Unioning them puts the hole straight back: `internal/w.TestShared (formerly
-		// internal/x.TestShared)` would be satisfied by EITHER package, so deleting the one the
-		// claim is actually about stays green as long as the other still has a namesake. This is
-		// the same rule the bare-segment case already obeys a few lines down — an ambiguous
-		// reference must not widen the candidate set, because widening is the defect and not the
-		// fix for it. The audit then reports the claim as unresolvable, which is loud and correct.
-		first := quals[0]
-		for _, tok := range quals[1:] {
-			if tok != first {
+		// A TARGET WRITTEN BOTH QUALIFIED AND BARE IN ONE CLAIM IS CONTRADICTORY, and this is the
+		// polarity a token reader otherwise cannot have. `TestShared (not internal/w.TestShared;
+		// it is local)` says the target is local AND spells a qualification of it, and no scanner
+		// can tell which half was meant — so it resolves to NOTHING and the audit says the claim
+		// is unresolvable. That is the only honest answer to a claim that says two things.
+		if bare {
+			return out
+		}
+		// TWO DIFFERENT QUALIFICATIONS ARE AMBIGUOUS TOO. Unioning them puts the hole straight
+		// back: `internal/w.TestShared (formerly internal/x.TestShared)` would be satisfied by
+		// EITHER, so deleting the one the claim is about stays green while the other has a
+		// namesake. Same rule the bare-segment case obeys below — widening is the defect, not the
+		// fix for it.
+		//
+		// THEY ARE COMPARED AS RESOLVED PACKAGES, NOT AS STRINGS. `internal/w` and
+		// `mythicalos.ai/ctl/internal/w` are two spellings of one package, and rejecting that pair
+		// as ambiguous would fail a claim that names one package twice in two valid ways.
+		var first map[string]bool
+		for _, tok := range quals {
+			got := map[string]bool{}
+			addTo(all, bySeg, got, tok)
+			if len(got) == 0 {
+				return out
+			}
+			if first == nil {
+				first = got
+				continue
+			}
+			if !sameSet(first, got) {
 				return out
 			}
 		}
-		add(first)
+		for p := range first {
+			out[p] = true
+		}
 		return out
 	}
 	// UNQUALIFIED: the claiming file's own package, and nothing else.
@@ -935,6 +939,39 @@ func candidatePackages(all map[string]map[string]bool, goFile, detail, target st
 	return out
 }
 
+// addTo resolves one package token into out. A multi-segment token must match a real path SUFFIX,
+// so cmd/probe can never resolve to internal/probe; a bare segment resolves only when it names
+// exactly one package in the module, because an ambiguous reference must not widen anything.
+func addTo(all map[string]map[string]bool, bySeg map[string][]string, out map[string]bool, tok string) {
+	tok = strings.Trim(tok, "/")
+	if tok == "" {
+		return
+	}
+	if strings.Contains(tok, "/") {
+		for p := range all {
+			if p == tok || strings.HasSuffix(p, "/"+tok) {
+				out[p] = true
+			}
+		}
+		return
+	}
+	if ps := bySeg[tok]; len(ps) == 1 {
+		out[ps[0]] = true
+	}
+}
+
+func sameSet(a, b map[string]bool) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k := range a {
+		if !b[k] {
+			return false
+		}
+	}
+	return true
+}
+
 // qualifiersFor returns the package tokens written IMMEDIATELY BEFORE this target and a dot —
 // `<package path>.<TestName>` — and nothing else. That is the whole cross-package syntax.
 //
@@ -943,8 +980,7 @@ func candidatePackages(all map[string]map[string]bool, goFile, detail, target st
 // the target it was compared against would be the full name, and a legitimately qualified claim
 // would silently fail to resolve. The tree already owns this grammar in one place — isGoTestName
 // and identRune — so the occurrence is found by string search and its boundary judged by those.
-func qualifiersFor(detail, target string) []string {
-	var out []string
+func qualifiersFor(detail, target string) (quals []string, bare bool) {
 	for i := 0; i+len(target) <= len(detail); i++ {
 		if !strings.HasPrefix(detail[i:], target) {
 			continue
@@ -955,18 +991,21 @@ func qualifiersFor(detail, target string) []string {
 		}
 		// Immediately preceded by a dot, and before it a path token. `.` is not an identifier
 		// rune, so the left boundary needs no separate test.
-		if i == 0 || detail[i-1] != '.' {
+		tok := ""
+		if i > 0 && detail[i-1] == '.' {
+			k := i - 1
+			for k > 0 && isPathByte(detail[k-1]) {
+				k--
+			}
+			tok = detail[k : i-1]
+		}
+		if tok == "" {
+			bare = true
 			continue
 		}
-		k := i - 1
-		for k > 0 && isPathByte(detail[k-1]) {
-			k--
-		}
-		if tok := detail[k : i-1]; tok != "" {
-			out = append(out, tok)
-		}
+		quals = append(quals, tok)
 	}
-	return out
+	return quals, bare
 }
 
 // isPathByte is what a package path may contain in a claim.

@@ -6,7 +6,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"mythicalos.ai/ctl/internal/cliio"
 	"mythicalos.ai/ctl/internal/famlock"
@@ -508,5 +510,61 @@ func TestMembershipSet(t *testing.T) {
 	// Idempotent delete: finding nothing has achieved its purpose.
 	if err := l.MemberDel("brokkr"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestReadRegularFileResolvesTheNameOnce: an Lstat followed by a ReadFile is two lookups of one
+// name, and both failures that live in the gap between them were measured on this tree.
+//
+// A FIFO makes an ordinary read BLOCK FOREVER — an installer that never returns, on paths every
+// command takes — and a symlink is FOLLOWED, so the bytes judged are the target's while the name
+// still refers to the link, and a caller that then moves "the file it judged" moves the link.
+// O_NOFOLLOW|O_NONBLOCK plus an fstat of the handle already held answers both.
+func TestReadRegularFileResolvesTheNameOnce(t *testing.T) {
+	dir := t.TempDir()
+	good := filepath.Join(dir, "plain")
+	if err := os.WriteFile(good, []byte("hello\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := ReadRegularFile(good); err != nil || string(got) != "hello\n" {
+		t.Fatalf("a regular file: %q, %v", got, err)
+	}
+
+	// A SYMLINK IS REFUSED, NOT FOLLOWED — even one pointing at a perfectly good file.
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(good, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadRegularFile(link); !errors.Is(err, ErrNotRegular) {
+		t.Fatalf("a symlink to a regular file was followed: %v", err)
+	}
+
+	// A FIFO IS REFUSED AND DOES NOT BLOCK. The deadline is the assertion: without O_NONBLOCK this
+	// call never returns and the test would HANG rather than fail, which is why it runs off-thread.
+	fifo := filepath.Join(dir, "fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Skipf("this filesystem does not support a FIFO (%v) — the blocking branch is not reachable here", err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := ReadRegularFile(fifo)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrNotRegular) {
+			t.Fatalf("a FIFO: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("ReadRegularFile did not return for a FIFO — it opened without O_NONBLOCK and is " +
+			"waiting for a writer that will never come")
+	}
+
+	// A DIRECTORY, and an absent path, are their own answers.
+	if _, err := ReadRegularFile(dir); !errors.Is(err, ErrNotRegular) {
+		t.Fatalf("a directory: %v", err)
+	}
+	if _, err := ReadRegularFile(filepath.Join(dir, "nope")); !os.IsNotExist(err) {
+		t.Fatalf("an absent path should answer NotExist: %v", err)
 	}
 }

@@ -160,15 +160,7 @@ func FirstUse(ctx context.Context, home string, objs Objects) error {
 	case serr == nil && si.Mode().IsRegular():
 		return stagingDiagnostic(staging)
 	case serr == nil:
-		// PRESENT, SO NOT FIRST USE — and unclassifiable, so not a resumable restore either.
-		// Prescribing resume or abandon here would send the operator to a verb that refuses this
-		// exact path, which is a recovery instruction whose only outcome is a second refusal.
-		return errors.New("prov: the restore staging ledger is present but is not a regular file — a directory, a\n" +
-			"  symlink or a device node (.state/ledger.staging).\n" +
-			"  Something is there, so this is not a first install; but it is also not a restore that can\n" +
-			"  be resumed or abandoned: the restore verb refuses a staging path it cannot classify, so\n" +
-			"  neither of those commands can act on this. It is reported instead.\n" +
-			"  Run 'mythical-ctl state repair'.")
+		return notRegularStaging
 	case !errors.Is(serr, fs.ErrNotExist):
 		return fmt.Errorf("prov: the restore staging ledger path could not be examined, so absence cannot be\n"+
 			"  established — refusing rather than treating this as a fresh machine: %w", serr)
@@ -227,6 +219,20 @@ func FirstUse(ctx context.Context, home string, objs Objects) error {
 	return nil
 }
 
+// notRegularStaging is the ONE answer for "something is at the staging path and it is not a
+// regular file", whether that was seen by the classifying Lstat or by the open that follows it.
+// Two spellings of one fact would let the two paths drift apart.
+//
+// PRESENT, SO NOT FIRST USE — and unclassifiable, so not a resumable restore either. Prescribing
+// resume or abandon here would send the operator to a verb that refuses this exact path, which is
+// a recovery instruction whose only outcome is a second refusal.
+var notRegularStaging = errors.New("prov: the restore staging ledger is present but is not a regular file — a directory, a\n" +
+	"  symlink or a device node (.state/ledger.staging).\n" +
+	"  Something is there, so this is not a first install; but it is also not a restore that can\n" +
+	"  be resumed or abandoned: the restore verb refuses a staging path it cannot classify, so\n" +
+	"  neither of those commands can act on this. It is reported instead.\n" +
+	"  Run 'mythical-ctl state repair'.")
+
 // stagingDiagnostic says what an operator can actually DO about the staging ledger standing here,
 // which requires READING it.
 //
@@ -249,7 +255,15 @@ func FirstUse(ctx context.Context, home string, objs Objects) error {
 // in the surrounding sentence closes one prescription early and swallows the next — the reader that
 // extracts these commands and runs them then never sees the second one.
 func stagingDiagnostic(path string) error {
-	data, rerr := os.ReadFile(path)
+	// ONE RESOLUTION OF THE NAME. The Lstat that classified this path as regular and a ReadFile
+	// here are two lookups with a gap between them: a FIFO swapped into that gap blocks FirstUse
+	// forever — on the path every install takes — and a symlink is followed, so a link pointing at
+	// a valid ledger would be called a resumable restore while the restore verb refuses the link
+	// itself. ledger.ReadRegularFile opens once with O_NOFOLLOW|O_NONBLOCK and fstats the handle.
+	data, rerr := ledger.ReadRegularFile(path)
+	if errors.Is(rerr, ledger.ErrNotRegular) {
+		return notRegularStaging
+	}
 	if rerr != nil {
 		return fmt.Errorf("prov: there is no active ledger, and the restore staging ledger could not be READ, so\n"+
 			"  whether a restore can be resumed was never established (.state/ledger.staging).\n"+

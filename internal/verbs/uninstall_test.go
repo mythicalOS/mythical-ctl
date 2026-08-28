@@ -1124,3 +1124,38 @@ func TestUninstallLetsAPerObjectRefusalWinOverALedgerOne(t *testing.T) {
 		t.Fatalf("the container's provenance was tombstoned on a refusal: %v", err)
 	}
 }
+
+// TestUninstallRetiresARecordForAContainerTheRuntimeSaysIsGone: a 404 from ContainerRemove is the
+// goal reached, not a failure.
+//
+// The container can disappear between the authority question and the removal — an operator, another
+// tool, a reaper. The daemon then answers 404, which is an ANSWER: the object is gone. Treating it
+// as "could not remove" KEPT the provenance and desired-state records for a container the runtime
+// had just said does not exist, and nothing could ever retire them, because every later attempt
+// gets the same 404. internal/bringup already draws this distinction from the same call.
+func TestUninstallRetiresARecordForAContainerTheRuntimeSaysIsGone(t *testing.T) {
+	r := newRig(t)
+	r.writeProduct("p1")
+	r.mintIdentity()
+	r.mustInstall("p1")
+	c := r.container("p1")
+	// THE WINDOW ITSELF, not the state after it. Removing the container up front would make
+	// prov.Authority answer ErrGone and the removal would never be attempted — the test would pass
+	// down a different branch entirely. RemoveMissing keeps every INSPECT answering (so authority
+	// proves the container ours) and 404s the DELETE alone, which is exactly an object removed by
+	// something else between those two calls.
+	r.fake.RemoveMissing = c
+	r.reset()
+
+	if rc := r.uninstall("p1", false); rc != cliio.ExitOK {
+		t.Fatalf("rc = %d, want 0 — a container the runtime says is gone is not a failed removal\n%s", rc, r.said())
+	}
+	// THE RECORDS ARE RETIRED. A provenance record for an object that does not exist is one no
+	// later run can ever clear.
+	if _, err := prov.Find(r.ledgerOnDisk(), prov.ClassContainer, c); !errors.Is(err, ledger.ErrAbsentRecord) {
+		t.Fatalf("provenance survived for a container the runtime says is gone: %v", err)
+	}
+	if _, err := state.DesiredGet(r.ledgerOnDisk(), c); !errors.Is(err, ledger.ErrAbsentRecord) {
+		t.Fatalf("desired state survived for a container the runtime says is gone: %v", err)
+	}
+}
