@@ -1428,14 +1428,19 @@ var removalAnswers = []struct {
 	refused bool
 	// unknown — the report must say nothing was established.
 	unknown bool
+	// absent — the daemon ANSWERED 404. The name is free, exactly as for a successful removal, so
+	// the control answer is the same; the REPORT is not. This call removed nothing, and saying
+	// "removed" attributes to the tool an action something else performed — and hides the only
+	// surprising fact here, which is that a third party is moving these objects.
+	absent bool
 	// rebuild — Recover may ask for a rebuild (the name is provably free).
 	rebuild bool
 }{
-	{"removed", nil, false, false, true},
-	{"already absent (404)", fmt.Errorf("engine: %w: No such container", engine.ErrAbsent), false, false, true},
-	{"refused by the daemon", errors.New("container is in use by a running task"), true, false, false},
-	{"a server error", errors.New("engine: 500 Internal Server Error"), true, false, false},
-	{"the daemon did not answer", fmt.Errorf("engine: %w: dial unix: connection refused", engine.ErrDaemonDown), false, true, false},
+	{"removed", nil, false, false, false, true},
+	{"already absent (404)", fmt.Errorf("engine: %w: No such container", engine.ErrAbsent), false, false, true, true},
+	{"refused by the daemon", errors.New("container is in use by a running task"), true, false, false, false},
+	{"a server error", errors.New("engine: 500 Internal Server Error"), true, false, false, false},
+	{"the daemon did not answer", fmt.Errorf("engine: %w: dial unix: connection refused", engine.ErrDaemonDown), false, true, false, false},
 }
 
 // TestRunReportsWhatTheRemovalActuallyEstablished: the removal's status is the operator's whole
@@ -1486,6 +1491,21 @@ func TestRunReportsWhatTheRemovalActuallyEstablished(t *testing.T) {
 				// nothing measured when the runtime never answered.
 				if says("STILL THERE") || says("removed \"") {
 					t.Fatalf("an unanswered removal was reported as a settled fact:\n%v", err)
+				}
+			case tc.absent:
+				// THE NAME IS FREE AND THIS BRING-UP DID NOT FREE IT.
+				if says("removed \"") {
+					t.Fatalf("a container something ELSE took away was reported as removed by this\n"+
+						"bring-up — which attributes an action to the tool that it did not perform, and\n"+
+						"buries the fact that a third party is moving these objects:\n%v", err)
+				}
+				for _, want := range []string{"IS GONE", "took nothing away"} {
+					if !says(want) {
+						t.Fatalf("the report does not say %q:\n%v", want, err)
+					}
+				}
+				if says("STILL THERE") || says("UNKNOWN") {
+					t.Fatalf("a container that is provably gone was reported as present or unknown:\n%v", err)
 				}
 			default:
 				if !says("removed \"") {
@@ -1554,6 +1574,21 @@ func TestRecoverReportsWhatTheRemovalActuallyEstablished(t *testing.T) {
 				}
 				if says("STILL THERE") {
 					t.Fatalf("an unanswered removal was reported as a settled fact:\n%v", err)
+				}
+			case tc.absent:
+				// The rebuild is asserted above and stands — the name IS provably free. What must
+				// not stand is the claim that this recovery removed the container.
+				if says("removed \"") {
+					t.Fatalf("a container something ELSE took away was reported as removed by this\n"+
+						"recovery:\n%v", err)
+				}
+				for _, want := range []string{"IS GONE", "took nothing away"} {
+					if !says(want) {
+						t.Fatalf("the report does not say %q:\n%v", want, err)
+					}
+				}
+				if says("STILL THERE") || says("UNKNOWN") {
+					t.Fatalf("a container that is provably gone was reported as present or unknown:\n%v", err)
 				}
 			default:
 				if !says("removed \"") || says("STILL THERE") || says("UNKNOWN") {

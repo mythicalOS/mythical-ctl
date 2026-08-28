@@ -198,7 +198,7 @@ func provenOurs(ctx context.Context, d Deps, l *ledger.Ledger, container, nonce 
 	return nil
 }
 
-// removalOutcome is what a removal's answer ESTABLISHES about the container — three facts, not two.
+// removalOutcome is what a removal's answer ESTABLISHES about the container — FOUR facts, not two.
 //
 // CHECKING THE ERROR IS ONLY HALF THE FIX, AND THE FIRST VERSION OF THIS FIX ONLY DID THAT HALF.
 // Treating every non-nil answer as "it is still there" replaces one wrong answer with another:
@@ -207,12 +207,23 @@ func provenOurs(ctx context.Context, d Deps, l *ledger.Ledger, container, nonce 
 // all. Reporting the first as "STILL THERE" sends an operator to hunt an object that does not
 // exist, and (in Recover) withholds the rebuild of a name that is free. Reporting the second as
 // "STILL THERE" states a fact nothing measured.
+//
+// AND THE SECOND HALF WAS ITSELF TOO COARSE. Success and a 404 answer the CONTROL question
+// identically — the name is free, a rebuild may proceed — so they were one constant, and the
+// report that followed said the container was "removed" in both. On a 404 this bring-up removed
+// NOTHING: something else took the container away between the check and the DELETE. Telling an
+// operator this run removed it attributes an action to the tool that the tool did not perform, and
+// hides the only interesting fact in the sequence, which is that a third party is moving the same
+// objects. The two are one fact for control flow and two for the report, so they are two constants.
 type removalOutcome int
 
 const (
-	// removalGone — it is NOT at that name: removed by this call, or already absent. The name is
-	// free and a rebuild may proceed.
-	removalGone removalOutcome = iota
+	// removalRemoved — the DELETE succeeded: THIS CALL removed it. The name is free and a rebuild
+	// may proceed.
+	removalRemoved removalOutcome = iota
+	// removalAlreadyAbsent — the daemon ANSWERED 404: the object is not at that name and this call
+	// removed nothing. Same control answer as removalRemoved (the name is free), different report.
+	removalAlreadyAbsent
 	// removalRefused — the daemon ANSWERED and the removal did NOT succeed (still in use, denied,
 	// a server error). What is established is that the DELETE did not report success; whether the
 	// container is still standing is NOT — a 5xx can follow a partial removal. So callers may say
@@ -225,9 +236,9 @@ const (
 func classifyRemoval(err error) removalOutcome {
 	switch {
 	case err == nil:
-		return removalGone
+		return removalRemoved
 	case errors.Is(err, engine.ErrAbsent):
-		return removalGone
+		return removalAlreadyAbsent
 	case errors.Is(err, engine.ErrDaemonDown):
 		return removalUnknown
 	}
@@ -585,6 +596,16 @@ func Run(ctx context.Context, l *ledger.Ledger, d Deps, launch Launcher, contain
 				"  Check with the container runtime whether it is still there before re-running.\n"+
 				"  The removal could not be asked for because: %v\n"+
 				"  It failed to verify because: %w", container, rerr, verr)
+		case removalAlreadyAbsent:
+			// THE NAME IS FREE, AND THIS BRING-UP DID NOT FREE IT. Claiming the removal would
+			// attribute to this run an action something else performed, and would bury the one
+			// surprising fact here: the container was taken away between the verification and the
+			// DELETE, so a third party is moving these objects.
+			return fmt.Errorf("bringup: %q IS GONE from that name — it did not verify, and the container runtime\n"+
+				"  then answered that no such object exists. This bring-up took nothing away: something\n"+
+				"  else did, between the check and the removal. Nothing was confirmed and nothing was\n"+
+				"  started.\n"+
+				"  It failed to verify because: %w", container, verr)
 		}
 		return fmt.Errorf("bringup: removed %q because it did not verify. Nothing was confirmed: %w", container, verr)
 	}
@@ -747,6 +768,14 @@ func Recover(ctx context.Context, l *ledger.Ledger, d Deps, container, netID, al
 				"  was never established.\n"+
 				"  The removal could not be asked for because: %v\n"+
 				"  The topology does not verify because: %w", container, rerr, verr)
+		case removalAlreadyAbsent:
+			// THE REBUILD STILL STANDS — the name is provably free, which is the only thing
+			// ErrRebuild is gated on. What changes is the sentence: this recovery removed nothing.
+			return fmt.Errorf("bringup: %q IS GONE from that name — its topology does not verify, and the container\n"+
+				"  runtime then answered that no such object exists, so this recovery took nothing away.\n"+
+				"  The name is free and a confirmed-but-detached container is a state this sequence must\n"+
+				"  never produce, so the rebuild still stands: %w",
+				container, errors.Join(ErrRebuild, verr))
 		}
 		return fmt.Errorf("bringup: removed %q — it was created but its topology does not verify, and a\n"+
 			"  confirmed-but-detached container is a state this sequence must never produce: %w",
