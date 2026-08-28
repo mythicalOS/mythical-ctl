@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -1488,8 +1489,14 @@ func TestLinkThenVerifiedUnlinkNeverDeletesAReplacement(t *testing.T) {
 	to2 := filepath.Join(dir, "second.staging.corrupt.1")
 	write(t, from2, []byte("evidence\n"))
 	swapErr := swapAfterLink(t, from2, to2, replacement)
-	if !errors.Is(swapErr, errActivatedWithResidue) {
-		t.Fatalf("a replaced source was not reported as a residue: %v", swapErr)
+	// A TAKEN NAME IS ITS OWN OUTCOME, not a residue. "Residue" means a leftover copy of what was
+	// moved and the report tells the operator to delete it — which, pointed at a file that merely
+	// appeared at the staging name, is an instruction to destroy something nobody has read.
+	if !errors.Is(swapErr, errStagingNameTaken) {
+		t.Fatalf("a replaced source was not reported as a taken staging name: %v", swapErr)
+	}
+	if errors.Is(swapErr, errActivatedWithResidue) {
+		t.Fatalf("a file that is NOT the preserved evidence was reported as a leftover copy: %v", swapErr)
 	}
 	back, rerr2 := os.ReadFile(from2)
 	if rerr2 != nil {
@@ -1500,16 +1507,69 @@ func TestLinkThenVerifiedUnlinkNeverDeletesAReplacement(t *testing.T) {
 	}
 }
 
+// TestReportResidueNeverTellsTheOperatorToDeleteSomethingElse: the two outcomes read differently
+// because the operator does different things with them.
+//
+// errActivatedWithResidue means a leftover COPY of the evidence is lying about, and the report says
+// to remove it. errStagingNameTaken means something ELSE arrived at the staging name while the
+// evidence was being moved — possibly a valid ledger. One message for both told an operator to
+// delete a file nobody had looked at.
+func TestReportResidueNeverTellsTheOperatorToDeleteSomethingElse(t *testing.T) {
+	r := newRig(t)
+	sf := stagingPath(r.home)
+
+	r.reset()
+	r.deps().reportResidue(errStagingNameTaken, sf)
+	taken := r.stderr()
+	if !strings.Contains(taken, "SOMETHING ELSE now stands") || !strings.Contains(taken, "Look at what it is") {
+		t.Fatalf("a taken staging name is not reported as one:\n%s", taken)
+	}
+	if strings.Contains(taken, "remove the leftover yourself") {
+		t.Fatalf("the operator is told to delete a file that is not ours:\n%s", taken)
+	}
+
+	r.reset()
+	r.deps().reportResidue(fmt.Errorf("%w: %v", errActivatedWithResidue, errors.New("permission denied")), sf)
+	leftover := r.stderr()
+	if !strings.Contains(leftover, "A COPY ALSO REMAINS") || !strings.Contains(leftover, "remove the leftover yourself") {
+		t.Fatalf("a genuine leftover copy is not reported as one:\n%s", leftover)
+	}
+
+	// AND NOTHING AT ALL when there is nothing to say.
+	r.reset()
+	r.deps().reportResidue(nil, sf)
+	if r.stderr() != "" {
+		t.Fatalf("a clean preservation reported a residue:\n%s", r.stderr())
+	}
+}
+
+// TestUnlinkIfSameTreatsAVanishedSourceAsDone: ENOENT is the state the unlink set out to reach, so
+// it is success — not a residue whose report tells the operator to go and remove a file that is
+// not there. The same rule residueOf already states for the unlink itself.
+func TestUnlinkIfSameTreatsAVanishedSourceAsDone(t *testing.T) {
+	dir := t.TempDir()
+	to := filepath.Join(dir, "preserved")
+	write(t, to, []byte("evidence\n"))
+	linked, err := os.Lstat(to)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uerr := unlinkIfSame(linked, filepath.Join(dir, "gone")); uerr != nil {
+		t.Fatalf("a source that is already gone was reported as a problem: %v", uerr)
+	}
+}
+
 // swapAfterLink reproduces the window by doing the fallback's own steps with a replacement dropped
 // in between, and then asking the function under test for its unlink decision about that state.
 func swapAfterLink(t *testing.T, from, to string, replacement []byte) error {
 	t.Helper()
-	before, err := os.Lstat(from)
-	if err != nil {
-		t.Fatal(err)
-	}
 	if err := os.Link(from, to); err != nil {
 		t.Skipf("this filesystem does not support hard links (%v)", err)
+	}
+	// THE ANCHOR IS THE LINK'S OWN RESULT, exactly as the production path takes it.
+	before, err := os.Lstat(to)
+	if err != nil {
+		t.Fatal(err)
 	}
 	if err := os.Remove(from); err != nil {
 		t.Fatal(err)
@@ -1523,4 +1583,80 @@ func swapAfterLink(t *testing.T, from, to string, replacement []byte) error {
 		t.Fatal("the fixture did not replace the inode — the window is not exercised")
 	}
 	return unlinkIfSame(before, from)
+}
+
+// TestLinkThenVerifiedUnlinkAgainstAConcurrentReplacer: the identity anchor must be the file the
+// LINK created, and that choice is only observable under a real concurrent writer.
+//
+// Sampling the source BEFORE the link answers the wrong question: if the source changes between
+// the sample and the link, the link names the NEW file at the destination while the sample still
+// describes the old one — and if the old inode reappears at the source, the comparison succeeds,
+// the ORIGINAL evidence is unlinked, and the destination holds unrelated bytes. Lstat of the
+// destination is, by construction, the inode that is now preserved.
+//
+// THE INVARIANT ASSERTED IS THE ONE THAT MATTERS AND HOLDS UNDER ANY INTERLEAVING: whatever this
+// call reports, the bytes it preserved at `to` and the bytes left at `from` are never a pair where
+// the evidence has been destroyed — the file unlinked from `from` is always the one that is also
+// at `to`. (Mirrors TestActivateRenameIsAtomicAgainstAConcurrentWriter's shape.)
+func TestLinkThenVerifiedUnlinkAgainstAConcurrentReplacer(t *testing.T) {
+	const rounds = 300
+	for round := 0; round < rounds; round++ {
+		dir := t.TempDir()
+		from := filepath.Join(dir, "ledger.staging")
+		to := filepath.Join(dir, "ledger.staging.corrupt.1")
+		evidence := []byte("evidence-" + strconv.Itoa(round) + "\n")
+		write(t, from, evidence)
+		// The replacement is a DIFFERENT inode carrying different bytes, so any confusion between
+		// the two is visible in the file contents rather than only in the metadata.
+		other := []byte("a valid ledger somebody else put here\n")
+		stop := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				tmp := filepath.Join(dir, "tmp")
+				if err := os.WriteFile(tmp, other, 0o600); err == nil {
+					_ = os.Rename(tmp, from)
+				}
+			}
+		}()
+		err := linkThenVerifiedUnlink(from, to)
+		close(stop)
+		wg.Wait()
+
+		// THE EVIDENCE IS NEVER LOST. Either the link preserved it at `to`, or the call reported a
+		// failure and did not claim to have preserved anything.
+		if err != nil && !errors.Is(err, errStagingNameTaken) && !errors.Is(err, errActivatedWithResidue) {
+			// A link that lost the race to the replacer is an ordinary failure, not a defect.
+			continue
+		}
+		got, rerr := os.ReadFile(to)
+		if rerr != nil {
+			t.Fatalf("round %d: the call returned %v but preserved nothing at %s: %v", round, err, to, rerr)
+		}
+		// Whatever was linked, the file left at `from` must never be the one that was unlinked out
+		// from under the preserved copy: if `from` still exists it is either the SAME file as `to`
+		// (nothing was removed) or a different one the replacer put there.
+		if fi, serr := os.Lstat(from); serr == nil {
+			ti, terr := os.Lstat(to)
+			if terr != nil {
+				t.Fatalf("round %d: %v", round, terr)
+			}
+			if os.SameFile(fi, ti) && err == nil {
+				t.Fatalf("round %d: the call reported the source unlinked, but it is still the same file "+
+					"as the preserved copy", round)
+			}
+		}
+		// And the preserved bytes are one of the two real files — never a torn or absent value.
+		if string(got) != string(evidence) && string(got) != string(other) {
+			t.Fatalf("round %d: the preserved copy holds %q, which is neither the evidence nor the "+
+				"replacement", round, string(got))
+		}
+	}
 }

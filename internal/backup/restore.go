@@ -820,7 +820,7 @@ func preserveCorrupt(sf string) (aside string, residue error, err error) {
 		switch {
 		case merr == nil:
 			return to, nil, nil
-		case errors.Is(merr, errActivatedWithResidue):
+		case errors.Is(merr, errActivatedWithResidue), errors.Is(merr, errStagingNameTaken):
 			// The move HAPPENED — `to` holds the corrupt bytes. Only the source could not be
 			// unlinked, which is a leftover, not a lost file.
 			return to, merr, nil
@@ -878,14 +878,21 @@ func preserveMove(from, to string) error {
 // path and skip — and the branch that must never delete somebody else's file would be exercised
 // nowhere.
 func linkThenVerifiedUnlink(from, to string) error {
-	before, serr := os.Lstat(from)
-	if serr != nil {
-		return serr
-	}
 	if err := os.Link(from, to); err != nil {
 		return err
 	}
-	return unlinkIfSame(before, from)
+	// THE ANCHOR IS THE FILE THE LINK ACTUALLY CREATED, not one sampled before it. Reading `from`
+	// first and comparing against that sample answers the wrong question: if the source changed
+	// between the sample and the link, the link named the NEW file at `to` while the sample still
+	// described the old one — and if the old inode then reappeared at `from`, the comparison would
+	// succeed, the ORIGINAL evidence would be deleted, and `to` would hold unrelated bytes. Lstat
+	// of `to` is the inode that is now preserved, by construction, whatever happened before it.
+	linked, lerr := os.Lstat(to)
+	if lerr != nil {
+		return fmt.Errorf("%w: the preserved copy could not be examined, so the staging name was left\n"+
+			"  alone rather than unlinked on an unchecked assumption: %w", errActivatedWithResidue, lerr)
+	}
+	return unlinkIfSame(linked, from)
 }
 
 // unlinkIfSame removes `from` ONLY IF it is still the inode `before` describes. A file that
@@ -895,26 +902,53 @@ func linkThenVerifiedUnlink(from, to string) error {
 // The identity test and the unlink are still two steps: there is no unlink-if-same-inode call
 // anywhere. What changes is that the window is now bounded by two adjacent syscalls instead of by a
 // link, and a swap that lands outside it is DETECTED rather than acted on.
-func unlinkIfSame(before os.FileInfo, from string) error {
+func unlinkIfSame(linked os.FileInfo, from string) error {
 	after, aerr := os.Lstat(from)
-	if aerr != nil || !os.SameFile(before, after) {
-		return fmt.Errorf("%w: the staging name no longer holds the file that was just preserved,\n"+
-			"  so it was left alone rather than deleted", errActivatedWithResidue)
+	switch {
+	case errors.Is(aerr, fs.ErrNotExist):
+		// ALREADY GONE IS THE STATE THIS CALL SET OUT TO REACH — the same rule residueOf states
+		// for the unlink itself. Nothing remains at the staging name, so there is no residue to
+		// report and nothing for an operator to remove.
+		return nil
+	case aerr != nil:
+		return fmt.Errorf("%w: the staging name could not be examined, so it was left alone rather than\n"+
+			"  unlinked on an unchecked assumption: %w", errActivatedWithResidue, aerr)
+	case !os.SameFile(linked, after):
+		// A DIFFERENT FILE, AND THE OPERATOR MUST NOT BE TOLD TO DELETE IT. It is not a leftover
+		// copy of the evidence; it is something that appeared at the well-known staging name while
+		// the evidence was being moved, and it may be a perfectly valid ledger.
+		return errStagingNameTaken
 	}
 	return residueOf(os.Remove(from))
 }
+
+// errStagingNameTaken marks the outcome where the evidence IS preserved and the staging name is
+// held by a DIFFERENT file. It is deliberately not errActivatedWithResidue: that word means "a
+// copy of what we moved is still lying about, remove it", and acting on this one that way would
+// delete a file nobody has looked at.
+var errStagingNameTaken = errors.New("restore: the staging name is held by a file that is NOT the preserved evidence")
 
 // reportResidue says the second half of a preservation that half-succeeded: the evidence IS at
 // the aside name, and a copy is ALSO still at the staging name. It is deliberately not an error —
 // the bytes were kept — but it must be SAID, because the leftover sits at the well-known staging
 // name where the next run will meet it and preserve it all over again.
 func (d Deps) reportResidue(residue error, sf string) {
-	if residue == nil {
+	switch {
+	case residue == nil:
 		return
+	case errors.Is(residue, errStagingNameTaken):
+		// NOT A LEFTOVER, AND NOT SOMETHING TO DELETE. Telling an operator to remove "the
+		// leftover" here would point them at a file that arrived while the evidence was being
+		// moved and may be a valid ledger nobody has read.
+		d.warn("  SOMETHING ELSE now stands at %s. It is NOT a copy of what was just preserved — it", sf)
+		d.warn("  appeared at the staging name while the evidence was being moved — so it was left")
+		d.warn("  exactly as it is. Look at what it is before doing anything with it; it may be a valid")
+		d.warn("  ledger somebody else put there.")
+	default:
+		d.warn("  A COPY ALSO REMAINS at %s — the move was made by linking and the original could not be", sf)
+		d.warn("  unlinked: %v", residue)
+		d.warn("  The evidence is safe at the preserved name; remove the leftover yourself.")
 	}
-	d.warn("  A COPY ALSO REMAINS at %s — the move was made by linking and the original could not be", sf)
-	d.warn("  unlinked: %v", residue)
-	d.warn("  The evidence is safe at the preserved name; remove the leftover yourself.")
 }
 
 // reportBlocking names the volumes that may belong to an attempt whose record just failed its
