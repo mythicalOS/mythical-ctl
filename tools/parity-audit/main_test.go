@@ -1180,6 +1180,30 @@ func TestCandidatePackagesDoesNotMineProse(t *testing.T) {
 	}
 }
 
+// TestQualificationUsesGosNameGrammarNotASCII: Go test names are UNICODE, and the audit already
+// owns that grammar (isGoTestName, identRune). An ASCII spelling of the name half truncates
+// `TestAlphaÉ` to `TestAlpha` — the target it is compared against is the full name, so a
+// legitimately qualified claim resolves against nothing and fails for a reason that has nothing to
+// do with the port. The same rule the other direction: a qualifier must not match a PREFIX of a
+// longer name.
+func TestQualificationUsesGosNameGrammarNotASCII(t *testing.T) {
+	goTests := map[string]map[string]bool{
+		"mythicalos.ai/ctl/internal/w": {"TestAlphaÉ": true, "TestFooBar": true},
+		"mythicalos.ai/ctl/internal/x": {},
+	}
+	if c := candidatePackages(goTests, "internal/x/x_test.go", "internal/w.TestAlphaÉ", "TestAlphaÉ"); !c["mythicalos.ai/ctl/internal/w"] {
+		t.Fatalf("a Unicode test name was not recognised as qualified: %v", c)
+	}
+	// A QUALIFIED LONGER NAME DOES NOT QUALIFY ITS PREFIX.
+	if c := candidatePackages(goTests, "internal/x/x_test.go", "internal/w.TestFooBar", "TestFoo"); c["mythicalos.ai/ctl/internal/w"] {
+		t.Fatalf("a qualification of TestFooBar was read as one of TestFoo: %v", c)
+	}
+	// A DOT WITH NO PACKAGE BEFORE IT QUALIFIES NOTHING — a sentence ending before the target.
+	if c := candidatePackages(goTests, "internal/x/x_test.go", ".TestFooBar", "TestFooBar"); len(c) != 1 || !c["mythicalos.ai/ctl/internal/x"] {
+		t.Fatalf("a bare dot supplied a package: %v", c)
+	}
+}
+
 // THE DIGEST PIN IS THE POST-CUTOVER GUARD, and this is the failure it exists for: with the bats
 // trees gone there is nothing to regenerate from, so a row could be REPLACED — an original
 // requirement deleted, an invented one of the same shape put in its place, and a claim written

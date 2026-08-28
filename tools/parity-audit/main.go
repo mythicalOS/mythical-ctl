@@ -905,21 +905,53 @@ func candidatePackages(all map[string]map[string]bool, goFile, detail, target st
 			out[ps[0]] = true
 		}
 	}
-	for _, m := range qualifiedTarget.FindAllStringSubmatch(detail, -1) {
-		// FOR THIS TARGET ONLY. A claim naming two tests may qualify one of them and not the
-		// other, and the unqualified one must not borrow the qualified one's package.
-		if m[2] != target {
-			continue
-		}
-		add(m[1])
+	// FOR THIS TARGET ONLY. A claim naming two tests may qualify one of them and not the other,
+	// and the unqualified one must not borrow the qualified one's package.
+	for _, tok := range qualifiersFor(detail, target) {
+		add(tok)
 	}
 	return out
 }
 
-// qualifiedTarget matches `<package path>.<TestName>` — the ONLY cross-package reference this audit
-// reads. The name half must satisfy the testing package's own grammar, so `enginetest/fake_test.go`
-// offers nothing (its suffix is `go`, not a test name) and neither does ordinary prose.
-var qualifiedTarget = regexp.MustCompile(`([A-Za-z0-9_./-]+)\.(Test[^a-z][A-Za-z0-9_]*|Test)\b`)
+// qualifiersFor returns the package tokens written IMMEDIATELY BEFORE this target and a dot —
+// `<package path>.<TestName>` — and nothing else. That is the whole cross-package syntax.
+//
+// IT IS NOT A REGEXP, AND THAT IS DELIBERATE. The obvious pattern spells the name half in ASCII
+// (`Test[A-Za-z0-9_]*`), and Go test names are UNICODE: `TestAlphaÉ` would match as `TestAlpha`,
+// the target it was compared against would be the full name, and a legitimately qualified claim
+// would silently fail to resolve. The tree already owns this grammar in one place — isGoTestName
+// and identRune — so the occurrence is found by string search and its boundary judged by those.
+func qualifiersFor(detail, target string) []string {
+	var out []string
+	for i := 0; i+len(target) <= len(detail); i++ {
+		if !strings.HasPrefix(detail[i:], target) {
+			continue
+		}
+		// A WHOLE IDENTIFIER. `internal/w.TestFooBar` does not qualify `TestFoo`.
+		if r, _ := utf8.DecodeRuneInString(detail[i+len(target):]); identRune(r) {
+			continue
+		}
+		// Immediately preceded by a dot, and before it a path token. `.` is not an identifier
+		// rune, so the left boundary needs no separate test.
+		if i == 0 || detail[i-1] != '.' {
+			continue
+		}
+		k := i - 1
+		for k > 0 && isPathByte(detail[k-1]) {
+			k--
+		}
+		if tok := detail[k : i-1]; tok != "" {
+			out = append(out, tok)
+		}
+	}
+	return out
+}
+
+// isPathByte is what a package path may contain in a claim.
+func isPathByte(b byte) bool {
+	return b >= 'A' && b <= 'Z' || b >= 'a' && b <= 'z' || b >= '0' && b <= '9' ||
+		b == '_' || b == '.' || b == '/' || b == '-'
+}
 
 // ---------------------------------------------------------------------------------------------
 // The audit
