@@ -3,6 +3,7 @@ package bringup
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -1413,11 +1414,30 @@ func TestReconcilerSaysWhyItDidNothing(t *testing.T) {
 
 // --- a removal that was REFUSED, and a confirmation with no image identity ----------------------
 
-// errRemoveRefused is what a daemon says when it will not remove a container — most often because
-// something is still bound to it.
-var errRemoveRefused = errors.New("container is in use by a running task")
+// removalAnswers is the THREE facts a removal's answer can establish, which is the correction the
+// first version of this fix needed: it treated every non-nil error as "the container is still
+// there". The engine splits them at the source — a 404 is an ANSWER from a daemon that is up, a
+// transport failure is no answer at all — and conflating them puts back the same wrong-answer
+// defect the fix exists to remove, facing the other way: an operator sent to hunt a container that
+// does not exist, and (in Recover) a rebuild withheld from a name that is free.
+var removalAnswers = []struct {
+	name string
+	err  error
+	// remains — the report must say the container is still there.
+	remains bool
+	// unknown — the report must say nothing was established.
+	unknown bool
+	// rebuild — Recover may ask for a rebuild (the name is provably free).
+	rebuild bool
+}{
+	{"removed", nil, false, false, true},
+	{"already absent (404)", fmt.Errorf("engine: %w: No such container", engine.ErrAbsent), false, false, true},
+	{"refused by the daemon", errors.New("container is in use by a running task"), true, false, false},
+	{"the daemon did not answer", fmt.Errorf("engine: %w: dial unix: connection refused", engine.ErrDaemonDown), false, true, false},
+}
 
-// TestRunReportsAContainerItCouldNotRemove: the removal's status is the operator's whole picture.
+// TestRunReportsWhatTheRemovalActuallyEstablished: the removal's status is the operator's whole
+// picture.
 //
 // Both removal sites used to read `_ = d.Mut.ContainerRemove(ctx, container)` with the NEXT LINE
 // telling the operator the container was removed. A daemon that refused the removal therefore
@@ -1425,77 +1445,118 @@ var errRemoveRefused = errors.New("container is in use by a running task")
 // at this installation's derived name. An operator told a container was removed has no reason to
 // look for it — so the object outlives the run, invisible, and the next bring-up meets it as a
 // same-name survivor for reasons nothing in the transcript explains.
-func TestRunReportsAContainerItCouldNotRemove(t *testing.T) {
+func TestRunReportsWhatTheRemovalActuallyEstablished(t *testing.T) {
 	ctx := context.Background()
-	l, objs, mut, _, st, d := fixture(t)
-	mut.removeErr = errRemoveRefused
-	lau := &fakeLauncher{objs: objs, st: st, nets: []Attachment{attach(net3, "", al1)}} // wrong network
-	err := Run(ctx, l, d, lau, c1, net1, al1, Running)
-	if err == nil {
-		t.Fatal("a bring-up whose container could not be removed reported success")
-	}
-	// IT WAS ASKED — the fix is checking the answer, not skipping the attempt.
-	if len(mut.removed) != 1 || mut.removed[0] != c1 {
-		t.Fatalf("the removal was not attempted: %v", mut.removed)
-	}
-	if strings.Contains(err.Error(), "removed \"") {
-		t.Fatalf("a container that was NOT removed was reported as removed: %v", err)
-	}
-	for _, want := range []string{"REMOVING IT FAILED", "STILL THERE", errRemoveRefused.Error()} {
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("the report does not say %q:\n%v", want, err)
-		}
-	}
-	// The verification failure that prompted the removal is reported ALONGSIDE it, not replaced
-	// by it: an operator needs both facts to know what to do next.
-	if !strings.Contains(err.Error(), "not permitted") {
-		t.Fatalf("the report drops the verification failure that prompted the removal:\n%v", err)
-	}
-	// And nothing was confirmed, while the write-ahead intent is kept.
-	if _, ferr := prov.Find(l, prov.ClassContainer, c1); !errors.Is(ferr, ledger.ErrAbsentRecord) {
-		t.Fatal("provenance was confirmed for a container that did not verify")
-	}
-	if _, ierr := intent.Find(l, prov.ClassContainer, c1); ierr != nil {
-		t.Fatalf("the write-ahead intent was consumed: %v", ierr)
-	}
-	if len(mut.started) != 0 {
-		t.Fatalf("an unverified container was started: %v", mut.started)
+	for _, tc := range removalAnswers {
+		t.Run(tc.name, func(t *testing.T) {
+			l, objs, mut, _, st, d := fixture(t)
+			mut.removeErr = tc.err
+			lau := &fakeLauncher{objs: objs, st: st, nets: []Attachment{attach(net3, "", al1)}} // wrong network
+			err := Run(ctx, l, d, lau, c1, net1, al1, Running)
+			if err == nil {
+				t.Fatal("a bring-up onto the wrong network reported success")
+			}
+			// IT WAS ASKED — the fix is checking the answer, not skipping the attempt.
+			if len(mut.removed) != 1 || mut.removed[0] != c1 {
+				t.Fatalf("the removal was not attempted: %v", mut.removed)
+			}
+			says := func(needle string) bool { return strings.Contains(err.Error(), needle) }
+			switch {
+			case tc.remains:
+				for _, want := range []string{"REMOVING IT WAS REFUSED", "STILL THERE", "REMOVE IT WITH THE CONTAINER RUNTIME"} {
+					if !says(want) {
+						t.Fatalf("the report does not say %q:\n%v", want, err)
+					}
+				}
+				if says("removed \"") {
+					t.Fatalf("a container that was NOT removed was reported as removed:\n%v", err)
+				}
+			case tc.unknown:
+				if !says("WHETHER IT WAS REMOVED IS UNKNOWN") {
+					t.Fatalf("an unanswered removal was not reported as unknown:\n%v", err)
+				}
+				// AND NOT AS EITHER SETTLED FACT. "still there" and "removed" are both claims
+				// nothing measured when the runtime never answered.
+				if says("STILL THERE") || says("removed \"") {
+					t.Fatalf("an unanswered removal was reported as a settled fact:\n%v", err)
+				}
+			default:
+				if !says("removed \"") {
+					t.Fatalf("a container that IS gone was not reported as removed:\n%v", err)
+				}
+				if says("STILL THERE") || says("UNKNOWN") {
+					t.Fatalf("a container that is provably gone was reported as present or unknown:\n%v", err)
+				}
+			}
+			// The verification failure that prompted the removal is reported ALONGSIDE it in every
+			// case, never replaced by it: an operator needs both facts to know what to do next.
+			if !says("not permitted") {
+				t.Fatalf("the report drops the verification failure that prompted the removal:\n%v", err)
+			}
+			// And nothing was confirmed, while the write-ahead intent is kept.
+			if _, ferr := prov.Find(l, prov.ClassContainer, c1); !errors.Is(ferr, ledger.ErrAbsentRecord) {
+				t.Fatal("provenance was confirmed for a container that did not verify")
+			}
+			if _, ierr := intent.Find(l, prov.ClassContainer, c1); ierr != nil {
+				t.Fatalf("the write-ahead intent was consumed: %v", ierr)
+			}
+			if len(mut.started) != 0 {
+				t.Fatalf("an unverified container was started: %v", mut.started)
+			}
+		})
 	}
 }
 
-// TestRecoverReportsAContainerItCouldNotRemove is the same fact on the recovery path, plus the
-// consequence that is specific to it: the caller acts on ErrRebuild by RE-CREATING the container
-// from its launch spec, under the same derived name. If the removal was refused, that name is
-// still held by the container standing here — so asking for a rebuild sends the caller to meet
-// this very container as a same-name survivor. The refusal must not carry ErrRebuild.
-func TestRecoverReportsAContainerItCouldNotRemove(t *testing.T) {
+// TestRecoverReportsWhatTheRemovalActuallyEstablished is the same three facts on the recovery path,
+// plus the consequence specific to it: the caller acts on ErrRebuild by RE-CREATING the container
+// from its launch spec, under the same derived name. So the rebuild may be asked for ONLY when that
+// name is provably free — not when the daemon refused the removal (the name is held), and not when
+// the daemon never answered (whether it is held was never established).
+func TestRecoverReportsWhatTheRemovalActuallyEstablished(t *testing.T) {
 	ctx := context.Background()
-	l, objs, mut, _, st, d := fixture(t)
-	mut.removeErr = errRemoveRefused
-	crashedAfterCreate(t, l, objs, st, state.Running, net1, []Attachment{attach(net3, "", al1)})
-	err := Recover(ctx, l, d, c1, net1, al1)
-	if err == nil {
-		t.Fatal("a recovery whose container could not be removed reported success")
-	}
-	if len(mut.removed) != 1 {
-		t.Fatalf("the removal was not attempted: %v", mut.removed)
-	}
-	if strings.Contains(err.Error(), "removed \"") {
-		t.Fatalf("a container that was NOT removed was reported as removed: %v", err)
-	}
-	if errors.Is(err, ErrRebuild) {
-		t.Fatalf("a rebuild was requested for a name the unremoved container still holds:\n%v", err)
-	}
-	for _, want := range []string{"REMOVING IT FAILED", "STILL THERE", "same-name survivor", errRemoveRefused.Error()} {
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("the report does not say %q:\n%v", want, err)
-		}
-	}
-	if _, ferr := prov.Find(l, prov.ClassContainer, c1); !errors.Is(ferr, ledger.ErrAbsentRecord) {
-		t.Fatal("provenance was confirmed for a container that did not verify")
-	}
-	if _, ierr := intent.Find(l, prov.ClassContainer, c1); ierr != nil {
-		t.Fatalf("the intent was consumed by a recovery that removed nothing: %v", ierr)
+	for _, tc := range removalAnswers {
+		t.Run(tc.name, func(t *testing.T) {
+			l, objs, mut, _, st, d := fixture(t)
+			mut.removeErr = tc.err
+			crashedAfterCreate(t, l, objs, st, state.Running, net1, []Attachment{attach(net3, "", al1)})
+			err := Recover(ctx, l, d, c1, net1, al1)
+			if err == nil {
+				t.Fatal("a recovery of a mis-attached container reported success")
+			}
+			if len(mut.removed) != 1 {
+				t.Fatalf("the removal was not attempted: %v", mut.removed)
+			}
+			if got := errors.Is(err, ErrRebuild); got != tc.rebuild {
+				t.Fatalf("ErrRebuild = %v, want %v — a rebuild re-creates under a name this container may\n"+
+					"still hold, so it may only be asked for when the name is provably free:\n%v", got, tc.rebuild, err)
+			}
+			says := func(needle string) bool { return strings.Contains(err.Error(), needle) }
+			switch {
+			case tc.remains:
+				for _, want := range []string{"REMOVING IT WAS REFUSED", "STILL THERE", "same-name survivor"} {
+					if !says(want) {
+						t.Fatalf("the report does not say %q:\n%v", want, err)
+					}
+				}
+			case tc.unknown:
+				if !says("WHETHER IT WAS REMOVED IS UNKNOWN") || !says("never established") {
+					t.Fatalf("an unanswered removal was not reported as unknown:\n%v", err)
+				}
+				if says("STILL THERE") {
+					t.Fatalf("an unanswered removal was reported as a settled fact:\n%v", err)
+				}
+			default:
+				if !says("removed \"") || says("STILL THERE") || says("UNKNOWN") {
+					t.Fatalf("a container that is provably gone was not reported as removed:\n%v", err)
+				}
+			}
+			if _, ferr := prov.Find(l, prov.ClassContainer, c1); !errors.Is(ferr, ledger.ErrAbsentRecord) {
+				t.Fatal("provenance was confirmed for a container that did not verify")
+			}
+			if _, ierr := intent.Find(l, prov.ClassContainer, c1); ierr != nil {
+				t.Fatalf("the intent was consumed by a recovery that confirmed nothing: %v", ierr)
+			}
+		})
 	}
 }
 

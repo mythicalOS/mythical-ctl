@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 
+	"mythicalos.ai/ctl/internal/engine"
 	"mythicalos.ai/ctl/internal/intent"
 	"mythicalos.ai/ctl/internal/ledger"
 	"mythicalos.ai/ctl/internal/netref"
@@ -197,6 +198,41 @@ func provenOurs(ctx context.Context, d Deps, l *ledger.Ledger, container, nonce 
 	return nil
 }
 
+// removalOutcome is what a removal's answer ESTABLISHES about the container — three facts, not two.
+//
+// CHECKING THE ERROR IS ONLY HALF THE FIX, AND THE FIRST VERSION OF THIS FIX ONLY DID THAT HALF.
+// Treating every non-nil answer as "it is still there" replaces one wrong answer with another:
+// the engine returns ErrAbsent for a 404 — a daemon that IS answering, saying the object is gone —
+// and ErrDaemonDown for a transport failure, where nothing about the container was established at
+// all. Reporting the first as "STILL THERE" sends an operator to hunt an object that does not
+// exist, and (in Recover) withholds the rebuild of a name that is free. Reporting the second as
+// "STILL THERE" states a fact nothing measured.
+type removalOutcome int
+
+const (
+	// removalGone — it is NOT at that name: removed by this call, or already absent. The name is
+	// free and a rebuild may proceed.
+	removalGone removalOutcome = iota
+	// removalRemains — the daemon ANSWERED and refused (still in use, denied, removal already in
+	// progress). The container is there and the name is held.
+	removalRemains
+	// removalUnknown — the daemon could not be asked. Nothing is established either way, so
+	// nothing may be asserted and no rebuild may be authorized.
+	removalUnknown
+)
+
+func classifyRemoval(err error) removalOutcome {
+	switch {
+	case err == nil:
+		return removalGone
+	case errors.Is(err, engine.ErrAbsent):
+		return removalGone
+	case errors.Is(err, engine.ErrDaemonDown):
+		return removalUnknown
+	}
+	return removalRemains
+}
+
 // imageRefusal is the one refusal both confirmation sites make about the image identity.
 //
 // AN EMPTY ANSWER AND A FAILED QUESTION ARE DIFFERENT FACTS and it says which. Neither may be
@@ -204,14 +240,22 @@ func provenOurs(ctx context.Context, d Deps, l *ledger.Ledger, container, nonce 
 // container was built from, and `id=` with nothing after it is not a smaller answer, it is a
 // record that will be believed and cannot be checked.
 func imageRefusal(container string, ierr error, kept string) error {
+	// THE REMEDY NAMED HERE IS THE ONE THAT WORKS, not the one that reads well. The container was
+	// created and still stands at its derived name, so "just re-run" is false: a re-run opens a
+	// FRESH intent under a new nonce (a keyed put supersedes), then fails to create over the
+	// occupied name — after which the surviving container matches no record and the unaccounted
+	// gate stops the next run. Removing it first is what actually clears the way.
+	const remedy = "\n  The container was created and STILL STANDS at that name: remove it with the container" +
+		"\n  runtime before re-running, or run 'mythical-ctl state repair'."
 	if ierr != nil {
 		return fmt.Errorf("bringup: the image %q was created from could not be read, so its provenance record would\n"+
 			"  carry no image identity — and a confirmed record nothing can check is worse than an\n"+
-			"  unfinished one. %s: %w", container, kept, errors.Join(errCannotAsk, ierr))
+			"  unfinished one. %s.%s\n"+
+			"  The image could not be read because: %w", container, kept, remedy, errors.Join(errCannotAsk, ierr))
 	}
 	return fmt.Errorf("bringup: the runtime reports NO image for %q. A provenance record confirmed with an empty\n"+
 		"  image identity says this container was built from nothing, which is not a fact anything\n"+
-		"  measured. %s.", container, kept)
+		"  measured. %s.%s", container, kept, remedy)
 }
 
 func barrier(d Deps, l *ledger.Ledger, what string) error {
@@ -491,12 +535,23 @@ func Run(ctx context.Context, l *ledger.Ledger, d Deps, launch Launcher, contain
 		// the object is gone while it was still standing, running or not, under this
 		// installation's labels. An operator told a container was removed does not go looking for
 		// it, and that is the whole cost: the report is the only thing they act on.
-		if rerr := d.Mut.ContainerRemove(ctx, container); rerr != nil {
-			return fmt.Errorf("bringup: %q did not verify, and REMOVING IT FAILED — the container this bring-up\n"+
-				"  created and owns is STILL THERE, unverified and unconfirmed. Nothing was confirmed and\n"+
-				"  nothing was started; the write-ahead intent is KEPT, so a recovery can finish or unwind\n"+
-				"  it. Remove it yourself, or re-run once the runtime accepts the removal.\n"+
-				"  The removal failed because: %v\n"+
+		rerr := d.Mut.ContainerRemove(ctx, container)
+		switch classifyRemoval(rerr) {
+		case removalRemains:
+			return fmt.Errorf("bringup: %q did not verify, and REMOVING IT WAS REFUSED — the container this\n"+
+				"  bring-up created and owns is STILL THERE, unverified and unconfirmed. Nothing was\n"+
+				"  confirmed and nothing was started.\n"+
+				"  REMOVE IT WITH THE CONTAINER RUNTIME BEFORE RE-RUNNING: while it stands at that name a\n"+
+				"  re-run cannot create the container, and the write-ahead record that ties this one to\n"+
+				"  this bring-up is replaced by the attempt.\n"+
+				"  The removal was refused because: %v\n"+
+				"  It failed to verify because: %w", container, rerr, verr)
+		case removalUnknown:
+			return fmt.Errorf("bringup: %q did not verify, and WHETHER IT WAS REMOVED IS UNKNOWN — the container\n"+
+				"  runtime did not answer, so nothing was established either way. Nothing was confirmed and\n"+
+				"  nothing was started.\n"+
+				"  Check with the container runtime whether it is still there before re-running.\n"+
+				"  The removal could not be asked for because: %v\n"+
 				"  It failed to verify because: %w", container, rerr, verr)
 		}
 		return fmt.Errorf("bringup: removed %q because it did not verify. Nothing was confirmed: %w", container, verr)
@@ -637,12 +692,27 @@ func Recover(ctx context.Context, l *ledger.Ledger, d Deps, container, netID, al
 		// same derived name. If the removal was refused, that name is still held by the container
 		// standing here, so the rebuild would meet itself as a same-name survivor. So the error
 		// says the container REMAINS and deliberately does not carry ErrRebuild.
-		if rerr := d.Mut.ContainerRemove(ctx, container); rerr != nil {
+		rerr := d.Mut.ContainerRemove(ctx, container)
+		switch classifyRemoval(rerr) {
+		case removalRemains:
+			// NO REBUILD. The caller acts on ErrRebuild by RE-CREATING from the launch spec, under
+			// the same derived name — which this container still holds, so the rebuild would meet
+			// it as a same-name survivor.
 			return fmt.Errorf("bringup: the intent for %q describes a container whose topology does not verify, and\n"+
-				"  REMOVING IT FAILED — it is STILL THERE, still holding that name. Nothing is confirmed,\n"+
-				"  the intent is KEPT, and no rebuild is asked for: re-creating under a name this\n"+
-				"  container still holds would meet it as a same-name survivor.\n"+
-				"  The removal failed because: %v\n"+
+				"  REMOVING IT WAS REFUSED — it is STILL THERE, still holding that name. Nothing is\n"+
+				"  confirmed, the intent is KEPT, and no rebuild is asked for: re-creating under a name\n"+
+				"  this container still holds would meet it as a same-name survivor.\n"+
+				"  The removal was refused because: %v\n"+
+				"  The topology does not verify because: %w", container, rerr, verr)
+		case removalUnknown:
+			// NO REBUILD EITHER, and for the opposite reason: not "the name is held" but "whether
+			// it is held was never established". A rebuild authorized on an unanswered question is
+			// the fail-open this whole sequence refuses.
+			return fmt.Errorf("bringup: the intent for %q describes a container whose topology does not verify, and\n"+
+				"  WHETHER IT WAS REMOVED IS UNKNOWN — the container runtime did not answer. Nothing is\n"+
+				"  confirmed, the intent is KEPT, and no rebuild is asked for: whether that name is free\n"+
+				"  was never established.\n"+
+				"  The removal could not be asked for because: %v\n"+
 				"  The topology does not verify because: %w", container, rerr, verr)
 		}
 		return fmt.Errorf("bringup: removed %q — it was created but its topology does not verify, and a\n"+
