@@ -238,75 +238,81 @@ func (b *Bridge) Flush(stdout, stderr io.Writer) {
 	if stderr == nil {
 		stderr = io.Discard
 	}
-	// ONE FILTER PER STREAM. The filter carries a rune split across two chunks, and stdout's
-	// chunks and stderr's interleave — a single shared filter would join the halves of a stdout
-	// rune across an intervening stderr write and mangle both.
-	var fout, ferr replayFilter
-	for _, c := range b.Record() {
-		w, f := stdout, &fout
+	rec := b.Record()
+	// PLANNED PER STREAM, THEN WRITTEN IN RECORD ORDER. The filtering has to see each stream whole,
+	// because a rune can be SPLIT ACROSS TWO WRITES of that stream (the record takes the raw bytes
+	// of every Write, and a Write may end part-way through one). Judging a chunk alone is wrong in
+	// both directions: a legitimate rune split in two is replaced twice over, and a bidi override
+	// split in two passes through as two innocent-looking fragments that the TERMINAL reassembles
+	// into exactly the override this exists to stop.
+	//
+	// The two streams are planned SEPARATELY because only same-stream bytes are adjacent to each
+	// other; joining a stdout fragment to a stderr one would invent a rune neither stream wrote.
+	out := sanitizeStream(rec, false)
+	errs := sanitizeStream(rec, true)
+	for _, c := range rec {
+		w, q := stdout, &out
 		if c.stderr {
-			w, f = stderr, &ferr
+			w, q = stderr, &errs
 		}
-		_, _ = io.WriteString(w, f.filter(c.text))
+		text := (*q)[0]
+		*q = (*q)[1:]
+		_, _ = io.WriteString(w, text)
 	}
-	_, _ = io.WriteString(stdout, fout.rest())
-	_, _ = io.WriteString(stderr, ferr.rest())
 }
 
-// replayFilter is Flush's per-stream rune filter.
+// sanitizeStream returns one sanitised string per chunk of the named stream, in order.
 //
-// IT IS STATEFUL FOR ONE REASON: a rune may be SPLIT ACROSS CHUNKS. The record takes the raw bytes
-// of every Write, and a Write can end part-way through a multi-byte rune. Judging each chunk on its
-// own would be wrong in both directions — a legitimate rune split in two would be replaced twice
-// over, and a bidi override split in two would pass through as two innocent-looking fragments that
-// the terminal reassembles into exactly the override this filter exists to stop. So a trailing
-// INCOMPLETE sequence is held until the next chunk of the same stream supplies the rest. Only a
-// truncated multi-byte sequence is ever held, and LF is a single ASCII byte that can never be part
-// of one — so no record boundary is ever delayed or moved.
-type replayFilter struct{ carry []byte }
-
-func (f *replayFilter) filter(s string) string {
-	p := []byte(s)
-	if len(f.carry) > 0 {
-		p = append(f.carry, p...)
-		f.carry = nil
-	}
-	var b strings.Builder
-	b.Grow(len(p))
-	for len(p) > 0 {
-		if !utf8.FullRune(p) {
-			// A PREFIX of a rune whose remaining bytes have not arrived. utf8.FullRune says false
-			// only for a truncated sequence — an invalid encoding is a full width-1 error rune — so
-			// this holds back exactly the split case and nothing else.
-			f.carry = append([]byte(nil), p...)
-			break
+// SEEING THE STREAM WHOLE WITHOUT MOVING ANYTHING. A rune that straddles a chunk boundary is
+// emitted with the chunk its FIRST BYTE fell in, and the chunk that held the remainder emits
+// nothing for it. That is the only assignment that keeps the replay in record order: the two
+// streams converge on a real terminal (and under `2>&1`), so a filter that HELD bytes back until
+// the next chunk of its own stream would emit them after an intervening chunk of the other one —
+// writing a later line before an earlier one. Measured on the first version of this fix, which did
+// hold: a fragment on stderr followed by a line on stdout replayed in the wrong order.
+//
+// Record boundaries survive: only a multi-byte remainder is ever attributed to an earlier chunk,
+// and LF is a single ASCII byte that can never be part of one.
+func sanitizeStream(rec []recordChunk, stderr bool) []string {
+	var data []byte
+	var ends []int
+	for _, c := range rec {
+		if c.stderr != stderr {
+			continue
 		}
-		r, size := utf8.DecodeRune(p)
+		data = append(data, c.text...)
+		ends = append(ends, len(data))
+	}
+	out := make([]string, len(ends))
+	var b strings.Builder
+	ci := 0
+	closeThrough := func(i int) {
+		for ci < len(ends) && i >= ends[ci] {
+			out[ci] = b.String()
+			b.Reset()
+			ci++
+		}
+	}
+	for i := 0; i < len(data); {
+		// A rune belongs to the chunk its first byte is in, so the boundary is crossed BEFORE the
+		// rune is decoded, never part-way through it.
+		closeThrough(i)
+		r, size := utf8.DecodeRune(data[i:])
 		switch {
 		case r == '\n':
 			b.WriteByte('\n')
 		case r == utf8.RuneError && size == 1, terminalHostile(r):
-			// A byte that is not valid UTF-8 becomes the placeholder too. It cannot be printed as
+			// A byte that is not valid UTF-8 becomes the placeholder too — it cannot be printed as
 			// itself, and passing it through raw would let a hostile rune cross a chunk boundary in
-			// pieces. This matches what the pane already draws: ranging over a string yields
-			// U+FFFD for such a byte, so screen and replay agree.
+			// pieces the terminal rejoins. It matches what the pane already draws: ranging over a
+			// string yields U+FFFD for such a byte, so screen and replay agree.
 			b.WriteRune('\ufffd')
 		default:
-			b.Write(p[:size])
+			b.Write(data[i : i+size])
 		}
-		p = p[size:]
+		i += size
 	}
-	return b.String()
-}
-
-// rest releases anything still held once the stream has no more chunks. What is left is a sequence
-// whose remainder never came, so it is not a rune and is replaced rather than emitted raw.
-func (f *replayFilter) rest() string {
-	if len(f.carry) == 0 {
-		return ""
-	}
-	out := strings.Repeat("\ufffd", len(f.carry))
-	f.carry = nil
+	closeThrough(len(data))
 	return out
 }
 

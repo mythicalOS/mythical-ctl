@@ -917,7 +917,9 @@ func TestStreamWriterRecordIsByteExact(t *testing.T) {
 //
 // AND IT MUST NOT MANGLE THE RECORD DOING IT. A sanitiser that touched LF would relocate every
 // line break in the replay — a different and worse defect than the one it fixes — so the newlines,
-// the stream each chunk belongs to, and their order are all asserted here beside the replacement.
+// the stream each chunk landed on, and the order WITHIN each stream are asserted here beside the
+// replacement. Order ACROSS the two streams is a separate property that two buffers cannot see;
+// TestFlushKeepsRecordOrderAcrossStreamsWhenARuneIsSplit asserts it into one.
 func TestFlushDoesNotReplayTerminalControlBytes(t *testing.T) {
 	b := NewBridge(context.Background(), blackHole{})
 	out := b.Writer(false)
@@ -993,6 +995,58 @@ func TestFlushJoinsARuneSplitAcrossChunksBeforeJudgingIt(t *testing.T) {
 	}
 	if e.String() != "\u00e9 rejoined\ncaf\u00e9\n" {
 		t.Fatalf("stderr replay %q — a legitimate rune split across two writes was mangled", e.String())
+	}
+}
+
+// THE REPLAY MUST STAY IN RECORD ORDER ACROSS THE TWO STREAMS, not merely within each one. This is
+// the defect the first version of this filter had, and the reason the assertion below flushes both
+// streams into ONE buffer: separate buffers erase the relative order of stdout and stderr, so a
+// test written that way cannot see the bug at all — and the streams really do converge, on the
+// operator's terminal and under `2>&1`.
+//
+// The mechanism was holding an incomplete rune back until the next chunk of its OWN stream. While
+// it was held, an intervening chunk of the other stream was written, so the held bytes surfaced
+// after a line that the verb wrote later. A rune is now emitted with the chunk its FIRST byte fell
+// in, which is where the verb wrote it.
+func TestFlushKeepsRecordOrderAcrossStreamsWhenARuneIsSplit(t *testing.T) {
+	// The minimal shape: stderr opens a multi-byte rune, stdout writes a whole line before stderr
+	// completes it.
+	b := NewBridge(context.Background(), blackHole{})
+	out, errw := b.Writer(false), b.Writer(true)
+	split := []byte("\u202e")
+	errw.Write(split[:1])
+	out.Write([]byte("ok\n"))
+	errw.Write(split[1:])
+
+	var merged bytes.Buffer
+	b.Flush(&merged, &merged)
+	if got, want := merged.String(), "\ufffdok\n"; got != want {
+		t.Fatalf("merged replay %q, want %q — the record has the stderr fragment BEFORE the stdout line, and the replay must too", got, want)
+	}
+
+	// And a lone invalid byte, which is never completed at all, behaves the same way.
+	b2 := NewBridge(context.Background(), blackHole{})
+	o2, e2 := b2.Writer(false), b2.Writer(true)
+	e2.Write([]byte{0xe2})
+	o2.Write([]byte("ok\n"))
+	var merged2 bytes.Buffer
+	b2.Flush(&merged2, &merged2)
+	if got, want := merged2.String(), "\ufffdok\n"; got != want {
+		t.Fatalf("merged replay %q, want %q — an unfinished sequence was deferred past a later write on the other stream", got, want)
+	}
+
+	// A longer interleaving, to show the rule is positional and not a special case for one shape.
+	b3 := NewBridge(context.Background(), blackHole{})
+	o3, e3 := b3.Writer(false), b3.Writer(true)
+	o3.Write([]byte("one\n"))
+	o3.Write(split[:2]) // stdout opens a rune...
+	e3.Write([]byte("two\n"))
+	o3.Write(split[2:]) // ...and closes it after stderr's line
+	o3.Write([]byte("three\n"))
+	var merged3 bytes.Buffer
+	b3.Flush(&merged3, &merged3)
+	if got, want := merged3.String(), "one\n\ufffdtwo\nthree\n"; got != want {
+		t.Fatalf("merged replay %q, want %q", got, want)
 	}
 }
 
