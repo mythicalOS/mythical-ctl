@@ -252,9 +252,9 @@ func TestMountsForPairwise(t *testing.T) {
 // parser does not read it. Two statements about one row, disagreeing, with only the wrong one
 // checkable.
 //
-// PORTED: tests/unit/bringup.bats: "the secret env file holds ONLY the product's declared keys, is 0600, and outlives the call" -> TestSecretsInjection (the ONLY-declared-keys half; the FILE half is a stated residual — there is no env file on this transport, so nothing has a mode or a lifetime to assert)
+// PORTED: tests/unit/bringup.bats: "the secret env file holds ONLY the product's declared keys, is 0600, and outlives the call" -> TestSecretsInjection -- the ONLY-declared-keys half; the FILE half is a stated residual — there is no env file on this transport, so nothing has a mode or a lifetime to assert
 // PORTED: tests/unit/bringup.bats: "a secret the product is not entitled to is REFUSED, not silently dropped" -> TestSecretsInjection
-// PORTED: tests/unit/bringup.bats: "a declared secret that is not set REFUSES and leaves no file behind" -> TestSecretsInjection (the refusal; no file to leave)
+// PORTED: tests/unit/bringup.bats: "a declared secret that is not set REFUSES and leaves no file behind" -> TestSecretsInjection -- the refusal; no file to leave
 func TestSecretsInjection(t *testing.T) {
 	r := newRig(t, "brokkr")
 	ctx := context.Background()

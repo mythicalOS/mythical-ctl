@@ -11,11 +11,11 @@ import (
 // this package's, so the tests live here rather than reaching through the provenance module.
 //
 // PORTED: tests/unit/prov.bats: "the key SELECTOR is validated too — it is one field split in two" -> TestSelectorIsValidated
-// PORTED: tests/unit/prov.bats: "the record KIND is validated too — it is serialized exactly like a field is" -> TestFieldGrammar (the forged-kind case)
-// PORTED: tests/unit/prov.bats: "a record carrying one field name TWICE is refused — it would answer for two objects" -> TestFieldGrammar (the dup case)
+// PORTED: tests/unit/prov.bats: "the record KIND is validated too — it is serialized exactly like a field is" -> TestFieldGrammar -- the forged-kind case
+// PORTED: tests/unit/prov.bats: "a record carrying one field name TWICE is refused — it would answer for two objects" -> TestFieldGrammar -- the dup case
 // PORTED: tests/unit/prov.bats: "neither editor deletes or supersedes a record it refuses to read" -> TestEditorsPreserveWhatTheyCannotRead
 // PORTED: tests/unit/prov.bats: "mi_led_field refuses to read a field out of a record that is not well-formed" -> TestNoFieldsWithoutTheGate
-// PORTED: tests/unit/prov.bats: "a listing refuses rather than silently omitting a record it cannot read" -> TestAmbiguityPreserves (the All case)
+// PORTED: tests/unit/prov.bats: "a listing refuses rather than silently omitting a record it cannot read" -> TestAmbiguityPreserves -- the All case
 // PORTED: tests/unit/prov.bats: "an identity the ledger cannot answer for is refused, not read as a fresh machine" -> TestIdentityCannotAnswer
 // PORTED: tests/unit/prov.bats: "two records answering one selector are ambiguous — nothing is read from them" -> TestAmbiguityPreserves
 // PORTED: tests/unit/prov.bats: "neither editor collapses a contradiction into one record" -> TestAmbiguityPreserves
@@ -24,7 +24,7 @@ import (
 // PORTED: tests/unit/prov.bats: "an identity record that answers nothing is not a fresh machine" -> TestIdentityCannotAnswer
 // PORTED: tests/unit/prov.bats: "a row that is only its KIND is a malformed record, not an absent one" -> TestBareKindRow
 // PORTED: tests/unit/prov.bats: "the bare-kind blind spot was in how a kind is RECOGNISED, so it was in every kind at once" -> TestBareKindRow
-// PORTED: tests/unit/prov.bats: "a blank body row is preserved by an editor rewrite, and reported" -> TestAmbiguityPreserves (the blank-row case)
+// PORTED: tests/unit/prov.bats: "a blank body row is preserved by an editor rewrite, and reported" -> TestAmbiguityPreserves -- the blank-row case
 // PORTED: tests/unit/prov.bats: "an EMPTY ledger body is not a blank row — the first write neither reports one nor makes one" -> TestEmptyBodyIsNotABlankRow
 
 func TestSelectorIsValidated(t *testing.T) {

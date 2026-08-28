@@ -29,7 +29,7 @@ import (
 // PORTED: tests/unit/policy.bats: "the wrong document type is rejected" -> TestSchemaRefusals
 // N/A: tests/unit/policy.bats: "the query functions refuse bad arity instead of aborting under set -u" -- compile-time arity
 // PORTED: tests/unit/policy.bats: "a policy that declares a gid returns it via mi_policy_family_gid" -> TestFamilyGID
-// PORTED: tests/unit/policy.bats: "family_gid absence is propagated as a failure, never a default" -> TestSchemaRefusals (absence rejects at parse — a Policy value always answers; no default exists anywhere)
+// PORTED: tests/unit/policy.bats: "family_gid absence is propagated as a failure, never a default" -> TestSchemaRefusals -- absence rejects at parse — a Policy value always answers; no default exists anywhere
 // PORTED: tests/unit/policy.bats: "a malformed or out-of-range family_gid is rejected at load, not waved through" -> TestSchemaRefusals
 // (policy.bats: "mi_accept_policy end to end: a matching chain is accepted and its records returned" — owned by the trust task)
 // (policy.bats: "mi_accept_policy refuses when the policy file's digest does not match the index" — owned by the trust task)

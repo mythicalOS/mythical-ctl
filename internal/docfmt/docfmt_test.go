@@ -27,7 +27,7 @@ import (
 // PORTED: tests/unit/doc.bats: "a 'many' key may appear zero, one or several times" -> TestCardinality
 // PORTED: tests/unit/doc.bats: "an unknown key is REJECTED, not ignored" -> TestParseRefusals
 // PORTED: tests/unit/doc.bats: "mi_doc_load's diagnostics report the label, not the raw file path" -> TestDiagnosticsUseLabel
-// PORTED: tests/unit/doc.bats: "a spec with the cardinality omitted is refused, not read as 'optional'" -> TestSchemaSelfCheck (the Go schema cannot omit Card syntactically — the zero value is One, the SAFE direction; what the row guards, a required key silently becoming optional, is structurally impossible, and the self-check pins the other spec bugs)
+// PORTED: tests/unit/doc.bats: "a spec with the cardinality omitted is refused, not read as 'optional'" -> TestSchemaSelfCheck -- the Go schema cannot omit Card syntactically — the zero value is One, the SAFE direction; what the row guards, a required key silently becoming optional, is structurally impossible, and the self-check pins the other spec bugs
 // N/A: tests/unit/doc.bats: "a spec written with spaces instead of TABs is refused, not read as unknown keys" -- the Go schema is a typed map, not TAB-framed text; there is no framing to get wrong
 // N/A: tests/unit/doc.bats: "a duplicate key in the spec is refused rather than resolving to the first" -- a Go map cannot hold a duplicate key
 // PORTED: tests/unit/doc.bats: "rolemount requires a role and an absolute path" -> TestDocTypes

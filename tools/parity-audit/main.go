@@ -286,13 +286,28 @@ func (k claimKind) String() string {
 	return "N/A"
 }
 
+// target is ONE resolvable PORTED target: a Go test FUNCTION name, plus the package token the
+// claim wrote before it, if it wrote one. Both halves come from the token the claim spelled — never
+// from a sentence beside it, which is the whole point of the grammar below.
+type target struct {
+	Pkg  string // the package path token written before the name, or "" when the claim wrote none
+	Name string
+}
+
+func (t target) String() string {
+	if t.Pkg == "" {
+		return t.Name
+	}
+	return t.Pkg + "." + t.Name
+}
+
 type claim struct {
 	Kind    claimKind
 	Pair    batsPair
-	Detail  string // the Go target expression (PORTED) or the argument (N/A)
+	Detail  string // the raw target column (PORTED) or the argument (N/A) — for messages only
 	GoFile  string
 	GoLine  int
-	Targets []string // PORTED only: the Go test function names named by Detail
+	Targets []target // PORTED only: the targets the column NAMES, parsed as tokens
 }
 
 // The inventory grammar. Leading whitespace is tolerated (one claim in the tree sits indented
@@ -413,15 +428,139 @@ func isGoIdent(s string) bool {
 	return len(ids) == 1 && ids[0] == s
 }
 
-// testNamesIn returns the Go test names appearing in a claim's target expression.
-func testNamesIn(expr string) []string {
-	var out []string
-	for _, id := range goIdentsIn(expr) {
-		if isGoTestName(id) {
-			out = append(out, id)
+// ---------------------------------------------------------------------------------------------
+// THE TARGET COLUMN IS A CLOSED, PROSE-FREE LIST. This is the smallest change that closes a whole
+// FAMILY of false greens rather than the three instances of it that were found.
+//
+// WHAT THE COLUMN USED TO BE. Free text, with every `TestFoo`-shaped identifier in it mined as a
+// target and every `pkg/path.` before one mined as a qualifier. Three demonstrations, all the same
+// shape and all made `bash check.sh parity` exit 0:
+//
+//   -> this behavior is not implemented; TestCLIUnknownVerbExitsTwo is only an unrelated
+//      neighboring test                       — a sentence DENYING the port satisfied the claim
+//   -> not internal/w.TestShared; the local TestShared is intended
+//                                             — a NEGATED qualifier resolved against what it negates
+//   -> TestOne[int] / TestOne via t.Run("...")— narrowed to `TestOne` and reported as resolved
+//
+// Prose has no polarity a scanner can read, and every rule invented to give it one (union the
+// qualifiers, reject contradictory ones, read only the first occurrence) was another rule ABOUT
+// prose waiting for a fourth shape. The reader therefore stops reading prose entirely: after `->`
+// comes a list of tokens and nothing else, and commentary moves behind the `--` delimiter the N/A
+// lines already use, where NOTHING reads it. A sentence can then neither satisfy, constrain nor
+// contradict a claim — the family is unreachable rather than individually ruled out.
+//
+// AND A NAME THIS PROGRAM CANNOT RESOLVE IS REFUSED, NEVER NARROWED. A generic instantiation and a
+// subtest spelling both name something `go test -list` does not enumerate; answering about the
+// parent function is the claim saying one thing and the resolver answering about another.
+// ---------------------------------------------------------------------------------------------
+
+// targetRune is what a target TOKEN may contain: identifier runes (Unicode letters, digits, `_`),
+// and the three bytes a package path adds. Deliberately rune-based, not an ASCII class: Go
+// identifiers are Unicode, and `TestAlphaÉ` must survive as one token rather than be cut at the É.
+func targetRune(r rune) bool { return identRune(r) || r == '.' || r == '/' || r == '-' }
+
+func isTargetSep(r rune) bool { return r == ' ' || r == '\t' || r == ',' || r == '+' }
+
+// splitNote divides the region after `->` at the first STANDALONE `--` field: everything before it
+// is the target list, everything after is commentary that nothing reads. Standalone, because `-` is
+// a legal package-path byte and a `--` glued to a token is a typo in a token, not a delimiter.
+func splitNote(region string) (list, note string, has bool) {
+	i := 0
+	for i < len(region) {
+		for i < len(region) && (region[i] == ' ' || region[i] == '\t') {
+			i++
+		}
+		start := i
+		for i < len(region) && region[i] != ' ' && region[i] != '\t' {
+			i++
+		}
+		if start == i {
+			break
+		}
+		if region[start:i] == "--" {
+			return region[:start], region[i:], true
 		}
 	}
-	return out
+	return region, "", false
+}
+
+// isPackagePathToken reports whether p can be a package path: non-empty segments separated by `/`,
+// none of them a dot-path. The RUNE set is already guaranteed by the caller.
+func isPackagePathToken(p string) bool {
+	if p == "" || strings.HasPrefix(p, "/") || strings.HasSuffix(p, "/") {
+		return false
+	}
+	for _, seg := range strings.Split(p, "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			return false
+		}
+	}
+	return true
+}
+
+// wantTarget is the one sentence every refusal below ends with, so the author is told the shape
+// rather than only that theirs was wrong.
+const wantTarget = "a target is `TestName` or `pkg/path.TestName`; put anything else — an aside, a file name, a sentence — after a ` -- ` delimiter, where it is commentary and nothing resolves it"
+
+// parseTargetToken turns ONE token into a target, or explains why it is not one.
+func parseTargetToken(tok string) (target, string) {
+	if strings.ContainsAny(tok, "[]") {
+		return target{}, fmt.Sprintf("%q is a generic instantiation, and `go test -list` enumerates the FUNCTION — so this audit could only ever resolve the function name while the claim named the instantiation, which is the claim saying one thing and the resolver answering about another. Name the function. %s", tok, wantTarget)
+	}
+	for _, r := range tok {
+		if !targetRune(r) {
+			return target{}, fmt.Sprintf("%q is not a target token. %s", tok, wantTarget)
+		}
+	}
+	pkg, name := "", tok
+	if i := strings.LastIndexByte(tok, '.'); i >= 0 {
+		pkg, name = tok[:i], tok[i+1:]
+		if pkg == "" {
+			return target{}, fmt.Sprintf("%q opens with a dot and names no package before it. %s", tok, wantTarget)
+		}
+		if !isPackagePathToken(pkg) {
+			return target{}, fmt.Sprintf("%q does not qualify a name with a package path (%q is not one). %s", tok, pkg, wantTarget)
+		}
+	}
+	if strings.Contains(name, "/") {
+		if parent, _, _ := strings.Cut(name, "/"); isGoIdent(parent) && isGoTestName(parent) {
+			return target{}, fmt.Sprintf("%q names the SUBTEST %q — `go test -list` enumerates test FUNCTIONS, and a subtest exists only while its parent runs, so this audit could only ever resolve %q and report the claim as satisfied. Deleting that subtest would leave the line green. Name the test function. %s", tok, name, parent, wantTarget)
+		}
+		return target{}, fmt.Sprintf("%q is not a target token. %s", tok, wantTarget)
+	}
+	if !isGoIdent(name) {
+		return target{}, fmt.Sprintf("%q does not end in a Go identifier. %s", tok, wantTarget)
+	}
+	if !isGoTestName(name) {
+		// ONE MESSAGE FOR BOTH READERS. A prose word landing here ("this", "not", "via") needs to
+		// hear that the COLUMN takes tokens; a near-miss like `Testfoo` needs to hear Go's actual
+		// rule. Saying both costs a clause and stops the refusal reading as a non-sequitur to
+		// whichever author hit it.
+		return target{}, fmt.Sprintf("%q is not a target token: it is not a Go TEST name — the testing package requires `Test` followed by nothing, or by a character that is not a lower-case letter, and ignores everything else in silence. %s", tok, wantTarget)
+	}
+	return target{Pkg: pkg, Name: name}, ""
+}
+
+// parseTargetColumn parses the whole region after `->`, or returns the refusal that names the token
+// which is not a target.
+func parseTargetColumn(region string) ([]target, string) {
+	list, note, has := splitNote(region)
+	if has && strings.TrimSpace(note) == "" {
+		return nil, "its ` -- ` commentary field is empty; drop the delimiter or say something after it"
+	}
+	fields := strings.FieldsFunc(list, isTargetSep)
+	if len(fields) == 0 {
+		return nil, "it names no target at all before the ` -- ` delimiter, so nothing about it is checkable. " + wantTarget
+	}
+	var out []target
+	for _, f := range fields {
+		tg, why := parseTargetToken(f)
+		if why != "" {
+			return nil, why
+		}
+		out = append(out, tg)
+	}
+	return out, ""
 }
 
 // minNAReason is a substance floor, not a style rule. "N/A -- n/a" satisfies a syntax check and
@@ -625,14 +764,10 @@ func parseInventory(rel string, content []byte, view *astView) ([]claim, []malfo
 		}
 		if claimable {
 			if m := invPorted.FindStringSubmatch(text); m != nil {
-				targets := testNamesIn(m[3])
-				if len(targets) == 0 {
-					bad = append(bad, malformed{rel, line, text})
-					continue
-				}
-				if sub := subtestTarget(m[3], targets); sub != "" {
+				targets, why := parseTargetColumn(m[3])
+				if why != "" {
 					bad = append(bad, malformed{rel, line,
-						fmt.Sprintf("its target names the subtest %q — `go test -list` enumerates test FUNCTIONS, and a subtest exists only while its parent runs, so this audit can only ever resolve %q and report a claim about the subtest as satisfied. Deleting that subtest would leave this line green. Name the test function. || %s", sub, sub[:strings.IndexByte(sub, '/')], text)})
+						fmt.Sprintf("its PORTED target column is not a closed list of targets: %s || %s", why, text)})
 					continue
 				}
 				claims = append(claims, claim{
@@ -1104,30 +1239,24 @@ func isTestTParam(fn *ast.FuncDecl) bool {
 // A BASENAME IS NOT A PACKAGE. `cmd/probe` and `internal/probe` must never collapse onto whichever
 // was seen last, so a multi-segment token must match a real path SUFFIX, and a bare segment matches
 // only when it is unambiguous across the whole module.
-func candidatePackages(all map[string]map[string]bool, goFile, detail, target string) map[string]bool {
+func candidatePackages(all map[string]map[string]bool, goFile string, tg target) map[string]bool {
 	bySeg := map[string][]string{}
 	for p := range all {
 		bySeg[path.Base(p)] = append(bySeg[path.Base(p)], p)
 	}
 	out := map[string]bool{}
-	// FOR THIS TARGET ONLY. A claim naming two tests may qualify one of them and not the other,
-	// and the unqualified one must not borrow the qualified one's package.
+	// FOR THIS TARGET ONLY, AND FROM ITS OWN TOKEN. A claim naming two tests may qualify one of
+	// them and not the other, and the unqualified one must not borrow the qualified one's package.
+	// The qualification is part of the token the claim spelled, so no arrangement of words
+	// anywhere else in the line can supply, widen or contradict one.
 	//
-	// A QUALIFICATION CONSTRAINS; IT DOES NOT WIDEN. The first version of this fix added the
-	// qualified package BESIDE the claiming file's own one, which left the hole open facing the
-	// other way: `internal/w.TestShared`, written in internal/x, stayed green after
-	// internal/w.TestShared was DELETED, because a namesake in internal/x satisfied it. A claim
-	// that says where its target lives is answered by THAT package or by nothing.
-	// THE TARGET'S FIRST OCCURRENCE DECIDES, and the rest of the claim is never read for it. See
-	// qualifierFor: this is a decision NOT to scan prose, which is what makes the whole family of
-	// prose-shaped false greens unreachable instead of individually ruled out.
-	if tok, ok := qualifierFor(detail, target); ok && tok != "" {
-		// A QUALIFICATION CONSTRAINS; IT DOES NOT WIDEN. An earlier version added the qualified
-		// package BESIDE the claiming file's own, which left the hole facing the other way:
-		// `internal/w.TestShared` written in internal/x stayed green after internal/w.TestShared
-		// was DELETED, because a namesake in internal/x satisfied it. A claim that says where its
-		// target lives is answered by THAT package or by nothing.
-		addTo(all, bySeg, out, tok)
+	// A QUALIFICATION CONSTRAINS; IT DOES NOT WIDEN. An earlier version added the qualified package
+	// BESIDE the claiming file's own, which left the hole facing the other way:
+	// `internal/w.TestShared`, written in internal/x, stayed green after internal/w.TestShared was
+	// DELETED, because a namesake in internal/x satisfied it. A claim that says where its target
+	// lives is answered by THAT package or by nothing.
+	if tg.Pkg != "" {
+		addTo(all, bySeg, out, tg.Pkg)
 		return out
 	}
 	// UNQUALIFIED: the claiming file's own package, and nothing else. Resolved by the SAME rule as
@@ -1194,107 +1323,6 @@ func resolvePathToken(all map[string]map[string]bool, tok string) (string, bool)
 		return found, true
 	}
 	return "", false
-}
-
-// qualifierFor returns the package token qualifying this target, read at the target's FIRST
-// OCCURRENCE in the claim and nowhere else.
-//
-// THE FIRST OCCURRENCE IS THE DESIGNATED REGION, AND NOTHING AFTER IT IS READ. Three false-green
-// classes have now been found in this reader, all the same shape: it approximated a grammar by
-// scanning prose, and prose has no polarity a scanner can see. `TestShared (not
-// internal/w.TestShared; it is local)` says the target is local and also spells a qualification of
-// it; a reader that looks at the whole claim cannot tell which half was meant, and every rule
-// invented to tell them apart is another rule ABOUT prose waiting for a fourth shape.
-//
-// So the reader stops looking. A claim states its target once, where the claim is made; whatever a
-// rationale says afterwards is commentary and is not scanned for that target at all. No sentence
-// anyone writes can then satisfy, constrain or contradict a claim — the family of findings is
-// unreachable rather than individually handled. (This is positional, not punctuational: a
-// delimiter like "up to the first parenthesis" cannot be used, because real claims in this tree
-// put a second target AFTER a parenthetical and one writes its whole target inside parentheses.)
-//
-// BOTH IDENTIFIER BOUNDARIES ARE CHECKED. Only the right-hand one was, so `TestFoo` matched inside
-// `NotTestFoo` — and that spurious "bare occurrence" made a legitimately qualified claim resolve to
-// nothing. An occurrence counts only when it is a WHOLE identifier: no identifier rune on either
-// side, except the `.` that carries a qualification.
-func qualifierFor(detail, target string) (tok string, found bool) {
-	i, ok := firstWholeOccurrence(detail, target)
-	if !ok {
-		return "", false
-	}
-	if i == 0 || detail[i-1] != '.' {
-		return "", true
-	}
-	k := i - 1
-	for k > 0 && isPathByte(detail[k-1]) {
-		k--
-	}
-	return detail[k : i-1], true
-}
-
-// firstWholeOccurrence is WHERE A CLAIM STATES ITS TARGET: the first place the target name appears
-// as a whole identifier. Written once and shared, because every reader of the target column has to
-// agree about that position — two copies of this rule would be two chances to fix one of them.
-//
-// BOTH IDENTIFIER BOUNDARIES ARE CHECKED. Only the right-hand one was, so `TestFoo` matched inside
-// `NotTestFoo` — and that spurious "bare occurrence" made a legitimately qualified claim resolve to
-// nothing. An occurrence counts only when it is a WHOLE identifier: no identifier rune on either
-// side, except the `.` that carries a qualification (a `.` is not an identifier rune, so a
-// qualification passes; a letter, digit or underscore means the match is the TAIL of a longer name).
-func firstWholeOccurrence(detail, target string) (int, bool) {
-	for i := 0; i+len(target) <= len(detail); i++ {
-		if !strings.HasPrefix(detail[i:], target) {
-			continue
-		}
-		if r, _ := utf8.DecodeRuneInString(detail[i+len(target):]); identRune(r) {
-			continue
-		}
-		if i > 0 {
-			r, _ := utf8.DecodeLastRuneInString(detail[:i])
-			if identRune(r) {
-				continue
-			}
-		}
-		return i, true
-	}
-	return 0, false
-}
-
-// subtestTarget reports the first target written as a SUBTEST reference — `TestOne/case` — or "".
-//
-// A SUBTEST IS NOT A NAME THIS PROGRAM CAN RESOLVE, AND IT MUST NOT PRETEND OTHERWISE. `go test
-// -list` enumerates test FUNCTIONS; a subtest exists only while its parent is running, so no
-// listing can testify about one. The name was therefore narrowed to its parent and reported as
-// resolved: `TestOne/deletes_the_socket` was answered by `TestOne`, and deleting the subtest the
-// inventory line actually names left the claim green. The claim said one thing and the resolver
-// answered about another — the shape every false green found in this reader has had.
-//
-// So it is REFUSED rather than narrowed, which is the fail-closed direction: the author is told to
-// name the test function, and the row stays visibly unclaimed until they do. This is not another
-// rule about what the prose in the target column means — it is the rule that a name this program
-// cannot resolve is never silently replaced by one it can.
-//
-// READ AT THE TARGET'S FIRST OCCURRENCE, like every other question asked about the target, so a
-// rationale that mentions a subtest further along is commentary and is not scanned.
-func subtestTarget(detail string, targets []string) string {
-	for _, t := range targets {
-		i, ok := firstWholeOccurrence(detail, t)
-		if !ok || detail[i+len(t):] == "" || detail[i+len(t)] != '/' {
-			continue
-		}
-		j := i + len(t)
-		for j < len(detail) && detail[j] != ' ' && detail[j] != '\t' {
-			j++
-		}
-		return detail[i:j]
-	}
-	return ""
-}
-
-// isPathByte is what a package path may contain in a claim.
-func isPathByte(b byte) bool {
-	return b >= 'A' && b <= 'Z' || b >= 'a' && b <= 'z' || b >= '0' && b <= '9' ||
-		b == '_' || b == '.' || b == '/' || b == '-'
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1539,7 +1567,7 @@ func auditCoverage(r *report, pairs []batsPair, claims []claim, bad []malformed,
 			continue
 		}
 		for _, t := range c.Targets {
-			cands := candidatePackages(goTests, c.GoFile, c.Detail, t)
+			cands := candidatePackages(goTests, c.GoFile, t)
 			found := false
 			for p := range cands {
 				// BOTH WITNESSES, WITHIN ONE LANE. `go test -list` says that lane registers the
@@ -1548,7 +1576,7 @@ func auditCoverage(r *report, pairs []batsPair, claims []claim, bad []malformed,
 				// printed by one lane's init and declared in a file only another lane compiles
 				// satisfies both halves while no lane runs a test by that name.
 				for _, ln := range testLanes {
-					if ln.list[p][t] && ln.src[p][t] {
+					if ln.list[p][t.Name] && ln.src[p][t.Name] {
 						found = true
 						break
 					}
@@ -1562,7 +1590,7 @@ func auditCoverage(r *report, pairs []batsPair, claims []claim, bad []malformed,
 			}
 			var elsewhere []string
 			for p, names := range goTests {
-				if names[t] {
+				if names[t.Name] {
 					elsewhere = append(elsewhere, p)
 				}
 			}

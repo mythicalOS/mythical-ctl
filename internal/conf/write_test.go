@@ -29,19 +29,19 @@ import (
 // PORTED: tests/unit/config_family.bats: "a key outside the core spec is refused" -> TestFamilyAddValidation
 // PORTED: tests/unit/config_family.bats: "a value invalid for its type is refused" -> TestFamilyAddValidation
 // PORTED: tests/unit/config_family.bats: "an existing file with an off-schema key is never modified" -> TestFamilyAddNeverModifiesUnparseable
-// PORTED: tests/unit/config_family.bats: "a change landing under us is refused, not overwritten" -> TestFamilyAddCASRefusesConcurrentChange (the CAS seam is exercised at the narrowest point Go exposes)
+// PORTED: tests/unit/config_family.bats: "a change landing under us is refused, not overwritten" -> TestFamilyAddCASRefusesConcurrentChange -- the CAS seam is exercised at the narrowest point Go exposes
 // N/A: tests/unit/config_family.bats: "bytes swapped in during the copy are validated, not persisted" -- the Go writer reads ONCE and builds from those bytes; there is no copy window with a second read to swap under (structural: single os.ReadFile)
 // PORTED: tests/unit/config_family.bats: "same-value no-op does not report success if the file changed under us" -> TestFamilyAddCASRefusesConcurrentChange
-// PORTED: tests/unit/config_family.bats: "a symlink planted after the first identity check is still refused before the replace" -> TestFamilySymlinkRefused (the pre-replace identity re-check is the same code path; the plant-between-checks window is the accepted pathname residual, as in bash)
+// PORTED: tests/unit/config_family.bats: "a symlink planted after the first identity check is still refused before the replace" -> TestFamilySymlinkRefused -- the pre-replace identity re-check is the same code path; the plant-between-checks window is the accepted pathname residual, as in bash
 // PORTED: tests/unit/config_family.bats: "a symlinked mythical.conf is refused, not followed and adopted" -> TestFamilySymlinkRefused
 // PORTED: tests/unit/config_family.bats: "a hardlinked mythical.conf is refused, leaving the other name untouched" -> TestFamilyHardlinkRefused
 // PORTED: tests/unit/config_family.bats: "an existing file that does not parse is never overwritten" -> TestFamilyAddNeverModifiesUnparseable
 // PORTED: tests/unit/config_family.bats: "mi_conf_family_load validates against the core spec" -> TestLoadFamilyValid
 // PORTED: tests/unit/config_family.bats: "writing without the family lock is refused" -> TestWritesRequireTheLock
-// PORTED: tests/unit/config_family.bats: "a forged lock token does not authorize a write" -> TestWritesRequireTheLock (a nil/foreign Held fails famlock.Assert — the sealed-type port of the token forgery test)
+// PORTED: tests/unit/config_family.bats: "a forged lock token does not authorize a write" -> TestWritesRequireTheLock -- a nil/foreign Held fails famlock.Assert — the sealed-type port of the token forgery test
 // N/A: tests/unit/config_family.bats: "mi_lock_assert_held refuses a no-argument call in its own words" -- Go arity is compile-time
 // N/A: tests/unit/config_family.bats: "the ledger's lock refusal is unchanged by the extraction" -- bash source-extraction regression; Go has no extraction seam
-// PORTED: tests/unit/config_family.bats: "a foreign-owned mythical.conf is refused" -> TestForeignOwnedRefused (drives FamilyAdd, the public door the row calls, and asserts the file is unchanged. STATED RESIDUAL — the reference could shim `ls`; this gate asks the kernel, so a foreign-owned fixture needs root and the test SKIPS otherwise. That the gate is APPLIED on that door at all is proved unprivileged by TestFamilySymlinkRefused)
+// PORTED: tests/unit/config_family.bats: "a foreign-owned mythical.conf is refused" -> TestForeignOwnedRefused + TestFamilySymlinkRefused -- the first drives FamilyAdd, the public door the row calls, and asserts the file is unchanged. STATED RESIDUAL — the reference could shim `ls`; this gate asks the kernel, so a foreign-owned fixture needs root and the test SKIPS otherwise, which is why the second is named too: it proves unprivileged that the gate is APPLIED on that door at all
 // PORTED: tests/unit/config_family.bats: "a non-regular mythical.conf is refused" -> TestNonRegularRefused
 //
 // Inventory — tests/unit/config_product.bats:
@@ -52,7 +52,7 @@ import (
 // PORTED: tests/unit/config_product.bats: "the file lands at 0660 with the family gid when chgrp succeeds" -> TestProductOwnershipApplied
 // PORTED: tests/unit/config_product.bats: "when chgrp fails the write reports rc 5 and leaves the file at 0600" -> TestProductOwnershipFailure
 // N/A: tests/unit/config_product.bats: "a failure while re-reading the body refuses instead of writing a truncated file" -- the Go writer never re-reads: the body is built from the one snapshot already in memory (structural)
-// PORTED: tests/unit/config_product.bats: "an oversized product conf is refused, and leaves no snapshot behind" -> TestProductOversizedRefused (Go's snapshot is in-memory; "no snapshot file behind" has no on-disk artifact to leak)
+// PORTED: tests/unit/config_product.bats: "an oversized product conf is refused, and leaves no snapshot behind" -> TestProductOversizedRefused -- Go's snapshot is in-memory; "no snapshot file behind" has no on-disk artifact to leak
 // PORTED: tests/unit/config_product.bats: "a retry after rc 5 repairs the mode and the group" -> TestProductOwnershipFailure
 // PORTED: tests/unit/config_product.bats: "a no-op merge does not rewrite the file" -> TestProductNoOpKeepsBytesAndInode
 // N/A: tests/unit/config_product.bats: "a chmod failure after the bytes have landed reports rc 5, not rc 1" -- the row induces its two states with a PATH shim over /bin/chmod, and this port calls the syscall: there is nothing to shim, and an unprivileged process cannot make chmod fail on a file it owns. So StateModeFailed and StateBothFailed are UNREACHABLE from a test here, and claiming this row as PORTED would overstate what runs. A round-1 pass did claim it, against TestProductOwnershipFailure, which induces only the THIRD state (StateGroupFailed) — a weaker assertion wearing the row's name. What IS guarded without the shim is the part that can still regress silently: TestOwnershipErrorNamesEachState pins all three states' DIAGNOSTICS — each state's own facts and the ABSENCE of the other states' — and TestProductOwnershipFailure pins the one state that can be induced end to end, classification included (StateGroupFailed, bytes committed, 0600 fallback, repair on retry). STATED RESIDUAL: which state ProductAdd SELECTS for a chmod failure is not pinned by anything, because nothing unprivileged can induce that failure; the two chmod branches carry their wording and nothing more
@@ -68,11 +68,11 @@ import (
 // PORTED: tests/unit/config_product.bats: "a marker-prefix line in the body is rejected, not treated as a comment" -> TestScanRefusals
 // N/A: tests/unit/config_product.bats: "a call with too few arguments refuses instead of aborting under set -u" -- compile-time arity
 // PORTED: tests/unit/config_product.bats: "a set into a torn file is refused rather than re-blessing damage" -> TestProductTornAndMalformed
-// PORTED: tests/unit/config_product.bats: "a launch-spec key is not in the product spec, so reading it is a rejection" -> TestProductAddRefusals (spec-driven: an off-spec key rejects on read and write alike)
+// PORTED: tests/unit/config_product.bats: "a launch-spec key is not in the product spec, so reading it is a rejection" -> TestProductAddRefusals -- spec-driven: an off-spec key rejects on read and write alike
 // PORTED: tests/unit/config_product.bats: "a symlinked product conf is refused on both read and write" -> TestProductSymlinkRefused
 // PORTED: tests/unit/config_product.bats: "a product conf hardlinked to mythical.conf is refused" -> TestProductHardlinkRefused
 // PORTED: tests/unit/config_product.bats: "a product conf hardlinked to a file under bin/ is refused" -> TestProductHardlinkRefused
-// PORTED: tests/unit/config_product.bats: "a product conf owned by another uid is refused on both read and write" -> TestForeignOwnedRefused (drives LoadProduct AND ProductAdd — both directions the row names. Same STATED RESIDUAL: root-only; the gate's application on both doors is proved unprivileged by TestProductSymlinkRefused)
+// PORTED: tests/unit/config_product.bats: "a product conf owned by another uid is refused on both read and write" -> TestForeignOwnedRefused + TestProductSymlinkRefused -- the first drives LoadProduct AND ProductAdd, both directions the row names. Same STATED RESIDUAL: root-only, which is why the second is named too — it proves the gate's application on both doors unprivileged
 // N/A: tests/unit/config_product.bats: "an unreadable owner is refused rather than assumed to be ours" -- the bash parsed `ls` output which could be garbled; os.Lstat's Stat_t either exists or the assertion fails closed (that fail-closed branch is in identityOK and cannot be induced portably)
 // PORTED: tests/unit/config_product.bats: "a matching marker reads silently" -> TestProductLoadRoundTrip
 // PORTED: tests/unit/config_product.bats: "a stale marker over a parseable body is torn, not accepted" -> TestProductTornAndMalformed
@@ -87,7 +87,7 @@ import (
 // N/A: tests/unit/config_product.bats: "mi_conf_product_load refuses bad arity instead of aborting under set -u" -- compile-time arity
 // N/A: tests/unit/config_product.bats: "no live-file CONTENT read happens outside the snapshot" -- the bash proved this with a tracing shim over its many readers; the Go load performs exactly one content read (SnapProduct) by construction, and the writer's only live-file reads are the digest CAS and Lstat identity
 // PORTED: tests/unit/config_product.bats: "a file that does not end in a newline is torn, not a parse error" -> TestProductTornAndMalformed
-// PORTED: tests/unit/config_product.bats: "a failing load still returns its contract code and leaves no snapshot behind" -> TestProductTornAndMalformed (typed errors ARE the contract codes; no on-disk snapshot exists to leak)
+// PORTED: tests/unit/config_product.bats: "a failing load still returns its contract code and leaves no snapshot behind" -> TestProductTornAndMalformed -- typed errors ARE the contract codes; no on-disk snapshot exists to leak
 // PORTED: tests/unit/config_product.bats: "a missing product conf reports rc 3, distinct from torn" -> TestProductMissingDistinct
 // PORTED: tests/unit/config_product.bats: "writing without the family lock is refused" -> TestWritesRequireTheLock
 // PORTED: tests/unit/config_product.bats: "a FIFO at the product path is refused, and does not block" -> TestNonRegularRefused
@@ -106,7 +106,7 @@ import (
 // PORTED: tests/unit/config_contract.bats: "a <product>.conf of exactly 1048576 bytes is accepted — the ceiling is inclusive" -> TestProductOversizedRefused
 // PORTED: tests/unit/config_contract.bats: "a <product>.conf of 1048577 bytes is refused outright, marker or no marker" -> TestProductOversizedRefused
 // PORTED: tests/unit/config_contract.bats: "the doc path in the shipped torn-file message resolves to a real file" -> TestTornMessageNamesRealDoc
-// PORTED: tests/unit/config_contract.bats: "every row of the document's marker-precedence table matches the CLI" -> TestProductTornAndMalformed (the table's rows: match+parse=accept, absent/mismatch=torn, match+broken=malformed)
+// PORTED: tests/unit/config_contract.bats: "every row of the document's marker-precedence table matches the CLI" -> TestProductTornAndMalformed -- the table's rows: match+parse=accept, absent/mismatch=torn, match+broken=malformed
 // PORTED: tests/unit/config_contract.bats: "the product-name grammar the document publishes is the grammar the CLI enforces" -> internal/layout.TestProductNameGrammar
 
 func lockFor(t *testing.T, home string) famlock.Held {

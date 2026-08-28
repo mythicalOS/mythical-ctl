@@ -24,7 +24,7 @@ import (
 // Inventory — tests/unit/copy.bats (this task owns the file WHOLE; every one of its 87 tests
 // is claimed exactly once below):
 // PORTED: tests/unit/copy.bats: "the copy image comes from the verified family index" -> TestImageFromIndex
-// PORTED: tests/unit/copy.bats: "an index that does not verify yields no copy image" -> TestImageFromIndex (structural: Image takes the acceptors' sealed *trust.Index, so a refused index yields no value to pass — the acceptor's own refusal is re-measured here)
+// PORTED: tests/unit/copy.bats: "an index that does not verify yields no copy image" -> TestImageFromIndex -- structural: Image takes the acceptors' sealed *trust.Index, so a refused index yields no value to pass — the acceptor's own refusal is re-measured here
 // PORTED: tests/unit/copy.bats: "an unobtainable copy image STOPS — no fallback to an unverified copy path" -> TestAvailable
 // PORTED: tests/unit/copy.bats: "a pull failure keeps the registry's own words" -> TestAvailable
 // PORTED: tests/unit/copy.bats: "the copy container mounts the source READ-ONLY, staging writable, and --network none" -> TestCopyLaunchContract

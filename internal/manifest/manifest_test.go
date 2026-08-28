@@ -20,7 +20,7 @@ import (
 // PORTED: tests/unit/manifest.bats: "launched=false reports rc 3 — the not-launched contract code" -> TestLaunched
 // PORTED: tests/unit/manifest.bats: "launched=true reports rc 0" -> TestLaunched
 // PORTED: tests/unit/manifest.bats: "a missing launched field is refused — launch state is never inferred" -> TestSchemaRefusals
-// PORTED: tests/unit/manifest.bats: "T5: mi_manifest_launched refuses a non-boolean launch state rather than reporting it launched" -> TestSchemaRefusals (the bool type refuses at parse; no Manifest value with a non-boolean state can exist)
+// PORTED: tests/unit/manifest.bats: "T5: mi_manifest_launched refuses a non-boolean launch state rather than reporting it launched" -> TestSchemaRefusals -- the bool type refuses at parse; no Manifest value with a non-boolean state can exist
 // PORTED: tests/unit/manifest.bats: "a manifest selecting only entitled things passes the check" -> TestEntitlementCheck
 // PORTED: tests/unit/manifest.bats: "a manifest asking for a role it is not entitled to is rejected" -> TestEntitlementCheck
 // PORTED: tests/unit/manifest.bats: "a manifest asking for a secret outside its namespace is rejected" -> TestEntitlementCheck
@@ -28,17 +28,17 @@ import (
 // PORTED: tests/unit/manifest.bats: "a manifest for a product the policy index does not know is rejected" -> TestEntitlementCheck
 // PORTED: tests/unit/manifest.bats: "a manifest declaring bindability is rejected" -> TestSchemaRefusals
 // PORTED: tests/unit/manifest.bats: "a manifest cannot choose a network at all" -> TestSchemaRefusals
-// PORTED: tests/unit/manifest.bats: "a manifest requiring a newer core is refused, even when fully authentic" -> internal/trust.TestNewerCoreRefusedThroughDoorWithoutFloorMovement (the door wiring; the comparator itself is TestCoreOK)
+// PORTED: tests/unit/manifest.bats: "a manifest requiring a newer core is refused, even when fully authentic" -> internal/trust.TestNewerCoreRefusedThroughDoorWithoutFloorMovement + TestCoreOK -- the first is the door wiring; the second is the comparator itself
 // PORTED: tests/unit/manifest.bats: "a manifest with no min_core is refused — unstated must not mean any core will do" -> TestSchemaRefusals
 // PORTED: tests/unit/manifest.bats: "the version comparator orders components numerically, not lexically" -> TestVersionComparator
-// PORTED: tests/unit/manifest.bats: "the core version tracks the entrypoint's VERSION" -> TestCoreOK (CoreOK takes internal/version.Version itself — there is no second constant to drift; the test compares against that exact value)
-// PORTED: tests/unit/manifest.bats: "coreversion accepts MAJOR[.MINOR[.PATCH]] and nothing else" -> (owned by internal/docfmt.TestDocTypes)
+// PORTED: tests/unit/manifest.bats: "the core version tracks the entrypoint's VERSION" -> TestCoreOK -- CoreOK takes internal/version.Version itself — there is no second constant to drift; the test compares against that exact value
+// PORTED: tests/unit/manifest.bats: "coreversion accepts MAJOR[.MINOR[.PATCH]] and nothing else" -> internal/docfmt.TestDocTypes -- the coreversion grammar is a docfmt field type, so the row is owned there
 // PORTED: tests/unit/manifest.bats: "names are derived from the installation identity plus the product" -> TestNaming
 // PORTED: tests/unit/manifest.bats: "two installations derive different names for the same product and role" -> TestNaming
-// PORTED: tests/unit/manifest.bats: "the network alias is the bare product name, not the derived one" -> TestNaming (the mythical-<product> ruling, asserted verbatim)
+// PORTED: tests/unit/manifest.bats: "the network alias is the bare product name, not the derived one" -> TestNaming -- the mythical-<product> ruling, asserted verbatim
 // PORTED: tests/unit/manifest.bats: "name derivation refuses inputs that are not identifiers" -> TestNaming
 // PORTED: tests/unit/manifest.bats: "Fix 5: mi_manifest_core_ok refuses a min_core value with a stray 4th component" -> TestCoreOK
-// PORTED: tests/unit/manifest.bats: "Fix 6: MI_CORE_VERSION is itself a valid coreversion" -> TestCoreOK (the binary version normalizes to a valid coreversion, asserted)
+// PORTED: tests/unit/manifest.bats: "Fix 6: MI_CORE_VERSION is itself a valid coreversion" -> TestCoreOK -- the binary version normalizes to a valid coreversion, asserted
 
 func man(overrides map[string]string, extra ...string) []byte {
 	base := map[string]string{

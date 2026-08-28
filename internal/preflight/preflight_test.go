@@ -16,11 +16,11 @@ import (
 // PORTED: tests/unit/preflight.bats: "a version we cannot parse is refused, never treated as new enough" -> TestEngineVersionGate
 // PORTED: tests/unit/preflight.bats: "a 100-major engine is accepted — the comparison is numeric, not lexical" -> TestEngineVersionGate
 // PORTED: tests/unit/preflight.bats: "a rootless daemon is refused with the reason" -> TestRootless
-// PORTED: tests/unit/preflight.bats: "a remote DOCKER_HOST is refused" -> internal/engine.TestResolveEndpointDockerHost (engine/endpoint_test.go — locality moved into the fail-closed resolver, before a client exists to preflight)
-// PORTED: tests/unit/preflight.bats: "an ssh:// context is refused" -> internal/engine.TestResolveEndpointContextSelection (engine/endpoint_test.go)
-// PORTED: tests/unit/preflight.bats: "Docker Desktop's managed VM socket is ACCEPTED" -> internal/engine.TestResolveEndpointDockerHost (engine/endpoint_test.go)
+// PORTED: tests/unit/preflight.bats: "a remote DOCKER_HOST is refused" -> internal/engine.TestResolveEndpointDockerHost -- engine/endpoint_test.go — locality moved into the fail-closed resolver, before a client exists to preflight
+// PORTED: tests/unit/preflight.bats: "an ssh:// context is refused" -> internal/engine.TestResolveEndpointContextSelection -- engine/endpoint_test.go
+// PORTED: tests/unit/preflight.bats: "Docker Desktop's managed VM socket is ACCEPTED" -> internal/engine.TestResolveEndpointDockerHost -- engine/endpoint_test.go
 // N/A: tests/unit/preflight.bats: "an npipe:// endpoint is accepted (Docker Desktop on Windows) but tcp:// is not" -- no Windows target in this arc (the plan's declared N/A): the bash ACCEPTS npipe as local; this resolver REFUSES it naming the platform gap — the opposite verdict, so the case is not ported. The refusal itself and the tcp half are asserted by TestResolveEndpointDockerHost (engine/endpoint_test.go); npipe acceptance returns with a Windows port.
-// PORTED: tests/unit/preflight.bats: "a REMOTE named pipe is refused — the scheme alone is not the locality" -> internal/engine.TestResolveEndpointDockerHost (engine/endpoint_test.go: with no Windows target BOTH pipe spellings refuse, the remote one included — the local/remote split returns with a Windows port)
+// PORTED: tests/unit/preflight.bats: "a REMOTE named pipe is refused — the scheme alone is not the locality" -> internal/engine.TestResolveEndpointDockerHost -- engine/endpoint_test.go: with no Windows target BOTH pipe spellings refuse, the remote one included — the local/remote split returns with a Windows port
 // PORTED: tests/unit/preflight.bats: "an absent daemon is refused, distinctly from a policy refusal" -> TestDaemonDown
 // PORTED: tests/unit/preflight.bats: "a daemon we cannot ask about rootlessness is refused, not assumed rootful" -> TestRootless
 // PORTED: tests/unit/preflight.bats: "a bridge network with no trusted_host_interfaces passes" -> TestNetwork
