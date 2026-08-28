@@ -42,20 +42,30 @@ migrate-storage · backup · restore
 [releases](https://github.com/mythicalOS/mythical-ctl/releases), **check its digest against the
 published `SHA256SUMS` before you run it**, then put it on your `PATH`:
 
+It runs in a subshell so a failed check stops it, and stops it there — nothing below a failure
+runs, and `set -e` cannot take your own shell with it:
+
 ```sh
-ver=v0.0.0            # the release you want
-plat=darwin_arm64     # darwin_amd64 · darwin_arm64 · linux_amd64 · linux_arm64
-base="https://github.com/mythicalOS/mythical-ctl/releases/download/$ver"
+(
+  set -e
+  ver=v0.0.0            # the release you want
+  plat=darwin_arm64     # darwin_amd64 · darwin_arm64 · linux_amd64 · linux_arm64
+  base="https://github.com/mythicalOS/mythical-ctl/releases/download/$ver"
 
-curl -fsSL --proto '=https' -o mythical-ctl  "$base/mythical-ctl_$plat"
-curl -fsSL --proto '=https' -o SHA256SUMS    "$base/SHA256SUMS"
+  curl -fsSL --proto '=https' -O "$base/mythical-ctl_$plat"
+  curl -fsSL --proto '=https' -O "$base/SHA256SUMS"
 
-# Verify BEFORE the first execution. Compare the digest of what you downloaded
-# against the line for that artifact; anything but a match, stop.
-shasum -a 256 mythical-ctl | awk '{print $1}'      # sha256sum on Linux
-grep "mythical-ctl_$plat\$" SHA256SUMS
+  # VERIFY BEFORE THE FIRST EXECUTION, and let the tool do the comparing — printing
+  # two digests side by side and leaving you to eyeball them is not verification.
+  # Pulling the one line out first is deliberate: `-c` over the whole file would try
+  # to check three artifacts you did not download and fail for the wrong reason.
+  grep " mythical-ctl_$plat\$" SHA256SUMS > expected.sha256
+  [ -s expected.sha256 ] || { echo "no digest published for mythical-ctl_$plat"; exit 1; }
+  shasum -a 256 -c expected.sha256      # sha256sum -c expected.sha256 on Linux
 
-chmod +x mythical-ctl && mv mythical-ctl /usr/local/bin/
+  chmod +x "mythical-ctl_$plat"
+  sudo mv "mythical-ctl_$plat" /usr/local/bin/mythical-ctl
+)
 ```
 
 The version string is not the integrity guarantee — the digest is. Every published binary also
@@ -84,7 +94,7 @@ and trust-chain contracts are in [`docs/CONFIG-FORMAT.md`](docs/CONFIG-FORMAT.md
 
 ## Develop
 
-Every check this tree gets lives in one script, run identically by CI and by a person:
+Every check the Go tree gets lives in one script, run identically by CI and by a person:
 
 ```sh
 bash check.sh go        # gofmt, build, vet, the reference-boundary gate, the whole test suite
@@ -93,6 +103,10 @@ bash check.sh release   # build the published matrix twice, require identical by
 bash check.sh           # all three
 ./tests/smoke.sh        # CLI contract, against a binary it builds (or MCTL_BIN=<path>)
 ```
+
+CI runs those, and a few things that are not Go: `shellcheck -x check.sh tests/*.sh tools/*.sh`,
+an executable-bit check on the same four scripts, the smoke script twice (once on its own default
+path, once against a stamped release artifact), and a gate on what may appear in a public tree.
 
 Tests are hermetic (a fake container engine) — a green suite proves logic, not Docker behaviour;
 `bash check.sh acceptance` re-measures the daemon behaviours against a real one, and is opt-in.

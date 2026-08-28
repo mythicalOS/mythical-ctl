@@ -28,7 +28,9 @@ This file grants no edit, run, commit, push, or release permission.
 
 Run only if your active role permits command execution.
 
-- Everything CI runs: `bash check.sh` (its stages, individually: `go`, `parity`, `release`)
+- The three lanes CI's `go` job runs: `bash check.sh` (individually: `go`, `parity`, `release`).
+  It is not quite everything CI runs — the shellcheck lint, the executable-bit check, the
+  public-safety hygiene gate and the two smoke runs are separate workflow steps, below.
 - Just the Go lane: `bash check.sh go` — package-count floors, gofmt, build, vet, the
   reference-boundary gate, and the full test suite
 - Smoke: `./tests/smoke.sh` (builds what it tests), or `MCTL_BIN=<binary> ./tests/smoke.sh`
@@ -45,7 +47,8 @@ checks exactly.
   non-executing reader with key allowlists and typed validation — never "simplify" a code path
   to `source` a config file, and never widen what a mounted `<product>.conf` may contain
   (`mythical.conf` stays host-only and unmounted).
-- **Data is never collateral.** `mi_zone` classifies every path into an ownership class; config
+- **Data is never collateral.** `layout.Zone` classifies every path into an ownership class (the
+  published contract in `docs/CONFIG-FORMAT.md` still calls it by its original name); config
   writes are additive by construction (append absent keys, refuse to change set ones, preserve
   every other byte). Any new write path must fit those zones.
 - **The host-tool slot is user-owned.** `~/.mythical/<product>/cli.toml` is carved out of the

@@ -80,8 +80,8 @@ jobs:
       - name: Smoke (the script's own default — MCTL_BIN deliberately unset)
         run: ./tests/smoke.sh
 
-      # The Go lane, byte-identical to the pull-request lane: same script, same
-      # stages. `release` builds the whole published matrix twice — the second
+      # The Go lane, byte-identical to the pull-request lane: same script, the
+      # same three stages, in the same order. `release` builds the whole published matrix twice — the second
       # time from a copy of the source at a different absolute path with a cold
       # build cache — and requires every artifact to be byte-identical. That is
       # the reproducibility claim being exercised rather than asserted, and it
@@ -89,6 +89,16 @@ jobs:
       # found before somebody is waiting on a tag.
       - name: check.sh go
         run: bash check.sh go
+
+      # THE PARITY GATE RUNS ON A TAG TOO, and it did not before this commit —
+      # ci.yml had it and this workflow did not, which is exactly the drift the
+      # comment above warns about, in the direction it warns about. It matters
+      # more now than it did: after the cutover tests/parity-manifest.tsv IS the
+      # corpus, so a commit that removed an inventory claim, hand-edited the
+      # manifest, or left a PORTED target naming a test that no longer exists
+      # could be tagged and published without anything noticing.
+      - name: check.sh parity
+        run: bash check.sh parity
 
       - name: check.sh release
         run: bash check.sh release

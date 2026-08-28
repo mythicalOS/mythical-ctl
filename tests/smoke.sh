@@ -18,13 +18,13 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 
-BUILT=''
+# A scratch directory ALWAYS, not only when self-building: the version assertions
+# below capture output to FILES and compare the bytes, which a shell variable
+# cannot do (command substitution strips trailing newlines, so two outputs that
+# differ only there compare equal).
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/mctl-smoke.XXXXXX")"
 # shellcheck disable=SC2317  # invoked via trap
-cleanup() {
-  if [ -n "$BUILT" ]; then
-    rm -rf "$BUILT"
-  fi
-}
+cleanup() { rm -rf "$WORK"; }
 trap cleanup EXIT
 
 if [ -n "${MCTL_BIN:-}" ]; then
@@ -36,8 +36,7 @@ else
     printf 'smoke: MCTL_BIN is unset and there is no go toolchain to build one with\n' >&2
     exit 1
   }
-  BUILT="$(mktemp -d "${TMPDIR:-/tmp}/mctl-smoke.XXXXXX")"
-  CTL="$BUILT/mythical-ctl"
+  CTL="$WORK/mythical-ctl"
   ( cd "$ROOT" && go build -o "$CTL" ./cmd/mythical-ctl ) || {
     printf 'smoke: could not build the CLI to test\n' >&2
     exit 1
@@ -85,29 +84,44 @@ check_exit_code '--version exits 0'             0 "$CTL" --version
 # rely on that split, so it is pinned here rather than left to convention.
 check_exit_code 'unknown command exits 2'       2 "$CTL" not-a-real-command
 
-# The release workflow asserts the git tag equals this version, so the format
-# has to stay machine-readable: exactly "mythical-ctl <semver>". The prerelease
-# suffix is PERMITTED, not merely tolerated: the tag grammar the release
-# workflow accepts is vX.Y.Z[-suffix], and an unstamped development build
-# reports X.Y.Z-dev — so a shape that rejected a suffix would fail on every
-# binary except a final release, which is the one this script least needs to be
-# able to run against.
-version_line="$("$CTL" --version)"
-if printf '%s' "$version_line" | grep -qE '^mythical-ctl [0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
-  printf '  ok    --version format is "mythical-ctl <semver>"\n'; pass=$((pass + 1))
+# The release workflow asserts the git tag equals this version, so the format has
+# to stay machine-readable: exactly "mythical-ctl <semver>", on stdout, ONE line,
+# terminated. The prerelease suffix is PERMITTED, not merely tolerated: the tag
+# grammar the release workflow accepts is vX.Y.Z[-suffix], and an unstamped
+# development build reports X.Y.Z-dev — so a shape that rejected a suffix would
+# fail on every binary except a final release, which is the one this script least
+# needs to be able to run against.
+#
+# THE LINE COUNT IS PART OF THE ASSERTION, and it is not decoration. `grep -E`
+# with anchors matches a LINE, so `junk\nmythical-ctl 1.2.3\n` satisfies the
+# pattern while being nothing a caller could parse. Requiring exactly one newline
+# in the whole file pins "one line, and it is terminated": zero newlines means an
+# unterminated line, two or more means there is something else on stdout.
+"$CTL" --version > "$WORK/version.out" 2>/dev/null
+version_line="$(cat "$WORK/version.out")"
+version_nl="$(wc -l < "$WORK/version.out" | tr -d '[:space:]')"
+if [ "$version_nl" = 1 ] \
+  && grep -qE '^mythical-ctl [0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' "$WORK/version.out"; then
+  printf '  ok    --version is one line, "mythical-ctl <semver>"\n'; pass=$((pass + 1))
 else
-  printf '  FAIL  --version format: %q\n' "$version_line"; fail=$((fail + 1))
+  printf '  FAIL  --version: %d newline(s), content %q\n' "$version_nl" "$version_line"
+  fail=$((fail + 1))
 fi
 
-# `-v` is --version's TWIN, not a near-synonym: same exit status, byte-identical
-# output. It is the short form people actually type, and a divergence in it is
-# invisible to every other check in this file.
+# `-v` is --version's TWIN: same exit status, and the same BYTES — compared with
+# cmp on the captured files, not with `[ "$a" = "$b" ]` on two command
+# substitutions. Command substitution strips every trailing newline, so the
+# variable form reports two outputs identical when one of them ends in a blank
+# line the other does not have; and it cannot hold a NUL at all. It is the short
+# form people actually type, and a divergence in it is invisible to every other
+# check in this file.
 v_short_rc=0
-v_short="$("$CTL" -v)" || v_short_rc=$?
-if [ "$v_short_rc" -eq 0 ] && [ "$v_short" = "$version_line" ]; then
-  printf "  ok    -v is --version's twin\n"; pass=$((pass + 1))
+"$CTL" -v > "$WORK/v.out" 2>/dev/null || v_short_rc=$?
+if [ "$v_short_rc" -eq 0 ] && cmp -s "$WORK/v.out" "$WORK/version.out"; then
+  printf "  ok    -v is --version's twin, byte for byte\n"; pass=$((pass + 1))
 else
-  printf '  FAIL  -v: rc=%d output=%q (--version gave %q)\n' "$v_short_rc" "$v_short" "$version_line"
+  printf '  FAIL  -v: rc=%d output=%q (--version gave %q)\n' \
+    "$v_short_rc" "$(cat "$WORK/v.out")" "$version_line"
   fail=$((fail + 1))
 fi
 

@@ -100,11 +100,15 @@ containers, images, and shared network live in your container runtime. None of t
 
 ## What is verified, and what is not
 
-The bootstrap installs each product image **pinned by content digest** (`@sha256:…`), which the
-container runtime checks on pull: if the bytes are not the bytes that were pinned, the pull fails and
-the installer stops rather than install unverified bytes. A product with no published digest yet is
-reported as not launched and is not installed. The bootstrap script *itself* is authenticated by TLS
-to a known origin, not by a separate signature — a deliberate, stated limit of this model.
+**The product images** are **pinned by content digest** (`@sha256:…`), which the container runtime
+checks on pull: if the bytes are not the bytes that were pinned, the pull fails and the installer
+stops rather than install unverified bytes. A product with no published digest yet is reported as
+not launched and is not installed.
+
+**The CLI itself** is verified by you, once, before you first run it — see the section below. That
+is the honest boundary of this model: nothing inside a downloaded binary can establish that the
+binary is the right one, so the check has to happen outside it, against a digest published beside
+it and a provenance attestation signed by the workflow that built it.
 
 ## What you download, and how you check it
 
