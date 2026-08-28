@@ -101,17 +101,18 @@ run, from which commit, produced exactly those bytes:
 gh attestation verify /usr/local/bin/mythical-ctl --repo mythicalOS/mythical-ctl
 ```
 
-It takes a **file path**, not a command name — so that line checks the file that is already
-installed. To check *before* installing instead, put this one inside the block above, immediately
-before `sudo install`, where the download still exists under its own name:
+It takes a **file path**, not a command name, so that line checks the file that is already
+installed — run it *after* the block.
 
-```sh
-  gh attestation verify "mythical-ctl_$plat" --repo mythicalOS/mythical-ctl
-```
+To check *before* installing instead, edit the block above rather than running anything separately:
+add `gh attestation verify "mythical-ctl_$plat" --repo mythicalOS/mythical-ctl` as the line
+immediately above `sudo install`. It has to go **inside**, because `$plat` and the downloaded file
+exist only there — the subshell's trap deletes the temporary directory as it exits, so the same
+command run afterwards would resolve `$plat` to nothing and check a file that is not there.
 
-The two are not interchangeable: run the `/usr/local/bin/...` form before the install and it
-attests **whatever was already there**, which is a green result about bytes you are not about to
-run — the one direction a verification step must never fail in.
+The two forms are not interchangeable. Run the `/usr/local/bin/...` one *before* installing and it
+attests **whatever was already there**: a green result about bytes you are not about to run, which
+is the one direction a verification step must never fail in.
 
 The version string is not the integrity guarantee — the digest is; anyone can print a version.
 [get.mythicalos.ai](https://get.mythicalos.ai) serves a pinned release artifact from here, so a
