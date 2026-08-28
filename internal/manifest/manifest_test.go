@@ -28,11 +28,11 @@ import (
 // PORTED: tests/unit/manifest.bats: "a manifest for a product the policy index does not know is rejected" -> TestEntitlementCheck
 // PORTED: tests/unit/manifest.bats: "a manifest declaring bindability is rejected" -> TestSchemaRefusals
 // PORTED: tests/unit/manifest.bats: "a manifest cannot choose a network at all" -> TestSchemaRefusals
-// PORTED: tests/unit/manifest.bats: "a manifest requiring a newer core is refused, even when fully authentic" -> internal/trust TestNewerCoreRefusedThroughDoorWithoutFloorMovement (the door wiring; the comparator itself is TestCoreOK)
+// PORTED: tests/unit/manifest.bats: "a manifest requiring a newer core is refused, even when fully authentic" -> internal/trust.TestNewerCoreRefusedThroughDoorWithoutFloorMovement (the door wiring; the comparator itself is TestCoreOK)
 // PORTED: tests/unit/manifest.bats: "a manifest with no min_core is refused — unstated must not mean any core will do" -> TestSchemaRefusals
 // PORTED: tests/unit/manifest.bats: "the version comparator orders components numerically, not lexically" -> TestVersionComparator
 // PORTED: tests/unit/manifest.bats: "the core version tracks the entrypoint's VERSION" -> TestCoreOK (CoreOK takes internal/version.Version itself — there is no second constant to drift; the test compares against that exact value)
-// PORTED: tests/unit/manifest.bats: "coreversion accepts MAJOR[.MINOR[.PATCH]] and nothing else" -> (owned by internal/docfmt TestDocTypes)
+// PORTED: tests/unit/manifest.bats: "coreversion accepts MAJOR[.MINOR[.PATCH]] and nothing else" -> (owned by internal/docfmt.TestDocTypes)
 // PORTED: tests/unit/manifest.bats: "names are derived from the installation identity plus the product" -> TestNaming
 // PORTED: tests/unit/manifest.bats: "two installations derive different names for the same product and role" -> TestNaming
 // PORTED: tests/unit/manifest.bats: "the network alias is the bare product name, not the derived one" -> TestNaming (the mythical-<product> ruling, asserted verbatim)

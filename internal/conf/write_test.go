@@ -107,7 +107,7 @@ import (
 // PORTED: tests/unit/config_contract.bats: "a <product>.conf of 1048577 bytes is refused outright, marker or no marker" -> TestProductOversizedRefused
 // PORTED: tests/unit/config_contract.bats: "the doc path in the shipped torn-file message resolves to a real file" -> TestTornMessageNamesRealDoc
 // PORTED: tests/unit/config_contract.bats: "every row of the document's marker-precedence table matches the CLI" -> TestProductTornAndMalformed (the table's rows: match+parse=accept, absent/mismatch=torn, match+broken=malformed)
-// PORTED: tests/unit/config_contract.bats: "the product-name grammar the document publishes is the grammar the CLI enforces" -> internal/layout TestProductNameGrammar
+// PORTED: tests/unit/config_contract.bats: "the product-name grammar the document publishes is the grammar the CLI enforces" -> internal/layout.TestProductNameGrammar
 
 func lockFor(t *testing.T, home string) famlock.Held {
 	t.Helper()

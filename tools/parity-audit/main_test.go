@@ -360,11 +360,18 @@ var tinyGoTests = map[string]map[string]bool{
 	"mythicalos.ai/ctl/internal/w": {"TestElsewhere": true, "TestOne": true},
 }
 
-// The SOURCE half of target resolution, keyed by package directory. A target must appear in BOTH:
-// `go test -list` proves the package registers it, the source proves that package declares it.
+// The SOURCE half of target resolution, keyed by IMPORT PATH — the same key as the list half, so
+// the two can be compared within one lane. A target must appear in BOTH: `go test -list` proves the
+// lane registers it, the lane's compiled test files prove that package declares it.
 var tinySrcTests = map[string]map[string]bool{
-	"internal/x": {"TestOne": true, "TestTwo": true, "TestThree": true},
-	"internal/w": {"TestElsewhere": true, "TestOne": true},
+	"mythicalos.ai/ctl/internal/x": {"TestOne": true, "TestTwo": true, "TestThree": true},
+	"mythicalos.ai/ctl/internal/w": {"TestElsewhere": true, "TestOne": true},
+}
+
+// oneLane is the fixture as ONE lane whose two witnesses agree — the ordinary world. The tests
+// that care about the pairing build their own disagreeing lanes.
+func oneLane() []testLane {
+	return []testLane{{name: "default", list: tinyGoTests, src: tinySrcTests}}
 }
 
 // The whole-file N/A pre-declaration is a PARAMETER of the audit, not a global it reads, so these
@@ -399,7 +406,7 @@ func TestAuditCoverageAcceptsACompleteInventory(t *testing.T) {
 		`// PORTED: tests/unit/b.bats: "one" -> TestTwo`,
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, oneLane(), noPreDeclared)
 	if len(r.Problems) != 0 {
 		t.Fatalf("a complete inventory was rejected: %v", r.Problems)
 	}
@@ -414,7 +421,7 @@ func TestAuditCoverageCatchesAnUnclaimedTest(t *testing.T) {
 		`// PORTED: tests/unit/b.bats: "one" -> TestTwo`,
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, oneLane(), noPreDeclared)
 	if !hasProblem(r, `"two" is claimed by NO inventory line`) {
 		t.Fatalf("the unclaimed test was not reported: %v", r.Problems)
 	}
@@ -431,7 +438,7 @@ func TestAuditCoverageCatchesADoubleClaim(t *testing.T) {
 		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, oneLane(), noPreDeclared)
 	if !hasProblem(r, "is claimed 2 times") {
 		t.Fatalf("the double claim was not reported: %v", r.Problems)
 	}
@@ -446,7 +453,7 @@ func TestAuditCoverageCatchesAClaimOnNoSuchTest(t *testing.T) {
 		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, oneLane(), noPreDeclared)
 	if !hasProblem(r, "no such test in the corpus") {
 		t.Fatalf("the phantom claim was not reported: %v", r.Problems)
 	}
@@ -463,7 +470,7 @@ func TestAuditCoverageDoesNotLetOneNameSatisfyTwoFiles(t *testing.T) {
 		`// PORTED: tests/unit/a.bats: "two" -> TestTwo`,
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, oneLane(), noPreDeclared)
 	if !hasProblem(r, `tests/unit/b.bats: "one" is claimed by NO inventory line`) {
 		t.Fatalf("b.bats' same-named row was treated as covered by a.bats' claim: %v", r.Problems)
 	}
@@ -478,7 +485,7 @@ func TestAuditCoverageCatchesADanglingPortedTarget(t *testing.T) {
 		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, oneLane(), noPreDeclared)
 	if !hasProblem(r, "PORTED target TestGoneAway does not exist") {
 		t.Fatalf("the dangling target was not reported: %v", r.Problems)
 	}
@@ -492,7 +499,7 @@ func TestAuditCoverageResolvesEverySecondaryTarget(t *testing.T) {
 		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, oneLane(), noPreDeclared)
 	if !hasProblem(r, "PORTED target TestVanished does not exist") {
 		t.Fatalf("a secondary target was not resolved: %v", r.Problems)
 	}
@@ -535,7 +542,7 @@ func TestANonASCIIIdentifierStartCannotResolveToADifferentTest(t *testing.T) {
 		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, oneLane(), noPreDeclared)
 	if len(r.Problems) == 0 {
 		t.Fatal(`the audit certified a PORTED claim naming ÉTestOne, which is not a Go test that exists — it resolved to TestOne, a DIFFERENT test, and the row read as covered`)
 	}
@@ -554,7 +561,7 @@ func TestAuditCoverageReportsMalformedLines(t *testing.T) {
 		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, oneLane(), noPreDeclared)
 	if !hasProblem(r, "inventory line does not parse") {
 		t.Fatalf("the malformed line was not reported: %v", r.Problems)
 	}
@@ -569,7 +576,7 @@ func TestAuditCoverageCatchesAnUndeclaredWholesaleNA(t *testing.T) {
 		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, oneLane(), noPreDeclared)
 	if !hasProblem(r, "all 2 tests are N/A") {
 		t.Fatalf("the wholesale-N/A file was not reported: %v", r.Problems)
 	}
@@ -587,7 +594,7 @@ func TestAuditCoverageAcceptsAPreDeclaredWholeFileNA(t *testing.T) {
 		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
 	)
 	r := &report{}
-	auditCoverage(r, corpus, c, b, st, tinyGoTests, tinySrcTests, tinyPreDeclared)
+	auditCoverage(r, corpus, c, b, st, oneLane(), tinyPreDeclared)
 	if len(r.Problems) != 0 {
 		t.Fatalf("the pre-declared whole-file N/A was rejected: %v", r.Problems)
 	}
@@ -608,7 +615,7 @@ func TestAuditCoverageCatchesAClaimOnAPreDeclaredFile(t *testing.T) {
 		`// PORTED: tests/unit/waived.bats: "x" -> TestOne`,
 	)
 	r := &report{}
-	auditCoverage(r, corpus, c, b, st, tinyGoTests, tinySrcTests, tinyPreDeclared)
+	auditCoverage(r, corpus, c, b, st, oneLane(), tinyPreDeclared)
 	if !hasProblem(r, "pre-declared N/A in tools/parity-audit") {
 		t.Fatalf("the contradiction was not reported: %v", r.Problems)
 	}
@@ -623,7 +630,7 @@ func TestAuditCoverageCatchesAPreDeclarationWithNoFile(t *testing.T) {
 		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, map[string]string{"tests/unit/gone.bats": "a file the corpus does not have"})
+	auditCoverage(r, tiny, c, b, st, oneLane(), map[string]string{"tests/unit/gone.bats": "a file the corpus does not have"})
 	if !hasProblem(r, "but the corpus has no such file") {
 		t.Fatalf("the empty pre-declaration was not reported: %v", r.Problems)
 	}
@@ -746,11 +753,20 @@ func e2eTree(t *testing.T) (root, goList string) {
 	if err := os.WriteFile(goList, lines(`TestOne`, `TestThree`, "ok  \tmythicalos.ai/ctl/internal/x\t0.1s"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// The SECOND witness for the same lane: the test files go would compile for it. Written by
+	// hand here for the same reason the list is — these tests drive the grader, not the toolchain.
+	if err := os.WriteFile(goFilesPath(root), lines(
+		"mythicalos.ai/ctl/internal/x\t"+filepath.Join(root, "internal", "x")+"\tx_test.go\t",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	return root, goList
 }
 
+func goFilesPath(root string) string { return filepath.Join(root, "gofiles.txt") }
+
 func e2eRun(root, goList string) error {
-	return run(root, "tests/parity-manifest.tsv", false, []string{goList}, 0)
+	return run(root, "tests/parity-manifest.tsv", false, []string{goList}, []string{goFilesPath(root)}, 0)
 }
 
 func TestEndToEndAcceptsACompleteTree(t *testing.T) {
@@ -858,7 +874,7 @@ func TestEndToEndRefusesAHalfPresentBashTree(t *testing.T) {
 func TestEndToEndRefusesWithNoGoTestList(t *testing.T) {
 	tinyLanes(t, 2, 1, 2)
 	root, _ := e2eTree(t)
-	err := run(root, "tests/parity-manifest.tsv", false, nil, 0)
+	err := run(root, "tests/parity-manifest.tsv", false, nil, nil, 0)
 	if err == nil || !strings.Contains(err.Error(), "no Go test names were loaded") {
 		t.Fatalf("err = %v, want a refusal naming the missing list", err)
 	}
@@ -921,7 +937,7 @@ func TestAuditCoverageCatchesAClaimWrittenMidLine(t *testing.T) {
 		t.Fatal("no mid-line claim was detected at all")
 	}
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, oneLane(), noPreDeclared)
 	if !hasProblem(r, "where the inventory parser does not read it") {
 		t.Fatalf("the mid-line claim was not reported: %v", r.Problems)
 	}
@@ -938,7 +954,7 @@ func TestAuditCoverageIgnoresAMidLineMentionOfANonCorpusFile(t *testing.T) {
 		`// and a fixture may say PORTED: tests/unit/nowhere.bats: "z" -> TestZ`,
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, oneLane(), noPreDeclared)
 	if len(r.Problems) != 0 {
 		t.Fatalf("a mention of a non-corpus file was reported: %v", r.Problems)
 	}
@@ -956,7 +972,7 @@ func TestStrayDetectionDoesNotFireOnCodeThatQuotesARowName(t *testing.T) {
 		"\t{\"tests/unit/a.bats\", \"two\"}: 22,",
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, oneLane(), noPreDeclared)
 	if len(r.Problems) != 0 {
 		t.Fatalf("a map entry keyed by (file, name) was read as a hidden claim: %v", r.Problems)
 	}
@@ -973,7 +989,7 @@ func TestStrayDetectionFiresOnClaimSyntaxEvenOutsideAComment(t *testing.T) {
 		"\texample := \"PORTED: tests/unit/b.bats: ...\"",
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, oneLane(), noPreDeclared)
 	if !hasProblem(r, "claim syntax") {
 		t.Fatalf("claim syntax naming a real corpus row went unreported: %v", r.Problems)
 	}
@@ -997,7 +1013,7 @@ func TestAuditCoverageCatchesAClaimSplitAcrossLines(t *testing.T) {
 		t.Fatal("the continuation line was not detected")
 	}
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, oneLane(), noPreDeclared)
 	if !hasProblem(r, "which is a real @test in that file") {
 		t.Fatalf("the split claim was not reported: %v", r.Problems)
 	}
@@ -1016,22 +1032,24 @@ func TestAuditCoverageCatchesAPortedTargetInAnotherPackage(t *testing.T) {
 		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, oneLane(), noPreDeclared)
 	if !hasProblem(r, "namesake") {
 		t.Fatalf("a target that lives only in another package was accepted: %v", r.Problems)
 	}
 }
 
-// ...and a claim that DOES name the other package resolves, because the tree's cross-package claims
-// already say where they point ("owned by internal/docfmt TestDocTypes", "enginetest/fake_test.go").
+// ...and a claim that names the other package EXPLICITLY, attached to the target, resolves.
+// `internal/w.TestElsewhere` points at one package for one test and can be read exactly one way;
+// prose that merely mentions a package cannot, which is what TestCandidatePackagesDoesNotMineProse
+// holds.
 func TestAuditCoverageAcceptsACrossPackageTargetThatNamesItsPackage(t *testing.T) {
 	c, b, st := claimsFrom(t,
 		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
-		`// PORTED: tests/unit/a.bats: "two" -> TestElsewhere (owned by internal/w, recorded here for the audit)`,
+		`// PORTED: tests/unit/a.bats: "two" -> internal/w.TestElsewhere (recorded here for the audit)`,
 		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, oneLane(), noPreDeclared)
 	if len(r.Problems) != 0 {
 		t.Fatalf("a cross-package claim that names its package was rejected: %v", r.Problems)
 	}
@@ -1050,7 +1068,7 @@ func TestAuditCoverageCatchesAClaimInABlockCommentContinuation(t *testing.T) {
 		`*/`,
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, oneLane(), noPreDeclared)
 	if !hasProblem(r, "which is a real @test in that file") {
 		t.Fatalf("the block-comment continuation was not reported: %v", r.Problems)
 	}
@@ -1096,7 +1114,7 @@ func TestAuditCoverageCatchesAClaimSpreadOverThreeLines(t *testing.T) {
 		t.Fatal("the three-line claim was not detected")
 	}
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, oneLane(), noPreDeclared)
 	if !hasProblem(r, "where the inventory parser does not read it") {
 		t.Fatalf("the three-line claim was not reported: %v", r.Problems)
 	}
@@ -1111,7 +1129,7 @@ func TestCandidatePackagesDoesNotConfuseTwoPackagesSharingABasename(t *testing.T
 		"mythicalos.ai/ctl/cmd/probe":      {"TestCmd": true},
 		"mythicalos.ai/ctl/internal/x":     {"TestOne": true},
 	}
-	got := candidatePackages(goTests, "internal/x/x_test.go", "TestOne (owned by cmd/probe)")
+	got := candidatePackages(goTests, "internal/x/x_test.go", "cmd/probe.TestOne", "TestOne")
 	if !got["mythicalos.ai/ctl/cmd/probe"] {
 		t.Fatalf("a full path did not resolve: %v", got)
 	}
@@ -1120,9 +1138,45 @@ func TestCandidatePackagesDoesNotConfuseTwoPackagesSharingABasename(t *testing.T
 	}
 	// A BARE, AMBIGUOUS segment must widen nothing — an ambiguous reference is not a licence to
 	// accept either answer.
-	amb := candidatePackages(goTests, "internal/x/x_test.go", "TestInternal (see probe)")
+	amb := candidatePackages(goTests, "internal/x/x_test.go", "probe.TestInternal", "TestInternal")
 	if amb["mythicalos.ai/ctl/internal/probe"] || amb["mythicalos.ai/ctl/cmd/probe"] {
 		t.Fatalf("a bare ambiguous segment widened the candidate set: %v", amb)
+	}
+}
+
+// TestCandidatePackagesDoesNotMineProse: a package named in a claim's PROSE is not a reference to
+// that package, and treating it as one is a false-green generator.
+//
+// Every path-like token anywhere in a claim was offered as a candidate, so a claim that says the
+// target is NOT in some package supplied that package anyway — prose has no polarity a token regexp
+// can read. The claim then resolved against a namesake there, and kept resolving after the local
+// test it was really about was DELETED: the claim survives the deletion of the thing it claims,
+// which is the whole failure this audit exists to prevent.
+func TestCandidatePackagesDoesNotMineProse(t *testing.T) {
+	goTests := map[string]map[string]bool{
+		"mythicalos.ai/ctl/internal/w": {"TestShared": true},
+		"mythicalos.ai/ctl/internal/x": {"TestOne": true},
+	}
+	// The claim's own package no longer declares TestShared (it was deleted); the prose merely
+	// MENTIONS internal/w, and says the target is not there.
+	got := candidatePackages(goTests, "internal/x/x_test.go", "TestShared (not internal/w; it is local)", "TestShared")
+	if got["mythicalos.ai/ctl/internal/w"] {
+		t.Fatalf("prose naming a package was read as a reference to it: %v", got)
+	}
+	if !got["mythicalos.ai/ctl/internal/x"] {
+		t.Fatalf("the claiming file's own package is always a candidate: %v", got)
+	}
+	// A QUALIFICATION IS PER TARGET. A claim naming two tests may qualify one and not the other,
+	// and the unqualified one must not borrow the qualified one's package.
+	two := map[string]map[string]bool{
+		"mythicalos.ai/ctl/internal/w": {"TestQualified": true, "TestBare": true},
+		"mythicalos.ai/ctl/internal/x": {},
+	}
+	if c := candidatePackages(two, "internal/x/x_test.go", "internal/w.TestQualified and TestBare", "TestBare"); c["mythicalos.ai/ctl/internal/w"] {
+		t.Fatalf("an unqualified target borrowed another target's package: %v", c)
+	}
+	if c := candidatePackages(two, "internal/x/x_test.go", "internal/w.TestQualified and TestBare", "TestQualified"); !c["mythicalos.ai/ctl/internal/w"] {
+		t.Fatalf("an explicitly qualified target did not resolve: %v", c)
 	}
 }
 
@@ -1223,7 +1277,7 @@ func TestAuditCoverageCatchesAClaimNamedByBareFilename(t *testing.T) {
 		t.Fatal("the bare-filename claim was not detected")
 	}
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, oneLane(), noPreDeclared)
 	if !hasProblem(r, "which is a real @test in that file") {
 		t.Fatalf("the bare-filename claim was not reported: %v", r.Problems)
 	}
@@ -1242,10 +1296,10 @@ func TestAPortedTargetNeedsBothTheListAndTheSource(t *testing.T) {
 	// The list says the package registers TestTwo; the SOURCE does not declare it — the shape a
 	// printed identifier produces.
 	srcMissing := map[string]map[string]bool{
-		"internal/x": {"TestOne": true, "TestThree": true},
+		"mythicalos.ai/ctl/internal/x": {"TestOne": true, "TestThree": true},
 	}
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, srcMissing, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, []testLane{{name: "default", list: tinyGoTests, src: srcMissing}}, noPreDeclared)
 	if !hasProblem(r, "TestTwo") {
 		t.Fatalf("a target the source does not declare was accepted: %v", r.Problems)
 	}
@@ -1256,9 +1310,53 @@ func TestAPortedTargetNeedsBothTheListAndTheSource(t *testing.T) {
 		"mythicalos.ai/ctl/internal/x": {"TestOne": true, "TestThree": true},
 	}
 	r2 := &report{}
-	auditCoverage(r2, tiny, c, b, st, listMissing, tinySrcTests, noPreDeclared)
+	auditCoverage(r2, tiny, c, b, st, []testLane{{name: "default", list: listMissing, src: tinySrcTests}}, noPreDeclared)
 	if !hasProblem(r2, "TestTwo") {
 		t.Fatalf("a target the package does not register was accepted: %v", r2.Problems)
+	}
+}
+
+// TestTheTwoWitnessesMustAgreeWithinONELane: two witnesses that are allowed to come from DIFFERENT
+// lanes are not two witnesses.
+//
+// The source half used to be one global walk of every *_test.go on disk with build constraints
+// deliberately not applied, and the list half is per-lane stdout. So a file tagged out of every lane
+// could declare TestClaimed while an ACTIVE init() in another lane merely PRINTED "TestClaimed" —
+// list ✓, source ✓, and no lane anywhere registers a test by that name. Each half is satisfied by
+// the other's blind spot, which is precisely what having two witnesses was supposed to rule out.
+func TestTheTwoWitnessesMustAgreeWithinONELane(t *testing.T) {
+	c, b, st := claimsFrom(t,
+		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
+		`// PORTED: tests/unit/a.bats: "two" -> TestTwo`,
+		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
+	)
+	const pkg = "mythicalos.ai/ctl/internal/x"
+	// LANE A registers the name (its init printed it) but compiles no file declaring it.
+	// LANE B compiles a file declaring it (tagged for this lane) but registers nothing by that name.
+	split := []testLane{
+		{name: "a", list: map[string]map[string]bool{pkg: {"TestOne": true, "TestTwo": true, "TestThree": true}},
+			src: map[string]map[string]bool{pkg: {"TestOne": true, "TestThree": true}}},
+		{name: "b", list: map[string]map[string]bool{pkg: {"TestOne": true, "TestThree": true}},
+			src: map[string]map[string]bool{pkg: {"TestOne": true, "TestTwo": true, "TestThree": true}}},
+	}
+	r := &report{}
+	auditCoverage(r, tiny, c, b, st, split, noPreDeclared)
+	if !hasProblem(r, "TestTwo") {
+		t.Fatalf("a target satisfied by two DIFFERENT lanes was accepted — the witnesses were not\n"+
+			"required to agree within one lane: %v", r.Problems)
+	}
+	// AND THE ORDINARY CASE STILL PASSES: one lane in which both halves agree resolves it, even
+	// though the other lane knows nothing about it. A fix that demanded every lane agree would
+	// refuse every acceptance-tagged test.
+	ok := []testLane{
+		split[0],
+		{name: "b", list: map[string]map[string]bool{pkg: {"TestOne": true, "TestTwo": true, "TestThree": true}},
+			src: map[string]map[string]bool{pkg: {"TestOne": true, "TestTwo": true, "TestThree": true}}},
+	}
+	r2 := &report{}
+	auditCoverage(r2, tiny, c, b, st, ok, noPreDeclared)
+	if hasProblem(r2, "TestTwo") {
+		t.Fatalf("a target both halves of ONE lane agree on was refused: %v", r2.Problems)
 	}
 }
 
@@ -1283,7 +1381,7 @@ func TestAmbiguousBasenamesAreAttributedToTheFileThatHoldsTheRow(t *testing.T) {
 		`// dup.bats: "a unit row" -> TestOne`,
 	)
 	r := &report{}
-	auditCoverage(r, corpus, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
+	auditCoverage(r, corpus, c, b, st, oneLane(), noPreDeclared)
 	// BOTH must be attributed to the file that actually holds the row. Keeping one corpus file per
 	// basename would leave whichever lost the race unreported — and map iteration decides which, so
 	// asserting only one of the two would pass or fail by luck.
@@ -1326,11 +1424,12 @@ func TestSourceWitnessIgnoresDeclarationsThatAreNotCode(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(pkg, "x_test.go"), []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	got, err := collectSourceTestFuncs(dir)
+	files := map[string][]string{"mythicalos.ai/ctl/internal/x": {filepath.Join(pkg, "x_test.go")}}
+	got, err := collectLaneSource(files)
 	if err != nil {
 		t.Fatal(err)
 	}
-	names := got["internal/x"]
+	names := got["mythicalos.ai/ctl/internal/x"]
 	if !names["TestReal"] {
 		t.Fatalf("the real declaration was missed: %v", names)
 	}
@@ -1347,10 +1446,54 @@ func TestSourceWitnessIgnoresDeclarationsThatAreNotCode(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(pkg, "broken_test.go"), []byte("package x\nfunc ("), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := collectSourceTestFuncs(dir); err == nil {
+	files["mythicalos.ai/ctl/internal/x"] = append(files["mythicalos.ai/ctl/internal/x"], filepath.Join(pkg, "broken_test.go"))
+	if _, err := collectLaneSource(files); err == nil {
 		t.Fatal("an unparseable _test.go was skipped rather than refused")
 	} else if !strings.Contains(err.Error(), "broken_test.go") {
 		t.Fatalf("the refusal does not name the file: %v", err)
+	}
+	_ = dir
+}
+
+// TestGoFileListIsTheToolchainsOwnSelection: the source witness is built from the files GO says
+// this lane compiles, so a file the lane does not build cannot testify about it.
+func TestGoFileListIsTheToolchainsOwnSelection(t *testing.T) {
+	got, err := parseGoFileList([]byte(
+		"mythicalos.ai/ctl/internal/x\t/abs/internal/x\ta_test.go b_test.go\tx_ext_test.go\n" +
+			"mythicalos.ai/ctl/internal/y\t/abs/internal/y\t\t\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		filepath.Join("/abs/internal/x", "a_test.go"),
+		filepath.Join("/abs/internal/x", "b_test.go"),
+		filepath.Join("/abs/internal/x", "x_ext_test.go"),
+	}
+	if fmt.Sprint(got["mythicalos.ai/ctl/internal/x"]) != fmt.Sprint(want) {
+		t.Fatalf("in-package and external test files: got %v, want %v", got["mythicalos.ai/ctl/internal/x"], want)
+	}
+	// A package with no test files contributes no entry — it declares nothing and must not be
+	// invented as an empty witness that quietly satisfies nothing.
+	if _, ok := got["mythicalos.ai/ctl/internal/y"]; ok {
+		t.Fatalf("a package with no test files produced an entry: %v", got)
+	}
+	// A MALFORMED LINE IS REFUSED, never partially read: silently dropping a package would empty
+	// that lane's source witness for it, and every claim on it would then fail for a reason that
+	// has nothing to do with the port.
+	if _, err := parseGoFileList([]byte("only\ttwo\n")); err == nil {
+		t.Fatal("a line with the wrong field count was accepted")
+	}
+}
+
+// TestPairedWitnessFlagsAreRefusedUnpaired: the two lists are ONE witness pair per lane. An
+// unpaired call would reintroduce the independence the pairing removes, and it would do so
+// silently — so it is refused up front rather than resolved against whatever happened to line up.
+func TestPairedWitnessFlagsAreRefusedUnpaired(t *testing.T) {
+	tinyLanes(t, 2, 1, 2)
+	root, goList := e2eTree(t)
+	err := run(root, "tests/parity-manifest.tsv", false, []string{goList}, nil, 0)
+	if err == nil || !strings.Contains(err.Error(), "must be given in the same number") {
+		t.Fatalf("err = %v, want a refusal naming the unpaired witnesses", err)
 	}
 }
 
@@ -1404,11 +1547,13 @@ func TestOnlyRealGoTestNamesCount(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(pkg, "x_test.go"), []byte(src), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	sf, err := collectSourceTestFuncs(dir)
+	const xpkg = "mythicalos.ai/ctl/internal/x"
+	sf, err := collectLaneSource(map[string][]string{xpkg: {filepath.Join(pkg, "x_test.go")}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !sf["internal/x"]["TestReal"] || sf["internal/x"]["Testfoo"] {
-		t.Fatalf("the source witness does not apply Go's grammar: %v", sf["internal/x"])
+	if !sf[xpkg]["TestReal"] || sf[xpkg]["Testfoo"] {
+		t.Fatalf("the source witness does not apply Go's grammar: %v", sf[xpkg])
 	}
+	_ = dir
 }

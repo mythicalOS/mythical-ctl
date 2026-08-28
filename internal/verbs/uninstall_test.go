@@ -15,6 +15,7 @@ import (
 	"mythicalos.ai/ctl/internal/famlock"
 	"mythicalos.ai/ctl/internal/ledger"
 	"mythicalos.ai/ctl/internal/prov"
+	"mythicalos.ai/ctl/internal/state"
 )
 
 // Inventory — the UNINSTALL half of Task 23's share of tests/unit/verbs.bats, as
@@ -992,5 +993,56 @@ func TestPurgeStopsWhenTheLedgerWillNotRecordWhatItRemoved(t *testing.T) {
 	// `return 1` left its earlier writes on disk, and so must this one.
 	if !r.tombstoned(prov.ClassContainer, r.container("p1")) {
 		t.Fatal("the work that succeeded before the stop was not made durable")
+	}
+}
+
+// TestUninstallNeverPersistsAHalfEditedLedger: the container's two ledger edits are one change.
+//
+// They used to run one after the other against the LIVE ledger. Each editor is individually atomic
+// — prov.Tombstone and state.Forget both ask every cardinality question before writing anything —
+// and stopAfterPartialRemoval's own comment rested on exactly that: "the failing edit itself mutates
+// nothing, so what is persisted is exactly the work that succeeded". That argument is true of each
+// editor ALONE and false of the PAIR, which is the gap a per-editor argument cannot see.
+//
+// With two contradicting desired rows for the container, Tombstone SUCCEEDS and Forget REFUSES —
+// and stopAfterPartialRemoval then persists what is in memory. The result on disk: the container's
+// provenance record is gone while the contradictory desired state SURVIVES. A ledger that says
+// nothing owns this name and also says what state that name should be in, with the object it was
+// about removed from the runtime and no record left that it was ever ours.
+func TestUninstallNeverPersistsAHalfEditedLedger(t *testing.T) {
+	r := newRig(t)
+	r.writeProduct("p1")
+	r.mintIdentity()
+	r.mustInstall("p1")
+	c := r.container("p1")
+
+	// A SECOND desired row for the same container — the damaged ledger a repair or a hand edit
+	// leaves, and the one shape state.Forget is specified to refuse.
+	r.appendRows("desired\tcontainer=" + c + "\tstate=stopped\tverify=none")
+	before := strings.Join(r.ledgerOnDisk().Lines(), "\n")
+	// THE PREMISE IS MEASURED. If the fixture did not actually make Forget refuse, every assertion
+	// below would be about an ordinary successful uninstall and would pass meaning nothing.
+	if err := state.Forget(r.ledgerNow(), c); err == nil {
+		t.Fatal("the fixture did not make state.Forget refuse — the half-edit branch is not reached")
+	}
+	r.reset()
+
+	if rc := r.uninstall("p1", false); rc == cliio.ExitOK {
+		t.Fatalf("an uninstall whose ledger edit cannot be made reported success\n%s", r.said())
+	}
+
+	// THE LEDGER ON DISK IS THE ASSERTION. Neither edit may have landed: they are one change.
+	after := strings.Join(r.ledgerOnDisk().Lines(), "\n")
+	if after != before {
+		t.Fatalf("a refused uninstall persisted a half-edited ledger.\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+	if _, err := prov.Find(r.ledgerOnDisk(), prov.ClassContainer, c); err != nil {
+		t.Fatalf("the container's provenance was tombstoned while the desired state it contradicts survived: %v", err)
+	}
+
+	// AND THE RUNTIME WAS NOT TOUCHED. Computing the edits before the removal is what turns
+	// "removed it, then found nothing could be written down" into a refusal that changed nothing.
+	if _, err := r.c.ContainerInspect(context.Background(), c); err != nil {
+		t.Fatalf("the container was removed by an uninstall that could not record the removal: %v", err)
 	}
 }

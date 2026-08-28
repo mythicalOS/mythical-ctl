@@ -22,7 +22,7 @@ import (
 
 // Inventory — tests/unit/probe.bats:
 // PORTED: tests/unit/probe.bats: "the probe image comes from the family index, not from a constant" -> TestImageFromIndex (a *trust.Index is constructible ONLY by the trust acceptors — a constant cannot be one)
-// PORTED: tests/unit/probe.bats: "an index that does not verify yields no probe image" -> TestImageFromIndex (structural: Image takes the acceptors' sealed Index, so a refused index yields no value to pass — the acceptor refusals themselves are trust_test.go's TestAcceptIndex)
+// PORTED: tests/unit/probe.bats: "an index that does not verify yields no probe image" -> TestImageFromIndex (structural: Image takes the acceptors' sealed Index, so a refused index yields no value to pass — the acceptor refusals themselves are internal/trust.TestAcceptIndex)
 // PORTED: tests/unit/probe.bats: "an index that names neither pinned helper image is refused — the keys are REQUIRED" -> TestIndexRequiresHelperImages
 // PORTED: tests/unit/probe.bats: "an index naming a FLOATING tag for the probe image is refused" -> TestIndexRequiresHelperImages
 // PORTED: tests/unit/probe.bats: "an UNOBTAINABLE probe image reports unavailable — it never falls back" -> TestAvailable
@@ -42,7 +42,7 @@ import (
 // PORTED: tests/unit/probe.bats: "an answer about a DIFFERENT alias is refused, never returned as this one's address" -> TestResolveAnswerGates
 // PORTED: tests/unit/probe.bats: "an answer naming TWO aliases, or TWO addresses, is refused rather than read down to one" -> TestResolveAnswerGates
 // PORTED: tests/unit/probe.bats: "an answer carrying no address field at all is a probe failure, not a non-resolving alias" -> TestResolveAnswerGates
-// PORTED: tests/unit/probe.bats: "the probe command set is CLOSED — nothing manifest-supplied reaches it" -> TestConstructorRefusals (engine/client_test.go: HelperCommand outside the closed set is a constructor error; the Prober exposes no free-string command anywhere)
+// PORTED: tests/unit/probe.bats: "the probe command set is CLOSED — nothing manifest-supplied reaches it" -> internal/engine.TestConstructorRefusals (engine/client_test.go: HelperCommand outside the closed set is a constructor error; the Prober exposes no free-string command anywhere)
 // PORTED: tests/unit/probe.bats: "a probe run is recorded under write-ahead intent and cleaned up when it completes" -> TestRunAccounting
 // PORTED: tests/unit/probe.bats: "a completed probe removes ITSELF — no container survives and nothing sweeps one up" -> TestRunAccounting
 // PORTED: tests/unit/probe.bats: "a run whose container could not be accounted for afterwards KEEPS its intent AND FAILS" -> TestUnaccountedRun

@@ -45,6 +45,19 @@ trap 'rm -rf "$TMP"' EXIT
 GOFLAGS='' GOENV=off go test -list '.*' ./... > "$TMP/list-default.txt"
 GOFLAGS='' GOENV=off go test -tags acceptance -list '.*' ./... > "$TMP/list-acceptance.txt"
 
+# THE SECOND WITNESS, PER LANE, AND IT IS THE TOOLCHAIN'S OWN FILE SELECTION.
+#
+# The grader used to build its source witness by WALKING every *_test.go on disk with build
+# constraints deliberately not applied. Paired with a list witness that reads unstructured stdout,
+# the two could agree about a test no lane runs: a file tagged out of every lane declaring
+# TestClaimed, and an active init() that merely PRINTS "TestClaimed". TestGoFiles/XTestGoFiles are
+# the files go itself compiles for THIS lane after applying its tags, so the source half can no
+# longer testify about a file the lane does not build.
+FILE_TMPL='{{.ImportPath}}	{{.Dir}}	{{join .TestGoFiles " "}}	{{join .XTestGoFiles " "}}'
+GOFLAGS='' GOENV=off go list -f "$FILE_TMPL" ./... > "$TMP/files-default.txt"
+GOFLAGS='' GOENV=off go list -tags acceptance -f "$FILE_TMPL" ./... > "$TMP/files-acceptance.txt"
+
+# PAIRED, AND IN THE SAME ORDER. The grader refuses a mismatched count rather than pairing by luck.
 go run ./tools/parity-audit \
-  --go-list "$TMP/list-default.txt" \
-  --go-list "$TMP/list-acceptance.txt"
+  --go-list "$TMP/list-default.txt" --go-files "$TMP/files-default.txt" \
+  --go-list "$TMP/list-acceptance.txt" --go-files "$TMP/files-acceptance.txt"

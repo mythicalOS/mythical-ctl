@@ -25,25 +25,25 @@ import (
 // N/A: tests/unit/harness.bats: "fs snapshot detects an in-place content change with the SAME mode" -- same: bash-harness instrument, not adapter behavior
 // N/A: tests/unit/harness.bats: "fs snapshot is robust to a filename containing a newline and a tab" -- same: bash-harness instrument
 // N/A: tests/unit/harness.bats: "fs snapshot does not hang on a FIFO — special files are recorded, never read" -- same: bash-harness instrument
-// PORTED: tests/unit/harness.bats: "runtime snapshot captures volumes and their labels" -> TestSnapshot (enginetest/fake_test.go)
-// PORTED: tests/unit/harness.bats: "a name that traverses out of the state directory is refused for every resource kind" -> TestCreateNameValidation (enginetest/fake_test.go; the traversal MECHANICS are structurally absent in map-backed state — what survives is the daemon's own name class on every create, so the fake is never more permissive than the daemon)
+// PORTED: tests/unit/harness.bats: "runtime snapshot captures volumes and their labels" -> enginetest.TestSnapshot (enginetest/fake_test.go)
+// PORTED: tests/unit/harness.bats: "a name that traverses out of the state directory is refused for every resource kind" -> enginetest.TestCreateNameValidation (enginetest/fake_test.go; the traversal MECHANICS are structurally absent in map-backed state — what survives is the daemon's own name class on every create, so the fake is never more permissive than the daemon)
 // N/A: tests/unit/harness.bats: "a traversing name cannot read or rewrite a file that already exists outside the state dir" -- map-backed state: no name is ever resolved as a filesystem path
-// PORTED: tests/unit/harness.bats: "every subcommand that takes a name validates it, not only create" -> TestCreateNameValidation (enginetest/fake_test.go; creates refuse the class) + TestWeirdNameLookupsAnswer404 (inspect/start/stop/remove/connect/disconnect of a weird-but-routable name answer 404 — the daemon's own answer for an absent object; a traversal spelling is unroutable at the HTTP layer — real daemon 301-path-cleans (measured), the fake's closed surface hard-errors — and is asserted never to address an object)
-// PORTED: tests/unit/harness.bats: "image records are keyed by the exact reference, not a character-folded one" -> TestImageKeyExactRef (enginetest/fake_test.go)
+// PORTED: tests/unit/harness.bats: "every subcommand that takes a name validates it, not only create" -> enginetest.TestCreateNameValidation (enginetest/fake_test.go; creates refuse the class) + TestWeirdNameLookupsAnswer404 (inspect/start/stop/remove/connect/disconnect of a weird-but-routable name answer 404 — the daemon's own answer for an absent object; a traversal spelling is unroutable at the HTTP layer — real daemon 301-path-cleans (measured), the fake's closed surface hard-errors — and is asserted never to address an object)
+// PORTED: tests/unit/harness.bats: "image records are keyed by the exact reference, not a character-folded one" -> enginetest.TestImageKeyExactRef (enginetest/fake_test.go)
 // PORTED: tests/unit/harness.bats: "a container cannot be created on a network that does not exist" -> TestCreateUnknownNetwork
 // PORTED: tests/unit/harness.bats: "network connect refuses a network that does not exist, and attaches by ID" -> TestConnectResolvesNetwork
 // PORTED: tests/unit/harness.bats: "network create records the driver it was ASKED for, not an assumed one" -> TestNetworkCreateExplicitBridge
-// PORTED: tests/unit/harness.bats: "an unimplemented flag is refused by every arm, never silently ignored" -> TestUnimplementedRouteIsFatal (enginetest/fake_test.go; the API-level closed surface: an unimplemented ROUTE or filter kind is a hard error, never a silent no-op)
+// PORTED: tests/unit/harness.bats: "an unimplemented flag is refused by every arm, never silently ignored" -> enginetest.TestUnimplementedRouteIsFatal (enginetest/fake_test.go; the API-level closed surface: an unimplemented ROUTE or filter kind is a hard error, never a silent no-op)
 // N/A: tests/unit/harness.bats: "a subcommand that acts on one object refuses a second one" -- an API path addresses exactly one object structurally; the multi-positional grammar does not exist
 // N/A: tests/unit/harness.bats: "version, info and context answer only the templates they implement" -- Go templates are CLI grammar; the API returns typed documents (the closed-surface rule is the route test above)
-// PORTED: tests/unit/harness.bats: "ls answers only the templates and filters it implements" -> TestListRefusesNonLabelFilter (enginetest/fake_test.go; the filter half — the template half is CLI grammar with no API analogue)
+// PORTED: tests/unit/harness.bats: "ls answers only the templates and filters it implements" -> enginetest.TestListRefusesNonLabelFilter (enginetest/fake_test.go; the filter half — the template half is CLI grammar with no API analogue)
 // PORTED: tests/unit/harness.bats: "a resource that is still referenced cannot be removed" -> TestReferencedResourcesCannotBeRemoved
 // PORTED: tests/unit/harness.bats: "network connect refuses a duplicate endpoint and a private-mode container, and the container name is always an alias" -> TestConnectDuplicateAndPrivate + TestCreateStoppedAttachedAliased (name-always-an-alias)
 // PORTED: tests/unit/harness.bats: "network disconnect resolves its network and refuses a container that is not attached" -> TestDisconnectResolution
-// PORTED: tests/unit/harness.bats: "a missing --env-file is refused, and a two-field publish records the address the daemon binds" -> TestEmptyHostIPReportsAllInterfaces (enginetest/fake_test.go; the publish half — the env-file half is N/A: env rides the create body over the local socket, there is no file vehicle to be missing, see the SpecOpts.Env doc)
-// PORTED: tests/unit/harness.bats: "container run without --rm leaves the container behind, as a real daemon does" -> TestHelperCrashWindowLeavesContainer (enginetest/fake_test.go; the Go client always removes — the fake keeps the fidelity that an UNREMOVED helper persists, which is the crash window the probe's accounting covers)
+// PORTED: tests/unit/harness.bats: "a missing --env-file is refused, and a two-field publish records the address the daemon binds" -> enginetest.TestEmptyHostIPReportsAllInterfaces (enginetest/fake_test.go; the publish half — the env-file half is N/A: env rides the create body over the local socket, there is no file vehicle to be missing, see the SpecOpts.Env doc)
+// PORTED: tests/unit/harness.bats: "container run without --rm leaves the container behind, as a real daemon does" -> enginetest.TestHelperCrashWindowLeavesContainer (enginetest/fake_test.go; the Go client always removes — the fake keeps the fidelity that an UNREMOVED helper persists, which is the crash window the probe's accounting covers)
 // PORTED: tests/unit/harness.bats: "a named volume a container mounts is auto-created, as the daemon does" -> TestAutoCreatedVolumeUnlabelled
-// PORTED: tests/unit/harness.bats: "an image id is stable across inspects" -> TestImageIDStable (enginetest/fake_test.go)
+// PORTED: tests/unit/harness.bats: "an image id is stable across inspects" -> enginetest.TestImageIDStable (enginetest/fake_test.go)
 // N/A: tests/unit/harness.bats: "the lock file and its temps (incl. the recovery gate) are excluded from the fs snapshot" -- fs-snapshot instrument (see above)
 //
 // Inventory — tests/unit/runtime.bats (the transport half; the spec-assembly half is Task 15's):
@@ -66,7 +66,7 @@ import (
 // PORTED: tests/unit/runtime.bats: "network create can be made to produce a duplicate, so D38 is testable" -> TestDuplicateNetworkKnob
 // PORTED: tests/unit/runtime.bats: "the family network is created with an EXPLICIT bridge driver (D29)" -> TestNetworkCreateExplicitBridge
 // PORTED: tests/unit/runtime.bats: "image pull failures are distinguishable" -> TestImagePullOutcomes
-// PORTED: tests/unit/runtime.bats: "snap_runtime captures containers and networks, not only volumes" -> TestSnapshot (enginetest/fake_test.go)
+// PORTED: tests/unit/runtime.bats: "snap_runtime captures containers and networks, not only volumes" -> enginetest.TestSnapshot (enginetest/fake_test.go)
 // PORTED: tests/unit/runtime.bats: "the helper's three mount specs are validated, not interpolated" -> TestHelperMountVocabulary (the closed helper-mount constructors pin target AND writability; path/name rules in TestConstructorRefusals)
 // PORTED: tests/unit/runtime.bats: "a container cannot be created from an image that was never pulled" -> TestUnpulledImageRefused
 // PORTED: tests/unit/runtime.bats: "a bind whose source does not exist is refused, never silently created" -> TestAbsentBindSourceRefused

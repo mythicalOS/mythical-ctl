@@ -479,6 +479,23 @@ func parseOpts(args []string, stderr io.Writer) (opts, int) {
 				return "", false
 			}
 			i++
+			// AN OPTION IS NOT A VALUE. `--image --purge` used to consume `--purge` AS the image
+			// and then RUN: measured, `install p1 --image --purge` exited 1 rather than 2, having
+			// entered installation with an image nobody wrote — and a live install persists trust
+			// floors, identity and network state before the bogus pull fails, so this is durable
+			// state written on the strength of a malformed command line. `--version --index
+			// --bogus` exited 0, swallowing an unknown option the dispatcher exists to refuse.
+			//
+			// Anything beginning with `-` is therefore refused as a value. It is a STATED
+			// DIVERGENCE from the frozen `_need_val`, which only checked `$# -lt 2`, and it only
+			// ever refuses more: a genuine path that starts with a dash is still writable as
+			// `./-name`, and no invocation the reference accepted AND ACTED ON CORRECTLY is
+			// rejected here.
+			if strings.HasPrefix(args[i], "-") {
+				fmt.Fprintf(stderr, "mythical-ctl: option %s requires a value, and %q is another option — refusing\n", a, args[i])
+				fmt.Fprintf(stderr, "  rather than taking it as the value. Nothing is attempted.\n")
+				return "", false
+			}
 			// AN EMPTY VALUE IS A USAGE ERROR, NOT AN UNSET OPTION. Every "applies to X only"
 			// refusal in this dispatcher — and opts.misplaced, which is most of them — asks
 			// whether a string option is non-empty, because that is what the frozen dispatcher's
@@ -544,6 +561,17 @@ func parseOpts(args []string, stderr io.Writer) (opts, int) {
 		default:
 			if strings.HasPrefix(a, "-") {
 				fmt.Fprintf(stderr, "mythical-ctl: unknown option: %s\n", a)
+				return opts{}, cliio.ExitUsage
+			}
+			// AN EMPTY OPERAND IS A USAGE ERROR, and it is the operand half of the hole the empty
+			// VALUE rule closes above. `status "" --plain` exited 0 — a malformed invocation
+			// reported as a SUCCESSFUL QUERY — while `install ""` and `backup ""` exited 1,
+			// reporting a usage mistake as operational work the tool attempted and failed. No verb
+			// in this CLI has a meaningful empty operand: every one of them is a product name, a
+			// directory or a subcommand.
+			if a == "" {
+				fmt.Fprintf(stderr, "mythical-ctl: an empty operand is not a product, a directory or a subcommand.\n")
+				fmt.Fprintf(stderr, "  Nothing is attempted.\n")
 				return opts{}, cliio.ExitUsage
 			}
 			o.products = append(o.products, a)

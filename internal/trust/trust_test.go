@@ -79,7 +79,7 @@ import (
 // PORTED: tests/unit/manifest.bats: "tampering at any level of the chain is refused" -> TestAcceptManifestChain
 // PORTED: tests/unit/manifest.bats: "a product the index does not vouch for is refused" -> TestAcceptManifestChain
 // PORTED: tests/unit/manifest.bats: "an authentic not-launched manifest reports rc 3, not 0" -> TestAcceptManifestChain (ErrNotLaunched, manifest still returned)
-// PORTED: tests/unit/manifest.bats: "the manifest cannot supply a name — only a role" -> (owned by internal/manifest TestSchemaRefusals; recorded here because the bats file exercises it through the door)
+// PORTED: tests/unit/manifest.bats: "the manifest cannot supply a name — only a role" -> (owned by internal/manifest.TestSchemaRefusals; recorded here because the bats file exercises it through the door)
 // PORTED: tests/unit/manifest.bats: "an entitlement violation is refused by the door itself, not only by mi_manifest_check" -> TestAcceptManifestChain
 // PORTED: tests/unit/manifest.bats: "Fix 1: an entitlement violation leaves the version floor unchanged" -> TestFloorDiscipline
 // PORTED: tests/unit/manifest.bats: "Fix 1: an accepted-but-not-launched manifest still advances the version floor" -> TestFloorDiscipline

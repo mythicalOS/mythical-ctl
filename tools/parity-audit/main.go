@@ -769,87 +769,121 @@ func parseGoTestList(content []byte) map[string]map[string]bool {
 	return out
 }
 
-// collectSourceTestFuncs reads the test functions each package DIRECTORY declares, from source.
+// testLane is ONE build-tag lane of the GO suite, and it carries BOTH witnesses — paired,
+// deliberately. (Not to be confused with the corpus `lane` above, which is a bats directory.)
 //
-// WHY SOURCE AS WELL AS `go test -list`. That command's stdout is unstructured text: anything a
-// package prints during initialisation lands in the same stream, so a deleted test's identifier
-// printed by a TestMain would be read back as a test that exists — and a PORTED claim on it would
-// stay green with the test gone. Requiring BOTH is what closes it: the list proves the package
-// compiles and registers its tests, the source proves the named function is really declared there.
+// WHY PAIRING IS THE FIX. The two witnesses were global and independent, and that let them agree
+// about a test no lane runs. The SOURCE witness walked every `_test.go` on disk with build
+// constraints DELIBERATELY NOT APPLIED, so a file tagged out of every lane still counted as a
+// declaration; the LIST witness parses `go test -list` stdout, which is unstructured text anything
+// a package prints during initialisation lands in. So a tagged-out file declaring TestClaimed, plus
+// an active init() that merely PRINTS "TestClaimed", satisfied both halves while nothing anywhere
+// registered a test by that name. Requiring the two to agree WITHIN ONE LANE closes it: the source
+// half is now built from exactly the files that lane compiles.
+type testLane struct {
+	name string
+	// list — what `go test -list` printed for this lane, per package.
+	list map[string]map[string]bool
+	// src — what the ACTIVE test files of this lane declare, per package (same key as list).
+	src map[string]map[string]bool
+}
+
+// parseGoFileList reads `go list -f '{{.ImportPath}}\t{{.Dir}}\t{{join .TestGoFiles " "}}\t{{join
+// .XTestGoFiles " "}}'` output and returns, per package import path, the absolute paths of the test
+// files THAT LANE COMPILES. TestGoFiles and XTestGoFiles are the in-package and external test files
+// go itself selected after applying build constraints — which is the whole point: the selection is
+// made by the toolchain for the lane, not re-derived here from a walk that ignores tags.
+func parseGoFileList(content []byte) (map[string][]string, error) {
+	out := map[string][]string{}
+	sc := bufio.NewScanner(bytes.NewReader(content))
+	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	for sc.Scan() {
+		t := strings.TrimRight(sc.Text(), "\r")
+		if strings.TrimSpace(t) == "" {
+			continue
+		}
+		f := strings.Split(t, "\t")
+		if len(f) != 4 {
+			return nil, fmt.Errorf("go-files line is not the 4 tab-separated fields this reader expects: %q", t)
+		}
+		pkg, dir := f[0], f[1]
+		if pkg == "" || dir == "" {
+			return nil, fmt.Errorf("go-files line names no package or no directory: %q", t)
+		}
+		for _, group := range f[2:] {
+			for _, name := range strings.Fields(group) {
+				out[pkg] = append(out[pkg], filepath.Join(dir, name))
+			}
+		}
+	}
+	return out, sc.Err()
+}
+
+// collectLaneSource parses the named files and returns the test functions each package DECLARES.
 //
 // THROUGH THE GO PARSER, NOT A LINE MATCH. An earlier version matched `^func Test…(` textually,
 // which counted a declaration written inside a block comment or a raw string as source evidence —
 // the same class of defect the inventory scanner had, in the tool that was fixing it. go/parser
 // knows what is code, and a file that does not parse is a hard error rather than a silent zero.
-//
-// BUILD CONSTRAINTS ARE DELIBERATELY NOT APPLIED. A test behind a tag this run did not enable is
-// still a real test somebody can run, and the LIST half already decides whether it is reachable in
-// a lane the audit actually drives (the audit passes both the default and the acceptance lane). A
-// declaration parsed here that no lane registers still fails, because the list is the other witness.
-func collectSourceTestFuncs(root string) (map[string]map[string]bool, error) {
+func collectLaneSource(files map[string][]string) (map[string]map[string]bool, error) {
 	out := map[string]map[string]bool{}
 	fset := token.NewFileSet()
-	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
+	for pkg, paths := range files {
+		if out[pkg] == nil {
+			out[pkg] = map[string]bool{}
 		}
-		if d.IsDir() {
-			if skipDirs[d.Name()] {
-				return fs.SkipDir
+		for _, p := range paths {
+			f, perr := parser.ParseFile(fset, p, nil, parser.SkipObjectResolution)
+			if perr != nil {
+				return nil, fmt.Errorf("parsing %s for its test declarations: %w", p, perr)
 			}
-			return nil
-		}
-		if !strings.HasSuffix(d.Name(), "_test.go") {
-			return nil
-		}
-		rel, rerr := filepath.Rel(root, p)
-		if rerr != nil {
-			return rerr
-		}
-		f, perr := parser.ParseFile(fset, p, nil, parser.SkipObjectResolution)
-		if perr != nil {
-			return fmt.Errorf("parsing %s for its test declarations: %w", rel, perr)
-		}
-		dir := path.Dir(filepath.ToSlash(rel))
-		if out[dir] == nil {
-			out[dir] = map[string]bool{}
-		}
-		for _, decl := range f.Decls {
-			fn, ok := decl.(*ast.FuncDecl)
-			// A METHOD IS NOT A TEST. `func (r *rig) TestX()` is never run by the testing package,
-			// so a receiver disqualifies the declaration however the name reads.
-			if !ok || fn.Recv != nil || fn.Name == nil {
-				continue
-			}
-			// The same grammar the testing package applies: `Test` alone, or `Test` followed by a
-			// character that is not a lower-case letter.
-			if n := fn.Name.Name; isGoTestName(n) {
-				out[dir][n] = true
+			for _, decl := range f.Decls {
+				fn, ok := decl.(*ast.FuncDecl)
+				// A METHOD IS NOT A TEST. `func (r *rig) TestX()` is never run by the testing
+				// package, so a receiver disqualifies the declaration however the name reads.
+				if !ok || fn.Recv != nil || fn.Name == nil {
+					continue
+				}
+				// The same grammar the testing package applies: `Test` alone, or `Test` followed
+				// by a character that is not a lower-case letter.
+				if n := fn.Name.Name; isGoTestName(n) {
+					out[pkg][n] = true
+				}
 			}
 		}
-		return nil
-	})
-	return out, err
+	}
+	return out, nil
 }
 
-// candidatePackages is where a PORTED claim's target may legitimately live: the package of the file
-// making the claim, plus any package the claim's own text names. Claims that point across a package
-// boundary already say so in prose ("owned by internal/docfmt TestDocTypes", "enginetest/fake_test.go"),
-// so this reads that prose rather than requiring a new syntax.
+// candidatePackages is where ONE PORTED target may legitimately live: the package of the file
+// making the claim, plus any package the claim names EXPLICITLY AND FOR THAT TARGET, by writing it
+// as `<package path>.<TestName>`.
 //
-// A BASENAME IS NOT A PACKAGE. An earlier version kept one package per last segment, so `cmd/probe`
-// and `internal/probe` would have collapsed onto whichever was seen last, and a claim naming one
-// could resolve against the other — putting back exactly the namesake hole per-package resolution
-// exists to close. A multi-segment token must therefore match a real path SUFFIX, and a bare segment
-// matches only when it is unambiguous across the whole module.
-func candidatePackages(goTests map[string]map[string]bool, goFile, detail string) map[string]bool {
+// IT USED TO MINE FREE PROSE, AND THAT IS A FALSE-GREEN GENERATOR. Every path-like token anywhere
+// in a claim's text was treated as a positive package reference, so a claim reading
+// `TestShared (not internal/w; it is local)` offered `internal/w` as a candidate — and would then
+// resolve against `internal/w.TestShared`, INCLUDING after the local test it was really about was
+// deleted. A sentence saying a package is NOT where the target lives cannot be distinguished from
+// one saying it is, because the reader is a token regexp and prose has no polarity. It is the same
+// class as a namesake in another package satisfying a claim: the claim survives the deletion of the
+// thing it claims.
+//
+// So a cross-package reference must be ATTACHED TO THE TARGET. `internal/docfmt.TestDocTypes` names
+// a package for TestDocTypes and for nothing else; no arrangement of prose can supply one by
+// accident, and a claim that means to point across a boundary says so in a form that cannot be read
+// two ways.
+//
+// A BASENAME IS NOT A PACKAGE. `cmd/probe` and `internal/probe` must never collapse onto whichever
+// was seen last, so a multi-segment token must match a real path SUFFIX, and a bare segment matches
+// only when it is unambiguous across the whole module.
+func candidatePackages(all map[string]map[string]bool, goFile, detail, target string) map[string]bool {
 	bySeg := map[string][]string{}
-	for p := range goTests {
+	for p := range all {
 		bySeg[path.Base(p)] = append(bySeg[path.Base(p)], p)
 	}
 	out := map[string]bool{}
 	own := path.Dir(filepath.ToSlash(goFile))
-	for p := range goTests {
+	for p := range all {
 		if p == own || strings.HasSuffix(p, "/"+own) {
 			out[p] = true
 		}
@@ -860,51 +894,32 @@ func candidatePackages(goTests map[string]map[string]bool, goFile, detail string
 			return
 		}
 		if strings.Contains(tok, "/") {
-			// A PATH: it must be a genuine suffix of a package path, so cmd/probe can never
-			// resolve to internal/probe.
-			for p := range goTests {
+			for p := range all {
 				if p == tok || strings.HasSuffix(p, "/"+tok) {
 					out[p] = true
 				}
 			}
 			return
 		}
-		// A BARE SEGMENT: only when it names exactly one package in the module. Two packages
-		// sharing a last segment make the reference ambiguous, and an ambiguous reference must
-		// not widen the candidate set — that is the hole, not the fix for it.
 		if ps := bySeg[tok]; len(ps) == 1 {
 			out[ps[0]] = true
 		}
 	}
-	for _, tok := range pathish.FindAllString(detail, -1) {
-		add(tok)
-		// ...and each leading path the token contains, with a Go-file suffix stripped, so
-		// "enginetest/fake_test.go" offers both that path and the package "enginetest".
-		segs := strings.Split(tok, "/")
-		for i := range segs {
-			segs[i] = strings.TrimSuffix(strings.TrimSuffix(segs[i], "_test.go"), ".go")
+	for _, m := range qualifiedTarget.FindAllStringSubmatch(detail, -1) {
+		// FOR THIS TARGET ONLY. A claim naming two tests may qualify one of them and not the
+		// other, and the unqualified one must not borrow the qualified one's package.
+		if m[2] != target {
+			continue
 		}
-		for i := range segs {
-			add(strings.Join(segs[:i+1], "/"))
-			add(segs[i])
-		}
+		add(m[1])
 	}
 	return out
 }
 
-var pathish = regexp.MustCompile(`[A-Za-z0-9_./-]+`)
-
-// dirOf maps a package IMPORT PATH to the repository-relative directory holding its source. The
-// module prefix is the part before the first path element that exists on disk here; stripping it by
-// module path would need go.mod, and every package in this module is under one of these roots.
-func dirOf(pkg string) string {
-	for _, root := range []string{"/internal/", "/cmd/", "/tools/"} {
-		if i := strings.Index(pkg, root); i >= 0 {
-			return pkg[i+1:]
-		}
-	}
-	return path.Base(pkg)
-}
+// qualifiedTarget matches `<package path>.<TestName>` — the ONLY cross-package reference this audit
+// reads. The name half must satisfy the testing package's own grammar, so `enginetest/fake_test.go`
+// offers nothing (its suffix is `go`, not a test name) and neither does ordinary prose.
+var qualifiedTarget = regexp.MustCompile(`([A-Za-z0-9_./-]+)\.(Test[^a-z][A-Za-z0-9_]*|Test)\b`)
 
 // ---------------------------------------------------------------------------------------------
 // The audit
@@ -984,7 +999,20 @@ func laneNames() string {
 // auditCoverage is the whole claim under audit: every bats test is accounted for EXACTLY ONCE, no
 // claim names a test that does not exist, every PORTED target is a Go test that really runs, and
 // no file is waved away wholesale except the two that were pre-declared with an argument.
-func auditCoverage(r *report, pairs []batsPair, claims []claim, bad []malformed, strays []stray, goTests map[string]map[string]bool, srcTests map[string]map[string]bool, preDeclared map[string]string) {
+func auditCoverage(r *report, pairs []batsPair, claims []claim, bad []malformed, strays []stray, testLanes []testLane, preDeclared map[string]string) {
+	// The union of what every lane REGISTERS — used to offer candidate packages and to say where a
+	// target does exist. Resolution itself never uses it: that must agree within ONE lane.
+	goTests := map[string]map[string]bool{}
+	for _, ln := range testLanes {
+		for pkg, ns := range ln.list {
+			if goTests[pkg] == nil {
+				goTests[pkg] = map[string]bool{}
+			}
+			for n := range ns {
+				goTests[pkg][n] = true
+			}
+		}
+	}
 	for _, b := range bad {
 		r.fail("%s:%d: inventory line does not parse (or its N/A argues nothing): %s", b.GoFile, b.GoLine, strings.TrimSpace(b.Text))
 	}
@@ -1123,15 +1151,22 @@ func auditCoverage(r *report, pairs []batsPair, claims []claim, bad []malformed,
 		if c.Kind != claimPorted {
 			continue
 		}
-		cands := candidatePackages(goTests, c.GoFile, c.Detail)
 		for _, t := range c.Targets {
+			cands := candidatePackages(goTests, c.GoFile, c.Detail, t)
 			found := false
 			for p := range cands {
-				// BOTH WITNESSES. `go test -list` says the package registers it (so it compiles and
-				// runs); the SOURCE says that package really declares it. A name that appears in
-				// only one of the two is not a test this claim can rest on.
-				if goTests[p][t] && srcTests[dirOf(p)][t] {
-					found = true
+				// BOTH WITNESSES, WITHIN ONE LANE. `go test -list` says that lane registers the
+				// name (so it compiles and runs there); the lane's ACTIVE test files say that
+				// package really declares it. Agreement ACROSS lanes proves nothing: a name
+				// printed by one lane's init and declared in a file only another lane compiles
+				// satisfies both halves while no lane runs a test by that name.
+				for _, ln := range testLanes {
+					if ln.list[p][t] && ln.src[p][t] {
+						found = true
+						break
+					}
+				}
+				if found {
 					break
 				}
 			}
@@ -1202,18 +1237,20 @@ func main() {
 		manifest  = flag.String("manifest", "tests/parity-manifest.tsv", "the committed corpus manifest, relative to -root")
 		writeMan  = flag.Bool("write-manifest", false, "regenerate the manifest from the bats trees and write it, instead of auditing")
 		goLists   listFlag
+		goFiles   listFlag
 		failFirst = flag.Int("max-problems", 0, "print at most this many problems (0 = all)")
 	)
 	flag.Var(&goLists, "go-list", "file holding `go test -list` output; repeatable (once per build-tag lane)")
+	flag.Var(&goFiles, "go-files", "file holding `go list -f '{{.ImportPath}}\\t{{.Dir}}\\t{{join .TestGoFiles \" \"}}\\t{{join .XTestGoFiles \" \"}}'` output for the SAME lane, in the SAME order as --go-list")
 	flag.Parse()
 
-	if err := run(*root, *manifest, *writeMan, goLists, *failFirst); err != nil {
+	if err := run(*root, *manifest, *writeMan, goLists, goFiles, *failFirst); err != nil {
 		fmt.Fprintf(os.Stderr, "parity-audit: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(root, manifestRel string, writeMan bool, goLists []string, maxProblems int) error {
+func run(root, manifestRel string, writeMan bool, goLists, goFiles []string, maxProblems int) error {
 	manifestPath := filepath.Join(root, filepath.FromSlash(manifestRel))
 
 	// Is the bash tree still here? Both lanes or neither. A half-deleted tree would regenerate a
@@ -1310,24 +1347,50 @@ func run(root, manifestRel string, writeMan bool, goLists []string, maxProblems 
 		return fmt.Errorf("scanned 0 Go files under %s — the inventory scan is pointed at the wrong tree", root)
 	}
 
-	goTests := map[string]map[string]bool{}
+	// THE TWO WITNESSES ARRIVE PAIRED, ONE PAIR PER LANE, and the pairing is checked rather than
+	// assumed: an unpaired list would silently reintroduce the very independence the pairing
+	// removes — a lane whose source half is empty resolves nothing, and one whose list half is
+	// empty would be skipped without anybody noticing which lane went missing.
+	if len(goFiles) != len(goLists) {
+		return fmt.Errorf("--go-list was given %d time(s) and --go-files %d — they are ONE witness pair per\n"+
+			"   build-tag lane and must be given in the same number and the same order: the source half\n"+
+			"   of target resolution is built from the files THAT LANE compiles",
+			len(goLists), len(goFiles))
+	}
+	var testLanes []testLane
 	names := 0
-	for _, p := range goLists {
+	for i, p := range goLists {
 		content, err := os.ReadFile(p)
 		if err != nil {
 			return fmt.Errorf("reading go-test list: %w", err)
 		}
-		for pkg, ns := range parseGoTestList(content) {
-			if goTests[pkg] == nil {
-				goTests[pkg] = map[string]bool{}
-			}
-			for n := range ns {
-				goTests[pkg][n] = true
-			}
+		fcontent, ferr := os.ReadFile(goFiles[i])
+		if ferr != nil {
+			return fmt.Errorf("reading go-files list: %w", ferr)
 		}
-	}
-	for _, ns := range goTests {
-		names += len(ns)
+		files, perr := parseGoFileList(fcontent)
+		if perr != nil {
+			return fmt.Errorf("reading %s: %w", goFiles[i], perr)
+		}
+		src, serr := collectLaneSource(files)
+		if serr != nil {
+			return serr
+		}
+		ln := testLane{name: p, list: parseGoTestList(content), src: src}
+		// EACH LANE'S OWN LIVENESS, not the union's. A lane that registers nothing, or whose
+		// compiled test files declare nothing, resolves no target — and a union check would hide
+		// that behind the other lane.
+		if len(ln.list) == 0 {
+			return fmt.Errorf("%s lists no packages — `go test -list` produced nothing for this lane", p)
+		}
+		if len(src) == 0 {
+			return fmt.Errorf("%s names no compiled test files — the source half of target resolution has\n"+
+				"   nothing to check against for this lane", goFiles[i])
+		}
+		for _, ns := range ln.list {
+			names += len(ns)
+		}
+		testLanes = append(testLanes, ln)
 	}
 	// Same liveness argument one level down: an empty set of known tests would make every PORTED
 	// target unresolvable, which is loud — but an empty set arriving because nobody passed a list
@@ -1336,15 +1399,19 @@ func run(root, manifestRel string, writeMan bool, goLists []string, maxProblems 
 	if names == 0 {
 		return fmt.Errorf("no Go test names were loaded (pass --go-list <file> with `go test -list '.*' ./...` output) — PORTED targets cannot be resolved")
 	}
+	goTests := map[string]map[string]bool{}
+	for _, ln := range testLanes {
+		for pkg, ns := range ln.list {
+			if goTests[pkg] == nil {
+				goTests[pkg] = map[string]bool{}
+			}
+			for n := range ns {
+				goTests[pkg][n] = true
+			}
+		}
+	}
 
-	srcTests, serr := collectSourceTestFuncs(root)
-	if serr != nil {
-		return serr
-	}
-	if len(srcTests) == 0 {
-		return fmt.Errorf("no _test.go files were found under %s — the source half of target resolution has nothing to check against", root)
-	}
-	auditCoverage(r, pairs, claims, bad, strays, goTests, srcTests, wholeFileNA)
+	auditCoverage(r, pairs, claims, bad, strays, testLanes, wholeFileNA)
 
 	fmt.Printf("go tree: %d files scanned, %d PORTED, %d N/A, %d Go test names known across %d packages\n", scanned, r.Ported, r.NA, names, len(goTests))
 	fmt.Printf("corpus: %d tests covered by a pre-declared whole-file N/A argument\n", r.WholeFileNA)

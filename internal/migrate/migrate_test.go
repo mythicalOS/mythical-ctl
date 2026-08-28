@@ -23,10 +23,10 @@ import (
 // Inventory — tests/unit/migrate.bats (the machine half; the path/identity/secure-location half is
 // in paths_test.go).
 //
-// PORTED: tests/unit/migrate.bats: "migrate-storage with NO ROLE is rejected — a product may have several volume roles" -> cmd/mythical-ctl TestMigrateStorageDispatchRefusals ("needs exactly <product> <role>", exit 2, nothing attempted — the surface where a missing operand is expressible at all; the library signature takes product and role as separate typed parameters, so this package cannot be handed the shape)
+// PORTED: tests/unit/migrate.bats: "migrate-storage with NO ROLE is rejected — a product may have several volume roles" -> cmd/mythical-ctl.TestMigrateStorageDispatchRefusals ("needs exactly <product> <role>", exit 2, nothing attempted — the surface where a missing operand is expressible at all; the library signature takes product and role as separate typed parameters, so this package cannot be handed the shape)
 // PORTED: tests/unit/migrate.bats: "an UNKNOWN role is rejected against the manifest, which names the valid roles" -> TestPrecheckRoleGates
 // PORTED: tests/unit/migrate.bats: "a SECRETS role is REFUSED WITH THE REASON — permitted but not bindable (D53)" -> TestPrecheckRoleGates
-// PORTED: tests/unit/migrate.bats: "a policy index collapsing permitted and bindable is rejected as MALFORMED (Plan 3's invariant)" -> internal/policy TestStructuralInvariants (the invariant is enforced at policy LOAD; this package can only ever hold a policy that already passed it, because policy.ParseVerified is boundary-gated to the trust acceptors)
+// PORTED: tests/unit/migrate.bats: "a policy index collapsing permitted and bindable is rejected as MALFORMED (Plan 3's invariant)" -> internal/policy.TestStructuralInvariants (the invariant is enforced at policy LOAD; this package can only ever hold a policy that already passed it, because policy.ParseVerified is boundary-gated to the trust acceptors)
 // PORTED: tests/unit/migrate.bats: "the role must be VOLUME-BACKED, proved by POSITIVE INSPECTION of the container's mounts" -> TestPrecheckRequiresPositiveVolumeBacking
 // PORTED: tests/unit/migrate.bats: "an ALREADY-BIND-BACKED role with NO live intent is refused, naming the current bind" -> TestPrecheckRefusesAnAlreadyBindBackedRole
 // PORTED: tests/unit/migrate.bats: "a live intent is checked FIRST, so a present bind after a crash RESUMES rather than refusing" -> TestPrecheckResumesAMatchingLiveIntent
@@ -49,10 +49,10 @@ import (
 // The compare-and-set is internal/conf's FamilyCAS, the one door authorized to CHANGE a mythical.conf
 // value, and its whole attempt table is asserted there. What THIS module owns — which attempt state
 // it presents to that door — is TestPhase6PresentsTheRecordedAttemptState.
-// PORTED: tests/unit/migrate.bats: "compare-and-set: not started, key absent → write" -> internal/conf TestFamilyCASAttemptTable
-// PORTED: tests/unit/migrate.bats: "compare-and-set: attempt in progress, key holds OUR value → advance without rewriting" -> internal/conf TestFamilyCASAttemptTable (asserted on the file's mtime — nothing was rewritten) + TestFamilyCASNarratesWhatItDid (it says so rather than looking like a write that did not happen)
-// PORTED: tests/unit/migrate.bats: "compare-and-set: attempt in progress, key ABSENT → STOP and require confirmation" -> internal/conf TestFamilyCASAttemptTable (refuse without confirmation; write only WITH it)
-// PORTED: tests/unit/migrate.bats: "compare-and-set: attempt in progress, key holds SOMETHING ELSE → STOP" -> internal/conf TestFamilyCASAttemptTable + TestOperatorEditIsNeverSilentlyOverwritten (the migration-level consequence: an operator's edit survives a crashed migration)
+// PORTED: tests/unit/migrate.bats: "compare-and-set: not started, key absent → write" -> internal/conf.TestFamilyCASAttemptTable
+// PORTED: tests/unit/migrate.bats: "compare-and-set: attempt in progress, key holds OUR value → advance without rewriting" -> internal/conf.TestFamilyCASAttemptTable (asserted on the file's mtime — nothing was rewritten) + internal/conf.TestFamilyCASNarratesWhatItDid (it says so rather than looking like a write that did not happen)
+// PORTED: tests/unit/migrate.bats: "compare-and-set: attempt in progress, key ABSENT → STOP and require confirmation" -> internal/conf.TestFamilyCASAttemptTable (refuse without confirmation; write only WITH it)
+// PORTED: tests/unit/migrate.bats: "compare-and-set: attempt in progress, key holds SOMETHING ELSE → STOP" -> internal/conf.TestFamilyCASAttemptTable + TestOperatorEditIsNeverSilentlyOverwritten (the migration-level consequence: an operator's edit survives a crashed migration)
 // PORTED: tests/unit/migrate.bats: "the bind reaches mythical.conf BEFORE the container is replaced" -> TestBindIsWrittenBeforeTheContainerIsReplaced
 // (migrate.bats' row about a RECREATE after the migration keeping the product on the bind was N/A here —
 // "re-claim against recreate once that verb lands". Wave 5 landed it, so the row is claimed in
