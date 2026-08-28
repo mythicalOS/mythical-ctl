@@ -214,7 +214,7 @@ func lifecycle(verb string, o opts, env []string, stdin io.Reader, stdout, stder
 // time. --index/--policy/--manifest-dir are the document locators every verb shares and are
 // accepted here exactly as the frozen dispatcher accepts them.
 func status(o opts, env []string, stdin io.Reader, stdout, stderr io.Writer) int {
-	if o.image != "" || o.forced || o.purge || o.family || o.toBind != "" || o.mapForeign || o.abandon {
+	if o.misplaced() {
 		fmt.Fprintln(stderr, "mythical-ctl: status takes no options other than --index")
 		return cliio.ExitUsage
 	}
@@ -321,6 +321,15 @@ func stateVerb(o opts, env []string, stdin io.Reader, stdout, stderr io.Writer) 
 		fmt.Fprintf(stderr, "mythical-ctl: %s\n", msg)
 		return cliio.ExitUsage
 	}
+	// THE FLAG-REFUSAL MATRIX, FIRST, BEFORE THE SUBVERB IS EVEN RESOLVED — see opts.misplaced
+	// for why this is a STATED DIVERGENCE from the frozen dispatcher rather than a port of it.
+	// Both subverbs confirm and then mutate: repair rewrites installer state from runtime labels,
+	// abandon-intent deletes a write-ahead record. Measured before this refusal existed, `state
+	// repair --purge` and `state abandon-intent <class> <name> --purge` both ran to COMPLETION
+	// with the option silently dropped.
+	if o.misplaced() {
+		return refuse("state takes no options other than --index/--policy/--manifest-dir")
+	}
 	sub := ""
 	if len(o.products) > 0 {
 		sub = o.products[0]
@@ -362,6 +371,13 @@ func netVerb(o opts, env []string, stdin io.Reader, stdout, stderr io.Writer) in
 	refuse := func(msg string) int {
 		fmt.Fprintf(stderr, "mythical-ctl: %s\n", msg)
 		return cliio.ExitUsage
+	}
+	// The same matrix, for the same reason and with the same standing: `net rebind` moves the
+	// whole fleet's network attachment, and with confirmation granted non-interactively it does
+	// so without asking. Measured before this refusal existed, `net rebind --purge` and
+	// `net rebind --to-bind PATH` both entered the rebind with the option silently dropped.
+	if o.misplaced() {
+		return refuse("net takes no options other than --index/--policy/--manifest-dir")
 	}
 	if len(o.products) == 0 || o.products[0] != "rebind" {
 		return refuse(`net takes "rebind"`)
@@ -427,6 +443,24 @@ type opts struct {
 	// other verb (see runEnv) rather than accepted and ignored.
 	plain    bool
 	products []string
+}
+
+// misplaced reports whether any option belonging to ANOTHER verb was given: every flag except
+// the three document locators (--index/--policy/--manifest-dir, which every verb shares) and
+// --plain, which runEnv already refuses centrally for every verb but status. It is ONE
+// predicate rather than the same seven-term expression written out at each of its call sites,
+// because a matrix maintained as N copies is a matrix that loses an option on N-1 of them —
+// and the direction it loses one is always "this verb now accepts a flag it does not honour".
+//
+// THE `state` AND `net` CALLS ARE A STATED DIVERGENCE FROM THE FROZEN DISPATCHER. Its `state)`
+// and `net)` arms carry no flag refusals at all, so this is not a port of the reference: it is
+// this tree deciding that the discipline the other seven verbs implement — "a misplaced option
+// is refused, not ignored" — has no principled exception at the two verbs that rebuild
+// installer state and move the fleet's network. The divergence only ever refuses more; no
+// invocation that the reference accepted and acted on correctly is rejected here.
+func (o opts) misplaced() bool {
+	return o.image != "" || o.forced || o.purge || o.family ||
+		o.toBind != "" || o.mapForeign || o.abandon
 }
 
 // parseOpts ports the frozen dispatcher's while-loop verbatim: known value-taking options
