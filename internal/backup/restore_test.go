@@ -1718,9 +1718,72 @@ func TestAnUnconfirmablePreservedCopyIsAFailureNotAResidue(t *testing.T) {
 
 	// preserveCorrupt's propagation of this — a plain error becomes ("", nil, err), so the caller
 	// prints "cannot preserve the corrupt staging ledger" instead of naming an aside — is asserted
-	// by TestPreserveCorruptRefusesAFileThatChangedUnderIt, which drives that same default arm.
-	// It cannot be driven from here: on a filesystem whose no-replace rename works, preserveMove
-	// never reaches the fallback at all.
+	// by TestPreserveCorruptPropagatesAMoveFailureAndClaimsNothing, through the preserveMoveNow
+	// seam. It cannot be driven from here: on a filesystem whose no-replace rename works,
+	// preserveMove never reaches the fallback at all.
+	//
+	// It was previously credited to TestPreserveCorruptRefusesAFileThatChangedUnderIt, which does
+	// NOT reach that arm: that test stands a file which VALIDATES, so preserveCorrupt returns at
+	// the re-judgement several statements before the move loop starts. Both tests passed while
+	// nothing at all covered the propagation.
+}
+
+// TestPreserveCorruptPropagatesAMoveFailureAndClaimsNothing: a move that failed outright is
+// reported as a failure, and NOTHING is claimed about where the evidence went.
+//
+// preserveCorrupt has three answers, and the caller prints a different sentence for each: an aside
+// with no residue ("PRESERVED at <aside>"), an aside WITH a residue ("preserved, and a copy also
+// remains at the staging name — remove it"), and a failure ("cannot preserve the corrupt staging
+// ledger"). The third is the one that says the bytes were NOT rescued. A regression that returned
+// the candidate name with a nil error, or folded the failure into the residue arm, would tell an
+// operator the evidence is safe at a path that holds nothing — and, in the residue case, tell them
+// to DELETE the only copy that still exists.
+func TestPreserveCorruptPropagatesAMoveFailureAndClaimsNothing(t *testing.T) {
+	dir := t.TempDir()
+	sf := filepath.Join(dir, "ledger.staging")
+	body := []byte("not a ledger\n")
+	write(t, sf, body)
+
+	// THE ARM IS REACHED THROUGH ITS OWN SEAM. The no-replace rename succeeds on the filesystems
+	// this project is developed on, so a fixture built from outside takes the rename path and the
+	// failure arm is exercised nowhere. Faking the move is what makes the branch reachable at all.
+	orig := preserveMoveNow
+	t.Cleanup(func() { preserveMoveNow = orig })
+	boom := errors.New("the destination directory could not be written")
+	var attempts int
+	preserveMoveNow = func(from, to string) error {
+		attempts++
+		return boom
+	}
+
+	aside, residue, err := preserveCorrupt(sf)
+	if err == nil {
+		t.Fatalf("a move that failed outright was reported as a success (aside %q)", aside)
+	}
+	if !errors.Is(err, boom) {
+		t.Fatalf("the move's own failure was replaced rather than propagated: %v", err)
+	}
+	if aside != "" {
+		t.Fatalf("a failed preservation named %q as the place the evidence went — nothing is there", aside)
+	}
+	if residue != nil {
+		t.Fatalf("a failed preservation was reported as a RESIDUE, which the caller prints as success\n"+
+			"and follows by telling the operator to delete the only copy that is left: %v", residue)
+	}
+	// A PLAIN FAILURE IS NOT RETRIED UNDER ANOTHER NAME. Only fs.ErrExist — "that name is taken",
+	// an ANSWER — advances the candidate loop; retrying a broken move 128 times says nothing new
+	// and buries the real reason under the bound's own message.
+	if attempts != 1 {
+		t.Fatalf("a move that failed for its own reason was retried %d times", attempts)
+	}
+	// THE EVIDENCE IS UNTOUCHED at its own name: nothing was moved, so nothing was removed.
+	got, rerr := os.ReadFile(sf)
+	if rerr != nil || string(got) != string(body) {
+		t.Fatalf("the corrupt ledger was disturbed by a preservation that failed: %q %v", got, rerr)
+	}
+	if m, _ := filepath.Glob(sf + ".corrupt.*"); len(m) != 0 {
+		t.Fatalf("a failed preservation left something behind: %v", m)
+	}
 }
 
 // --- WHOSE before WHICH: the installation label, on both destructive paths --------------------

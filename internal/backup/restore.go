@@ -904,7 +904,7 @@ func preserveCorrupt(sf string) (aside string, residue error, err error) {
 		if i > 0 {
 			to += "-" + strconv.Itoa(i)
 		}
-		merr := preserveMove(sf, to)
+		merr := preserveMoveNow(sf, to)
 		switch {
 		case merr == nil:
 			return to, nil, nil
@@ -923,6 +923,17 @@ func preserveCorrupt(sf string) (aside string, residue error, err error) {
 	return "", nil, fmt.Errorf("restore: %d preserved copies of a corrupt staging ledger already exist beside %s;\n"+
 		"  refusing to overwrite any of them. Move or remove them and run this again", candidates, sf)
 }
+
+// preserveMoveNow is preserveMove behind a seam, for the SAME reason lstatAfterLink is one: the arm
+// preserveCorrupt takes on a plain move failure — return ("", nil, err), so the caller says "cannot
+// preserve the corrupt staging ledger" and names no aside — cannot be reached from outside on the
+// filesystems this project is developed on, because the no-replace rename succeeds there and the
+// fallback that can fail this way is never entered. Without the seam, that arm's only claimed
+// coverage was a test which exits during VALIDATION, several statements before the move loop runs
+// at all: a regression turning that error into a residue or a success passed it untouched.
+//
+// Production never assigns it; a test that does restores it.
+var preserveMoveNow = preserveMove
 
 // preserveMove is activateRename's counterpart for RESCUING a file rather than consuming one, and
 // the difference is the unlink.

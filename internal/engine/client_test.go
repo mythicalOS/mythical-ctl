@@ -743,6 +743,89 @@ func TestVolumeCreateExistingKeepsLabels(t *testing.T) {
 	}
 }
 
+// TestProvenanceLabelsAreSpelledLiterally: the provenance labels are a WIRE FORMAT, and every
+// other assertion about them in this tree reads them back through the same constant that wrote
+// them.
+//
+// `info.Labels[engine.LabelNS+"installation"]` agrees with itself whatever LabelNS and that key
+// become. Rename either and the tool stays perfectly self-consistent — it writes the new spelling
+// and reads the new spelling — while every object a PREVIOUS version created still carries the old
+// one. This installer then finds no installation label on its own volumes, networks and
+// containers, preserves every one of them as unattributable (which is the correct answer to what
+// it can see), and can never remove them again; and the unaccounted gate meets them as strangers
+// standing at names it would create, which stops every mutating verb. Nothing in the suite would
+// have gone red.
+//
+// So the spelling is pinned ONCE, here, in literals that share nothing with the code under test —
+// the namespace, both provenance keys, and the namespacing of the container-label vocabulary.
+func TestProvenanceLabelsAreSpelledLiterally(t *testing.T) {
+	f, c := newFake(t)
+	ctx := context.Background()
+	m, _ := newMutator(t, c)
+
+	if err := m.VolumeCreate(ctx, "vol1", mustProv(t)); err != nil {
+		t.Fatal(err)
+	}
+	vi, err := c.VolumeInspect(ctx, "vol1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantVol := map[string]string{
+		"mythicalos.installation": "inst1",
+		"mythicalos.nonce":        "nonce1",
+	}
+	// AN EXACT SET, not a containment: an extra label is a wire change too.
+	if len(vi.Labels) != len(wantVol) {
+		t.Fatalf("a created volume carries %d labels, want exactly %d: %v", len(vi.Labels), len(wantVol), vi.Labels)
+	}
+	for k, v := range wantVol {
+		if vi.Labels[k] != v {
+			t.Fatalf("volume label %q = %q, want %q — the provenance wire spelling changed, which orphans\n"+
+				"every object a previous version created: %v", k, vi.Labels[k], v, vi.Labels)
+		}
+	}
+
+	// The same namespace over the container-label vocabulary, which the spec builder prefixes
+	// rather than the provenance constructor.
+	f.PullImage("img:v1")
+	if _, nerr := m.NetworkCreate(ctx, "net1", mustProv(t)); nerr != nil {
+		t.Fatal(nerr)
+	}
+	spec := launchSpec(t, "c1", "img:v1", "net1", "a1", engine.SpecOpts{
+		Labels: map[string]string{"installation": "inst1", "nonce": "nonce1", "product": "brokkr", "role": "app", "generation": "1"},
+	})
+	if _, cerr := m.ContainerCreate(ctx, spec); cerr != nil {
+		t.Fatal(cerr)
+	}
+	ci, err := c.ContainerInspect(ctx, "c1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCon := map[string]string{
+		"mythicalos.installation": "inst1",
+		"mythicalos.nonce":        "nonce1",
+		"mythicalos.product":      "brokkr",
+		"mythicalos.role":         "app",
+		"mythicalos.generation":   "1",
+	}
+	for k, v := range wantCon {
+		if ci.Labels[k] != v {
+			t.Fatalf("container label %q = %q, want %q: %v", k, ci.Labels[k], v, ci.Labels)
+		}
+	}
+
+	// And a created network carries the same two provenance labels under the same namespace.
+	ni, err := c.NetworkInspect(ctx, "net1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for k, v := range wantVol {
+		if ni.Labels[k] != v {
+			t.Fatalf("network label %q = %q, want %q: %v", k, ni.Labels[k], v, ni.Labels)
+		}
+	}
+}
+
 func TestCreateUnknownNetwork(t *testing.T) {
 	f, c := newFake(t)
 	ctx := context.Background()

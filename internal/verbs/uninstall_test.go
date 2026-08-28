@@ -799,9 +799,16 @@ func TestFamilyUninstallRefusesAnUnreadableOperatorReference(t *testing.T) {
 func TestUninstallWithNoProductIsAUsageError(t *testing.T) {
 	// The LIBRARY's own arity contract: a caller reaching this package directly has no dispatcher
 	// in front of it, and a missing operand is a usage error (2), never an operational failure.
+	//
+	// THE LITERAL, NOT cliio.ExitUsage. This assertion's subject is the NUMBER — an operator's
+	// script branches on 2, and 2 is what the published help promises. Comparing against the same
+	// constant production returns restates the code instead of checking it: the pair agrees with
+	// itself whatever the constant becomes, so the one thing this test names is the one thing it
+	// could not have caught. (internal/cliio's TestExitContractValues pins all four codes, so the
+	// suite as a whole does catch it — this line simply stops claiming a check it was not making.)
 	r := newRig(t)
-	if rc := r.uninstall("", false); rc != cliio.ExitUsage {
-		t.Fatalf("rc = %d, want 2\n%s", rc, r.said())
+	if rc := r.uninstall("", false); rc != 2 {
+		t.Fatalf("rc = %d, want 2 (a usage error, not the operational failure 1)\n%s", rc, r.said())
 	}
 	if len(r.fake.RequestLog()) != 0 {
 		t.Fatalf("the refusal reached the daemon: %v", r.fake.RequestLog())
