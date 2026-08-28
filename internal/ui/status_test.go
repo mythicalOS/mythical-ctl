@@ -1751,9 +1751,12 @@ func TestACancelledFIRSTReportIsStillPublished(t *testing.T) {
 //
 // WHAT THE OUTCOME GUARD GIVES BACK IS NARROWER THAN "it is discarded", and the narrow version is
 // the true one: an INTERRUPTED run never replaces a completed one, so a run torn off in that
-// window cannot reach the operator as the report. A run that both starts AND FINISHES inside it is
-// not torn, samples vctx.Err() as nil, and does replace — the escape is between close(uiDone) and
-// the cancel three instructions later. What escapes is therefore a COMPLETE report the operator
+// window cannot reach the operator as the report. A run that both starts AND FINISHES before the
+// cancel is not torn, samples vctx.Err() as nil, and does replace; if it also finishes after Run
+// returned, the operator never saw it. So the unseen-replacement span is the five statements
+// between p.Run() returning and cancel() — not, as this said before, the one gap between
+// close(uiDone) and the cancel that immediately follows it. What escapes is a COMPLETE report the
+// operator
 // asked for, replacing an older complete one, which is what the refresh path is specified to do
 // (TestRunStatusRefreshRunsTheReportAgain); the code cannot differ either, since the only verb
 // this runner drives always returns 0. It is a stated residual of the runner, and this test
@@ -1763,10 +1766,13 @@ func TestACancelledFIRSTReportIsStillPublished(t *testing.T) {
 // queued together and this fake's loop handles them IN ORDER and runs each command synchronously,
 // so 'r's command — which is what puts the request in the runner's queue — has already run when
 // 'q' returns tea.Quit and ends the loop. THE SYNCHRONOUS HALF OF THAT IS THE FAKE'S, DELIBERATELY,
-// AND IS NOT A CLAIM ABOUT A TERMINAL. The real runtime does order the two KEY MESSAGES — one input
-// loop decodes and sends them serially over an unbuffered channel, so 'q' cannot be sent until 'r'
-// has been taken — but it dispatches each command on its own goroutine, so 'r's hook is NOT
-// guaranteed to have run before 'q' is handled. That is exactly the guarantee this test needs and
+// AND IS NOT A CLAIM ABOUT A TERMINAL. What the real runtime does with two keys typed in a row is
+// not this, in two ways. If they land in one read it does not produce two messages at all: the
+// decoder takes the longest run of printable runes as ONE multi-rune key, and "rq" matches neither
+// case in handleKey, so both are simply ignored. If they are decoded separately their ORDER does
+// hold — one input loop sends them serially over an unbuffered channel — but each command is
+// dispatched on its own goroutine, so 'r's hook is still not guaranteed to have run before 'q' is
+// handled. Synchronous, in-order command execution is exactly the guarantee this test needs and
 // the real runtime does not give; the fake gives it. What is under test is the runner's own
 // arbitration, and the fake is the seam that lets that arbitration be reached with everything
 // pending at once. The report is then held on its own context, which runStatus
