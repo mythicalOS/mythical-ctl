@@ -354,6 +354,13 @@ var tinyGoTests = map[string]map[string]bool{
 	"mythicalos.ai/ctl/internal/w": {"TestElsewhere": true, "TestOne": true},
 }
 
+// The SOURCE half of target resolution, keyed by package directory. A target must appear in BOTH:
+// `go test -list` proves the package registers it, the source proves that package declares it.
+var tinySrcTests = map[string]map[string]bool{
+	"internal/x": {"TestOne": true, "TestTwo": true, "TestThree": true},
+	"internal/w": {"TestElsewhere": true, "TestOne": true},
+}
+
 // The whole-file N/A pre-declaration is a PARAMETER of the audit, not a global it reads, so these
 // tests can put a file in it and take one out. The real map is asserted separately, below.
 var (
@@ -386,7 +393,7 @@ func TestAuditCoverageAcceptsACompleteInventory(t *testing.T) {
 		`// PORTED: tests/unit/b.bats: "one" -> TestTwo`,
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
 	if len(r.Problems) != 0 {
 		t.Fatalf("a complete inventory was rejected: %v", r.Problems)
 	}
@@ -401,7 +408,7 @@ func TestAuditCoverageCatchesAnUnclaimedTest(t *testing.T) {
 		`// PORTED: tests/unit/b.bats: "one" -> TestTwo`,
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
 	if !hasProblem(r, `"two" is claimed by NO inventory line`) {
 		t.Fatalf("the unclaimed test was not reported: %v", r.Problems)
 	}
@@ -418,7 +425,7 @@ func TestAuditCoverageCatchesADoubleClaim(t *testing.T) {
 		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
 	if !hasProblem(r, "is claimed 2 times") {
 		t.Fatalf("the double claim was not reported: %v", r.Problems)
 	}
@@ -433,7 +440,7 @@ func TestAuditCoverageCatchesAClaimOnNoSuchTest(t *testing.T) {
 		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
 	if !hasProblem(r, "no such test in the corpus") {
 		t.Fatalf("the phantom claim was not reported: %v", r.Problems)
 	}
@@ -450,7 +457,7 @@ func TestAuditCoverageDoesNotLetOneNameSatisfyTwoFiles(t *testing.T) {
 		`// PORTED: tests/unit/a.bats: "two" -> TestTwo`,
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
 	if !hasProblem(r, `tests/unit/b.bats: "one" is claimed by NO inventory line`) {
 		t.Fatalf("b.bats' same-named row was treated as covered by a.bats' claim: %v", r.Problems)
 	}
@@ -465,7 +472,7 @@ func TestAuditCoverageCatchesADanglingPortedTarget(t *testing.T) {
 		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
 	if !hasProblem(r, "PORTED target TestGoneAway does not exist") {
 		t.Fatalf("the dangling target was not reported: %v", r.Problems)
 	}
@@ -479,7 +486,7 @@ func TestAuditCoverageResolvesEverySecondaryTarget(t *testing.T) {
 		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
 	if !hasProblem(r, "PORTED target TestVanished does not exist") {
 		t.Fatalf("a secondary target was not resolved: %v", r.Problems)
 	}
@@ -492,7 +499,7 @@ func TestAuditCoverageReportsMalformedLines(t *testing.T) {
 		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
 	if !hasProblem(r, "inventory line does not parse") {
 		t.Fatalf("the malformed line was not reported: %v", r.Problems)
 	}
@@ -507,7 +514,7 @@ func TestAuditCoverageCatchesAnUndeclaredWholesaleNA(t *testing.T) {
 		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
 	if !hasProblem(r, "all 2 tests are N/A") {
 		t.Fatalf("the wholesale-N/A file was not reported: %v", r.Problems)
 	}
@@ -525,7 +532,7 @@ func TestAuditCoverageAcceptsAPreDeclaredWholeFileNA(t *testing.T) {
 		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
 	)
 	r := &report{}
-	auditCoverage(r, corpus, c, b, st, tinyGoTests, tinyPreDeclared)
+	auditCoverage(r, corpus, c, b, st, tinyGoTests, tinySrcTests, tinyPreDeclared)
 	if len(r.Problems) != 0 {
 		t.Fatalf("the pre-declared whole-file N/A was rejected: %v", r.Problems)
 	}
@@ -546,7 +553,7 @@ func TestAuditCoverageCatchesAClaimOnAPreDeclaredFile(t *testing.T) {
 		`// PORTED: tests/unit/waived.bats: "x" -> TestOne`,
 	)
 	r := &report{}
-	auditCoverage(r, corpus, c, b, st, tinyGoTests, tinyPreDeclared)
+	auditCoverage(r, corpus, c, b, st, tinyGoTests, tinySrcTests, tinyPreDeclared)
 	if !hasProblem(r, "pre-declared N/A in tools/parity-audit") {
 		t.Fatalf("the contradiction was not reported: %v", r.Problems)
 	}
@@ -561,7 +568,7 @@ func TestAuditCoverageCatchesAPreDeclarationWithNoFile(t *testing.T) {
 		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, map[string]string{"tests/unit/gone.bats": "a file the corpus does not have"})
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, map[string]string{"tests/unit/gone.bats": "a file the corpus does not have"})
 	if !hasProblem(r, "but the corpus has no such file") {
 		t.Fatalf("the empty pre-declaration was not reported: %v", r.Problems)
 	}
@@ -662,11 +669,16 @@ func e2eTree(t *testing.T) (root, goList string) {
 		`@test "one" {`, `}`, `@test "two" {`, `}`, ``}, "\n"))
 	write("tests/acceptance/b.bats", strings.Join([]string{
 		`@test "three" {`, `}`, ``}, "\n"))
+	// The fixture declares the functions it claims: target resolution needs BOTH witnesses — the
+	// go-test list AND the source — so a fixture of comments alone would fail for a reason that has
+	// nothing to do with what each case is testing.
 	write("internal/x/x_test.go", string(lines(
 		`package x`,
 		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
 		`// N/A: tests/unit/a.bats: "two" -- bash-only: a source-time hazard Go does not have`,
 		`// PORTED: tests/acceptance/b.bats: "three" -> TestThree`,
+		`func TestOne(t *testing.T)   {}`,
+		`func TestThree(t *testing.T) {}`,
 	)))
 	pairs, err := collectBats(root)
 	if err != nil {
@@ -854,7 +866,7 @@ func TestAuditCoverageCatchesAClaimWrittenMidLine(t *testing.T) {
 		t.Fatal("no mid-line claim was detected at all")
 	}
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
 	if !hasProblem(r, "where the inventory parser does not read it") {
 		t.Fatalf("the mid-line claim was not reported: %v", r.Problems)
 	}
@@ -871,7 +883,7 @@ func TestAuditCoverageIgnoresAMidLineMentionOfANonCorpusFile(t *testing.T) {
 		`// and a fixture may say PORTED: tests/unit/nowhere.bats: "z" -> TestZ`,
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
 	if len(r.Problems) != 0 {
 		t.Fatalf("a mention of a non-corpus file was reported: %v", r.Problems)
 	}
@@ -889,7 +901,7 @@ func TestStrayDetectionDoesNotFireOnCodeThatQuotesARowName(t *testing.T) {
 		"\t{\"tests/unit/a.bats\", \"two\"}: 22,",
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
 	if len(r.Problems) != 0 {
 		t.Fatalf("a map entry keyed by (file, name) was read as a hidden claim: %v", r.Problems)
 	}
@@ -906,7 +918,7 @@ func TestStrayDetectionFiresOnClaimSyntaxEvenOutsideAComment(t *testing.T) {
 		"\texample := \"PORTED: tests/unit/b.bats: ...\"",
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
 	if !hasProblem(r, "claim syntax") {
 		t.Fatalf("claim syntax naming a real corpus row went unreported: %v", r.Problems)
 	}
@@ -930,7 +942,7 @@ func TestAuditCoverageCatchesAClaimSplitAcrossLines(t *testing.T) {
 		t.Fatal("the continuation line was not detected")
 	}
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
 	if !hasProblem(r, "which is a real @test in that file") {
 		t.Fatalf("the split claim was not reported: %v", r.Problems)
 	}
@@ -949,7 +961,7 @@ func TestAuditCoverageCatchesAPortedTargetInAnotherPackage(t *testing.T) {
 		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
 	if !hasProblem(r, "namesake") {
 		t.Fatalf("a target that lives only in another package was accepted: %v", r.Problems)
 	}
@@ -964,7 +976,7 @@ func TestAuditCoverageAcceptsACrossPackageTargetThatNamesItsPackage(t *testing.T
 		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
 	if len(r.Problems) != 0 {
 		t.Fatalf("a cross-package claim that names its package was rejected: %v", r.Problems)
 	}
@@ -983,7 +995,7 @@ func TestAuditCoverageCatchesAClaimInABlockCommentContinuation(t *testing.T) {
 		`*/`,
 	)
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
 	if !hasProblem(r, "which is a real @test in that file") {
 		t.Fatalf("the block-comment continuation was not reported: %v", r.Problems)
 	}
@@ -1029,8 +1041,8 @@ func TestAuditCoverageCatchesAClaimSpreadOverThreeLines(t *testing.T) {
 		t.Fatal("the three-line claim was not detected")
 	}
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
-	if !hasProblem(r, "which is a real @test in that file") {
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
+	if !hasProblem(r, "where the inventory parser does not read it") {
 		t.Fatalf("the three-line claim was not reported: %v", r.Problems)
 	}
 }
@@ -1143,17 +1155,86 @@ func TestAuditCoverageCatchesAClaimNamedByBareFilename(t *testing.T) {
 		`// PORTED: tests/unit/a.bats: "two" -> TestTwo`,
 		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
 		`func f() {}`,
-		`/* PORTED:`,
+		// NO claim words anywhere in this block, and the file mention and the row name on DIFFERENT
+		// lines — so only the REGION search can find it. Line-local matching would see a filename on
+		// one line and a sentence on the next, and neither alone says anything.
+		`/* a note about`,
 		`   tests/unit/`,
-		`   a.bats: "two" -> TestTwo, claimed again where nothing reads it`,
+		`   a.bats, and separately about the row`,
+		`   two, which is claimed again here where nothing reads it`,
 		`*/`,
 	)
 	if len(st) == 0 {
 		t.Fatal("the bare-filename claim was not detected")
 	}
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, tinyGoTests, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
 	if !hasProblem(r, "which is a real @test in that file") {
 		t.Fatalf("the bare-filename claim was not reported: %v", r.Problems)
+	}
+}
+
+// TARGET RESOLUTION NEEDS TWO WITNESSES. `go test -list` stdout is unstructured: anything a package
+// prints while initialising lands in the same stream, so a DELETED test's identifier printed by a
+// TestMain would read back as a test that exists and a PORTED claim on it would stay green. The
+// source is the second witness, and neither can be forged by the other's blind spot.
+func TestAPortedTargetNeedsBothTheListAndTheSource(t *testing.T) {
+	c, b, st := claimsFrom(t,
+		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
+		`// PORTED: tests/unit/a.bats: "two" -> TestTwo`,
+		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
+	)
+	// The list says the package registers TestTwo; the SOURCE does not declare it — the shape a
+	// printed identifier produces.
+	srcMissing := map[string]map[string]bool{
+		"internal/x": {"TestOne": true, "TestThree": true},
+	}
+	r := &report{}
+	auditCoverage(r, tiny, c, b, st, tinyGoTests, srcMissing, noPreDeclared)
+	if !hasProblem(r, "TestTwo") {
+		t.Fatalf("a target the source does not declare was accepted: %v", r.Problems)
+	}
+
+	// ...and the other direction: declared in source but not registered by the package (it does not
+	// compile into the test binary, or lives behind a build tag nothing enables).
+	listMissing := map[string]map[string]bool{
+		"mythicalos.ai/ctl/internal/x": {"TestOne": true, "TestThree": true},
+	}
+	r2 := &report{}
+	auditCoverage(r2, tiny, c, b, st, listMissing, tinySrcTests, noPreDeclared)
+	if !hasProblem(r2, "TestTwo") {
+		t.Fatalf("a target the package does not register was accepted: %v", r2.Problems)
+	}
+}
+
+// A BASENAME CAN BE AMBIGUOUS, and round 6 asserted it could not: migrate.bats is BOTH
+// tests/unit/migrate.bats and tests/acceptance/migrate.bats in the real corpus. Keeping one entry
+// per basename attributed an acceptance row to the unit file — the audit still failed, but named
+// the wrong file, which is a worse kind of right answer.
+func TestAmbiguousBasenamesAreAttributedToTheFileThatHoldsTheRow(t *testing.T) {
+	corpus := []batsPair{
+		{"tests/unit/dup.bats", "a unit row"},
+		{"tests/acceptance/dup.bats", "an acceptance row"},
+		{"tests/unit/a.bats", "one"},
+	}
+	c, b, st := claimsFrom(t,
+		`// PORTED: tests/unit/dup.bats: "a unit row" -> TestOne`,
+		`// PORTED: tests/acceptance/dup.bats: "an acceptance row" -> TestTwo`,
+		`// PORTED: tests/unit/a.bats: "one" -> TestThree`,
+		`// and a hidden second claim naming only the basename:`,
+		`// dup.bats: "an acceptance row" -> TestTwo`,
+		`func g() {}`,
+		`// and another, naming the other file's row by the same basename:`,
+		`// dup.bats: "a unit row" -> TestOne`,
+	)
+	r := &report{}
+	auditCoverage(r, corpus, c, b, st, tinyGoTests, tinySrcTests, noPreDeclared)
+	// BOTH must be attributed to the file that actually holds the row. Keeping one corpus file per
+	// basename would leave whichever lost the race unreported — and map iteration decides which, so
+	// asserting only one of the two would pass or fail by luck.
+	for _, want := range []string{"tests/acceptance/dup.bats", "tests/unit/dup.bats"} {
+		if !hasProblem(r, "this names "+want) {
+			t.Fatalf("no stray attributed to %s: %v", want, r.Problems)
+		}
 	}
 }

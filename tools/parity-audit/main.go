@@ -399,11 +399,11 @@ type malformed struct {
 type stray struct {
 	GoFile     string
 	GoLine     int
-	BatsFile   string
-	Text       string
-	ClaimWords bool     // the line carries PORTED:/N/A: somewhere
-	InComment  bool     // the line opens as a comment (the only place a claim can be written)
-	Quoted     []string // every quoted string on the line; any may be a row name
+	BatsFile   string // the corpus path, or a bare basename auditCoverage must resolve
+	Text       string // the mentioning line, for the message
+	Region     string // the WHOLE contiguous comment region, for the row-name search
+	ClaimWords bool   // the region carries PORTED:/N/A: somewhere
+	InComment  bool   // the mention is in a comment (the only place a claim can be written)
 }
 
 // parseInventory reads one Go file's claims. Anything that opens like an inventory line but does
@@ -425,8 +425,9 @@ func parseInventory(rel string, content []byte) ([]claim, []malformed, []stray, 
 		line int
 		text string
 	}
-	var winPaths, winBases []seenPath
-	var winQuotes []string
+	var region []string
+	var regionFiles []seenPath
+	regionClaim := false
 	sc := bufio.NewScanner(bytes.NewReader(content))
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	line := 0
@@ -441,7 +442,7 @@ func parseInventory(rel string, content []byte) ([]claim, []malformed, []stray, 
 		inBlock, inRaw = lexAfter(inBlock, inRaw, text)
 		isComment := openedInBlock || inBlock || invCommentLine.MatchString(text)
 		if !isComment {
-			winPaths, winBases, winQuotes = nil, nil, nil
+			region, regionFiles, regionClaim = nil, nil, false
 		}
 
 		claimable := !openedInRaw && !openedInBlock && invAny.MatchString(text)
@@ -478,62 +479,47 @@ func parseInventory(rel string, content []byte) ([]claim, []malformed, []stray, 
 			continue
 		}
 
-		// NOT A CLAIM. If it nevertheless names a corpus file in claim syntax, or pairs a corpus
-		// file with one of its row names anywhere in this comment block, somebody wrote a claim the
-		// audit cannot read — record it and let auditCoverage decide, since only it knows the corpus.
+		// NOT A CLAIM. If it nevertheless names a corpus file, and this comment REGION also carries
+		// claim syntax or one of that file's row names, somebody wrote a claim the audit cannot read
+		// — record it and let auditCoverage decide, since only it knows the corpus.
+		//
+		// THE WHOLE REGION IS THE UNIT, not the line, and round 7 is why: a quoted row name can be
+		// split across lines too (the opening quote on one, the closing on the next), so extracting
+		// quoted STRINGS could not see it. The region's text is searched for row names instead,
+		// which covers every way a claim can be broken up at once — across quotes, across the path,
+		// across the claim words.
 		//
 		// EVERY path on the line, not the first: a mention of a file the corpus does not hold,
-		// earlier on the same line, would otherwise shadow a real one after it.
+		// earlier on the same line, would otherwise shadow a real one after it. Bare `<name>.bats`
+		// counts too, because the PATH can be split as well.
 		paths := invStrayPath.FindAllString(text, -1)
-		bases := invStrayBase.FindAllString(text, -1)
+		paths = append(paths, invStrayBase.FindAllString(text, -1)...)
 		claimWords := invStrayClaim.MatchString(text)
-		var quoted []string
-		for _, q := range invQuoted.FindAllStringSubmatch(text, -1) {
-			quoted = append(quoted, q[1])
-		}
 		if isComment {
+			region = append(region, text)
+			if claimWords {
+				regionClaim = true
+			}
 			for _, p := range paths {
-				winPaths = append(winPaths, seenPath{p, line, text})
+				regionFiles = append(regionFiles, seenPath{p, line, text})
 			}
-			for _, b := range bases {
-				winBases = append(winBases, seenPath{b, line, text})
-			}
-			winQuotes = append(winQuotes, quoted...)
 		}
-		// DEDUPED PER (line, bats file). The window pairs every path with every quoted string, which
-		// is quadratic inside a long inventory block and says the same thing many times over; the
-		// report only ever names a line once anyway.
+		if !isComment {
+			for _, p := range paths {
+				strays = append(strays, stray{rel, line, p, text, text, claimWords, false})
+			}
+			continue
+		}
+		// One stray per (file, mentioning line) for the region SO FAR, re-emitted as the region
+		// grows: auditCoverage dedupes by line and only the evidence it can act on survives.
+		joined := strings.Join(region, "\n")
 		seenHere := map[string]bool{}
-		emit := func(file, text string, quoted []string) {
-			if seenHere[file] {
-				return
+		for _, sp := range regionFiles {
+			if seenHere[sp.file] {
+				continue
 			}
-			seenHere[file] = true
-			strays = append(strays, stray{rel, line, file, text, claimWords, isComment, quoted})
-		}
-		// The cross-line pairing FIRST, so the richer evidence wins the one slot per file: this
-		// line's quoted strings against paths seen earlier in the block, and this line's paths
-		// against quoted strings seen earlier.
-		if isComment {
-			if len(quoted) > 0 {
-				for _, sp := range winPaths {
-					emit(sp.file, sp.text+" || "+text, quoted)
-				}
-				for _, sb := range winBases {
-					emit(sb.file, sb.text+" || "+text, quoted)
-				}
-			}
-			if len(winQuotes) > 0 {
-				for _, p := range paths {
-					emit(p, text, winQuotes)
-				}
-				for _, b := range bases {
-					emit(b, text, winQuotes)
-				}
-			}
-		}
-		for _, p := range paths {
-			emit(p, text, quoted)
+			seenHere[sp.file] = true
+			strays = append(strays, stray{rel, sp.line, sp.file, sp.text, joined, regionClaim, true})
 		}
 	}
 	if err := sc.Err(); err != nil {
@@ -688,6 +674,57 @@ func parseGoTestList(content []byte) map[string]map[string]bool {
 	return out
 }
 
+// goTestFuncDecl matches a Go test function DECLARATION in source. Deliberately anchored and
+// deliberately narrow: `func TestX(t *testing.T)` and nothing else.
+var goTestFuncDecl = regexp.MustCompile(`^func (Test[A-Za-z0-9_]*)\(`)
+
+// collectSourceTestFuncs reads the test functions each package DIRECTORY declares, from source.
+//
+// WHY SOURCE AS WELL AS `go test -list`. That command's stdout is unstructured text: anything a
+// package prints during initialisation lands in the same stream, so a deleted test's identifier
+// printed by a TestMain would be read back as a test that exists — and a PORTED claim on it would
+// stay green with the test gone. Requiring BOTH is what closes it: the list proves the package
+// compiles and registers its tests, the source proves the named function is really declared there.
+// Neither alone is sufficient and neither can be forged by the other's blind spot.
+func collectSourceTestFuncs(root string) (map[string]map[string]bool, error) {
+	out := map[string]map[string]bool{}
+	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if skipDirs[d.Name()] {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(d.Name(), "_test.go") {
+			return nil
+		}
+		content, rerr := os.ReadFile(p)
+		if rerr != nil {
+			return rerr
+		}
+		rel, rerr := filepath.Rel(root, p)
+		if rerr != nil {
+			return rerr
+		}
+		dir := path.Dir(filepath.ToSlash(rel))
+		if out[dir] == nil {
+			out[dir] = map[string]bool{}
+		}
+		sc := bufio.NewScanner(bytes.NewReader(content))
+		sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+		for sc.Scan() {
+			if m := goTestFuncDecl.FindStringSubmatch(sc.Text()); m != nil {
+				out[dir][m[1]] = true
+			}
+		}
+		return sc.Err()
+	})
+	return out, err
+}
+
 // candidatePackages is where a PORTED claim's target may legitimately live: the package of the file
 // making the claim, plus any package the claim's own text names. Claims that point across a package
 // boundary already say so in prose ("owned by internal/docfmt TestDocTypes", "enginetest/fake_test.go"),
@@ -749,6 +786,18 @@ func candidatePackages(goTests map[string]map[string]bool, goFile, detail string
 }
 
 var pathish = regexp.MustCompile(`[A-Za-z0-9_./-]+`)
+
+// dirOf maps a package IMPORT PATH to the repository-relative directory holding its source. The
+// module prefix is the part before the first path element that exists on disk here; stripping it by
+// module path would need go.mod, and every package in this module is under one of these roots.
+func dirOf(pkg string) string {
+	for _, root := range []string{"/internal/", "/cmd/", "/tools/"} {
+		if i := strings.Index(pkg, root); i >= 0 {
+			return pkg[i+1:]
+		}
+	}
+	return path.Base(pkg)
+}
 
 // ---------------------------------------------------------------------------------------------
 // The audit
@@ -828,7 +877,7 @@ func laneNames() string {
 // auditCoverage is the whole claim under audit: every bats test is accounted for EXACTLY ONCE, no
 // claim names a test that does not exist, every PORTED target is a Go test that really runs, and
 // no file is waved away wholesale except the two that were pre-declared with an argument.
-func auditCoverage(r *report, pairs []batsPair, claims []claim, bad []malformed, strays []stray, goTests map[string]map[string]bool, preDeclared map[string]string) {
+func auditCoverage(r *report, pairs []batsPair, claims []claim, bad []malformed, strays []stray, goTests map[string]map[string]bool, srcTests map[string]map[string]bool, preDeclared map[string]string) {
 	for _, b := range bad {
 		r.fail("%s:%d: inventory line does not parse (or its N/A argues nothing): %s", b.GoFile, b.GoLine, strings.TrimSpace(b.Text))
 	}
@@ -838,57 +887,6 @@ func auditCoverage(r *report, pairs []batsPair, claims []claim, bad []malformed,
 	for _, p := range pairs {
 		corpus[p] = true
 		perFile[p.File] = append(perFile[p.File], p)
-	}
-
-	// A claim about a real corpus file, written somewhere the parser does not read. It states
-	// something about a row that some OTHER line is meanwhile claiming, and the two can disagree
-	// forever because only one of them is checked.
-	// A mention is reported when the corpus holds the file AND either the line carries claim words or
-	// it quotes one of that file's actual @test names. The second signal is what closes the
-	// split-across-lines hiding place: the continuation line carries the row identity even when the
-	// claim words sat on the line above.
-	// Keyed by BOTH the full corpus path and its basename: a hidden claim can name either, and every
-	// corpus basename is unique so the second key is unambiguous.
-	namesOf := map[string]map[string]bool{}
-	fullOf := map[string]string{}
-	for _, p := range pairs {
-		for _, k := range []string{p.File, path.Base(p.File)} {
-			if namesOf[k] == nil {
-				namesOf[k] = map[string]bool{}
-			}
-			namesOf[k][p.Name] = true
-			fullOf[k] = p.File
-		}
-	}
-	type where struct {
-		file string
-		line int
-	}
-	reported := map[where]bool{}
-	for _, s := range strays {
-		full, known := fullOf[s.BatsFile]
-		if !known || len(perFile[full]) == 0 {
-			continue
-		}
-		why := ""
-		if s.ClaimWords {
-			why = "it carries PORTED:/N/A: claim syntax"
-		}
-		for _, q := range s.Quoted {
-			if s.InComment && namesOf[s.BatsFile][q] {
-				why = fmt.Sprintf("it quotes %q, which is a real @test in that file", q)
-				break
-			}
-		}
-		if why == "" {
-			continue
-		}
-		if reported[where{s.GoFile, s.GoLine}] {
-			continue
-		}
-		reported[where{s.GoFile, s.GoLine}] = true
-		r.fail("%s:%d: this names %s where the inventory parser does not read it (%s) — a claim here is invisible to every gate, so it can contradict the real one forever. Put it at the start of its own comment line, or reword it so it neither uses the claim syntax nor quotes a row name: %s",
-			s.GoFile, s.GoLine, full, why, strings.TrimSpace(s.Text))
 	}
 
 	byPair := map[batsPair][]claim{}
@@ -909,6 +907,79 @@ func auditCoverage(r *report, pairs []batsPair, claims []claim, bad []malformed,
 		if !corpus[c.Pair] {
 			r.fail("%s:%d: %s claims %s: %q — no such test in the corpus (copy the @test name byte-exactly; a claim outside the bats corpus is not machine-checkable and must not use this syntax)",
 				c.GoFile, c.GoLine, c.Kind, c.Pair.File, c.Pair.Name)
+		}
+	}
+
+	// A claim about a real corpus file, written somewhere the parser does not read. It states
+	// something about a row that some OTHER line is meanwhile claiming, and the two can disagree
+	// forever because only one of them is checked.
+	//
+	// Row names keyed by corpus PATH, plus the set of corpus files each BASENAME can mean. The
+	// basename map is a LIST, not one entry: round 6 asserted every basename was unique and it is
+	// not — migrate.bats is both tests/unit/migrate.bats and tests/acceptance/migrate.bats. Keeping
+	// one entry silently attributed an acceptance row to the unit file.
+	namesOf := map[string]map[string]bool{}
+	byBase := map[string][]string{}
+	for _, p := range pairs {
+		if namesOf[p.File] == nil {
+			namesOf[p.File] = map[string]bool{}
+		}
+		namesOf[p.File][p.Name] = true
+	}
+	for f := range namesOf {
+		byBase[path.Base(f)] = append(byBase[path.Base(f)], f)
+	}
+	for b := range byBase {
+		sort.Strings(byBase[b])
+	}
+
+	// A mention is reported when it names a corpus file AND the comment region it sits in either
+	// carries claim syntax or contains one of that file's row names. The REGION is the unit, not the
+	// line: a claim can be broken across lines at any point — the claim words, the path, even the
+	// quoted row name itself — and searching the region's text covers all of those at once.
+	type where struct {
+		file string
+		line int
+	}
+	reported := map[where]bool{}
+	for _, s := range strays {
+		// Resolve the mention to the corpus file(s) it can mean.
+		var cands []string
+		if len(namesOf[s.BatsFile]) > 0 {
+			cands = []string{s.BatsFile}
+		} else {
+			cands = byBase[s.BatsFile]
+		}
+		if len(cands) == 0 {
+			continue
+		}
+		for _, cand := range cands {
+			why := ""
+			// THE ROW-NAME SIGNAL IS COMMENT-ONLY. Code that carries a row name is not a claim, and
+			// the tree has 144 lines of it: the Wave 5 owner map is keyed by (file, name) pairs by
+			// design. Sweeping it up would fire on 144 legitimate lines, which is how a check gets
+			// switched off. Claim SYNTAX beside a corpus path is never innocent, wherever it sits.
+			if s.InComment {
+				for name := range namesOf[cand] {
+					if strings.Contains(s.Region, name) {
+						why = fmt.Sprintf("it carries %q, which is a real @test in that file", name)
+						break
+					}
+				}
+			}
+			if why == "" && s.ClaimWords {
+				why = "it carries PORTED:/N/A: claim syntax"
+			}
+			if why == "" {
+				continue
+			}
+			if reported[where{s.GoFile, s.GoLine}] {
+				break
+			}
+			reported[where{s.GoFile, s.GoLine}] = true
+			r.fail("%s:%d: this names %s where the inventory parser does not read it (%s) — a claim here is invisible to every gate, so it can contradict the real one forever. Put it at the start of its own comment line, or reword it so it neither uses the claim syntax nor carries a row name: %s",
+				s.GoFile, s.GoLine, cand, why, strings.TrimSpace(s.Text))
+			break
 		}
 	}
 
@@ -949,7 +1020,10 @@ func auditCoverage(r *report, pairs []batsPair, claims []claim, bad []malformed,
 		for _, t := range c.Targets {
 			found := false
 			for p := range cands {
-				if goTests[p][t] {
+				// BOTH WITNESSES. `go test -list` says the package registers it (so it compiles and
+				// runs); the SOURCE says that package really declares it. A name that appears in
+				// only one of the two is not a test this claim can rest on.
+				if goTests[p][t] && srcTests[dirOf(p)][t] {
 					found = true
 					break
 				}
@@ -1156,7 +1230,14 @@ func run(root, manifestRel string, writeMan bool, goLists []string, maxProblems 
 		return fmt.Errorf("no Go test names were loaded (pass --go-list <file> with `go test -list '.*' ./...` output) — PORTED targets cannot be resolved")
 	}
 
-	auditCoverage(r, pairs, claims, bad, strays, goTests, wholeFileNA)
+	srcTests, serr := collectSourceTestFuncs(root)
+	if serr != nil {
+		return serr
+	}
+	if len(srcTests) == 0 {
+		return fmt.Errorf("no _test.go files were found under %s — the source half of target resolution has nothing to check against", root)
+	}
+	auditCoverage(r, pairs, claims, bad, strays, goTests, srcTests, wholeFileNA)
 
 	fmt.Printf("go tree: %d files scanned, %d PORTED, %d N/A, %d Go test names known across %d packages\n", scanned, r.Ported, r.NA, names, len(goTests))
 	fmt.Printf("corpus: %d tests covered by a pre-declared whole-file N/A argument\n", r.WholeFileNA)
