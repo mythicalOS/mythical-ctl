@@ -1423,6 +1423,43 @@ func TestAnAmbiguousOwnPackageResolvesToNothing(t *testing.T) {
 	}
 }
 
+// TestASubtestTargetIsRefusedRatherThanResolvedToItsParent: `go test -list` enumerates test
+// FUNCTIONS. A subtest is a runtime construct — it exists only while its parent is running, and no
+// listing can see it. So a target written `TestOne/deletes_the_socket` was resolved against
+// `TestOne` and the audit reported that the claim resolved: delete the subtest the inventory line
+// actually names and nothing goes red, because the name that was checked was never the name that
+// was written.
+//
+// That is the same shape as every other false green found in this reader — the claim says one
+// thing, the resolver answers about another and calls it the same. The rule is not another
+// heuristic about the target column: it is that a name this program CANNOT resolve is refused,
+// loudly, instead of being silently narrowed to one it can.
+func TestASubtestTargetIsRefusedRatherThanResolvedToItsParent(t *testing.T) {
+	c, b, st := claimsFrom(t,
+		`// PORTED: tests/unit/a.bats: "one" -> TestOne/deletes_the_socket`,
+		`// PORTED: tests/unit/a.bats: "two" -> TestTwo`,
+		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
+	)
+	r := &report{}
+	auditCoverage(r, tiny, c, b, st, oneLane(), noPreDeclared)
+	if !hasProblem(r, "subtest") {
+		t.Fatalf("a claim naming TestOne/deletes_the_socket was satisfied by TestOne: the audit certified a name it never resolved, and deleting that subtest leaves the claim green: %v", r.Problems)
+	}
+
+	// A PACKAGE QUALIFICATION IS NOT A SUBTEST, and the difference is which side of the name the
+	// slash is on. This is the nearest legitimate neighbour and it must still resolve.
+	c2, b2, st2 := claimsFrom(t,
+		`// PORTED: tests/unit/a.bats: "one" -> internal/w.TestElsewhere`,
+		`// PORTED: tests/unit/a.bats: "two" -> TestTwo`,
+		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
+	)
+	r2 := &report{}
+	auditCoverage(r2, tiny, c2, b2, st2, oneLane(), noPreDeclared)
+	if len(r2.Problems) != 0 {
+		t.Fatalf("a package-qualified cross-package target was refused as a subtest: %v", r2.Problems)
+	}
+}
+
 // THE DIGEST PIN IS THE POST-CUTOVER GUARD, and this is the failure it exists for: with the bats
 // trees gone there is nothing to regenerate from, so a row could be REPLACED — an original
 // requirement deleted, an invented one of the same shape put in its place, and a claim written

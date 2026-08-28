@@ -540,6 +540,11 @@ func parseInventory(rel string, content []byte) ([]claim, []malformed, []stray, 
 					bad = append(bad, malformed{rel, line, text})
 					continue
 				}
+				if sub := subtestTarget(m[3], targets); sub != "" {
+					bad = append(bad, malformed{rel, line,
+						fmt.Sprintf("its target names the subtest %q — `go test -list` enumerates test FUNCTIONS, and a subtest exists only while its parent runs, so this audit can only ever resolve %q and report a claim about the subtest as satisfied. Deleting that subtest would leave this line green. Name the test function. || %s", sub, sub[:strings.IndexByte(sub, '/')], text)})
+					continue
+				}
 				claims = append(claims, claim{
 					Kind: claimPorted, Pair: batsPair{File: m[1], Name: m[2]},
 					Detail: m[3], GoFile: rel, GoLine: line, Targets: targets,
@@ -990,6 +995,30 @@ func resolvePathToken(all map[string]map[string]bool, tok string) (string, bool)
 // nothing. An occurrence counts only when it is a WHOLE identifier: no identifier rune on either
 // side, except the `.` that carries a qualification.
 func qualifierFor(detail, target string) (tok string, found bool) {
+	i, ok := firstWholeOccurrence(detail, target)
+	if !ok {
+		return "", false
+	}
+	if i == 0 || detail[i-1] != '.' {
+		return "", true
+	}
+	k := i - 1
+	for k > 0 && isPathByte(detail[k-1]) {
+		k--
+	}
+	return detail[k : i-1], true
+}
+
+// firstWholeOccurrence is WHERE A CLAIM STATES ITS TARGET: the first place the target name appears
+// as a whole identifier. Written once and shared, because every reader of the target column has to
+// agree about that position — two copies of this rule would be two chances to fix one of them.
+//
+// BOTH IDENTIFIER BOUNDARIES ARE CHECKED. Only the right-hand one was, so `TestFoo` matched inside
+// `NotTestFoo` — and that spurious "bare occurrence" made a legitimately qualified claim resolve to
+// nothing. An occurrence counts only when it is a WHOLE identifier: no identifier rune on either
+// side, except the `.` that carries a qualification (a `.` is not an identifier rune, so a
+// qualification passes; a letter, digit or underscore means the match is the TAIL of a longer name).
+func firstWholeOccurrence(detail, target string) (int, bool) {
 	for i := 0; i+len(target) <= len(detail); i++ {
 		if !strings.HasPrefix(detail[i:], target) {
 			continue
@@ -999,24 +1028,44 @@ func qualifierFor(detail, target string) (tok string, found bool) {
 		}
 		if i > 0 {
 			r, _ := utf8.DecodeLastRuneInString(detail[:i])
-			// A `.` is not an identifier rune, so a qualification passes this test; a letter,
-			// digit or underscore means the match is the TAIL of a longer identifier.
 			if identRune(r) {
 				continue
 			}
 		}
-		// THE FIRST WHOLE-IDENTIFIER OCCURRENCE DECIDES, qualified or not. Returning here is the
-		// whole rule.
-		if i == 0 || detail[i-1] != '.' {
-			return "", true
-		}
-		k := i - 1
-		for k > 0 && isPathByte(detail[k-1]) {
-			k--
-		}
-		return detail[k : i-1], true
+		return i, true
 	}
-	return "", false
+	return 0, false
+}
+
+// subtestTarget reports the first target written as a SUBTEST reference — `TestOne/case` — or "".
+//
+// A SUBTEST IS NOT A NAME THIS PROGRAM CAN RESOLVE, AND IT MUST NOT PRETEND OTHERWISE. `go test
+// -list` enumerates test FUNCTIONS; a subtest exists only while its parent is running, so no
+// listing can testify about one. The name was therefore narrowed to its parent and reported as
+// resolved: `TestOne/deletes_the_socket` was answered by `TestOne`, and deleting the subtest the
+// inventory line actually names left the claim green. The claim said one thing and the resolver
+// answered about another — the shape every false green found in this reader has had.
+//
+// So it is REFUSED rather than narrowed, which is the fail-closed direction: the author is told to
+// name the test function, and the row stays visibly unclaimed until they do. This is not another
+// rule about what the prose in the target column means — it is the rule that a name this program
+// cannot resolve is never silently replaced by one it can.
+//
+// READ AT THE TARGET'S FIRST OCCURRENCE, like every other question asked about the target, so a
+// rationale that mentions a subtest further along is commentary and is not scanned.
+func subtestTarget(detail string, targets []string) string {
+	for _, t := range targets {
+		i, ok := firstWholeOccurrence(detail, t)
+		if !ok || detail[i+len(t):] == "" || detail[i+len(t)] != '/' {
+			continue
+		}
+		j := i + len(t)
+		for j < len(detail) && detail[j] != ' ' && detail[j] != '\t' {
+			j++
+		}
+		return detail[i:j]
+	}
+	return ""
 }
 
 // isPathByte is what a package path may contain in a claim.
