@@ -41,8 +41,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          submodules: true
 
       # The version the binaries will report is the tag with its "v" stripped —
       # it is stamped in, not read out of the source — so the only thing to
@@ -70,14 +68,17 @@ jobs:
       - name: Ensure shellcheck is available
         run: command -v shellcheck >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck; }
 
+      # The same narrowed scope as ci.yml's lint job: the four scripts that are
+      # all the shell this repository still has after the cutover.
       - name: shellcheck
-        run: shellcheck -x bin/* lib/*.sh tests/*.sh tests/harness/* tools/*.sh
+        run: shellcheck -x check.sh tests/*.sh tools/*.sh
 
-      - name: Smoke tests
+      # MCTL_BIN is deliberately UNSET, so this takes tests/smoke.sh's own
+      # default path and builds the binary it tests — the same reason ci.yml
+      # runs it that way. The published artifacts get their own smoke below,
+      # after they exist.
+      - name: Smoke (the script's own default — MCTL_BIN deliberately unset)
         run: ./tests/smoke.sh
-
-      - name: Bats unit tests
-        run: third_party/bats-core/bin/bats tests/unit
 
       # The Go lane, byte-identical to the pull-request lane: same script, same
       # stages. `release` builds the whole published matrix twice — the second
@@ -97,13 +98,12 @@ jobs:
       # internal name could be published. docs-bar.yml does NOT cover this: it
       # triggers on pull_request and push to main only, never on tags.
       #
-      # third_party/ (the bats submodule, checked out for the test step) is
-      # excluded as third-party text, matching CI's plain-checkout hygiene scope.
-      # It is excluded by that name and not by vendor/: the submodule moved when
-      # the Go module arrived, because a directory named vendor/ puts the go
-      # command into vendor mode. The old exclusion had stopped naming anything
-      # that exists, which would have put upstream bats text through a gate
-      # written for this project's own prose.
+      # THERE IS NO third_party/ EXCLUSION ANY MORE. It existed for the bats
+      # submodule, which the cutover deregistered — and an --exclude-dir naming
+      # a directory that does not exist is precisely the shape of stale gate
+      # this file already got caught by once (it used to say vendor/ after the
+      # submodule had moved). This workflow's scan now covers the whole tree,
+      # exactly as ci.yml's plain-checkout scan always did.
       #
       # The term list is sourced from the organisation secret DOCS_DENY_PATTERN,
       # never written here — see the long note in ci.yml for why an inline,
@@ -150,7 +150,7 @@ jobs:
           # PASS 1 — the combined pattern, .github excluded so the repo-local
           # EXTRAS spelled out in this file cannot match it.
           hits="$(grep -rlaiE -e "$FULL" . \
-              --exclude-dir=.git --exclude-dir=.github --exclude-dir=node_modules --exclude-dir=third_party)" && rc=0 || rc=$?
+              --exclude-dir=.git --exclude-dir=.github --exclude-dir=node_modules)" && rc=0 || rc=$?
           [ "$rc" -le 1 ] || { echo "::error::tree scan failed (grep rc=$rc) — the tree was NOT fully scanned"; exit 1; }
           if [ -n "$hits" ]; then
             # A path is printed, never the matched line. Workflow commands are
@@ -168,10 +168,8 @@ jobs:
           # PASS 2 — the SECRET half over the WHOLE tree, .github INCLUDED. See
           # the long note in ci.yml: --exclude-dir skips that directory name at
           # EVERY depth, so pass 1 alone is blind to nested .github paths too.
-          # third_party/ stays excluded in both passes: it is the third-party
-          # bats submodule, not this project's text.
           ghits="$(grep -rlaiE -e "$DENY" . \
-              --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=third_party)" && rc=0 || rc=$?
+              --exclude-dir=.git --exclude-dir=node_modules)" && rc=0 || rc=$?
           [ "$rc" -le 1 ] || { echo "::error::whole-tree scan failed (grep rc=$rc) — NOT fully scanned"; exit 1; }
           if [ -n "$ghits" ]; then
             # A path is printed, never the matched line. Workflow commands are
@@ -208,7 +206,7 @@ jobs:
           # here, so the old .github exclusion would only cost a blind spot.
           # grep rc >=2 means the scan failed, not that the tree is clean.
           hits="$(grep -rlaE -e "$DENY_CS" . \
-              --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=third_party)" && rc=0 || rc=$?
+              --exclude-dir=.git --exclude-dir=node_modules)" && rc=0 || rc=$?
           [ "$rc" -le 1 ] || { echo "::error::tree scan failed (grep rc=$rc) — the tree was NOT fully scanned"; exit 1; }
           if [ -n "$hits" ]; then
             # A path is printed, never the matched line. Workflow commands are
@@ -234,17 +232,6 @@ jobs:
           done
           [ "$missing" -eq 0 ] || { echo "::error::required health file(s) missing from the tree"; exit 1; }
 
-      # The bash bundler (tools/bundle.sh) is no longer built here: it produces
-      # the artifact this release stopped publishing. It stays gated on every
-      # push by ci.yml's test job for as long as the bash tree exists.
-      #
-      # tests/smoke.sh above still runs against the bash entrypoint rather than
-      # against a built binary. Re-pointing it belongs with the cutover, because
-      # its version-shape assertion rejects a prerelease suffix and that
-      # assertion cannot be edited before then; what the published artifact is
-      # held to here is release-verify's exec round-trip, which requires the
-      # exact version line from both --version and -v.
-      #
       # THE PUBLISHED ARTIFACTS. One static binary per supported platform,
       # stamped with the tag, built with the determinism flags, plus the
       # checksum file. tools/build-release.sh carries the flags and the reasons
@@ -272,6 +259,24 @@ jobs:
           ls -l dist
           cat dist/SHA256SUMS
           ( cd dist && sha256sum -c SHA256SUMS )
+
+      # THE RELEASE-ARTIFACT SMOKE. tests/smoke.sh survived the cutover for this
+      # step: its assertions are the transport-level CLI contract — exit codes,
+      # the exact `mythical-ctl <semver>` line, --version and -v agreeing, usage
+      # errors staying off stdout — and this is the one place they are asserted
+      # against the bytes that are about to be PUBLISHED rather than against a
+      # binary built a moment ago for the purpose.
+      #
+      # The artifact is named by the runner's own platform, never hard-coded: a
+      # literal linux_amd64 would name a missing file the day this job moves,
+      # and MCTL_BIN pointing at nothing fails one assertion out of eight in a
+      # way that reads like a CLI defect rather than a broken step.
+      - name: Smoke against the published artifact
+        run: |
+          set -euo pipefail
+          art="dist/mythical-ctl_$(go env GOOS)_$(go env GOARCH)"
+          [ -f "$art" ] || { echo "::error::no release artifact at $art"; exit 1; }
+          MCTL_BIN="$PWD/$art" ./tests/smoke.sh
 
       # Every binary is attested. SHA256SUMS is not: it is not an artifact
       # anybody executes, and its integrity is the digests it carries, each of

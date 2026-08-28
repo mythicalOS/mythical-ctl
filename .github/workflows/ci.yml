@@ -225,22 +225,32 @@ jobs:
       - name: Ensure shellcheck is available
         run: command -v shellcheck >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck; }
 
-      # -x follows `source`d files, so the lint keeps working once bin/ grows
-      # beyond a single self-contained script.
+      # THE SHIPPED CLI IS NO LONGER SHELL — the four scripts below are all the
+      # shell this repository still has, and every one of them is load-bearing:
+      # check.sh is the gate every lane runs, tools/build-release.sh builds what
+      # gets published, tools/parity-audit.sh drives the parity gate, and
+      # tests/smoke.sh is the release-artifact smoke. The scope was NARROWED at
+      # the cutover rather than deleted along with the bash tree: a lint that
+      # stops existing is not the same thing as a lint with nothing left to say.
+      #
+      # -x follows `source`d files. Nothing sources anything today; it stays on
+      # so the lint keeps working if one of these grows a helper.
       - name: shellcheck
         run: |
           set -euo pipefail
           shellcheck --version
-          shellcheck -x bin/* lib/*.sh tests/*.sh tests/harness/* tools/*.sh
+          shellcheck -x check.sh tests/*.sh tools/*.sh
           echo "shellcheck: clean"
 
-      # Shell that is not executable is shell that will not run when installed. tools/bundle.sh is
-      # in scope because the release workflow invokes it directly, not via `bash tools/bundle.sh`.
+      # Shell that is not executable is shell that will not run when invoked by
+      # name. All four are in scope: the release workflow runs build-release.sh
+      # through `bash`, but check.sh invokes parity-audit.sh and a person
+      # invokes check.sh the way its own header documents.
       - name: Entrypoints are executable
         run: |
           set -euo pipefail
           rc=0
-          for f in bin/* tests/*.sh tools/*.sh; do
+          for f in check.sh tests/*.sh tools/*.sh; do
             [ -x "$f" ] || { echo "::error file=$f::not executable"; rc=1; }
           done
           exit "$rc"
@@ -282,38 +292,27 @@ jobs:
       - name: check.sh release
         run: bash check.sh release
 
-  test:
-    name: test
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          submodules: true
-
-      - name: Smoke tests
+      # SMOKE, TWICE, AND THE FIRST ONE IS THE POINT OF RUNNING IT TWICE.
+      #
+      # MCTL_BIN is deliberately ABSENT here, so this run takes tests/smoke.sh's
+      # OWN default path — which builds the binary it tests. Every job that ever
+      # ran this script passed MCTL_BIN, which meant the default was never once
+      # exercised: before the cutover it named bin/mythical-ctl and could have
+      # named anything at all without a single lane going red. A default nothing
+      # runs is not a default, so one lane runs it with nothing set.
+      - name: Smoke (the script's own default — MCTL_BIN deliberately unset)
         run: ./tests/smoke.sh
 
-      - name: Bats unit tests
-        run: third_party/bats-core/bin/bats tests/unit
-
-      # The release publishes ONE self-contained file, not bin/mythical-ctl — so the bundle is what
-      # users actually run, and it has to clear the same bars the repository tree does. Building it
-      # on every push is what stops "works in the repo, broken when installed" reaching a tag.
-      - name: Build the release bundle
+      # And once against a STAMPED artifact, built by the real release script so
+      # the version this asserts came through the same -X path a published
+      # binary's does. The artifact name is derived rather than spelled out: a
+      # hard-coded linux_amd64 would silently test nothing the day this job's
+      # runner changes architecture, because MCTL_BIN would name a file that
+      # does not exist and the first assertion would be the only one to fail.
+      - name: Smoke against a stamped release artifact
         run: |
           set -euo pipefail
-          tools/bundle.sh dist/mythical-ctl
-
-      - name: Ensure shellcheck is available
-        run: command -v shellcheck >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck; }
-
-      # No -x: the bundle has nothing to follow, and that is the property under test.
-      - name: shellcheck the bundle
-        run: |
-          set -euo pipefail
-          shellcheck dist/mythical-ctl
-          echo "shellcheck (bundle): clean"
-
-      - name: Smoke tests against the bundle
-        run: MCTL_BIN="$PWD/dist/mythical-ctl" ./tests/smoke.sh
+          bash tools/build-release.sh 0.0.0-ci "$RUNNER_TEMP/relsmoke"
+          art="$RUNNER_TEMP/relsmoke/mythical-ctl_$(go env GOOS)_$(go env GOARCH)"
+          [ -f "$art" ] || { echo "::error::no release artifact at $art"; exit 1; }
+          MCTL_BIN="$art" ./tests/smoke.sh
