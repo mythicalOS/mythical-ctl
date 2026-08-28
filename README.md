@@ -101,9 +101,17 @@ run, from which commit, produced exactly those bytes:
 gh attestation verify /usr/local/bin/mythical-ctl --repo mythicalOS/mythical-ctl
 ```
 
-(It takes a **file path**, so name the installed file. To check before installing instead, add the
-same line inside the block above, just before `sudo install` — the download only exists there, in
-the temporary directory the block cleans up.)
+It takes a **file path**, not a command name — so that line checks the file that is already
+installed. To check *before* installing instead, put this one inside the block above, immediately
+before `sudo install`, where the download still exists under its own name:
+
+```sh
+  gh attestation verify "mythical-ctl_$plat" --repo mythicalOS/mythical-ctl
+```
+
+The two are not interchangeable: run the `/usr/local/bin/...` form before the install and it
+attests **whatever was already there**, which is a green result about bytes you are not about to
+run — the one direction a verification step must never fail in.
 
 The version string is not the integrity guarantee — the digest is; anyone can print a version.
 [get.mythicalos.ai](https://get.mythicalos.ai) serves a pinned release artifact from here, so a
