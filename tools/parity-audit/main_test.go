@@ -1771,11 +1771,18 @@ func TestAPortedTargetNeedsBothTheListAndTheSource(t *testing.T) {
 	)
 	// The list says the package registers TestTwo; the SOURCE does not declare it — the shape a
 	// printed identifier produces.
+	//
+	// THE EXECUTION WITNESS IS SET TO THE MOST PERMISSIVE THING IT COULD SAY — it agrees with the
+	// LIST, so it claims TestTwo ran — precisely so that it cannot be what reddens this case. The
+	// fixture helper would have derived it from the source instead, which would have made the
+	// execution witness dissent too and left this test unable to say WHICH witness caught the
+	// defect it is named for.
 	srcMissing := srcOf(map[testPkg][]string{
 		{Path: "mythicalos.ai/ctl/internal/x"}: {"TestOne", "TestThree"},
 	})
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, withExecAll([]testLane{{name: "default", list: tinyGoTests, src: srcMissing}}), noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, []testLane{{name: "default", list: tinyGoTests, src: srcMissing,
+		executed: true, exec: tinyGoTests}}, noPreDeclared)
 	if !hasProblem(r, "TestTwo") {
 		t.Fatalf("a target the source does not declare was accepted: %v", r.Problems)
 	}
@@ -1785,8 +1792,11 @@ func TestAPortedTargetNeedsBothTheListAndTheSource(t *testing.T) {
 	listMissing := listOf(map[string][]string{
 		"mythicalos.ai/ctl/internal/x": {"TestOne", "TestThree"},
 	})
+	// Same posture on this side: the execution witness says TestTwo ran, so only the LIST half can
+	// be what refuses it.
 	r2 := &report{}
-	auditCoverage(r2, tiny, c, b, st, withExecAll([]testLane{{name: "default", list: listMissing, src: tinySrcTests}}), noPreDeclared)
+	auditCoverage(r2, tiny, c, b, st, []testLane{{name: "default", list: listMissing, src: tinySrcTests,
+		executed: true, exec: tinyGoTests}}, noPreDeclared)
 	if !hasProblem(r2, "TestTwo") {
 		t.Fatalf("a target the package does not register was accepted: %v", r2.Problems)
 	}
@@ -1809,12 +1819,19 @@ func TestTheTwoWitnessesMustAgreeWithinONELane(t *testing.T) {
 	const pkg = "mythicalos.ai/ctl/internal/x"
 	// LANE A registers the name (its init printed it) but compiles no file declaring it.
 	// LANE B compiles a file declaring it (tagged for this lane) but registers nothing by that name.
-	split := withExecAll([]testLane{
+	//
+	// BOTH LANES SAY TestTwo RAN, so the execution witness cannot be what refuses it here — this
+	// case is about the LANE PAIRING, and a fixture whose third witness also dissented would pass
+	// without ever exercising it.
+	allRan := listOf(map[string][]string{pkg: {"TestOne", "TestTwo", "TestThree"}})
+	split := []testLane{
 		{name: "a", list: listOf(map[string][]string{pkg: {"TestOne", "TestTwo", "TestThree"}}),
-			src: srcOf(map[testPkg][]string{{Path: pkg}: {"TestOne", "TestThree"}})},
+			src:      srcOf(map[testPkg][]string{{Path: pkg}: {"TestOne", "TestThree"}}),
+			executed: true, exec: allRan},
 		{name: "b", list: listOf(map[string][]string{pkg: {"TestOne", "TestThree"}}),
-			src: srcOf(map[testPkg][]string{{Path: pkg}: {"TestOne", "TestTwo", "TestThree"}})},
-	})
+			src:      srcOf(map[testPkg][]string{{Path: pkg}: {"TestOne", "TestTwo", "TestThree"}}),
+			executed: true, exec: allRan},
+	}
 	r := &report{}
 	auditCoverage(r, tiny, c, b, st, split, noPreDeclared)
 	if !hasProblem(r, "TestTwo") {
@@ -1824,11 +1841,12 @@ func TestTheTwoWitnessesMustAgreeWithinONELane(t *testing.T) {
 	// AND THE ORDINARY CASE STILL PASSES: one lane in which both halves agree resolves it, even
 	// though the other lane knows nothing about it. A fix that demanded every lane agree would
 	// refuse every acceptance-tagged test.
-	ok := withExecAll([]testLane{
+	ok := []testLane{
 		split[0],
 		{name: "b", list: listOf(map[string][]string{pkg: {"TestOne", "TestTwo", "TestThree"}}),
-			src: srcOf(map[testPkg][]string{{Path: pkg}: {"TestOne", "TestTwo", "TestThree"}})},
-	})
+			src:      srcOf(map[testPkg][]string{{Path: pkg}: {"TestOne", "TestTwo", "TestThree"}}),
+			executed: true, exec: allRan},
+	}
 	r2 := &report{}
 	auditCoverage(r2, tiny, c, b, st, ok, noPreDeclared)
 	if hasProblem(r2, "TestTwo") {

@@ -141,6 +141,28 @@ require_floor() { # require_floor <name> <value>
    it is no floor at all, so this is refused rather than accepted."
       ;;
   esac
+  # DIGITS ARE NOT ENOUGH, AND THE FIRST VERSION OF THIS GUARD STOPPED HERE.
+  #
+  # bash's `[` parses an integer with strtoimax, so a value at or above 2^63 is `integer expression
+  # expected` all over again — the digit check lets it straight through. MEASURED, with the digit
+  # check in place: `MIN_TESTED_PACKAGES=9223372036854775808 bash check.sh tested-floor` printed
+  # `tested packages: 0 (floor 9223372036854775808)` and then `check.sh: OK`, exit 0, having compared
+  # nothing. 9223372036854775807 — one less — refuses correctly. That is the very bypass the digit
+  # check was added to close, reached through a value the digit check calls well-formed, and it is
+  # the reason this second half exists at all.
+  #
+  # SO THE CHECK ASKS `[` ITSELF rather than naming a bound. A hardcoded limit is a second opinion
+  # about what this shell will do, and a second opinion is a thing that can be wrong; running the
+  # comparison is the property, stated directly. `$(( ))` is NOT an alternative — it WRAPS
+  # (9223372036854775808 evaluates to a negative number), and a floor that silently becomes a
+  # different number is worse than one that is rejected. The value cannot be negative here, so the
+  # only way this comparison is not true is that it could not be made.
+  if ! [ 0 -le "$2" ] 2> /dev/null; then
+    die "$1=$2 is made of digits but is not a number this shell's \`[\` can compare — it is at or
+   beyond the integer range, so \`[ N -lt $1 ]\` ERRORS exactly as a non-numeric value does, the
+   enclosing \`if\` reads the error as 'no', and the stage prints OK having compared nothing.
+   Measured: 9223372036854775807 refuses correctly, 9223372036854775808 does not."
+  fi
 }
 require_floor MIN_PACKAGES "$MIN_PACKAGES"
 require_floor MIN_TESTED_PACKAGES "$MIN_TESTED_PACKAGES"
@@ -479,6 +501,16 @@ check_selfcheck() {
   selfcheck_probe 'the package floor still refuses a tree below it' refuse \
     'expected at least 100000' \
     env MIN_PACKAGES=100000 bash "$SELF" packages
+  # THE SECOND DOOR INTO THE SAME BYPASS, and the first version of the guard left it open: a
+  # DIGIT-ONLY value at or beyond 2^63 makes `[` error exactly as a non-numeric one does. 2^63 is
+  # probed rather than some larger round number because it is the first value that fails, and
+  # 2^63-1 is probed beside it so this pair cannot pass by refusing every large number.
+  selfcheck_probe 'the package floor refuses an uncomparable integer' refuse \
+    'is made of digits but is not a number' \
+    env MIN_PACKAGES=9223372036854775808 bash "$SELF" packages
+  selfcheck_probe 'the package floor still ACCEPTS the largest comparable one' refuse \
+    'expected at least 9223372036854775807' \
+    env MIN_PACKAGES=9223372036854775807 bash "$SELF" packages
 
   selfcheck_probe 'the tested-package floor refuses a malformed value' refuse \
     'MIN_TESTED_PACKAGES=not-a-number is not a non-negative integer' \
@@ -489,6 +521,12 @@ check_selfcheck() {
   selfcheck_probe 'the tested-package floor still refuses a stream below it' refuse \
     'expected at least 100000' \
     env MIN_TESTED_PACKAGES=100000 bash -c "$floorprobe" _ "$floorstream" "$SELF"
+  selfcheck_probe 'the tested-package floor refuses an uncomparable integer' refuse \
+    'is made of digits but is not a number' \
+    env MIN_TESTED_PACKAGES=9223372036854775808 bash -c "$floorprobe" _ "$floorstream" "$SELF"
+  selfcheck_probe 'the tested-package floor still ACCEPTS the largest comparable one' refuse \
+    'expected at least 9223372036854775807' \
+    env MIN_TESTED_PACKAGES=9223372036854775807 bash -c "$floorprobe" _ "$floorstream" "$SELF"
 
   # Two flags, two different defeats: -exec replaces the grader with a program that grades
   # nothing, -ldflags rewrites the constant the parity auditor pins the corpus digest to. The
