@@ -57,12 +57,12 @@ each launch itself. The mounting described here is behaviour you can verify agai
 Where each part of a launch comes from, because the inventory matters more than the summary: the
 **image** is the authenticated manifest's, unless the operator passes `--image`, which replaces it
 loudly and is recorded; the **mounts** are the core-fixed set described below, plus a host bind for
-any role `mythical.conf` names *and* the authenticated policy index makes bindable — the manifest is where the role
-has to be declared in the first place, and a configured bind for a role it does not declare is not
-a mount at all — plus a named volume for every other role the manifest declares; the **published
-ports** are the manifest's, with
-the host-side number optionally overridden from `mythical.conf`; and the **bootstrap secrets** are
-named by the manifest, granted by the policy index, and valued from `mythical.conf`.
+any role `mythical.conf` names *and* the authenticated policy index makes bindable — the manifest
+is where the role has to be declared in the first place, and a configured bind for a role it does
+not declare is not a mount at all — plus a named volume for every other role the manifest declares;
+the **published ports** are the manifest's, with the host-side number optionally overridden from
+`mythical.conf`; and the **bootstrap secrets** are named by the manifest, granted by the policy
+index, and valued from `mythical.conf`.
 
 Two of those runtime guarantees are why the format is shaped the way it is — why `<product>.conf`
 must be written in place, why it needs a marker, and why its size is treated as
@@ -86,7 +86,7 @@ describes the path at the moment it runs (see [Ownership and identity](#ownershi
 
 **What this release's verbs actually do to these two files**, stated because everything after this
 point is a *contract* and not a description of one program's behaviour. The rules below are
-implemented — the reader and the writer that apply them ship in the binary, and they are what a
+implemented — the reader and the writer that apply them are in this tree, and they are what a
 product's own UI has to match on both sides. What the verbs reach is narrower than all of it:
 
 - **`mythical.conf` is read one key at a time, by name.** That read applies the syntax, the byte
