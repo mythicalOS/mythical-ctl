@@ -46,6 +46,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/sha256"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"go/ast"
@@ -1110,6 +1111,80 @@ func parseGoTestList(content []byte) map[string]map[string]int {
 	return out
 }
 
+// notExecutedPrefix marks a --go-exec value that is an ARGUMENT rather than a file: this lane was
+// deliberately not run, and the text after the colon says why. It is spelled out at the call site
+// rather than inferred, because a lane that quietly opts out of the execution witness is exactly the
+// special case this witness was added to forbid.
+const notExecutedPrefix = "not-executed:"
+
+// parseGoTestExec reads `go test -json -count=1 ./...` output — THE EXECUTION WITNESS — and returns,
+// per package, how many times each test NAME was actually STARTED.
+//
+// WHY A THIRD WITNESS AT ALL, WHEN TWO ALREADY AGREE. Because both of the others answer
+// "does this test EXIST", and neither answers "does it RUN". A test can be declared in a file the
+// lane compiles (the source witness), registered by the toolchain and printed by `go test -list`
+// (the list witness), and still never execute: `func TestMain(m *testing.M)` is the package's own
+// entry point, so it can parse `-test.list` and print whatever it likes, then set `-test.run` to
+// something else and call m.Run. MEASURED, with the reviewer's probe: `go test -list '.*'` printed
+// only `TestClaimed`, a normal `go test -v` ran only `TestOther`, and both of the other witnesses
+// were satisfied. This one is not: the run events name TestOther and nothing else.
+//
+// AND IT IS NOT UNFORGEABLE — SAY SO PLAINLY, BECAUSE THE OPPOSITE BELIEF IS THE DANGEROUS ONE.
+// `go test -json` is `test2json`, a parser of the test binary's STDOUT, and it still honours the
+// unmarked framework line format for compatibility. MEASURED on go1.26.5: a package that prints
+// `=== RUN   TestClaimed` and `--- PASS: TestClaimed (0.00s)` gets a genuine `"Action":"run"` event
+// with `"Test":"TestClaimed"`, indistinguishable from a real one. (Go does prefix its own lines with
+// \x16 under `-test.v=test2json`, but the marker is stripped before the JSON is emitted — and a
+// package could print that byte too.) So NO stdout-derived evidence can be proof against a package
+// that sets out to lie; what this witness does is close the accident and the shortcut. Printing a
+// bare identifier during a listing run is something a package can do by mistake; emitting the
+// framework's own RUN/PASS lines for a test that did not run is not.
+//
+// COUNTED, LIKE THE LIST WITNESS, AND FOR THE SAME REASON: `x` and `x_test` may each declare a test
+// of one name and both run under one package, so the number of starts is what can be held against
+// the number of declarations.
+//
+// SUBTESTS ARE NOT THEIR PARENT. `t.Run` emits `"Test":"TestFoo/case"`, and counting those toward
+// TestFoo would put the run count far above the declaration count for every table-driven test in the
+// tree (1662 events against 1369 top-level starts, measured here). A subtest name is also not a
+// legal target token, so nothing can claim one; they are dropped.
+func parseGoTestExec(name string, content []byte) (map[string]map[string]int, error) {
+	out := map[string]map[string]int{}
+	sc := bufio.NewScanner(bytes.NewReader(content))
+	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	line := 0
+	for sc.Scan() {
+		line++
+		raw := bytes.TrimRight(sc.Bytes(), "\r")
+		if len(bytes.TrimSpace(raw)) == 0 {
+			continue
+		}
+		var ev struct {
+			Action  string
+			Package string
+			Test    string
+		}
+		// A LINE THAT IS NOT AN EVENT IS A HARD ERROR, NOT A SKIP. This stream is the only evidence
+		// that anything ran; a reader that shrugged at unparseable lines would report an empty or
+		// half-empty witness for a stream it had not understood, and every PORTED target would go
+		// dangling for a reason that is not about the port.
+		if err := json.Unmarshal(raw, &ev); err != nil {
+			return nil, fmt.Errorf("%s line %d is not a `go test -json` event: %w (the execution witness must be the STDOUT of `go test -json -count=1 ./...` and nothing else)", name, line, err)
+		}
+		if ev.Action != "run" || ev.Test == "" || ev.Package == "" {
+			continue
+		}
+		if strings.Contains(ev.Test, "/") {
+			continue
+		}
+		if out[ev.Package] == nil {
+			out[ev.Package] = map[string]int{}
+		}
+		out[ev.Package][ev.Test]++
+	}
+	return out, sc.Err()
+}
+
 // testLane is ONE build-tag lane of the GO suite, and it carries BOTH witnesses — paired,
 // deliberately. (Not to be confused with the corpus `lane` above, which is a bats directory.)
 //
@@ -1134,6 +1209,19 @@ type testLane struct {
 	list map[string]map[string]int
 	// src — what the ACTIVE test files of this lane declare, per COMPILED TEST PACKAGE.
 	src declSet
+	// exec — what actually STARTED in an unfiltered `go test -json -count=1` run of this lane, per
+	// package, with multiplicity. Keyed no finer than the list half for the same reason: one test
+	// binary per package under test, and its run events do not say which of the two compiled test
+	// packages a name came from.
+	exec map[string]map[string]int
+	// executed — whether this lane was run at all. A lane that was not run is not a lane whose tests
+	// failed to run: it can confirm nothing, and it says so rather than resolving on the strength of
+	// the two witnesses that only prove existence.
+	executed bool
+	// execWhy — the ARGUMENT for not executing this lane, supplied at the call site. A claim that
+	// needs this lane is refused with it, so the exception is visible in the refusal rather than
+	// buried in a flag.
+	execWhy string
 }
 
 // testPkg identifies ONE COMPILED TEST PACKAGE: the import path under test, and whether this is the
@@ -1507,6 +1595,7 @@ type resolution struct {
 	Ambiguous string // two declarations this claim cannot choose between
 	WrongPkg  string // declared in this import path, but in its OTHER compiled test package
 	Disagree  string // the two witnesses disagree about HOW MANY tests carry the name
+	NotRun    string // it exists in this lane, but this lane cannot witness that it RAN
 }
 
 // resolve binds ONE target to ONE declaration, or says why it cannot.
@@ -1555,10 +1644,36 @@ func (ln testLane) resolve(pkg string, bd bind, name string) resolution {
 	// is something a package PRINTED during the listing run (the list witness is stdout), a missing
 	// one is a declaration the toolchain did not register. Either way this lane cannot say which
 	// test the claim is about, and saying yes anyway is exactly the guess this audit must not make.
-	if declared := len(in) + len(ex); listed != declared {
+	declared := len(in) + len(ex)
+	if listed != declared {
 		return resolution{Disagree: fmt.Sprintf(
 			"is declared %d time(s) under %s but `go test -list` printed it %d time(s) for that package — the two witnesses disagree about how many tests carry this name, so neither can say which one this claim is about",
 			declared, pkg, listed)}
+	}
+	// THE THIRD WITNESS, AND THE ONLY ONE THAT ANSWERS THE QUESTION THE PROMISE ASKS. Everything
+	// above establishes that the test EXISTS: a file this lane compiles declares it, and the
+	// toolchain printed it. Neither says it RUNS. `func TestMain(m *testing.M)` is the package's own
+	// entry point, so it can print a name during a `-test.list` run and then set `-test.run` to
+	// something else for the real one — measured, and both of the checks above stay satisfied.
+	if !ln.executed {
+		return resolution{NotRun: fmt.Sprintf(
+			"is declared and listed under %s, but the %s lane is NOT EXECUTED by this audit (%s) — so nothing here witnesses that it RUNS, and existence is not the claim being made. Either give this lane an execution witness, or move the claim to a test a run of this audit actually executes",
+			pkg, ln.name, ln.execWhy)}
+	}
+	// COUNTED AGAINST THE DECLARATIONS FOR THE REASON THE LISTING IS. A name declared once in the
+	// package and once in its external test package is two tests running under one package in the
+	// run events; if only one of them started, this lane cannot say which one the claim is about —
+	// and the one that did not start is exactly the one a claim would be hiding.
+	ran := ln.exec[pkg][name]
+	if ran == 0 {
+		return resolution{NotRun: fmt.Sprintf(
+			"is declared and listed under %s but NEVER RAN: an unfiltered `go test -json -count=1` of the %s lane started no test by that name. A test that exists and does not execute is the hole this inventory exists to prevent, and the two existence witnesses cannot see it",
+			pkg, ln.name)}
+	}
+	if ran != declared {
+		return resolution{NotRun: fmt.Sprintf(
+			"is declared %d time(s) under %s but only %d of them RAN in the %s lane — the declarations and the run events disagree about how many tests of this name execute, so neither can say which one this claim is about, and the one that never ran is the one a claim would be hiding",
+			declared, pkg, ran, ln.name)}
 	}
 	return resolution{OK: true}
 }
@@ -1905,7 +2020,7 @@ func auditCoverage(r *report, pairs []batsPair, claims []claim, bad []malformed,
 					// none does, the reason a lane REACHED and refused says far more than "does not
 					// exist" — which is what this used to say about a test sitting in the next
 					// package over.
-					for _, why := range []string{res.Ambiguous, res.Disagree, res.WrongPkg} {
+					for _, why := range []string{res.Ambiguous, res.Disagree, res.NotRun, res.WrongPkg} {
 						if why != "" && decisive == "" {
 							decisive = why
 						}
@@ -1988,19 +2103,21 @@ func main() {
 		writeMan  = flag.Bool("write-manifest", false, "regenerate the manifest from the bats trees and write it, instead of auditing")
 		goLists   listFlag
 		goFiles   listFlag
+		goExecs   listFlag
 		failFirst = flag.Int("max-problems", 0, "print at most this many problems (0 = all)")
 	)
 	flag.Var(&goLists, "go-list", "file holding `go test -list` output; repeatable (once per build-tag lane)")
 	flag.Var(&goFiles, "go-files", "file holding `go list -f '{{.ImportPath}}\\t{{.Dir}}\\t{{join .GoFiles \" \"}}\\t{{join .TestGoFiles \" \"}}\\t{{join .XTestGoFiles \" \"}}'` output for the SAME lane, in the SAME order as --go-list")
+	flag.Var(&goExecs, "go-exec", "file holding `go test -json -count=1 ./...` output for the SAME lane, in the SAME order as --go-list — or `not-executed:<why>` to state that this lane is deliberately not run, in which case it can confirm no PORTED target")
 	flag.Parse()
 
-	if err := run(*root, *manifest, *writeMan, goLists, goFiles, *failFirst); err != nil {
+	if err := run(*root, *manifest, *writeMan, goLists, goFiles, goExecs, *failFirst); err != nil {
 		fmt.Fprintf(os.Stderr, "parity-audit: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(root, manifestRel string, writeMan bool, goLists, goFiles []string, maxProblems int) error {
+func run(root, manifestRel string, writeMan bool, goLists, goFiles, goExecs []string, maxProblems int) error {
 	manifestPath := filepath.Join(root, filepath.FromSlash(manifestRel))
 
 	// Is the bash tree still here? Both lanes or neither. A half-deleted tree would regenerate a
@@ -2091,11 +2208,12 @@ func run(root, manifestRel string, writeMan bool, goLists, goFiles []string, max
 	// assumed: an unpaired list would silently reintroduce the very independence the pairing
 	// removes — a lane whose source half is empty resolves nothing, and one whose list half is
 	// empty would be skipped without anybody noticing which lane went missing.
-	if len(goFiles) != len(goLists) {
-		return fmt.Errorf("--go-list was given %d time(s) and --go-files %d — they are ONE witness pair per\n"+
-			"   build-tag lane and must be given in the same number and the same order: the source half\n"+
-			"   of target resolution is built from the files THAT LANE compiles",
-			len(goLists), len(goFiles))
+	if len(goFiles) != len(goLists) || len(goExecs) != len(goLists) {
+		return fmt.Errorf("--go-list was given %d time(s), --go-files %d and --go-exec %d — they are ONE witness\n"+
+			"   TRIPLE per build-tag lane and must be given in the same number and the same order: the source\n"+
+			"   half of target resolution is built from the files THAT LANE compiles, and the execution half\n"+
+			"   from what THAT LANE actually ran",
+			len(goLists), len(goFiles), len(goExecs))
 	}
 	var testLanes []testLane
 	// EVERY FILE THE TOOLCHAIN COMPILES, ACROSS EVERY LANE. This is the set a claim may be written
@@ -2104,6 +2222,7 @@ func run(root, manifestRel string, writeMan bool, goLists, goFiles []string, max
 	// in it is legitimate.
 	eligible := map[string]fileKind{}
 	names := 0
+	executedLanes := 0
 	for i, p := range goLists {
 		content, err := os.ReadFile(p)
 		if err != nil {
@@ -2137,7 +2256,49 @@ func run(root, manifestRel string, writeMan bool, goLists, goFiles []string, max
 		if serr != nil {
 			return serr
 		}
+		// THE EXECUTION HALF OF THIS LANE — a file of `go test -json` events, or a stated argument
+		// for not running the lane at all. There is no third possibility and no default: a missing
+		// value is refused by the arity check above, so no lane can arrive without having answered
+		// the question.
 		ln := testLane{name: p, list: parseGoTestList(content), src: src}
+		if why, notRun := strings.CutPrefix(goExecs[i], notExecutedPrefix); notRun {
+			why = strings.TrimSpace(why)
+			// AN OPT-OUT WITH NO ARGUMENT IS THE QUIET SPECIAL CASE THIS WITNESS EXISTS TO FORBID.
+			// A lane may legitimately be unrunnable here — the acceptance lane needs a live daemon —
+			// but that is a claim about the world, and it has to be written down where the refusal
+			// it causes can quote it.
+			if why == "" {
+				return fmt.Errorf("--go-exec %q declares the lane listed in %s not executed but gives no reason;\n"+
+					"   write it as `%s<why this lane cannot be run here>` — a lane that opts out of the\n"+
+					"   execution witness can confirm no PORTED target, and the claim that is refused because of\n"+
+					"   it quotes this text", goExecs[i], p, notExecutedPrefix)
+			}
+			ln.execWhy = why
+		} else {
+			econtent, eerr := os.ReadFile(goExecs[i])
+			if eerr != nil {
+				return fmt.Errorf("reading go-test execution witness: %w", eerr)
+			}
+			exec, eperr := parseGoTestExec(goExecs[i], econtent)
+			if eperr != nil {
+				return eperr
+			}
+			// THE SAME LIVENESS ARGUMENT THE OTHER TWO HALVES GET, and it is what stops a truncated,
+			// empty or failed-to-build witness from silently turning the strongest evidence in this
+			// program back into the weakest. An empty file parses cleanly and testifies to nothing.
+			laneRan := 0
+			for _, ns := range exec {
+				laneRan += len(ns)
+			}
+			if laneRan == 0 {
+				return fmt.Errorf("%s records no test as having RUN — `go test -json -count=1` started nothing for\n"+
+					"   this lane, so it can witness no target at all. Either the run failed before any test\n"+
+					"   executed (a build error, or a filter in the environment), or the witness was not captured.",
+					goExecs[i])
+			}
+			ln.exec, ln.executed = exec, true
+			executedLanes++
+		}
 		// EACH LANE'S OWN LIVENESS, not the union's. A lane that registers nothing, or whose
 		// compiled test files declare nothing, resolves no target — and a union check would hide
 		// that behind the other lane.
@@ -2173,6 +2334,14 @@ func run(root, manifestRel string, writeMan bool, goLists, goFiles []string, max
 	// look at the port. Say so up front.
 	if names == 0 {
 		return fmt.Errorf("no Go test names were loaded (pass --go-list <file> with `go test -list '.*' ./...` output) — PORTED targets cannot be resolved")
+	}
+	// ...and the same argument for the execution half. If EVERY lane declares itself not executed
+	// the audit still runs, still parses, still resolves nothing — and reports 1,121 dangling
+	// targets, which is loud about the wrong thing. Say the real reason once, up front.
+	if executedLanes == 0 {
+		return fmt.Errorf("no lane was executed: every --go-exec is a `%s` argument, so nothing here witnesses that\n"+
+			"   any test RUNS and no PORTED target can be resolved. At least one lane must be run with\n"+
+			"   `go test -json -count=1 ./...`, unfiltered", notExecutedPrefix)
 	}
 	// THE CLAIM-BEARING SET NEEDS NO SEPARATE LIVENESS CHECK, and saying so is worth more than a
 	// check that cannot fire: every lane has already been refused unless its compiled TEST files

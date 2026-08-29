@@ -441,10 +441,40 @@ func srcOf(m map[testPkg][]string) declSet {
 	return out
 }
 
-// oneLane is the fixture as ONE lane whose two witnesses agree — the ordinary world. The tests
+// oneLane is the fixture as ONE lane whose three witnesses agree — the ordinary world. The tests
 // that care about the pairing build their own disagreeing lanes.
 func oneLane() []testLane {
-	return []testLane{{name: "default", list: tinyGoTests, src: tinySrcTests}}
+	return withExecAll([]testLane{{name: "default", list: tinyGoTests, src: tinySrcTests}})
+}
+
+// withExec completes a fixture lane's EXECUTION witness from its own SOURCE declarations: every test
+// this lane compiles is a test this lane ran, once per declaration, which is the ordinary world.
+//
+// DERIVED FROM THE SOURCE HALF AND NOT FROM THE LIST HALF, deliberately. The list half is the one a
+// package can write, so deriving from it would make every fixture agree with the weakest witness in
+// the program — and a fixture whose exec map is a restatement of its list map proves nothing about
+// the check that holds those two apart. Fixtures whose SUBJECT is execution spell their own exec
+// map out and do not come through here.
+func withExec(ln testLane) testLane {
+	ln.exec = map[string]map[string]int{}
+	for pkg, names := range ln.src {
+		if ln.exec[pkg.Path] == nil {
+			ln.exec[pkg.Path] = map[string]int{}
+		}
+		for n, ds := range names {
+			ln.exec[pkg.Path][n] += len(ds)
+		}
+	}
+	ln.executed = true
+	return ln
+}
+
+func withExecAll(ls []testLane) []testLane {
+	out := make([]testLane, 0, len(ls))
+	for _, ln := range ls {
+		out = append(out, withExec(ln))
+	}
+	return out
 }
 
 // The whole-file N/A pre-declaration is a PARAMETER of the audit, not a global it reads, so these
@@ -833,13 +863,33 @@ func e2eTree(t *testing.T) (root, goList string) {
 	), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// The THIRD witness: what this lane actually RAN. Real `go test -json` events, so the reader
+	// under test is the one the shipped script feeds.
+	e2eExec(t, root, "TestOne", "TestThree")
 	return root, goList
 }
 
 func goFilesPath(root string) string { return filepath.Join(root, "gofiles.txt") }
+func goExecPath(root string) string  { return filepath.Join(root, "goexec.json") }
+
+// e2eExec writes an execution witness in which each named test of internal/x started exactly once.
+func e2eExec(t *testing.T, root string, ran ...string) {
+	t.Helper()
+	const pkg = "mythicalos.ai/ctl/internal/x"
+	var l []string
+	l = append(l, `{"Action":"start","Package":"`+pkg+`"}`)
+	for _, n := range ran {
+		l = append(l, `{"Action":"run","Package":"`+pkg+`","Test":"`+n+`"}`)
+		l = append(l, `{"Action":"pass","Package":"`+pkg+`","Test":"`+n+`","Elapsed":0}`)
+	}
+	l = append(l, `{"Action":"pass","Package":"`+pkg+`","Elapsed":0.1}`)
+	if err := os.WriteFile(goExecPath(root), lines(l...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func e2eRun(root, goList string) error {
-	return run(root, "tests/parity-manifest.tsv", false, []string{goList}, []string{goFilesPath(root)}, 0)
+	return run(root, "tests/parity-manifest.tsv", false, []string{goList}, []string{goFilesPath(root)}, []string{goExecPath(root)}, 0)
 }
 
 func TestEndToEndAcceptsACompleteTree(t *testing.T) {
@@ -947,7 +997,7 @@ func TestEndToEndRefusesAHalfPresentBashTree(t *testing.T) {
 func TestEndToEndRefusesWithNoGoTestList(t *testing.T) {
 	tinyLanes(t, 2, 1, 2)
 	root, _ := e2eTree(t)
-	err := run(root, "tests/parity-manifest.tsv", false, nil, nil, 0)
+	err := run(root, "tests/parity-manifest.tsv", false, nil, nil, nil, 0)
 	if err == nil || !strings.Contains(err.Error(), "no Go test names were loaded") {
 		t.Fatalf("err = %v, want a refusal naming the missing list", err)
 	}
@@ -1443,10 +1493,10 @@ func TestAQualificationConstrainsRatherThanWidens(t *testing.T) {
 		"mythicalos.ai/ctl/internal/w": {"TestOther"},
 		"mythicalos.ai/ctl/internal/x": {"TestOne", "TestThree", "TestShared"},
 	}
-	lanes := []testLane{{name: "default", list: listOf(names), src: srcOf(map[testPkg][]string{
+	lanes := withExecAll([]testLane{{name: "default", list: listOf(names), src: srcOf(map[testPkg][]string{
 		{Path: "mythicalos.ai/ctl/internal/w"}: {"TestOther"},
 		{Path: "mythicalos.ai/ctl/internal/x"}: {"TestOne", "TestThree", "TestShared"},
-	})}}
+	})}})
 	r := &report{}
 	auditCoverage(r, tiny, c, b, st, lanes, noPreDeclared)
 	if !hasProblem(r, "TestShared") {
@@ -1492,11 +1542,11 @@ func TestAnAmbiguousQualifierResolvesToNothing(t *testing.T) {
 		"mythicalos.ai/ctl/internal/x":        {"TestOne", "TestThree"},
 	}
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, []testLane{{name: "default", list: listOf(names), src: srcOf(map[testPkg][]string{
+	auditCoverage(r, tiny, c, b, st, withExecAll([]testLane{{name: "default", list: listOf(names), src: srcOf(map[testPkg][]string{
 		{Path: "mythicalos.ai/ctl/internal/w"}:        {"TestOther"},
 		{Path: "mythicalos.ai/ctl/nested/internal/w"}: {"TestShared"},
 		{Path: "mythicalos.ai/ctl/internal/x"}:        {"TestOne", "TestThree"},
-	})}}, noPreDeclared)
+	})}}), noPreDeclared)
 	if !hasProblem(r, "TestShared") {
 		t.Fatalf("the audit stayed green after internal/w.TestShared was deleted, because a namesake in nested/internal/w answered the qualifier: %v", r.Problems)
 	}
@@ -1551,10 +1601,10 @@ func TestAnAmbiguousOwnPackageResolvesToNothing(t *testing.T) {
 		"mythicalos.ai/ctl/nested/internal/x": {"TestOne"},
 	}
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, []testLane{{name: "default", list: listOf(names), src: srcOf(map[testPkg][]string{
+	auditCoverage(r, tiny, c, b, st, withExecAll([]testLane{{name: "default", list: listOf(names), src: srcOf(map[testPkg][]string{
 		{Path: "mythicalos.ai/ctl/internal/x"}:        {"TestTwo", "TestThree"},
 		{Path: "mythicalos.ai/ctl/nested/internal/x"}: {"TestOne"},
-	})}}, noPreDeclared)
+	})}}), noPreDeclared)
 	if !hasProblem(r, "TestOne") {
 		t.Fatalf("the audit stayed green after internal/x.TestOne was deleted, because a namesake in nested/internal/x answered the unqualified claim: %v", r.Problems)
 	}
@@ -1725,7 +1775,7 @@ func TestAPortedTargetNeedsBothTheListAndTheSource(t *testing.T) {
 		{Path: "mythicalos.ai/ctl/internal/x"}: {"TestOne", "TestThree"},
 	})
 	r := &report{}
-	auditCoverage(r, tiny, c, b, st, []testLane{{name: "default", list: tinyGoTests, src: srcMissing}}, noPreDeclared)
+	auditCoverage(r, tiny, c, b, st, withExecAll([]testLane{{name: "default", list: tinyGoTests, src: srcMissing}}), noPreDeclared)
 	if !hasProblem(r, "TestTwo") {
 		t.Fatalf("a target the source does not declare was accepted: %v", r.Problems)
 	}
@@ -1736,7 +1786,7 @@ func TestAPortedTargetNeedsBothTheListAndTheSource(t *testing.T) {
 		"mythicalos.ai/ctl/internal/x": {"TestOne", "TestThree"},
 	})
 	r2 := &report{}
-	auditCoverage(r2, tiny, c, b, st, []testLane{{name: "default", list: listMissing, src: tinySrcTests}}, noPreDeclared)
+	auditCoverage(r2, tiny, c, b, st, withExecAll([]testLane{{name: "default", list: listMissing, src: tinySrcTests}}), noPreDeclared)
 	if !hasProblem(r2, "TestTwo") {
 		t.Fatalf("a target the package does not register was accepted: %v", r2.Problems)
 	}
@@ -1759,12 +1809,12 @@ func TestTheTwoWitnessesMustAgreeWithinONELane(t *testing.T) {
 	const pkg = "mythicalos.ai/ctl/internal/x"
 	// LANE A registers the name (its init printed it) but compiles no file declaring it.
 	// LANE B compiles a file declaring it (tagged for this lane) but registers nothing by that name.
-	split := []testLane{
+	split := withExecAll([]testLane{
 		{name: "a", list: listOf(map[string][]string{pkg: {"TestOne", "TestTwo", "TestThree"}}),
 			src: srcOf(map[testPkg][]string{{Path: pkg}: {"TestOne", "TestThree"}})},
 		{name: "b", list: listOf(map[string][]string{pkg: {"TestOne", "TestThree"}}),
 			src: srcOf(map[testPkg][]string{{Path: pkg}: {"TestOne", "TestTwo", "TestThree"}})},
-	}
+	})
 	r := &report{}
 	auditCoverage(r, tiny, c, b, st, split, noPreDeclared)
 	if !hasProblem(r, "TestTwo") {
@@ -1774,15 +1824,152 @@ func TestTheTwoWitnessesMustAgreeWithinONELane(t *testing.T) {
 	// AND THE ORDINARY CASE STILL PASSES: one lane in which both halves agree resolves it, even
 	// though the other lane knows nothing about it. A fix that demanded every lane agree would
 	// refuse every acceptance-tagged test.
-	ok := []testLane{
+	ok := withExecAll([]testLane{
 		split[0],
 		{name: "b", list: listOf(map[string][]string{pkg: {"TestOne", "TestTwo", "TestThree"}}),
 			src: srcOf(map[testPkg][]string{{Path: pkg}: {"TestOne", "TestTwo", "TestThree"}})},
-	}
+	})
 	r2 := &report{}
 	auditCoverage(r2, tiny, c, b, st, ok, noPreDeclared)
 	if hasProblem(r2, "TestTwo") {
 		t.Fatalf("a target both halves of ONE lane agree on was refused: %v", r2.Problems)
+	}
+}
+
+// THE THIRD WITNESS, AND THE HOLE IT CLOSES: a test can be LISTED without ever RUNNING.
+//
+// `func TestMain(m *testing.M)` is the package's own entry point. It can parse `-test.list`, print
+// `TestClaimed`, and exit 0 — then, on a normal run, set `-test.run` to something else and call
+// m.Run. MEASURED with a real probe on go1.26.5: `go test -list '.*'` printed only TestClaimed, a
+// normal `go test -v` ran only TestOther, and the SOURCE witness corroborated the declaration
+// because TestClaimed really is declared in a file the lane compiles. Both of the existing witnesses
+// answer "does this test EXIST"; neither answers "does it RUN", and the audit's whole promise is the
+// second question.
+func TestATargetThatIsListedAndDeclaredButNeverRanCannotSatisfyAClaim(t *testing.T) {
+	c, b, st := claimsFrom(t,
+		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
+		`// PORTED: tests/unit/a.bats: "two" -> TestTwo`,
+		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
+	)
+	// Both existing witnesses are complete and agree. Only the execution witness dissents: the
+	// package started TestOne and TestThree, and never started TestTwo.
+	ln := testLane{
+		name:     "default",
+		list:     tinyGoTests,
+		src:      tinySrcTests,
+		executed: true,
+		exec: map[string]map[string]int{
+			"mythicalos.ai/ctl/internal/x": {"TestOne": 1, "TestThree": 1},
+			"mythicalos.ai/ctl/internal/w": {"TestElsewhere": 1, "TestOne": 1},
+		},
+	}
+	r := &report{}
+	auditCoverage(r, tiny, c, b, st, []testLane{ln}, noPreDeclared)
+	if !hasProblem(r, "TestTwo") {
+		t.Fatalf("a PORTED claim was satisfied by a test that is listed and declared but NEVER RAN — a\n"+
+			"TestMain that prints a name during a listing run and filters it out of the real run defeats\n"+
+			"both of the other witnesses, and this is the one that is supposed to notice: %v", r.Problems)
+	}
+	if !hasProblem(r, "NEVER RAN") {
+		t.Fatalf("the refusal does not say the target never ran, so its reader is sent looking for a\n"+
+			"missing declaration that is not missing: %v", r.Problems)
+	}
+	// AND THE ORDINARY WORLD STILL RESOLVES. A guard that refused every target would satisfy the
+	// assertion above while destroying the audit.
+	r2 := &report{}
+	auditCoverage(r2, tiny, c, b, st, oneLane(), noPreDeclared)
+	if hasProblem(r2, "TestTwo") {
+		t.Fatalf("a target all three witnesses agree on was refused: %v", r2.Problems)
+	}
+}
+
+// ...and the same property END TO END, through run(), on the reviewer's exact probe shape: the list
+// stream names TestOne, the compiled test file declares it, and the `go test -json` events show only
+// TestThree having started.
+func TestEndToEndRefusesATargetTheExecutionWitnessNeverSawRun(t *testing.T) {
+	tinyLanes(t, 2, 1, 2)
+	root, goList := e2eTree(t)
+	if err := e2eRun(root, goList); err != nil {
+		t.Fatalf("the fixture must pass before it is broken: %v", err)
+	}
+	e2eExec(t, root, "TestThree") // TestOne is listed and declared, and never starts
+	err := e2eRun(root, goList)
+	if err == nil {
+		t.Fatal("the audit EXITED CLEAN over a PORTED target that never ran")
+	}
+	if !strings.Contains(err.Error(), "NEVER RAN") {
+		t.Fatalf("err = %v, want the refusal to name the target that never ran", err)
+	}
+}
+
+// THE COUNT, NOT ONLY THE PRESENCE, for the reason the list witness is counted: `x` and `x_test` may
+// each declare a test of one name, and `go test -json` reports both under the one package. If two
+// are declared and one starts, this lane cannot say which one the claim is about — and the one that
+// did not start is exactly the one a claim would be hiding.
+func TestTheExecutionWitnessMustAgreeOnHowManyTestsOfANameRan(t *testing.T) {
+	const x = "mythicalos.ai/ctl/internal/x"
+	c, b, st := claimsFrom(t,
+		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
+		`// PORTED: tests/unit/a.bats: "two" -> internal/x_test.TestShared`,
+		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
+	)
+	// TestShared is declared twice under internal/x — once internally, once externally — and the
+	// listing prints it twice. Only ONE of them ran.
+	ln := testLane{
+		name: "default",
+		list: listOf(map[string][]string{x: {"TestOne", "TestThree", "TestShared", "TestShared"}}),
+		src: srcOf(map[testPkg][]string{
+			{Path: x}:                 {"TestOne", "TestThree", "TestShared"},
+			{Path: x, External: true}: {"TestShared"},
+		}),
+		executed: true,
+		exec:     map[string]map[string]int{x: {"TestOne": 1, "TestThree": 1, "TestShared": 1}},
+	}
+	r := &report{}
+	auditCoverage(r, tiny, sited(c, fileInternalTest), b, st, []testLane{ln}, noPreDeclared)
+	if !hasProblem(r, "TestShared") {
+		t.Fatalf("two same-named tests were declared and listed, only ONE started, and the claim on the\n"+
+			"external one was accepted anyway: %v", r.Problems)
+	}
+	// ...and when both start, it resolves.
+	ln.exec = map[string]map[string]int{x: {"TestOne": 1, "TestThree": 1, "TestShared": 2}}
+	r2 := &report{}
+	auditCoverage(r2, tiny, sited(c, fileInternalTest), b, st, []testLane{ln}, noPreDeclared)
+	if hasProblem(r2, "TestShared") {
+		t.Fatalf("both declarations ran and the claim was still refused: %v", r2.Problems)
+	}
+}
+
+// A LANE THAT WAS NOT EXECUTED CONFIRMS NOTHING, AND SAYS SO IN THOSE WORDS.
+//
+// The acceptance lane is the real case: its one tagged test needs a live daemon, so this audit
+// cannot witness it running. That is an argued exception, not a silent one — the lane still loads,
+// still parses, still contributes its packages, and simply cannot answer a PORTED claim. The
+// alternative would be to let a target resolve on existence alone in exactly the lane where nothing
+// is ever run, which is the promise quietly weakened for whoever needed it weakened.
+func TestALaneThatIsNotExecutedCanConfirmNoTarget(t *testing.T) {
+	c, b, st := claimsFrom(t,
+		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
+		`// PORTED: tests/unit/a.bats: "two" -> TestTwo`,
+		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
+	)
+	ln := testLane{name: "acceptance", list: tinyGoTests, src: tinySrcTests,
+		execWhy: "it needs a live daemon"}
+	r := &report{}
+	auditCoverage(r, tiny, c, b, st, []testLane{ln}, noPreDeclared)
+	if !hasProblem(r, "TestOne") {
+		t.Fatalf("a lane that ran nothing resolved a PORTED target on existence alone: %v", r.Problems)
+	}
+	if !hasProblem(r, "it needs a live daemon") {
+		t.Fatalf("the refusal does not quote the argument for not executing the lane, so the exception is\n"+
+			"invisible at the only place a reader meets it: %v", r.Problems)
+	}
+	// AND AN EXECUTED LANE BESIDE IT STILL ANSWERS. This is how the real tree works: the acceptance
+	// lane is a superset of the default one, so every claim is resolved by the lane that ran.
+	r2 := &report{}
+	auditCoverage(r2, tiny, c, b, st, append(oneLane(), ln), noPreDeclared)
+	if len(r2.Problems) != 0 {
+		t.Fatalf("a target the EXECUTED lane confirms was refused because another lane could not: %v", r2.Problems)
 	}
 }
 
@@ -2029,7 +2216,7 @@ func TestGoFileListIsTheToolchainsOwnSelection(t *testing.T) {
 func TestPairedWitnessFlagsAreRefusedUnpaired(t *testing.T) {
 	tinyLanes(t, 2, 1, 2)
 	root, goList := e2eTree(t)
-	err := run(root, "tests/parity-manifest.tsv", false, []string{goList}, nil, 0)
+	err := run(root, "tests/parity-manifest.tsv", false, []string{goList}, nil, nil, 0)
 	if err == nil || !strings.Contains(err.Error(), "must be given in the same number") {
 		t.Fatalf("err = %v, want a refusal naming the unpaired witnesses", err)
 	}
@@ -2489,11 +2676,16 @@ func e2eWrite(t *testing.T, root, rel, content string) {
 	}
 }
 
-// e2eWitnesses rewrites BOTH witness halves of the single fixture lane: what `go test -list`
-// printed, and which files the toolchain compiles for the package — internal test files and
-// external ones kept apart, as `go list` reports them.
+// e2eWitnesses rewrites ALL THREE witness halves of the single fixture lane: what `go test -list`
+// printed, which files the toolchain compiles for the package — internal test files and external
+// ones kept apart, as `go list` reports them — and what ran.
+//
+// THE EXECUTION HALF MIRRORS `listed` HERE, and that is right for these cases rather than lazy:
+// their subject is the internal/external package IDENTITY, so execution is what they hold constant.
+// A case whose subject IS execution writes its own e2eExec and does not come through here.
 func e2eWitnesses(t *testing.T, root, goList string, listed []string, internal, external string) {
 	t.Helper()
+	e2eExec(t, root, listed...)
 	body := append(append([]string{}, listed...), "ok  \tmythicalos.ai/ctl/internal/x\t0.1s")
 	if err := os.WriteFile(goList, lines(body...), 0o644); err != nil {
 		t.Fatal(err)
@@ -2574,7 +2766,7 @@ func TestSameNamedInternalAndExternalDeclarationsRefuseRatherThanPickOne(t *test
 			"mythicalos.ai/ctl/internal/x": {"TestOne", "TestThree"},
 			w:                              {"TestShared", "TestShared"},
 		})
-		return testLane{name: "default", list: list, src: src}
+		return withExec(testLane{name: "default", list: list, src: src})
 	}
 
 	// A BARE PATH QUALIFIER NAMES THE IMPORT PATH AND NOT A HALF OF IT, so with a namesake in each
@@ -2585,7 +2777,7 @@ func TestSameNamedInternalAndExternalDeclarationsRefuseRatherThanPickOne(t *test
 		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
 	)
 	r := &report{}
-	auditCoverage(r, tiny, sited(c, fileInternalTest), b, st, []testLane{both()}, noPreDeclared)
+	auditCoverage(r, tiny, sited(c, fileInternalTest), b, st, withExecAll([]testLane{both()}), noPreDeclared)
 	if !hasProblem(r, "is declared 2 times") {
 		t.Fatalf("a target declared in BOTH the package and its external test package was resolved against one of them: %v", r.Problems)
 	}
@@ -2598,7 +2790,7 @@ func TestSameNamedInternalAndExternalDeclarationsRefuseRatherThanPickOne(t *test
 		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
 	)
 	r2 := &report{}
-	auditCoverage(r2, tiny, sited(ext, fileInternalTest), b2, st2, []testLane{both()}, noPreDeclared)
+	auditCoverage(r2, tiny, sited(ext, fileInternalTest), b2, st2, withExecAll([]testLane{both()}), noPreDeclared)
 	if hasProblem(r2, "TestShared") {
 		t.Fatalf("the external half named by its own path did not resolve: %v", r2.Problems)
 	}
@@ -2606,7 +2798,7 @@ func TestSameNamedInternalAndExternalDeclarationsRefuseRatherThanPickOne(t *test
 	// ...AND IT RESOLVES AGAINST THAT HALF ONLY. Delete the external declaration — leaving the
 	// internal namesake, exactly the arrangement that used to keep the claim green — and the claim
 	// must fail.
-	gone := testLane{name: "default",
+	gone := withExec(testLane{name: "default",
 		list: listOf(map[string][]string{
 			"mythicalos.ai/ctl/internal/x": {"TestOne", "TestThree"},
 			w:                              {"TestShared"},
@@ -2614,14 +2806,14 @@ func TestSameNamedInternalAndExternalDeclarationsRefuseRatherThanPickOne(t *test
 		src: srcOf(map[testPkg][]string{
 			{Path: "mythicalos.ai/ctl/internal/x"}: {"TestOne", "TestThree"},
 			{Path: w}:                              {"TestShared"},
-		})}
+		})})
 	ext2, b3, st3 := claimsFrom(t,
 		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
 		`// PORTED: tests/unit/a.bats: "two" -> internal/w_test.TestShared`,
 		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
 	)
 	r3 := &report{}
-	auditCoverage(r3, tiny, sited(ext2, fileInternalTest), b3, st3, []testLane{gone}, noPreDeclared)
+	auditCoverage(r3, tiny, sited(ext2, fileInternalTest), b3, st3, withExecAll([]testLane{gone}), noPreDeclared)
 	if !hasProblem(r3, "TestShared") {
 		t.Fatalf("a claim on the EXTERNAL TestShared stayed green after it was deleted, answered by the internal namesake: %v", r3.Problems)
 	}
@@ -2633,12 +2825,12 @@ func TestSameNamedInternalAndExternalDeclarationsRefuseRatherThanPickOne(t *test
 func TestAnUnqualifiedClaimBindsToTheTestPackageItIsWrittenIn(t *testing.T) {
 	const x = "mythicalos.ai/ctl/internal/x"
 	// Only the EXTERNAL half declares TestTwo.
-	ln := testLane{name: "default",
+	ln := withExec(testLane{name: "default",
 		list: listOf(map[string][]string{x: {"TestOne", "TestTwo", "TestThree"}}),
 		src: srcOf(map[testPkg][]string{
 			{Path: x}:                 {"TestOne", "TestThree"},
 			{Path: x, External: true}: {"TestTwo"},
-		})}
+		})})
 	body := []string{
 		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
 		`// PORTED: tests/unit/a.bats: "two" -> TestTwo`,
@@ -2648,7 +2840,7 @@ func TestAnUnqualifiedClaimBindsToTheTestPackageItIsWrittenIn(t *testing.T) {
 	// Written in the EXTERNAL test file: TestTwo is its own package's, and resolves.
 	c, b, st := claimsFrom(t, body...)
 	r := &report{}
-	auditCoverage(r, tiny, sited(c, fileExternalTest), b, st, []testLane{ln}, noPreDeclared)
+	auditCoverage(r, tiny, sited(c, fileExternalTest), b, st, withExecAll([]testLane{ln}), noPreDeclared)
 	if hasProblem(r, "TestTwo") {
 		t.Fatalf("a claim in the external test file did not resolve against its OWN package: %v", r.Problems)
 	}
@@ -2656,7 +2848,7 @@ func TestAnUnqualifiedClaimBindsToTheTestPackageItIsWrittenIn(t *testing.T) {
 	// Written in the IN-PACKAGE test file: the same text names a test that package does not have.
 	c2, b2, st2 := claimsFrom(t, body...)
 	r2 := &report{}
-	auditCoverage(r2, tiny, sited(c2, fileInternalTest), b2, st2, []testLane{ln}, noPreDeclared)
+	auditCoverage(r2, tiny, sited(c2, fileInternalTest), b2, st2, withExecAll([]testLane{ln}), noPreDeclared)
 	if !hasProblem(r2, "which is a DIFFERENT package") {
 		t.Fatalf("a claim in `package x` was answered by a declaration in `package x_test`: %v", r2.Problems)
 	}
@@ -2675,27 +2867,27 @@ func TestTheTwoWitnessesMustAgreeOnHowManyTestsCarryAName(t *testing.T) {
 		`// PORTED: tests/unit/b.bats: "one" -> TestThree`,
 	}
 	// One declaration, TWO listed lines: something printed the name.
-	printed := testLane{name: "default",
+	printed := withExec(testLane{name: "default",
 		list: listOf(map[string][]string{x: {"TestOne", "TestTwo", "TestTwo", "TestThree"}}),
-		src:  srcOf(map[testPkg][]string{{Path: x}: {"TestOne", "TestTwo", "TestThree"}})}
+		src:  srcOf(map[testPkg][]string{{Path: x}: {"TestOne", "TestTwo", "TestThree"}})})
 	c, b, st := claimsFrom(t, body...)
 	r := &report{}
-	auditCoverage(r, tiny, sited(c, fileInternalTest), b, st, []testLane{printed}, noPreDeclared)
+	auditCoverage(r, tiny, sited(c, fileInternalTest), b, st, withExecAll([]testLane{printed}), noPreDeclared)
 	if !hasProblem(r, "disagree about how many") {
 		t.Fatalf("a name listed more times than it is declared resolved anyway: %v", r.Problems)
 	}
 
 	// TWO declarations, ONE listed line: the toolchain registered one of them and this program
 	// cannot know which — so a claim that binds to one of the two is a guess.
-	half := testLane{name: "default",
+	half := withExec(testLane{name: "default",
 		list: listOf(map[string][]string{x: {"TestOne", "TestTwo", "TestThree"}}),
 		src: srcOf(map[testPkg][]string{
 			{Path: x}:                 {"TestOne", "TestTwo", "TestThree"},
 			{Path: x, External: true}: {"TestTwo"},
-		})}
+		})})
 	c2, b2, st2 := claimsFrom(t, body...)
 	r2 := &report{}
-	auditCoverage(r2, tiny, sited(c2, fileInternalTest), b2, st2, []testLane{half}, noPreDeclared)
+	auditCoverage(r2, tiny, sited(c2, fileInternalTest), b2, st2, withExecAll([]testLane{half}), noPreDeclared)
 	if !hasProblem(r2, "disagree about how many") {
 		t.Fatalf("a name declared twice but listed once resolved anyway: %v", r2.Problems)
 	}
