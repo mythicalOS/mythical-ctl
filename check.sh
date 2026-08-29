@@ -95,8 +95,8 @@ export GOWORK=off
 
 # Floors, not exact counts: the tree grows a package per port task, and each task raises these
 # two literals in its commit. Overridable ONLY so a test harness can prove the guard refuses.
-MIN_PACKAGES="${MIN_PACKAGES:-30}"
-MIN_TESTED_PACKAGES="${MIN_TESTED_PACKAGES:-30}"
+MIN_PACKAGES="${MIN_PACKAGES:-31}"
+MIN_TESTED_PACKAGES="${MIN_TESTED_PACKAGES:-31}"
 
 # The reference-boundary rules, one per line: `<guarded-import-path>:<Identifier>=<allowed
 # import path>[,<more allowed>]`. Each rule is
