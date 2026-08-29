@@ -107,7 +107,7 @@ func goBuild(out string, t Target, trimpath bool, symbol, version string) error 
 	cmd.Dir = moduleRoot()
 	cmd.Env = append(os.Environ(),
 		"CGO_ENABLED=0",
-		"GOFLAGS=",
+		"GOFLAGS=", "GOENV=off",
 		"GOOS="+t.GOOS,
 		"GOARCH="+t.GOARCH,
 	)
@@ -571,7 +571,7 @@ func TestCheckBuildInfoRefusesADifferentMainPackage(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "other-program")
 	cmd := exec.Command("go", "build", "-trimpath", "-buildvcs=false", "-o", out, "./tools/boundary-gate")
 	cmd.Dir = moduleRoot()
-	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOFLAGS=")
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOFLAGS=", "GOENV=off")
 	if b, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("building a second main package: %v: %s", err, b)
 	}
@@ -583,7 +583,7 @@ func TestCheckBuildInfoRefusesAForeignModule(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(src, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	env := append(os.Environ(), "CGO_ENABLED=0", "GOFLAGS=")
+	env := append(os.Environ(), "CGO_ENABLED=0", "GOFLAGS=", "GOENV=off")
 	init := exec.Command("go", "mod", "init", "example.test/elsewhere")
 	init.Dir = src
 	init.Env = env
@@ -608,7 +608,7 @@ func TestCheckBuildInfoRefusesACgoBuild(t *testing.T) {
 		"-ldflags", "-s -w -X "+VersionSymbolForTest+"="+testVersion,
 		"-o", out, "./cmd/mythical-ctl")
 	cmd.Dir = moduleRoot()
-	cmd.Env = append(os.Environ(), "CGO_ENABLED=1", "GOFLAGS=")
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=1", "GOFLAGS=", "GOENV=off")
 	if b, err := cmd.CombinedOutput(); err != nil {
 		t.Skipf("a CGO_ENABLED=1 build is not available here: %v: %s", err, b)
 	}
@@ -699,7 +699,7 @@ func TestCheckBuildInfoRefusesANonDefaultArchLevel(t *testing.T) {
 	cmd := exec.Command("go", "build", "-trimpath", "-buildvcs=false",
 		"-ldflags", "-s -w -X "+VersionSymbolForTest+"="+testVersion, "-o", out, "./cmd/mythical-ctl")
 	cmd.Dir = moduleRoot()
-	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOFLAGS=", "GOOS=linux", "GOARCH=amd64", "GOAMD64=v3")
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOFLAGS=", "GOENV=off", "GOOS=linux", "GOARCH=amd64", "GOAMD64=v3")
 	if b, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("go build: %v: %s", err, b)
 	}
@@ -715,7 +715,7 @@ func TestCheckBuildInfoRefusesAnUnexpectedSetting(t *testing.T) {
 	cmd := exec.Command("go", "build", "-tags", "somethingextra", "-trimpath", "-buildvcs=false",
 		"-ldflags", "-s -w -X "+VersionSymbolForTest+"="+testVersion, "-o", out, "./cmd/mythical-ctl")
 	cmd.Dir = moduleRoot()
-	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOFLAGS=")
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOFLAGS=", "GOENV=off")
 	if b, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("go build: %v: %s", err, b)
 	}

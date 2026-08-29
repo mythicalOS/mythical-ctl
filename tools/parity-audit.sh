@@ -27,7 +27,35 @@ set -euo pipefail
 
 cd "$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# THE GO ENVIRONMENT IS OWNED BY THIS SCRIPT, PROCESS-WIDE — NOT INVOCATION BY INVOCATION, WHICH
+# IS HOW THIS AUDIT WAS ONCE DISARMED IN ONE ENVIRONMENT VARIABLE.
+#
+# The four witness commands below used to carry `GOFLAGS='' GOENV=off` and the `go run` that
+# GRADED did not. `go run` honours GOFLAGS and GOFLAGS carries `-exec`, so
+# `GOFLAGS=-exec=/usr/bin/true bash check.sh parity` built the auditor, ran /usr/bin/true instead
+# of it, printed `check.sh: OK` and exited 0 — with a genuine unclaimed corpus row present, which
+# the same command without that variable exits 1 on. Every missing, duplicate, malformed or
+# dangling record passed that way. GOFLAGS carries `-ldflags` too, so
+# `-ldflags=-X=main.manifestSHA256=<digest>` replaces the pin the auditor compares the committed
+# manifest against: an edited manifest plus its new digest would have passed without the source
+# pin changing. Both measured on this tree.
+#
+# An inherited -run or -tags is the milder version of the same thing and the original reason the
+# witnesses were guarded: it changes which tests are listed, and a SHORTER list makes PORTED
+# targets look dangling — a red for a reason that has nothing to do with the port.
+#
+# GOFLAGS='' IS NOT ENOUGH ON ITS OWN. Go treats an EMPTY environment variable as UNSET and falls
+# back to the go env FILE (measured: with GOFLAGS='' exported and a file setting GOFLAGS,
+# `go env GOFLAGS` reports the FILE's value), so GOENV=off is the half that closes the file
+# channel. GOWORK=off is the same shape again — a `go.work` in an ancestor directory is picked up
+# without being asked, and its `replace` directives choose which copy of a dependency ends up
+# inside the grader. `bash check.sh selfcheck` probes both channels against this script.
+export GOFLAGS=''
+export GOENV=off
+export GOWORK=off
+
 if [ "${1:-}" = "--write-manifest" ]; then
+  # Guarded by the export block above, like every other `go` invocation in this file.
   exec go run ./tools/parity-audit --write-manifest
 fi
 
@@ -39,11 +67,8 @@ fi
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/mctl-parity.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
-# GOFLAGS/GOENV are owned by these invocations. An inherited -run or -tags would change which tests
-# are listed, and a SHORTER list makes PORTED targets look dangling — a red for a reason that has
-# nothing to do with the port.
-GOFLAGS='' GOENV=off go test -list '.*' ./... > "$TMP/list-default.txt"
-GOFLAGS='' GOENV=off go test -tags acceptance -list '.*' ./... > "$TMP/list-acceptance.txt"
+go test -list '.*' ./... > "$TMP/list-default.txt"
+go test -tags acceptance -list '.*' ./... > "$TMP/list-acceptance.txt"
 
 # THE SECOND WITNESS, PER LANE, AND IT IS THE TOOLCHAIN'S OWN FILE SELECTION.
 #
@@ -61,8 +86,8 @@ GOFLAGS='' GOENV=off go test -tags acceptance -list '.*' ./... > "$TMP/list-acce
 # with a file that was not even valid Go. The claim-bearing set is now exactly what go compiles:
 # GoFiles + TestGoFiles + XTestGoFiles, unioned across the lanes.
 FILE_TMPL='{{.ImportPath}}	{{.Dir}}	{{join .GoFiles " "}}	{{join .TestGoFiles " "}}	{{join .XTestGoFiles " "}}'
-GOFLAGS='' GOENV=off go list -f "$FILE_TMPL" ./... > "$TMP/files-default.txt"
-GOFLAGS='' GOENV=off go list -tags acceptance -f "$FILE_TMPL" ./... > "$TMP/files-acceptance.txt"
+go list -f "$FILE_TMPL" ./... > "$TMP/files-default.txt"
+go list -tags acceptance -f "$FILE_TMPL" ./... > "$TMP/files-acceptance.txt"
 
 # PAIRED, AND IN THE SAME ORDER. The grader refuses a mismatched count rather than pairing by luck.
 go run ./tools/parity-audit \

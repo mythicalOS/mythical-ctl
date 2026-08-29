@@ -18,6 +18,20 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 
+# THE GO ENVIRONMENT IS OWNED BY THIS SCRIPT. MCTL_BIN is the supported way to choose the binary
+# under test; the shell's GOFLAGS is not. An inherited `-tags`, or an
+# `-ldflags=-X=...Version=...` that stamps a version the source cannot produce, would silently
+# change what the self-build path below produces — and that path is the one CI runs with MCTL_BIN
+# deliberately absent, precisely so the default stays proven, so what it builds has to be what the
+# repository says rather than what the shell happened to be carrying.
+#
+# GOFLAGS='' does not close the go env FILE channel on its own: go treats an EMPTY environment
+# variable as UNSET and falls back to the file (measured), so GOENV=off is the other half. GOWORK
+# is ambient file state of the same shape.
+export GOFLAGS=''
+export GOENV=off
+export GOWORK=off
+
 # A scratch directory ALWAYS, not only when self-building: the version assertions
 # below capture output to FILES and compare the bytes, which a shell variable
 # cannot do (command substitution strips trailing newlines, so two outputs that

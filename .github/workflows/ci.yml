@@ -282,6 +282,19 @@ jobs:
       - name: check.sh parity
         run: bash check.sh parity
 
+      # THE GATE'S OWN GATE, AND IT RUNS HERE FOR THE REASON EVERY OTHER STAGE DOES.
+      # `go run` honours GOFLAGS, and GOFLAGS carries -exec: an inherited
+      # `GOFLAGS=-exec=/usr/bin/true` makes a stage BUILD its grader and then execute
+      # /usr/bin/true instead of it, so the stage prints OK and exits 0 having graded
+      # nothing — measured on this repository, on boundary and on parity, the latter
+      # with a real parity hole present. This stage re-runs those graders under exactly
+      # that environment, on both channels the go command reads it from (the variable
+      # and the go env file), and requires each one to still reach its true answer:
+      # exit 0 AND its own verdict line. A guard nobody invokes is the shape of defect
+      # it exists to close, so it is a step here rather than a script somebody remembers.
+      - name: check.sh selfcheck
+        run: bash check.sh selfcheck
+
       # The release build runs on EVERY pull request, not only at a tag. A
       # release lane that carries checks the PR lane does not is a lane whose
       # breakage is discovered while somebody is waiting to ship; this stage

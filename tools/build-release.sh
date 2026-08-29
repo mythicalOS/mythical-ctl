@@ -97,11 +97,22 @@ if [ -n "${GOTOOLCHAIN:-}" ] && [ "${GOTOOLCHAIN}" != "$PIN_GOTOOLCHAIN" ]; then
    can reproduce. Change the pin here and in the CI go job together, in one commit."
 fi
 
-# GOFLAGS/GOENV are owned by this invocation: an inherited -tags or -mod selection would change
-# what gets compiled into a published artifact without appearing anywhere in this script.
+# GOFLAGS/GOENV/GOWORK are owned by this script, process-wide. An inherited -tags or -mod
+# selection would change what gets compiled into a published artifact without appearing anywhere
+# in this script — and `go run` honours `-exec`, so an inherited GOFLAGS would replace this
+# script's two GRADERS (release-verify's `verify` and its `compare`) with a program that grades
+# nothing, while every step still printed and exited 0.
+#
+# GOFLAGS='' DOES NOT IMPLY GOENV=off. Go treats an EMPTY environment variable as UNSET and falls
+# back to the go env FILE (measured: with GOFLAGS='' exported and a file setting GOFLAGS,
+# `go env GOFLAGS` reports the FILE's value), so the file channel is closed by GOENV=off alone.
+# GOWORK=off closes the third of the same kind: a `go.work` in any ancestor directory is read
+# without being asked, and its `replace` directives decide which copy of a dependency is linked
+# into a published binary.
 export GOTOOLCHAIN="$PIN_GOTOOLCHAIN"
 export GOFLAGS=''
 export GOENV=off
+export GOWORK=off
 export CGO_ENABLED=0
 # Convenience, not the guarantee -- see the note above. `unset` on an unset name is a no-op.
 unset GOEXPERIMENT GOAMD64 GOARM64 GOARM GO386 GOMIPS GOMIPS64 GOPPC64 GORISCV64 GOWASM \
