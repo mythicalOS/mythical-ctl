@@ -12,6 +12,12 @@ import (
 	"mythicalos.ai/ctl/internal/volatile"
 )
 
+// Inventory — tests/unit/mounts.bats (the credential-home mount rows):
+// PORTED: tests/unit/mounts.bats: "mi_bringup_specs emits the volatile mount for the canonical root" -> TestVolatileMountEmittedForCanonicalRoot -- the Go seam is buildSpec, shared by LaunchProduct and PrelaunchCheck, and the assertion is on the mount the daemon actually received rather than on an emitted spec string
+// PORTED: tests/unit/mounts.bats: "mi_bringup_specs refuses a non-canonical volatile root and emits no spec for it" -> TestVolatileMountRefusesNonCanonicalRoot -- and nothing is created for it — there is no spec string to inspect in Go, so the absence is asserted on the container
+// PORTED: tests/unit/mounts.bats: "mi_bringup_specs refuses a mount that overlaps the volatile credential-home root" -> TestVolatileMountRefusesOverlappingMounts TestVolatileMountAllowsDisjointMounts -- the bats row carries both halves: the overlap refusals (equal, child, an equivalent spelling of that child, the container root) and the disjoint volume that must still launch
+// PORTED: tests/unit/mounts.bats: "mi_bringup_specs emits no volatile spec when the manifest declares none" -> TestVolatileMountAbsentEmitsNothing -- absence is not a mount: no tmpfs at all, not an empty one and not one at a default path
+
 // launchWith assembles and creates a container for this manifest, returning the inspected
 // container or the refusal. The volatile arm is the only thing under test, so the rig is the
 // plainest one that reaches it.

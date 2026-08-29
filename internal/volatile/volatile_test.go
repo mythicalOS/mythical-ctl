@@ -7,6 +7,20 @@ import (
 	"mythicalos.ai/ctl/internal/volatile"
 )
 
+// Inventory — tests/unit/volatile.bats:
+// PORTED: tests/unit/volatile.bats: "the canonical root and the fixed security options are the wire's exact literals" -> TestWireLiterals
+// PORTED: tests/unit/volatile.bats: "a bounded absolute path of safe segments is accepted" -> TestPathOKAccepts
+// PORTED: tests/unit/volatile.bats: "every path the wire's grammar rejects is rejected" -> TestPathOKRejectsGrammar -- the empty string is added to the bats list: PathOK is a field validator and must refuse rather than panic
+// PORTED: tests/unit/volatile.bats: "a value carrying a second token or an option is rejected — the field cannot widen the mount" -> TestPathOKIsTheClosure
+// PORTED: tests/unit/volatile.bats: "a whitespace or control byte in the path is rejected" -> TestPathOKRejectsWhitespaceAndControl
+// PORTED: tests/unit/volatile.bats: "the length bound is enforced at both ends" -> TestPathOKLengthBound -- 512 accepted, 513 refused, and the 1-byte floor
+// PORTED: tests/unit/volatile.bats: "the canonical-root predicate is true only for the fixed root" -> TestIsCanonicalRoot
+// PORTED: tests/unit/volatile.bats: "the production guard accepts the canonical root and refuses every other, even valid, path" -> TestAssertProductionRoot -- including that an invalid path and a valid non-canonical one are refused for DIFFERENT stated reasons
+// PORTED: tests/unit/volatile.bats: "the security-option check accepts only the exact frozen set" -> TestSecOptsOK
+// PORTED: tests/unit/volatile.bats: "path disjointness catches equal, child, and ancestor overlaps but allows a sibling" -> TestPathDisjoint -- every case asserted in BOTH argument orders, the container root included — the boundary a prefix check misses
+// PORTED: tests/unit/volatile.bats: "path normalization defeats equivalent spellings of an overlapping path" -> TestPathNorm TestPathDisjointNormalizesFirst -- the normalizer itself, and the overlap answers it produces; `..` is deliberately NOT resolved, so this is not path.Clean
+// PORTED: tests/unit/volatile.bats: "the typed launch spec is emitted for a valid path and refused for an invalid one" -> internal/engine.TestTmpfsMountRefusedAtTheLaunchSite internal/engine.TestTmpfsMountRendersFrozenHardening -- Go has no `volatile=<path>` spec STRING — the runtime adapter takes a typed value, so the equivalent is the engine constructor: it validates the path first and either yields the mount the daemon receives or refuses, which is exactly what the row pins
+
 // TestWireLiterals pins the two values the wire is made of.
 //
 // THE OPTION STRING IS A BYTE-PARITY CONTRACT, NOT A STABLE SPELLING. The three flags and

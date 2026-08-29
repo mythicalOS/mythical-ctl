@@ -693,10 +693,10 @@ func TestPinnedCorpusSizeIsThePlansNumbers(t *testing.T) {
 	if len(manifestSHA256) != 64 {
 		t.Fatalf("manifestSHA256 = %q, which is not a sha256 hex digest", manifestSHA256)
 	}
-	if wantBatsFiles != 34 {
-		t.Fatalf("wantBatsFiles = %d, want 34", wantBatsFiles)
+	if wantBatsFiles != 35 {
+		t.Fatalf("wantBatsFiles = %d, want 35", wantBatsFiles)
 	}
-	want := []lane{{"tests/unit/", 1122}, {"tests/acceptance/", 56}}
+	want := []lane{{"tests/unit/", 1145}, {"tests/acceptance/", 56}}
 	if len(lanes) != len(want) {
 		t.Fatalf("lanes = %+v", lanes)
 	}
@@ -718,7 +718,7 @@ func TestProblemsIsWhatTurnsAFindingIntoAFailure(t *testing.T) {
 }
 
 // tinyLanes shrinks the pinned corpus for the duration of one test, and restores it. Without this
-// every end-to-end case would need a 1,178-row fixture, and the cases that matter most — the ones
+// every end-to-end case would need a 1,201-row fixture, and the cases that matter most — the ones
 // where the audit must FAIL — would be the hardest to write.
 func tinyLanes(t *testing.T, unit, acceptance, files int) {
 	t.Helper()
@@ -2228,7 +2228,7 @@ func TestALaneThatCanConfirmNothingIsRefused(t *testing.T) {
 // DEMONSTRATION 1 — the target column was free prose, and prose has no polarity.
 //
 // The reviewer rewrote a REAL claim's target to a sentence DENYING the port and the audit still
-// reported all 1,178 rows covered, because a `TestFoo` mentioned anywhere in that sentence was
+// reported all 1,201 rows covered, because a `TestFoo` mentioned anywhere in that sentence was
 // mined as the target. The same reader resolved a NEGATED package qualifier against the very
 // package the sentence said the target was not in, and silently narrowed a generic instantiation
 // and a `t.Run` subtest spelling to their parent function name.

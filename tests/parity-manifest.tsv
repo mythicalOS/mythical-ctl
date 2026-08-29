@@ -417,6 +417,7 @@ tests/unit/doc.bats	a spec with the cardinality omitted is refused, not read as 
 tests/unit/doc.bats	a spec written with spaces instead of TABs is refused, not read as unknown keys
 tests/unit/doc.bats	a duplicate key in the spec is refused rather than resolving to the first
 tests/unit/doc.bats	rolemount requires a role and an absolute path
+tests/unit/doc.bats	cpath accepts a bounded absolute container path and refuses a widened or traversal one
 tests/unit/doc.bats	docver and epoch are non-negative bounded digits
 tests/unit/doc.bats	digestref requires <repository>@sha256:<64 hex>, exactly one @
 tests/unit/doc.bats	digestref's repository component is constrained: lowercase, digits, . _ - / : only
@@ -581,6 +582,7 @@ tests/unit/lock.bats	a LIVE recovery gate blocks the break — another operation
 tests/unit/lock.bats	release will NOT delete a lock it does not own
 tests/unit/lock.bats	release is a safe no-op when not held
 tests/unit/manifest.bats	a valid manifest loads
+tests/unit/manifest.bats	the volatile_mount field is accepted, grammar-checked, and closed to option siblings
 tests/unit/manifest.bats	a digest-pinned image is required; a tag is refused
 tests/unit/manifest.bats	a tag alongside a digest is accepted (still pinned by the digest); a bare tag with no digest is refused
 tests/unit/manifest.bats	mi_manifest_image returns the pinned reference
@@ -597,6 +599,7 @@ tests/unit/manifest.bats	a manifest declaring bindability is rejected
 tests/unit/manifest.bats	a manifest cannot choose a network at all
 tests/unit/manifest.bats	a manifest requiring a newer core is refused, even when fully authentic
 tests/unit/manifest.bats	a manifest with no min_core is refused — unstated must not mean any core will do
+tests/unit/manifest.bats	the compat gate accepts a manifest requiring this core (0.2.0) and refuses one requiring newer
 tests/unit/manifest.bats	the version comparator orders components numerically, not lexically
 tests/unit/manifest.bats	the core version tracks the entrypoint's VERSION
 tests/unit/manifest.bats	coreversion accepts MAJOR[.MINOR[.PATCH]] and nothing else
@@ -719,6 +722,10 @@ tests/unit/mounts.bats	mi_mount_binds applies the pairwise rule to the whole set
 tests/unit/mounts.bats	the emitted bind spec is one the runtime adapter accepts, and mounts the declared path
 tests/unit/mounts.bats	a bound role the manifest declares but does not PLACE is refused, never given a target
 tests/unit/mounts.bats	a role the policy index does not make bindable cannot be bound by naming its key
+tests/unit/mounts.bats	mi_bringup_specs emits the volatile mount for the canonical root
+tests/unit/mounts.bats	mi_bringup_specs refuses a non-canonical volatile root and emits no spec for it
+tests/unit/mounts.bats	mi_bringup_specs refuses a mount that overlaps the volatile credential-home root
+tests/unit/mounts.bats	mi_bringup_specs emits no volatile spec when the manifest declares none
 tests/unit/mounts.bats	a role with no bind key falls through to a named volume rather than failing
 tests/unit/mounts.bats	the product key spec names the port and every BINDABLE role, and nothing else
 tests/unit/mounts.bats	no bindable_role entitlement means no bind key at all
@@ -983,6 +990,10 @@ tests/unit/runtime.bats	a caller cannot supply its own Go template
 tests/unit/runtime.bats	an argument containing a control byte is refused before it reaches the runtime
 tests/unit/runtime.bats	a created container is stopped, on exactly one network, with the alias
 tests/unit/runtime.bats	a stopped container has NO address; starting it assigns one
+tests/unit/runtime.bats	a volatile spec renders a NON-PERSISTENT tmpfs carrying the fixed nodev,nosuid,noexec
+tests/unit/runtime.bats	the volatile mount is not a named volume — nothing for the volume-backup path to see
+tests/unit/runtime.bats	teardown wipes: removing the container discards the volatile tmpfs
+tests/unit/runtime.bats	a volatile spec with a path the wire rejects is refused at the launch site
 tests/unit/runtime.bats	EVERY published port is on 127.0.0.1 — a caller cannot ask for anything else
 tests/unit/runtime.bats	publish=<host>:<container> is the only accepted publish shape
 tests/unit/runtime.bats	host / none / container: network modes are refused at creation
@@ -1186,3 +1197,15 @@ tests/unit/verbs.bats	a re-install whose container removal FAILS does not procee
 tests/unit/verbs.bats	a recreate whose container removal FAILS does not proceed to bring-up and restores the container
 tests/unit/verbs.bats	recreate HONORS a recorded force-install on a still-not-launched manifest, rather than refusing it
 tests/unit/verbs.bats	status reports a netmig record missing fields as UNREADABLE, not a blank migration
+tests/unit/volatile.bats	the canonical root and the fixed security options are the wire's exact literals
+tests/unit/volatile.bats	a bounded absolute path of safe segments is accepted
+tests/unit/volatile.bats	every path the wire's grammar rejects is rejected
+tests/unit/volatile.bats	a value carrying a second token or an option is rejected — the field cannot widen the mount
+tests/unit/volatile.bats	a whitespace or control byte in the path is rejected
+tests/unit/volatile.bats	the length bound is enforced at both ends
+tests/unit/volatile.bats	the canonical-root predicate is true only for the fixed root
+tests/unit/volatile.bats	the production guard accepts the canonical root and refuses every other, even valid, path
+tests/unit/volatile.bats	the security-option check accepts only the exact frozen set
+tests/unit/volatile.bats	path disjointness catches equal, child, and ancestor overlaps but allows a sibling
+tests/unit/volatile.bats	path normalization defeats equivalent spellings of an overlapping path
+tests/unit/volatile.bats	the typed launch spec is emitted for a valid path and refused for an invalid one

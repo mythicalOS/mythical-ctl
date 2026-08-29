@@ -69,9 +69,9 @@ import (
 // ---------------------------------------------------------------------------------------------
 
 const (
-	wantUnitTests       = 1122
+	wantUnitTests       = 1145
 	wantAcceptanceTests = 56
-	batsFilesInCorpus   = 34
+	batsFilesInCorpus   = 35
 )
 
 // THE MANIFEST'S IDENTITY, NOT ONLY ITS SIZE.
@@ -90,7 +90,7 @@ const (
 //
 // A var only so the end-to-end tests can drive run() over a synthetic manifest; the shipped value is
 // asserted by TestPinnedCorpusSizeIsThePlansNumbers, and the tests restore it with t.Cleanup.
-var manifestSHA256 = "fe06341d4145d4686eaeeddb4984c6edea9fd88b2c4a967d0432354f5a187cb4"
+var manifestSHA256 = "9b4179c038c7d258baf1f702ffd8c1394e22e62ad6691dc964ace38cdce93ca5"
 
 type lane struct {
 	prefix string
@@ -101,7 +101,7 @@ type lane struct {
 // the audit does not know how to count, and is refused rather than silently ignored.
 //
 // VARIABLES, NOT CONSTANTS, FOR ONE REASON: the end-to-end tests drive run() over a synthetic tree
-// of three tests, and a run() that could only ever be exercised against the real 1,178 could not be
+// of three tests, and a run() that could only ever be exercised against the real 1,201 could not be
 // shown to FAIL at all — which is the property that matters most about an audit. They are restored
 // by t.Cleanup, and TestPinnedCorpusSizeIsThePlansNumbers asserts the shipped values, so the pin is
 // still a pin.

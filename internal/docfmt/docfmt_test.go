@@ -42,6 +42,7 @@ import (
 // PORTED: tests/unit/doc.bats: "expiry compares against a supplied clock" -> TestExpiry
 // PORTED: tests/unit/doc.bats: "a document with no expiry never expires" -> TestExpiry
 // N/A: tests/unit/doc.bats: "the public functions refuse bad arity instead of aborting under set -u" -- compile-time arity
+// PORTED: tests/unit/doc.bats: "cpath accepts a bounded absolute container path and refuses a widened or traversal one" -> TestCpathType -- checked through BOTH surfaces the row is about — the type function and a real schema load, because "refused at the manifest door" is the property
 
 func testSchema() Schema {
 	return Schema{

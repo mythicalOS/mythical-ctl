@@ -39,6 +39,8 @@ import (
 // PORTED: tests/unit/manifest.bats: "name derivation refuses inputs that are not identifiers" -> TestNaming
 // PORTED: tests/unit/manifest.bats: "Fix 5: mi_manifest_core_ok refuses a min_core value with a stray 4th component" -> TestCoreOK
 // PORTED: tests/unit/manifest.bats: "Fix 6: MI_CORE_VERSION is itself a valid coreversion" -> TestCoreOK -- the binary version normalizes to a valid coreversion, asserted
+// PORTED: tests/unit/manifest.bats: "the volatile_mount field is accepted, grammar-checked, and closed to option siblings" -> TestVolatileMountField -- acceptance, the grammar refusal, and the options-sibling rejection as an UNKNOWN KEY
+// PORTED: tests/unit/manifest.bats: "the compat gate accepts a manifest requiring this core (0.2.0) and refuses one requiring newer" -> TestCoreVersionBoundaryIsThisRelease -- the premise assertion is ported too, so a later core bump fails loudly here rather than quietly re-deriving whatever number is current
 
 func man(overrides map[string]string, extra ...string) []byte {
 	base := map[string]string{
