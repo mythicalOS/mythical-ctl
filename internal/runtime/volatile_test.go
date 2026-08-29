@@ -2,6 +2,7 @@ package runtime_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -14,7 +15,7 @@ import (
 
 // Inventory — tests/unit/mounts.bats (the credential-home mount rows):
 // PORTED: tests/unit/mounts.bats: "mi_bringup_specs emits the volatile mount for the canonical root" -> TestVolatileMountEmittedForCanonicalRoot -- the Go seam is buildSpec, shared by LaunchProduct and PrelaunchCheck, and the assertion is on the mount the daemon actually received rather than on an emitted spec string
-// PORTED: tests/unit/mounts.bats: "mi_bringup_specs refuses a non-canonical volatile root and emits no spec for it" -> TestVolatileMountRefusesNonCanonicalRoot -- and nothing is created for it — there is no spec string to inspect in Go, so the absence is asserted on the container
+// PORTED: tests/unit/mounts.bats: "mi_bringup_specs refuses a non-canonical volatile root and emits no spec for it" -> TestVolatileMountRefusesNonCanonicalRoot -- Go emits no spec STRING, so the bats "emits no spec" half is asserted as the effect it stands for: the refusal names the required root AND the product container is provably absent afterwards
 // PORTED: tests/unit/mounts.bats: "mi_bringup_specs refuses a mount that overlaps the volatile credential-home root" -> TestVolatileMountRefusesOverlappingMounts TestVolatileMountAllowsDisjointMounts -- the bats row carries both halves: the overlap refusals (equal, child, an equivalent spelling of that child, the container root) and the disjoint volume that must still launch
 // PORTED: tests/unit/mounts.bats: "mi_bringup_specs emits no volatile spec when the manifest declares none" -> TestVolatileMountAbsentEmitsNothing -- absence is not a mount: no tmpfs at all, not an empty one and not one at a default path
 
@@ -48,6 +49,19 @@ func launchWith(t *testing.T, m *manifest.Manifest, p *policy.Policy) (*engine.C
 		t.Fatalf("PrelaunchCheck and LaunchProduct disagree: prelaunch=%v launch=%v", preErr, err)
 	}
 	if err != nil {
+		// A REFUSAL CREATES NOTHING, and that is CHECKED rather than inferred from the error.
+		// The refusals under test happen during assembly, before any request is issued — but
+		// "the call returned an error" and "the call had no effect" are different claims, and an
+		// implementation that created the container and then refused would satisfy the first
+		// while breaking the second. Only this assertion can tell them apart.
+		name, nerr := manifest.ContainerName(cfg.Identity, m.Product())
+		if nerr != nil {
+			t.Fatal(nerr)
+		}
+		if _, ierr := r.c.ContainerInspect(ctx, name); !errors.Is(ierr, engine.ErrAbsent) {
+			t.Fatalf("the launch was refused, but inspecting %q returned %v — want ErrAbsent; "+
+				"a refusal that left a container behind is not a refusal", name, ierr)
+		}
 		return nil, err
 	}
 	info, ierr := r.c.ContainerInspect(ctx, id)
