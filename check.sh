@@ -400,6 +400,14 @@ check_selfcheck() {
     env GOFLAGS="$payload" GOENV=off bash "$SELF" parity
   selfcheck_write_manifest 'GOFLAGS variable' env GOFLAGS="$payload" GOENV=off
 
+  # tools/build-release.sh is the third script with graders in it, and its first `go run` decides
+  # what the other steps operate on: neutered, `release-verify targets` prints nothing, the script
+  # refuses an empty matrix, and the whole lane goes red for a reason that is not about the tree.
+  # Its guard predates this stage; the probe is what keeps it. A plain build, not --repro — the
+  # comparison is check.sh release's job, and this is asking a different question.
+  selfcheck_probe 'release graders run (GOFLAGS variable)' ok 'all digests recomputed and matching' \
+    env GOFLAGS="$payload" GOENV=off bash tools/build-release.sh 0.0.0-selfcheck "$SELFCHECK_TMPDIR/rel-goflags"
+
   # CHANNEL 2 — the go env FILE, and it is NOT the same channel. `GOFLAGS=''` does not close it:
   # go treats an EMPTY environment variable as UNSET and falls back to the file (measured — with
   # GOFLAGS='' exported and a file setting GOFLAGS, `go env GOFLAGS` reports the FILE's value). A
@@ -412,6 +420,8 @@ check_selfcheck() {
   selfcheck_probe 'parity grader runs (go env file)' ok 'parity-audit: every one of the' \
     env -u GOFLAGS GOENV="$SELFCHECK_TMPDIR/goenv" bash "$SELF" parity
   selfcheck_write_manifest 'go env file' env -u GOFLAGS GOENV="$SELFCHECK_TMPDIR/goenv"
+  selfcheck_probe 'release graders run (go env file)' ok 'all digests recomputed and matching' \
+    env -u GOFLAGS GOENV="$SELFCHECK_TMPDIR/goenv" bash tools/build-release.sh 0.0.0-selfcheck "$SELFCHECK_TMPDIR/rel-goenv"
 
   # CHANNEL 3 — an inherited go WORKSPACE. `go.work` is ambient file state of the same kind as the
   # go env file: the go command reads it without being asked, from GOWORK or from any ancestor
@@ -432,6 +442,15 @@ check_selfcheck() {
   selfcheck_probe 'parity grader runs (go.work file)' ok 'parity-audit: every one of the' \
     env GOWORK="$SELFCHECK_TMPDIR/go.work" bash "$SELF" parity
   selfcheck_write_manifest 'go.work file' env GOWORK="$SELFCHECK_TMPDIR/go.work"
+  selfcheck_probe 'release graders run (go.work file)' ok 'all digests recomputed and matching' \
+    env GOWORK="$SELFCHECK_TMPDIR/go.work" bash tools/build-release.sh 0.0.0-selfcheck "$SELFCHECK_TMPDIR/rel-gowork"
+
+  # And tests/smoke.sh's SELF-BUILD path, the one CI runs with MCTL_BIN deliberately absent so the
+  # default stays proven. Only this channel can reach it: `go build` ignores -exec, and an
+  # -ldflags version stamp still satisfies smoke's shape assertion, but a workspace that does not
+  # `use` this directory stops the build outright.
+  selfcheck_probe 'smoke self-build reaches its true answer (go.work file)' ok '0 failed' \
+    env GOWORK="$SELFCHECK_TMPDIR/go.work" bash tests/smoke.sh
 
   [ "$SELFCHECK_RC" -eq 0 ] || die "a grader above can be switched off from the environment, so
    every stage that depends on it can report OK while the property it names is false."

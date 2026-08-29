@@ -108,7 +108,12 @@ fi
 # `go env GOFLAGS` reports the FILE's value), so the file channel is closed by GOENV=off alone.
 # GOWORK=off closes the third of the same kind: a `go.work` in any ancestor directory is read
 # without being asked, and its `replace` directives decide which copy of a dependency is linked
-# into a published binary.
+# into a published binary. That one is a PIN rather than a convenience, and the distinction is
+# real: the --repro comparison cannot see it (both builds inherit it equally and agree, exactly as
+# the note above says), and the artifact's own record does not cover it either — release-verify
+# grades the build SETTINGS and the main module, not the dependency list. `bash check.sh
+# selfcheck` runs this script under an inherited workspace and requires it to still reach its true
+# answer.
 export GOTOOLCHAIN="$PIN_GOTOOLCHAIN"
 export GOFLAGS=''
 export GOENV=off
