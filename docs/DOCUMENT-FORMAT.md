@@ -149,6 +149,7 @@ Types specific to these authenticated documents:
 | `productdigest` | `<product>:<64 hex>` | The family index's flat encoding of "this product's manifest must hash to this." Exactly one colon. |
 | `coreversion` | `MAJOR[.MINOR[.PATCH]]`, numeric components only | Deliberately not full semver — pre-release and build-metadata suffixes have ordering rules a shell comparator would get subtly wrong, and a minimum-core requirement has no need of them. |
 | `rolemount` | `<role>:/<absolute path>` | The flat encoding of what would be an object (`{role, mount}`) in a format that could nest. See [Residual: the format cannot nest](#residual-the-format-cannot-nest). No `..` component. |
+| `cpath` | a bounded absolute container path of safe segments | A single mount point, stricter than `path:<maxlen>`: it must begin with `/`, each segment is `[A-Za-z0-9._-]+`, there is no trailing slash and the bare root `/` is refused, no empty (`//`) or `.`/`..` segment, no whitespace or control byte, and the length is 2..512 bytes. The tight charset is what makes the type **closed**: a value cannot carry a second token or an options list (a space, comma, colon, or `=` is refused), so a field of this type names *where* a mount lives and nothing about *how* it is mounted. See [The volatile credential-home mount](VOLATILE-MOUNT-FORMAT.md). |
 
 Every type is checked in byte order (`LC_ALL=C`), so the same document validates identically
 whatever locale the reader runs under.
@@ -316,6 +317,7 @@ expect are simply absent from the grammar below; their absence is the enforcemen
 | `mount` | `ident` | many | A fixed mount this product needs. |
 | `port` | `int:1:65535` | many | A port this product's container listens on. |
 | `probe` | `str:256` | opt | An optional health-check path. |
+| `volatile_mount` | `cpath` | opt | Where this product's credential-bearing isolated-home mount lives, for a product that materializes a file-based credential per session. A bare mount point and nothing else: every hardening property of the mount is **fixed** and is not declared here, so a manifest names only the path and can never widen the mount. See [The volatile credential-home mount](VOLATILE-MOUNT-FORMAT.md). Optional — a product needing no such mount omits it. |
 | `min_core` | `coreversion` | one | The minimum `mythical-ctl` version this manifest requires. Required — an unstated minimum would silently mean "any core will do," which is never a safe default for a document this privileged. |
 | `runtime_uid` | `int:0:4294967295` | one | The uid this product's container runs as. Required, because migration **maps** ownership rather than preserving it, and this is the principal it maps to. Guessing it, or preserving uid/gid raw, is the dual-owner problem at directory scale: a preserved `0600` file owned by the operator is unreadable by a container still running as uid 900 — and a wrong value here does not fail loudly, it produces a migrated tree the product cannot read, discovered on the first start after the source has already been retired. |
 
