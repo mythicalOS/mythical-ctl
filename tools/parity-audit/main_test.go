@@ -2318,12 +2318,21 @@ func TestALaneMayNotOptOutOfExecutionWithoutAnArgument(t *testing.T) {
 
 // THE EXECUTION WITNESS READER, and the two things it must get right.
 //
-// A SUBTEST IS NOT ITS PARENT. `t.Run` emits `"Test":"TestFoo/case"`; counting those toward TestFoo
-// would put the run count far above the declaration count for every table-driven test in the tree
-// (1662 events against 1369 top-level starts, measured on this repository) and the count check would
-// then refuse everything.
+// A SUBTEST IS NOT ITS PARENT. `t.Run` emits `"Test":"TestFoo/case"`, and this reader drops it.
+// BEWARE THE PLAUSIBLE REASON THAT IS NOT THE REAL ONE: an earlier version of this comment said
+// keeping subtests would push the run count above the declaration count and make the check refuse
+// everything. That is false twice over. `TestFoo/case` is a DIFFERENT map key from `TestFoo`, so a
+// subtest never touches its parent's count at all (measured both ways: with the drop
+// `map[TestOne:1]`, without it `map[TestOne:1 TestOne/case:1]`); and the count check is a FLOOR,
+// `ran < declared`, so excess starts are accepted anyway. The event counts that sentence cited
+// (1662 against 1369) were real; the conclusion drawn from them was not.
 //
-// AND A LINE THAT IS NOT AN EVENT IS A HARD ERROR. A reader that shrugged at unparseable lines would
+// What the drop actually does is keep the witness keyed to the thing a claim can name. A PORTED
+// target is a top-level test, so a subtest key could never satisfy one, and admitting them would
+// only put unmatchable keys in the map.
+//
+// AND A LINE THAT IS NOT JSON IS A HARD ERROR (valid JSON carrying no run is skipped — see the
+// reader's own note on why that bar is not "not a run event"). A reader that shrugged at unparseable lines would
 // report a half-empty witness for a stream it had not understood, and every PORTED target would go
 // dangling for a reason that has nothing to do with the port.
 func TestParseGoTestExecReadsStartsAndNotSubtestsOrProse(t *testing.T) {
@@ -2386,6 +2395,40 @@ func TestParseGoTestExecReadsStartsAndNotSubtestsOrProse(t *testing.T) {
 		`ok  	`+pkg+`	0.1s`,
 	)); err == nil {
 		t.Fatal("a line that is not a go test -json event was skipped in silence")
+	}
+}
+
+// VALID JSON CARRYING NO RUN IS SKIPPED, AND THAT IS THE CONTRACT, NOT AN OVERSIGHT.
+//
+// A real `go test -json` stream is mostly non-run events, so the reader's bar is "is this JSON",
+// not "is this a run". A cross-model review read the neighbouring comment's "not an event is a hard
+// error" and reported the skip as a contract violation; the comment was overstating, the code was
+// right. This test pins the real shape in both directions so the next reader gets the code's answer
+// rather than the comment's: junk-but-valid JSON is skipped rather than refused, AND it buys
+// nothing — the target it fails to vouch for stays unvouched.
+func TestValidJSONCarryingNoRunIsSkippedAndVouchesForNothing(t *testing.T) {
+	const pkg = "mythicalos.ai/ctl/internal/x"
+	got, err := parseGoTestExec("witness", lines(
+		`{}`,
+		`null`,
+		`{"Action":"bogus","Package":"`+pkg+`","Test":"TestOne"}`,
+		`{"Action":"run","Package":"`+pkg+`"}`,
+		`{"Action":"output","Package":"`+pkg+`","Test":"TestOne"}`,
+		`{"Action":"run","Package":"`+pkg+`","Test":"TestReal"}`,
+	))
+	if err != nil {
+		t.Fatalf("valid JSON carrying no run was refused, but a real witness is mostly such lines: %v", err)
+	}
+	if got[pkg]["TestReal"] != 1 {
+		t.Fatalf("the one genuine run event was lost among the non-events: %v", got)
+	}
+	// The point of the skip is that it vouches for NOTHING. A target named only by a non-event
+	// must be exactly as unvouched as one never mentioned at all.
+	if _, ok := got[pkg]["TestOne"]; ok {
+		t.Fatalf("a target named only by a non-run event was credited with a run: %v", got)
+	}
+	if len(got[pkg]) != 1 {
+		t.Fatalf("non-events added keys to the witness: %v", got[pkg])
 	}
 }
 

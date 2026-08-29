@@ -1184,10 +1184,19 @@ func parseGoTestExec(name string, content []byte) (map[string]map[string]int, er
 			Package string
 			Test    string
 		}
-		// A LINE THAT IS NOT AN EVENT IS A HARD ERROR, NOT A SKIP. This stream is the only evidence
+		// A LINE THAT IS NOT JSON IS A HARD ERROR, NOT A SKIP. This stream is the only evidence
 		// that anything ran; a reader that shrugged at unparseable lines would report an empty or
 		// half-empty witness for a stream it had not understood, and every PORTED target would go
 		// dangling for a reason that is not about the port.
+		//
+		// NOT-JSON IS THE BAR HERE, NOT NOT-A-RUN-EVENT, and the distinction is deliberate rather
+		// than an oversight. A real stream is mostly things that are not runs — start, output, pass,
+		// fail, pause, cont, skip — so rejecting every non-run line would reject every real witness.
+		// Valid JSON carrying no run (`{}`, `null`, an unknown Action, a run with no Test) is
+		// therefore SKIPPED, and the refusal that covers it lives elsewhere and is per-target: a
+		// lane whose witness yields no run at all fails the liveness check, and any single target
+		// without a run event is refused on its own. So a junk-but-valid-JSON witness cannot buy a
+		// green audit for a test that did not run; it can only fail to help one that did.
 		if err := json.Unmarshal(raw, &ev); err != nil {
 			return nil, fmt.Errorf("%s line %d is not a `go test -json` event: %w (the execution witness must be the STDOUT of `go test -json -count=1 ./...` and nothing else)", name, line, err)
 		}
