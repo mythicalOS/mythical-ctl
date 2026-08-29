@@ -1920,11 +1920,17 @@ func TestEndToEndRefusesATargetTheExecutionWitnessNeverSawRun(t *testing.T) {
 	}
 }
 
-// THE COUNT, NOT ONLY THE PRESENCE, for the reason the list witness is counted: `x` and `x_test` may
-// each declare a test of one name, and `go test -json` reports both under the one package. If two
-// are declared and one starts, this lane cannot say which one the claim is about — and the one that
-// did not start is exactly the one a claim would be hiding.
-func TestTheExecutionWitnessMustAgreeOnHowManyTestsOfANameRan(t *testing.T) {
+// EVERY DECLARATION MUST HAVE STARTED — a FLOOR on the count, not an equality.
+//
+// `x` and `x_test` may each declare a test of one name, and `go test -json` reports both under the
+// one package. If two are declared and one starts, this lane cannot say which one the claim is about,
+// and the one that did not start is exactly the one a claim would be hiding. That is the check.
+//
+// It must NOT be an equality, which is how it was first written. Go supports `TestMain` calling
+// `m.Run()` more than once and -count=1 does not prevent it — MEASURED, a probe declaring ONE test
+// emitted TWO run events — so `ran > declared` is a state a correct package reaches, and refusing it
+// is a false red about the very thing this witness confirms. Both directions are asserted below.
+func TestEveryDeclarationOfANameMustHaveStarted(t *testing.T) {
 	const x = "mythicalos.ai/ctl/internal/x"
 	c, b, st := claimsFrom(t,
 		`// PORTED: tests/unit/a.bats: "one" -> TestOne`,
@@ -1955,6 +1961,18 @@ func TestTheExecutionWitnessMustAgreeOnHowManyTestsOfANameRan(t *testing.T) {
 	auditCoverage(r2, tiny, sited(c, fileInternalTest), b, st, []testLane{ln}, noPreDeclared)
 	if hasProblem(r2, "TestShared") {
 		t.Fatalf("both declarations ran and the claim was still refused: %v", r2.Problems)
+	}
+	// AND MORE STARTS THAN DECLARATIONS IS NOT A DEFECT. A `TestMain` that calls `m.Run()` twice —
+	// which Go supports, and which -count=1 does not prevent — starts every test in its package
+	// twice. Measured with a probe: one declaration, two run events. Those tests unambiguously RUN,
+	// so a claim on one of them must resolve; an equality check refused it, which is a false red
+	// about the one property this witness exists to establish.
+	ln.exec = map[string]map[string]int{x: {"TestOne": 2, "TestThree": 2, "TestShared": 4}}
+	r3 := &report{}
+	auditCoverage(r3, tiny, sited(c, fileInternalTest), b, st, []testLane{ln}, noPreDeclared)
+	if len(r3.Problems) != 0 {
+		t.Fatalf("a package whose TestMain ran its suite twice had every claim refused, though every\n"+
+			"declaration demonstrably started: %v", r3.Problems)
 	}
 }
 
@@ -2352,8 +2370,12 @@ func TestParseGoTestExecReadsStartsAndNotSubtestsOrProse(t *testing.T) {
 			t.Fatalf("a subtest was kept as an entry of its own (%q) — the execution witness is no longer keyed by the names a target can name, and the lane's run count is counting subtests: %v", k, got[pkg])
 		}
 	}
+	// TWO STARTS ARE TWO STARTS. What they MEAN is decided at resolution, not here: they may be a
+	// package's internal and external test of one name, or one test whose TestMain called m.Run()
+	// twice. The reader's job is to report the number faithfully either way — an earlier version of
+	// this line asserted they were "two tests, not a repetition", which is simply not true.
 	if got[pkg]["TestSame"] != 2 {
-		t.Fatalf("two starts of one name are two tests, not a repetition: got %d", got[pkg]["TestSame"])
+		t.Fatalf("the reader did not report both starts of one name: got %d", got[pkg]["TestSame"])
 	}
 	// An `output` event is not a start. Only `run` says a test began.
 	if _, ok := got[pkg]["TestTwo"]; ok {

@@ -1680,19 +1680,34 @@ func (ln testLane) resolve(pkg string, bd bind, name string) resolution {
 			"is declared and listed under %s, but the %s lane is NOT EXECUTED by this audit (%s) — so nothing here witnesses that it RUNS, and existence is not the claim being made. Either give this lane an execution witness, or move the claim to a test a run of this audit actually executes",
 			pkg, ln.name, ln.execWhy)}
 	}
-	// COUNTED AGAINST THE DECLARATIONS FOR THE REASON THE LISTING IS. A name declared once in the
-	// package and once in its external test package is two tests running under one package in the
-	// run events; if only one of them started, this lane cannot say which one the claim is about —
-	// and the one that did not start is exactly the one a claim would be hiding.
+	// COUNTED AGAINST THE DECLARATIONS FOR THE REASON THE LISTING IS — BUT AS A FLOOR, NOT AN
+	// EQUALITY, AND THAT DISTINCTION WAS GOT WRONG FIRST.
+	//
+	// The property is that EVERY DECLARATION STARTED. A name declared once in the package and once in
+	// its external test package is two tests running under one package in the run events; if only one
+	// of them started, this lane cannot say which one the claim is about, and the one that did not
+	// start is exactly the one a claim would be hiding. That is `ran < declared`.
+	//
+	// It was written as `ran != declared`, which ALSO refuses `ran > declared` — and that is a state
+	// a correct package can be in. Go supports `TestMain` calling `m.Run()` more than once, and
+	// -count=1 does not prevent it: MEASURED with a probe declaring ONE test, `go test -json` emitted
+	// TWO run events for it. Such a test unambiguously runs, so refusing its claim is a false red
+	// about the one thing this witness was added to confirm.
+	//
+	// A NOTE FOR WHOEVER MEETS THAT PACKAGE ANYWAY: the audit as a whole will still refuse it, on the
+	// LIST witness's `listed != declared` above — the same probe printed the name twice under
+	// `go test -list` as well. That check is older than this one and deliberate, and relaxing it is a
+	// separate decision about a different witness; what is fixed here is that the execution half no
+	// longer adds a second, redundant false red of its own.
 	ran := ln.exec[pkg][name]
 	if ran == 0 {
 		return resolution{NotRun: fmt.Sprintf(
 			"is declared and listed under %s but NEVER RAN: an unfiltered `go test -json -count=1` of the %s lane started no test by that name. A test that exists and does not execute is the hole this inventory exists to prevent, and the two existence witnesses cannot see it",
 			pkg, ln.name)}
 	}
-	if ran != declared {
+	if ran < declared {
 		return resolution{NotRun: fmt.Sprintf(
-			"is declared %d time(s) under %s but only %d of them RAN in the %s lane — the declarations and the run events disagree about how many tests of this name execute, so neither can say which one this claim is about, and the one that never ran is the one a claim would be hiding",
+			"is declared %d time(s) under %s but only %d start(s) were recorded in the %s lane — at least one declaration of this name never ran, so this lane cannot say which one the claim is about, and the one that never started is the one a claim would be hiding",
 			declared, pkg, ran, ln.name)}
 	}
 	return resolution{OK: true}
