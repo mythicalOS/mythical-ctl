@@ -2224,10 +2224,12 @@ func run(root, manifestRel string, writeMan bool, goLists, goFiles, goExecs []st
 		fmt.Printf("corpus: bats trees absent (post-cutover) — auditing against the committed %s\n", manifestRel)
 	}
 
-	// THE TWO WITNESSES ARRIVE PAIRED, ONE PAIR PER LANE, and the pairing is checked rather than
+	// THE THREE WITNESSES ARRIVE AS A TRIPLE, ONE PER LANE, and the pairing is checked rather than
 	// assumed: an unpaired list would silently reintroduce the very independence the pairing
-	// removes — a lane whose source half is empty resolves nothing, and one whose list half is
-	// empty would be skipped without anybody noticing which lane went missing.
+	// removes — a lane whose source half is empty resolves nothing, one whose list half is empty
+	// would be skipped without anybody noticing which lane went missing, and one whose execution
+	// half is absent would resolve targets on existence alone, which is the whole defect the third
+	// witness exists to close.
 	if len(goFiles) != len(goLists) || len(goExecs) != len(goLists) {
 		return fmt.Errorf("--go-list was given %d time(s), --go-files %d and --go-exec %d — they are ONE witness\n"+
 			"   TRIPLE per build-tag lane and must be given in the same number and the same order: the source\n"+
