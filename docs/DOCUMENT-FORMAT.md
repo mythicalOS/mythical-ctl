@@ -9,20 +9,32 @@ rejected, and rejection is not a bug.
 
 These documents are **more privileged than `<product>.conf`**, not less. A manifest names the image
 that will run, the mounts that will be made, and the secrets that will be injected. Every rule
-[`docs/CONFIG-FORMAT.md`](CONFIG-FORMAT.md) places on product configuration binds here too, plus the
-authentication and freshness rules this document adds on top.
+[`docs/CONFIG-FORMAT.md`](CONFIG-FORMAT.md) places on the **bytes and values** of product
+configuration binds here too — the byte policy, the value rule, the key-count ceiling — plus the
+authentication and freshness rules this document adds on top. Its **integrity marker** is the one
+thing that does not carry over: these documents have none. Their authenticity comes from a digest a
+parent document vouches for, and a line that merely looks like a marker is an ordinary comment
+here.
 
 ## Why line-oriented `key=value`, not JSON
 
 Every document in this family — including the family index and the policy index — is the same
-`key=value` text format `<product>.conf` uses, not JSON. `/detect` is the one place in the system
-that speaks JSON, and it does so because it isn't ours: it's an existing HTTP response from a
-product's own runtime, defined separately (see the note on `/detect` at the end of this document).
+`key=value` text format `<product>.conf` uses, not JSON. The one JSON a *product* puts in front of
+this tool is `/detect`, and that is JSON because it isn't ours: it is an existing HTTP response
+from the product's own runtime, defined separately (see the note on `/detect` at the end of this
+document).
 Everything *authenticated* — the index, the policy, the manifest — is emitted and consumed
-entirely inside this project's own tooling, so there is no external format to inter-operate with,
-and the dependency floor (bash, a container runtime, `curl`, `mktemp`, `sha256sum`/`shasum` — no
-`jq`, no JSON parser) rules JSON out anyway: hand-rolling a JSON parser in bash to read the most
-security-sensitive input in the system would be the least reviewable code in the repository.
+entirely inside this project's own tooling, so there is no external format to inter-operate with.
+What the shared format buys is that these documents and `<product>.conf` pass through the **same**
+byte gate and the **same** value rule rather than through two implementations of them: one audited
+scanner decides what counts as a control byte and what a value may contain, for the least-trusted
+input in the system and the most privileged alike. A separate grammar for the privileged documents
+would be a second thing to get wrong, on exactly the inputs where getting it wrong is worst.
+
+**This is not a claim that the tool cannot parse JSON.** `mythical-ctl` is a single static binary,
+and it does link a JSON decoder — it speaks the container runtime's JSON API over the daemon
+socket. The authenticated documents do not go through it, and neither does the `/detect` reader;
+in both cases that is a choice, stated where it is made, rather than a missing capability.
 
 ## The three document types, and their header line
 
@@ -42,24 +54,36 @@ there is no sniffing and no fallback.
 
 ## Grammar
 
-The body — everything after the header line — is line-oriented text, and it is never `source`d,
-`eval`d, or shell-expanded by anything that reads it:
+The body — everything after the header line — is line-oriented text, and nothing that reads it
+evaluates, expands or executes any part of it:
 
 - Every line ends with `\n`, **including the last**. A file that doesn't end in a newline is
   rejected as truncated.
 - Blank lines and lines starting with `#` are ignored.
 - Every other line is `KEY=VALUE`, split on the **first** `=`. A value may itself contain `=`.
-- A key is lowercase ASCII, and may carry **exactly one** dotted prefix: `brokkr.permitted_role` is
-  legal, `a.b.c` is not. The prefix, when present, must itself be a valid product identifier (see
-  `ident` below). This is how the policy index scopes an entitlement to one product without the
-  format needing real nesting — see [Residual: the format cannot nest](#residual-the-format-cannot-nest).
-  A key that is not in the document's schema is **rejected, not ignored** — the whole document fails
-  to load, the same as an unknown key in `<product>.conf`.
+- A key is `[a-z][a-z0-9_]*`, at most 128 bytes whole, and may carry **exactly one** dotted prefix
+  of the same shape: `brokkr.permitted_role` is legal, `a.b.c` is not. This is how the policy index
+  scopes an entitlement to one product without the format needing real nesting — see
+  [Residual: the format cannot nest](#residual-the-format-cannot-nest). The policy index
+  additionally requires the prefix to be a valid `ident` (see the types below), so a well-formed
+  key whose prefix is not a product identifier is refused there as an unknown key. A key that is
+  not in the document's schema is **rejected, not ignored** — the whole document fails to load, the
+  same as an unknown key in `<product>.conf`.
+
+  **The key alphabet and `ident` are not the same alphabet, and the difference is a real limit
+  rather than a subtlety.** A key half admits `_` and not `-`; `ident` (and the product-name
+  grammar in [`docs/CONFIG-FORMAT.md`](CONFIG-FORMAT.md)) admits `-` and not `_`. They overlap on
+  `[a-z][a-z0-9]*`. So a product whose name contains a hyphen cannot be named as a prefix at all:
+  `my-product.permitted_role` is refused as an invalid key name, even though `my-product` is a
+  valid product name. That is measured, not inferred. No product in this family is so named, and
+  nothing silently mis-grants as a result — the document is refused either way — but a publisher
+  for a hyphenated product has no spelling that works, and this format cannot give them one
+  without changing what a key may be.
 - A duplicate key is rejected, unless the document's schema explicitly marks that key repeatable
   (`many`, below) — in which case every occurrence is kept, in order.
-- At most 1024 keys per document. This is the same ceiling `<product>.conf` and `mythical.conf`
-  carry, and for the same reason: the cost of detecting a violation is incurred *while accumulating*
-  the document, so a generous, cheap-to-check ceiling exists rather than an after-the-fact one.
+- At most 1024 keys per document — the same ceiling `<product>.conf` and `mythical.conf` carry.
+  It is enforced **during** the scan: a document is refused at the line that crosses the cap,
+  naming the cap, rather than after the whole of it has been accumulated.
 
 ### Byte and value rules (inherited from `docs/CONFIG-FORMAT.md`)
 
@@ -67,7 +91,9 @@ The byte policy and the value rule are **exactly** `docs/CONFIG-FORMAT.md`'s —
 second implementation of it:
 
 - **No control bytes** anywhere except the `\n` that ends each line (no NUL, CR, TAB, DEL). A file
-  containing one is rejected outright, before the marker or the schema is even considered.
+  containing one is rejected outright, before the header or the schema is considered — but *after*
+  the digest, which is checked before any of these bytes are inspected at all (see
+  [Precedence](#precedence-the-order-these-checks-run-in)).
 - **Values**: no leading or trailing space; no control characters; none of `$`, `` ` ``, `\`; bounded
   length. Any other byte is passed through verbatim, including non-ASCII (UTF-8) content — the
   reader never decodes a value, so it never needs to validate UTF-8.
@@ -75,8 +101,14 @@ second implementation of it:
   the line. Do not wrap a value in quotes; the quotes become part of it.
 
 If you are implementing a writer for one of these documents, read `docs/CONFIG-FORMAT.md`'s
-"Syntax" and "Writing safely" sections in full — they describe the same rules in more depth, with
-worked examples, and apply here without change.
+"Syntax" section in full: it describes these same byte and value rules in more depth, with worked
+examples, and they apply here unchanged. Its "Writing safely" section carries over only in part.
+The rule against writing a value containing a newline applies here for the same reason — a newline
+in a value forges a second assignment on the next read. The other two do **not**: these documents
+have **no integrity marker** (their authenticity comes from a digest a parent document vouches for,
+not from a marker line of their own — a line that merely looked like one would be an ordinary
+comment here), and they are **not bind-mounted**, so the prohibition on replacing the file by
+`rename()` does not apply to them either.
 
 ## Precedence: the order these checks run in
 
@@ -84,13 +116,16 @@ An implementer's first instinct is usually to check the checks in the order that
 write, which is not the order this format is actually verified in. The order matters because each
 step's failure mode is a different, specific answer, and collapsing two into one gives an operator
 the wrong diagnosis. In the order they actually run, for every document handled through this
-project's acceptance path (`mi_accept_index`, `mi_accept_policy`, `mi_accept_manifest`):
+project's acceptance path (`trust.AcceptIndex`, `trust.AcceptPolicy`, `trust.AcceptManifest`, and
+their check-only siblings, which run the identical chain and commit nothing):
 
 1. **Does the document authenticate against its digest?** This runs **first**, over the file's raw
    bytes — before the byte policy, the grammar, or the schema are applied to those bytes at all.
-   (The file must of course be openable to be hashed in the first place; that is a mechanical
-   precondition for computing anything, not a content check with its own diagnosis — the byte policy
-   below is what inspects what the bytes actually *contain*, and that is what step 2 gates on.) The
+   (Two things do precede it, and neither inspects content: the file must be openable to be hashed
+   at all, and the read that hashes it is bounded at the same 1048576-byte ceiling
+   `<product>.conf` carries — a document over that ceiling is refused for being over it, before
+   any digest is computed. What step 2 gates on is everything that inspects what the bytes
+   actually *contain*.) The
    expected digest for an index comes from the trust anchor (see [Trust model](#trust-model)); the
    expected digest for a policy index or a manifest comes from the *already-authenticated* parent
    document (the family index) that names it. A digest that does not match is rejected immediately,
@@ -100,10 +135,13 @@ project's acceptance path (`mi_accept_index`, `mi_accept_policy`, `mi_accept_man
    already-authenticated has vouched for its bytes.
 2. **Only once the digest matches** are the bytes handed to anything that looks at their content —
    and the byte policy (readable at all; no control bytes; ends in a newline) is the *first* thing
-   that content-reading step does, immediately followed by the header line, the grammar above, and
-   the document's own schema (which fields exist, their types, their cardinality). A control byte, a
-   missing trailing newline, or a malformed line is rejected here — but only ever for a document that
-   has already authenticated.
+   that content-reading step does. Then the **body**: the line grammar above, the key grammar, the
+   value rule and the key-count ceiling. Then the **header line** — after the body has been scanned,
+   deliberately, and before anything at all is handed back to a caller (see
+   [The three document types](#the-three-document-types-and-their-header-line)). Then the document's
+   own **schema**: which fields exist, their types, their cardinality. A control byte, a missing
+   trailing newline, or a malformed line is rejected here — but only ever for a document that has
+   already authenticated.
 3. **Is it fresh?** A version is present, an expiry is present and has not passed, and the version is
    not below the highest one this installation has already accepted for that document (anti-rollback
    — see [Trust model](#trust-model)).
@@ -145,14 +183,14 @@ Types specific to these authenticated documents:
 | `epoch` | a non-negative decimal integer, bounded to 18 digits | Unix seconds. Compared against the host clock — see the residual on clock dependence below. |
 | `ident` | `[a-z][a-z0-9-]{0,63}` | A product or role identifier. |
 | `sha256` | exactly 64 lowercase hex characters | A raw digest, compared as a literal string — an uppercase-but-otherwise-correct digest does not match. |
-| `digestref` | `<repository>@sha256:<64 hex>` | An image reference **pinned by content digest**: the value must carry `@sha256:` followed by exactly 64 lowercase hex characters, and a bare tag with no digest (`:latest`, `:v1`) is refused — there is no floating reference this format can express, by construction, not by a denylist of tags an attacker would simply avoid. The `<repository>` half is shape- and charset-bounded (see below) but is **not** fully parsed — telling a tag apart from a registry-host port (`host:5000/repo`) needs Docker's full reference grammar, which this project deliberately does not implement. So a tag **may** appear alongside the digest (`repo:latest@sha256:<64 hex>`) and is simply ignored: the digest is what selects the image, so the value is still pinned to one exact content hash either way. |
+| `digestref` | `<repository>@sha256:<64 hex>` | An image reference **pinned by content digest**: the value must carry `@sha256:` followed by exactly 64 lowercase hex characters, and a bare tag with no digest (`:latest`, `:v1`) is refused — there is no floating reference this format can express, by construction, not by a denylist of tags an attacker would simply avoid. The `<repository>` half is shape- and charset-bounded but is **not** fully parsed — telling a tag apart from a registry-host port (`host:5000/repo`) needs Docker's full reference grammar, which this project deliberately does not implement. The bound it does carry, in full: at most 255 bytes; lowercase letters, digits and `. _ - / :` only (an uppercase byte is refused); it may not begin or end with `/` or `:`; and it may not contain `//`, `::`, `:/` or `/:`, each of which brackets an empty component and is not a valid reference. So a tag **may** appear alongside the digest (`repo:latest@sha256:<64 hex>`) and is simply ignored: the digest is what selects the image, so the value is still pinned to one exact content hash either way. |
 | `productdigest` | `<product>:<64 hex>` | The family index's flat encoding of "this product's manifest must hash to this." Exactly one colon. |
-| `coreversion` | `MAJOR[.MINOR[.PATCH]]`, numeric components only | Deliberately not full semver — pre-release and build-metadata suffixes have ordering rules a shell comparator would get subtly wrong, and a minimum-core requirement has no need of them. |
-| `rolemount` | `<role>:/<absolute path>` | The flat encoding of what would be an object (`{role, mount}`) in a format that could nest. See [Residual: the format cannot nest](#residual-the-format-cannot-nest). No `..` component. |
+| `coreversion` | `MAJOR[.MINOR[.PATCH]]`, numeric components only, each at most 18 digits | Deliberately not full semver — pre-release and build-metadata suffixes carry ordering machinery a minimum-core requirement has no need of. |
+| `rolemount` | `<role>:/<absolute path>` | The flat encoding of what would be an object (`{role, mount}`) in a format that could nest. See [Residual: the format cannot nest](#residual-the-format-cannot-nest). No `..` component, and the path is at most 4096 bytes. **The path may contain no `:` of its own**: the first colon separates the role from the path, and a second one would make the split ambiguous in a format with no escaping — so a colon anywhere after it is refused, even though a colon is a legal byte in a pathname. |
 | `cpath` | a bounded absolute container path of safe segments | A single mount point, stricter than `path:<maxlen>`: it must begin with `/`, each segment is `[A-Za-z0-9._-]+`, there is no trailing slash and the bare root `/` is refused, no empty (`//`) or `.`/`..` segment, no whitespace or control byte, and the length is 2..512 bytes. The tight charset is what makes the type **closed**: a value cannot carry a second token or an options list (a space, comma, colon, or `=` is refused), so a field of this type names *where* a mount lives and nothing about *how* it is mounted. See [The volatile credential-home mount](VOLATILE-MOUNT-FORMAT.md). |
 
-Every type is checked in byte order (`LC_ALL=C`), so the same document validates identically
-whatever locale the reader runs under.
+Every type is checked byte by byte, with no collation or locale involved anywhere, so the same
+document validates identically wherever it is read.
 
 ### What a `sha256` digest covers
 
@@ -163,9 +201,9 @@ this document tells you what bytes go in unless it says so explicitly, here:
 **A digest is a plain SHA-256 over the entire raw file, byte for byte, exactly as it sits on disk.**
 That means the header line, every comment line, every blank line, and the mandatory trailing
 newline are all part of what gets hashed — nothing is stripped, trimmed, reordered, or normalized
-before hashing. Compute it the same way the reference tooling does: `sha256sum <file>` (or
-`shasum -a 256 <file>` where that's what's available) over the file exactly as it will be shipped,
-and take the lowercase hex digest.
+before hashing. Compute it the plainest way there is: `sha256sum <file>` (or `shasum -a 256 <file>`
+where that's what's available) over the file exactly as it will be shipped, and take the lowercase
+hex digest.
 
 **There is no canonicalization of any kind, and that is deliberate, not an oversight.** A publisher
 who reasonably strips comments, sorts keys, or normalizes the trailing newline before hashing —
@@ -189,6 +227,17 @@ something this index says, directly or transitively.
 | `expires` | `epoch` | one | Mandatory. An index with no expiry would let the highest version ever served replay forever against an installation that has been offline. |
 | `policy_digest` | `sha256` | one | The digest the family policy index must hash to. |
 | `manifest` | `productdigest` | many | One entry per product: `<product>:<64-hex digest>`. A product listed **twice** makes the index ambiguous about which digest vouches for it, and is rejected at load time, not merely at the moment someone looks that product up. |
+| `probe_image` | `digestref` | one | The pinned image the health probe runs. |
+| `copy_image` | `digestref` | one | The pinned image the volume copy runs — the helper `backup`, `restore` and `migrate-storage` hand a product's data to. |
+
+**The two helper images belong here, and are required here.** They are images this tool runs
+itself, and the copy helper in particular is handed every byte of a product's data with a
+writable mount — so the reference that selects it has to arrive through the same chain as
+everything else, named by the one document verified against the persisted anchor, rather than
+being read out of local configuration or resolved to whatever small utility image happens to be
+on the machine. `digestref` refuses a floating tag by construction. They are `one`, not `opt`:
+an index that does not name them does not load at all, so there is no verified index from which
+a helper reference can be missing at the moment one is needed.
 
 ## The family policy index (`mythical-policy 1`)
 
@@ -219,7 +268,7 @@ possible failure.
 | Key | Type | Cardinality | Meaning |
 |---|---|---|---|
 | `<product>.permitted_role` | `ident` | many | A volume role this product may declare in its manifest. |
-| `<product>.bindable_role` | `ident` | many | A subset of the above: a role this product's own settings UI may additionally point at an operator-chosen bind path, rather than only a named volume. |
+| `<product>.bindable_role` | `ident` | many | A subset of the above: a role the **operator** may additionally point at a host directory of their own, rather than leaving it on a named volume. The bind path is named in `mythical.conf`, which is host-only — the product's own settings UI never writes it and cannot ask for a bind. This key grants the operator that option; it grants the product nothing. |
 | `<product>.precious_role` | `ident` | many | A subset of `permitted_role`: a role whose volume holds data that **cannot be regenerated**. A data class, not a permission — it grants nothing and denies nothing. See [Precious roles](#precious-roles-precious_role) below. |
 | `<product>.permitted_secret` | `str:128` | many | A bootstrap secret name this product may request. |
 | `<product>.permitted_mount` | `ident` | many | A fixed mount this product may declare. |
@@ -312,11 +361,11 @@ expect are simply absent from the grammar below; their absence is the enforcemen
 | `product` | `ident` | one | The product this manifest is for. Checked against the product the installer asked for — a perfectly valid manifest for a sibling product is still the wrong answer. |
 | `launched` | `bool` | one | **Declared, never inferred.** Whether this product has a published image yet. Required: inferring "not launched" from, say, a registry 404 would turn a broken publication into a reassuring "not launched yet" notice instead of an error. |
 | `image` | `digestref` | one | The image to run, pinned by content digest. |
-| `volume` | `rolemount` | many | `<role>:<mount point>` — see the `rolemount` type above. |
-| `secret` | `str:128` | many | A bootstrap secret name this product needs injected. |
-| `mount` | `ident` | many | A fixed mount this product needs. |
+| `volume` | `rolemount` | many | `<role>:<mount point>` — see the `rolemount` type above. A role may be placed **at most once**: the same role at two mount points is two answers to a question that has one, and the launch refuses rather than letting record order decide which directory appears where. |
+| `secret` | `str:128` | many | A bootstrap secret name this product needs injected. Three things must hold when the launch is assembled, or it refuses: the policy index grants this product that name; the name is a key `mythical.conf`'s **core vocabulary defines** — a product selects from that vocabulary and cannot name an arbitrary key; and the key is actually **set** there — a declared secret with no value is a refusal, never an empty injection. |
+| `mount` | `ident` | many | A fixed mount this product needs. **The selectable vocabulary is closed to `transcripts` and `logs`** — the two core-fixed directory mounts. `conf` is not selectable, because `<product>.conf` is mounted for every product whether or not the manifest asks. Any other name is refused when the launch is assembled, even though the `ident` type accepts it and the policy index can be written to grant it. |
 | `port` | `int:1:65535` | many | A port this product's container listens on. |
-| `probe` | `str:256` | opt | An optional health-check path. |
+| `probe` | `str:256` | opt | An optional health-check path. **Declared and validated, but consumed by nothing in this release** — no verb reads it, so supplying it changes no behaviour today. It is listed because the schema accepts it and a manifest carrying it loads; it is not listed as something that does anything. |
 | `volatile_mount` | `cpath` | opt | Where this product's credential-bearing isolated-home mount lives, for a product that materializes a file-based credential per session. A bare mount point and nothing else: every hardening property of the mount is **fixed** and is not declared here, so a manifest names only the path and can never widen the mount. See [The volatile credential-home mount](VOLATILE-MOUNT-FORMAT.md). Optional — a product needing no such mount omits it. |
 | `min_core` | `coreversion` | one | The minimum `mythical-ctl` version this manifest requires. Required — an unstated minimum would silently mean "any core will do," which is never a safe default for a document this privileged. |
 | `runtime_uid` | `int:0:4294967295` | one | The uid this product's container runs as. Required, because migration **maps** ownership rather than preserving it, and this is the principal it maps to. Guessing it, or preserving uid/gid raw, is the dual-owner problem at directory scale: a preserved `0600` file owned by the operator is unreadable by a container still running as uid 900 — and a wrong value here does not fail loudly, it produces a migrated tree the product cannot read, discovered on the first start after the source has already been retired. |
@@ -352,8 +401,8 @@ The family index is the **only** root. Nothing else authenticates itself: a dige
 authentication on its own — verifying a document against a digest that merely arrived beside it
 proves only that whoever sent both computed one correctly. A digest is meaningful *only* when the
 expected value came from a document that was itself already authenticated. So the family index is
-verified against a locally recorded **anchor** (a digest, established the first time this
-installation successfully verified an index — see the residual on trust-on-first-use, below); the
+verified against a locally recorded **anchor** — a digest held in this installation's own state
+(see [the residual on the anchor](#residuals) below); the
 family policy index and every product's manifest are then verified against digests **the index
 itself names** (`policy_digest`, and one entry per product under `manifest`); nothing is ever
 accepted on its own say-so. Every document additionally carries a **version**, which can only move
@@ -364,7 +413,8 @@ version anyone ever legitimately served would remain replayable forever against 
 been offline. A version floor, once recorded, only moves down through an explicit, reasoned,
 recorded downgrade — never through the ordinary acceptance path — because an emergency rollback that
 could happen silently would not be an emergency rollback, it would be exactly the replay this model
-exists to prevent.
+exists to prevent. The ordinary path only ever raises the floor, and it refuses to lower it; no verb
+in this release performs a downgrade.
 
 Every digest in this chain — the anchor, `policy_digest`, each `manifest` entry — is computed the
 same way: a plain SHA-256 over a document's entire raw bytes, header line and trailing newline
@@ -375,22 +425,33 @@ digest computed over exact, unmodified bytes is only meaningful if it is checked
 have been touched by anything — a byte-policy pass, a parser, a canonicalizer — that might read,
 normalize, or reject them on the way.
 
-## `/detect`: the one place this project reads JSON, and does not parse it
+## `/detect`: JSON read without being decoded
 
 `/detect` is a live HTTP endpoint each running product exposes, and its response body is JSON — that
 is defined by the products themselves, not by this document, and it is not this project's format to
-change. `mythical-ctl` needs exactly three flat string fields out of that response — `product`,
-`version`, `ui_url` — and, per the dependency floor above, has no JSON parser and will not grow one.
-So it reads those three fields with a small bounded scanner that understands JSON's *shape* well
-enough to find top-level members and tell a plain string apart from everything else, and it
-**refuses** — rather than guesses at — anything it cannot read unambiguously:
+change.
 
-- **The whole response is capped at 32768 bytes (32 KiB)**, checked in the shell before a single byte
-  reaches the scanner, and a response over the cap is refused outright, naming the cap in the refusal.
-  Some awk implementations' string handling is superlinear in the length of the value being
-  accumulated, so an unbounded response could stall the installer on a misbehaving or hostile
-  product; bounding the input before it ever reaches the scanner keeps the cost bounded regardless of
-  which awk is on `PATH`. No real `/detect` response comes close to the cap.
+**No verb in this release reads `/detect`.** The reader described in this section exists in the
+source, but nothing in the command set calls it — it is not even in the shipped binary's dependency
+graph — so what a product puts in that response changes nothing about this release's behaviour. The
+section stays because these rules are the contract a product's response has to satisfy, and because
+they are why the reader is shaped the way it is — not because a command runs them today.
+
+The reader needs exactly three flat string fields out of that response — `product`, `version`,
+`ui_url` — and it does not hand the body to a JSON decoder to get them. That is a
+choice, not a missing capability: a decoding tokenizer makes a literal `"product"` and an escaped
+spelling of it indistinguishable, and this reader has to **refuse** the escaped spelling rather
+than match it. So it reads those three fields with a small bounded scanner that works on raw bytes
+and understands JSON's *shape* well enough to find top-level members and tell a plain string apart
+from everything else, and it **refuses** — rather than guesses at — anything it cannot read
+unambiguously:
+
+- **The whole response is capped at 32768 bytes (32 KiB)**, checked before a single byte reaches
+  the scanner, and a response over the cap is refused outright, naming both the cap and the size
+  that exceeded it. The scan itself is a single linear pass, so the cap is not bounding an
+  algorithm — it is there because the input is a live reply from a product's own container, which
+  makes its size something that product controls. No real `/detect` response comes close to the
+  cap.
 
 - A value containing any escape sequence (`\"`, `\\`, `\n`, `\uXXXX`, …) is refused, not decoded. A
   product that starts escaping characters in `product`, `version`, or `ui_url` will see its response
@@ -427,7 +488,7 @@ enough to find top-level members and tell a plain string apart from everything e
   if something deeper inside it is not valid JSON.
 
   **The repeated-key row splits in two because "refused" there means something narrower than for the
-  other rows: only a repeat of the field being queried is refused.** `mi_detect_field` checks whether
+  other rows: only a repeat of the field being queried is refused.** The reader checks whether
   *its own answer* is ambiguous, not whether the response contains a duplicate key anywhere. Querying
   `version` in `{"x":"a","x":"b","version":"1"}` succeeds and returns `1`; querying `x` in that same
   response is refused as ambiguous. A duplicate of some other top-level key is never inspected,
@@ -443,12 +504,14 @@ than "every way of spelling this key is recognized"; it is stated here because i
 where the honest answer ("this reader cannot tell") and the intuitive one ("that key was clearly
 meant as `product`") diverge, and the honest one is what ships.
 
-`version` is the field `mythical-ctl` prefers. `image_version` is a **deprecated alias**, read only
-when `version` is entirely absent (never when `version` is present but unreadable — an unreadable
-`version` must not be silently answered from a different field). A response carrying neither reports
-an explicit `unknown` marker. It never fabricates a value, and it never inherits one from a sibling
-field such as `components.ui`'s version — unmeasured is not measured-clean, the same principle this
-format applies to unattested products in the family index.
+`version` is the field this reader prefers. `image_version` is a **deprecated alias**, consulted
+in exactly two of the three ways `version` can come back: when `version` is **absent**, and when it
+is present and **empty**. It is never consulted when `version` is present but **unreadable** —
+something was reported and this reader failed to read it, and answering from a different field
+would hide that; that case reports the explicit `unknown` marker instead, as does a response in
+which neither field yields a usable value. The reader never fabricates a value, and never inherits
+one from a sibling field such as `components.ui`'s version — unmeasured is not measured-clean, the
+same principle this format applies to unattested products in the family index.
 
 ## Residuals
 
@@ -466,7 +529,19 @@ override for the "current time" this is checked against in normal operation — 
 make an expired document look current would defeat the exact replay protection expiry exists to
 provide.
 
-**Residual: the anchor is trust-on-first-use.** The first successful verification of a family index
-establishes the anchor that every later verification is checked against; nothing authenticates that
-very first fetch beyond TLS to a known origin. This is a stated limit of the model, not an
-oversight, and this document does not claim otherwise.
+**Residual: nothing in this release establishes the anchor.** Every verification of a family index
+is checked against a digest already recorded in this installation's own state, and an installation
+with no such record **refuses** to verify an index rather than adopting whatever it was handed. What
+this release does not have is a path that *derives* a first one from an index it verified. Three
+things touch the record, and none of them is that: `state repair` preserves an existing anchor
+across a ledger rebuild; `uninstall --family` clears it; and `restore`, which stages and activates
+a ledger captured by `backup`, transplants onto a machine with no installation whatever anchor the
+backed-up installation already held. This release also fetches nothing — the family index, the
+policy index and the manifests are read as local files, named on the command line or found at
+their default paths.
+
+So the question a trust-on-first-use model has to answer — what vouches for the very first index,
+before any anchor exists? — is not answered here, because nothing here asks it. That is a gap in
+what ships, stated rather than papered over. It changes nothing about this format or about a
+publisher's obligations: a document that will be verified against an anchor is produced exactly the
+same way as one that would establish it.
