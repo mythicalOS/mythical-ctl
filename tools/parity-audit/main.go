@@ -1148,6 +1148,17 @@ const notExecutedPrefix = "not-executed:"
 // TestFoo would put the run count far above the declaration count for every table-driven test in the
 // tree (1662 events against 1369 top-level starts, measured here). A subtest name is also not a
 // legal target token, so nothing can claim one; they are dropped.
+//
+// A START, NOT AN OUTCOME — AND THAT IS THE RIGHT READING, BUT SAY WHICH IT IS. `run` is emitted
+// when the test function is INVOKED, so a test that fails still counts (a failing test is still a
+// test the claim points at, and whether the suite passes is `check.sh go`'s question) and so does a
+// test that runs and then calls t.Skip. This tree has three skipping tests and one of them,
+// internal/conf's TestForeignOwnedRefused, IS a PORTED target: it needs root to build a
+// foreign-owned fixture. Its inventory line already carries that residual in writing and names a
+// second, unprivileged target beside it, which is the honest shape for such a claim — the
+// alternative, refusing a start that ends in a skip, would redden that claim on every machine that
+// is not root and could never be made green. What this witness rules out is a test that is never
+// INVOKED; it does not rule out one that is invoked and declines.
 func parseGoTestExec(name string, content []byte) (map[string]map[string]int, error) {
 	out := map[string]map[string]int{}
 	sc := bufio.NewScanner(bytes.NewReader(content))

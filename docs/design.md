@@ -149,7 +149,12 @@ result from the FILES rather than from the commands that made them.
 `check.sh parity` is the evidence that retiring the previous shell implementation lost nothing:
 `tests/parity-manifest.tsv` records all 1,201 tests of the suite that specified it, and the audit
 requires each one to be claimed exactly once by a `PORTED:` or argued `N/A:` inventory line in the
-Go tree, with every `PORTED` target resolving to a test that really runs.
+Go tree, with every `PORTED` target resolving to a test that really runs. "Really runs" rests on
+three witnesses that must agree within one build-tag lane: the test is declared in a file the
+toolchain compiles for that lane, the toolchain lists it, and an unfiltered `go test -json -count=1`
+of that lane recorded it starting. The third is why the stage executes the suite rather than only
+listing it — the first two establish that a test exists, and existence is not the claim being made.
+A lane that cannot be executed here has to say so, and can then confirm no target at all.
 
 ## Siblings
 

@@ -2210,15 +2210,158 @@ func TestGoFileListIsTheToolchainsOwnSelection(t *testing.T) {
 	}
 }
 
-// TestPairedWitnessFlagsAreRefusedUnpaired: the two lists are ONE witness pair per lane. An
+// TestPairedWitnessFlagsAreRefusedUnpaired: the three lists are ONE witness TRIPLE per lane. An
 // unpaired call would reintroduce the independence the pairing removes, and it would do so
 // silently — so it is refused up front rather than resolved against whatever happened to line up.
 func TestPairedWitnessFlagsAreRefusedUnpaired(t *testing.T) {
 	tinyLanes(t, 2, 1, 2)
 	root, goList := e2eTree(t)
-	err := run(root, "tests/parity-manifest.tsv", false, []string{goList}, nil, nil, 0)
-	if err == nil || !strings.Contains(err.Error(), "must be given in the same number") {
-		t.Fatalf("err = %v, want a refusal naming the unpaired witnesses", err)
+	for _, c := range []struct {
+		name         string
+		files, execs []string
+	}{
+		{"no --go-files", nil, []string{goExecPath(root)}},
+		// AND THE EXECUTION HALF IS PART OF THE TRIPLE, not an optional extra. If a missing
+		// --go-exec meant "do not check that anything runs", the strongest witness in this program
+		// would be switched off by leaving a flag out — which is the shape of every defect this
+		// program has ever had.
+		{"no --go-exec", []string{goFilesPath(root)}, nil},
+	} {
+		err := run(root, "tests/parity-manifest.tsv", false, []string{goList}, c.files, c.execs, 0)
+		if err == nil || !strings.Contains(err.Error(), "must be given in the same number") {
+			t.Fatalf("%s: err = %v, want a refusal naming the unpaired witnesses", c.name, err)
+		}
+	}
+}
+
+// THE EXECUTION WITNESS GETS THE LIVENESS CHECK THE OTHER TWO HALVES GET, and it is what stops an
+// empty, truncated or failed-to-build stream from silently turning the strongest evidence in this
+// program back into the weakest. The witness-producing command's exit status is deliberately not
+// propagated by tools/parity-audit.sh — a FAILING test still proves its target runs — so this is
+// the check that stands where that status would have.
+func TestAnExecutionWitnessThatRecordsNoRunIsRefused(t *testing.T) {
+	tinyLanes(t, 2, 1, 2)
+	root, goList := e2eTree(t)
+	// A stream that parses perfectly and testifies to nothing: the shape a build failure, or a run
+	// that died before the first test started, leaves behind.
+	if err := os.WriteFile(goExecPath(root), lines(
+		`{"Action":"start","Package":"mythicalos.ai/ctl/internal/x"}`,
+		`{"Action":"fail","Package":"mythicalos.ai/ctl/internal/x","Elapsed":0}`,
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := e2eRun(root, goList)
+	if err == nil || !strings.Contains(err.Error(), "records no test as having RUN") {
+		t.Fatalf("err = %v, want a refusal naming the empty execution witness", err)
+	}
+}
+
+// A LANE MAY DECLARE ITSELF NOT EXECUTED — AND MUST SAY WHY. The reason is not decoration: it is
+// quoted back inside the refusal any claim needing that lane receives, so it is the only place a
+// reader meets the exception. An opt-out with no argument is the quiet special case this whole
+// witness was added to forbid, so it is refused rather than accepted with an empty string.
+func TestALaneMayNotOptOutOfExecutionWithoutAnArgument(t *testing.T) {
+	tinyLanes(t, 2, 1, 2)
+	root, goList := e2eTree(t)
+	for _, v := range []string{notExecutedPrefix, notExecutedPrefix + "   "} {
+		err := run(root, "tests/parity-manifest.tsv", false,
+			[]string{goList}, []string{goFilesPath(root)}, []string{v}, 0)
+		if err == nil || !strings.Contains(err.Error(), "gives no reason") {
+			t.Fatalf("--go-exec %q: err = %v, want a refusal naming the missing argument", v, err)
+		}
+	}
+	// ...and with an argument it is accepted as a lane that can confirm nothing — which, since this
+	// fixture has only the one lane, means the audit refuses UP FRONT rather than reporting every
+	// PORTED target dangling, which would be loud about the wrong thing.
+	err := run(root, "tests/parity-manifest.tsv", false,
+		[]string{goList}, []string{goFilesPath(root)}, []string{notExecutedPrefix + "a fixture lane with no runner"}, 0)
+	if err == nil || !strings.Contains(err.Error(), "no lane was executed") {
+		t.Fatalf("err = %v, want the up-front refusal naming the unexecuted audit", err)
+	}
+}
+
+// THE EXECUTION WITNESS READER, and the two things it must get right.
+//
+// A SUBTEST IS NOT ITS PARENT. `t.Run` emits `"Test":"TestFoo/case"`; counting those toward TestFoo
+// would put the run count far above the declaration count for every table-driven test in the tree
+// (1662 events against 1369 top-level starts, measured on this repository) and the count check would
+// then refuse everything.
+//
+// AND A LINE THAT IS NOT AN EVENT IS A HARD ERROR. A reader that shrugged at unparseable lines would
+// report a half-empty witness for a stream it had not understood, and every PORTED target would go
+// dangling for a reason that has nothing to do with the port.
+func TestParseGoTestExecReadsStartsAndNotSubtestsOrProse(t *testing.T) {
+	const pkg = "mythicalos.ai/ctl/internal/x"
+	got, err := parseGoTestExec("witness", lines(
+		`{"Action":"start","Package":"`+pkg+`"}`,
+		`{"Action":"run","Package":"`+pkg+`","Test":"TestOne"}`,
+		`{"Action":"run","Package":"`+pkg+`","Test":"TestOne/case-a"}`,
+		`{"Action":"run","Package":"`+pkg+`","Test":"TestOne/case-b"}`,
+		`{"Action":"output","Package":"`+pkg+`","Test":"TestTwo","Output":"=== RUN   TestTwo\n"}`,
+		`{"Action":"pass","Package":"`+pkg+`","Test":"TestOne","Elapsed":0}`,
+		``,
+		`{"Action":"run","Package":"`+pkg+`","Test":"TestSame"}`,
+		`{"Action":"run","Package":"`+pkg+`","Test":"TestSame"}`,
+		// A START, NOT AN OUTCOME. A test that is invoked and then declines — t.Skip, or a failure —
+		// still STARTED, and that is what this witness is about. internal/conf's
+		// TestForeignOwnedRefused is a real PORTED target of exactly this shape (it needs root), and
+		// its inventory line carries the residual in writing and names an unprivileged target beside
+		// it. Refusing a start that ends in a skip would redden that claim on every machine that is
+		// not root, with no way to make it green.
+		`{"Action":"run","Package":"`+pkg+`","Test":"TestSkipping"}`,
+		`{"Action":"skip","Package":"`+pkg+`","Test":"TestSkipping","Elapsed":0}`,
+		`{"Action":"run","Package":"`+pkg+`","Test":"TestFailing"}`,
+		`{"Action":"fail","Package":"`+pkg+`","Test":"TestFailing","Elapsed":0}`,
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []string{"TestSkipping", "TestFailing"} {
+		if got[pkg][n] != 1 {
+			t.Fatalf("%s was INVOKED and its start was not counted — the witness is about invocation, not outcome: %v", n, got[pkg])
+		}
+	}
+	if got[pkg]["TestOne"] != 1 {
+		t.Fatalf("TestOne started once and its two subtests are not it: got %d", got[pkg]["TestOne"])
+	}
+	if got[pkg]["TestSame"] != 2 {
+		t.Fatalf("two starts of one name are two tests, not a repetition: got %d", got[pkg]["TestSame"])
+	}
+	// An `output` event is not a start. Only `run` says a test began.
+	if _, ok := got[pkg]["TestTwo"]; ok {
+		t.Fatalf("an output event was read as a start: %v", got[pkg])
+	}
+	if _, err := parseGoTestExec("witness", lines(
+		`{"Action":"run","Package":"`+pkg+`","Test":"TestOne"}`,
+		`ok  	`+pkg+`	0.1s`,
+	)); err == nil {
+		t.Fatal("a line that is not a go test -json event was skipped in silence")
+	}
+}
+
+// WHAT THE EXECUTION WITNESS CANNOT DO, PINNED SO NOBODY LATER BELIEVES OTHERWISE.
+//
+// `go test -json` is test2json, a parser of the test binary's STDOUT, and it still honours the
+// unmarked framework line format. MEASURED on go1.26.5 with a real probe: a package that prints
+// `=== RUN   TestClaimed` and `--- PASS: TestClaimed (0.00s)` produces a genuine
+// `{"Action":"run",...,"Test":"TestClaimed"}` event, indistinguishable from a real one. (Go prefixes
+// its OWN lines with \x16 under -test.v=test2json, but the marker is stripped before the JSON is
+// emitted, and a package can print that byte too.) So no stdout-derived evidence is proof against a
+// package that sets out to lie — what the third witness closes is the accident and the shortcut, not
+// forgery. This test states the limit in code so that a later reader who assumes the opposite is
+// contradicted by a green test rather than by nothing.
+func TestTheExecutionWitnessIsStdoutAndThereforeNotUnforgeable(t *testing.T) {
+	const pkg = "mythicalos.ai/ctl/internal/x"
+	// This is the JSON test2json emits for the forged lines above; the reader cannot tell it from
+	// the real thing, and it must not pretend it can.
+	got, err := parseGoTestExec("witness", lines(
+		`{"Action":"run","Package":"`+pkg+`","Test":"TestClaimed"}`,
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[pkg]["TestClaimed"] != 1 {
+		t.Fatalf("the reader is not reading run events as run events: %v", got)
 	}
 }
 

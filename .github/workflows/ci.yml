@@ -279,6 +279,13 @@ jobs:
       # nothing. It runs HERE, on every pull request, rather than once at the cutover: an audit
       # nobody invokes protects only the day it was run. It also keeps running after the
       # deletion, from the committed tests/parity-manifest.tsv.
+      #
+      # IT EXECUTES THE SUITE, and that is the step's cost rather than an accident. Listing a test
+      # proves it EXISTS; a TestMain can print a name during a listing run and filter that same
+      # test out of the real one. So the stage runs `go test -json -count=1` unfiltered and
+      # requires a run event for every PORTED target. It is a second full suite run in this job,
+      # deliberately: the `go` step above answers whether the suite passes, this one answers
+      # whether the tests the inventory claims are the tests that ran.
       - name: check.sh parity
         run: bash check.sh parity
 
