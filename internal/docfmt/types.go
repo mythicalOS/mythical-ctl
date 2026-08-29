@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"mythicalos.ai/ctl/internal/conf"
+	"mythicalos.ai/ctl/internal/volatile"
 )
 
 // TypeOK is the document type vocabulary: the doc-specific types here, everything else
@@ -31,6 +32,17 @@ func TypeOK(typ, v string) bool {
 		return IdentOK(p) && sha256OK(h)
 	case "coreversion":
 		return CoreVersionOK(v)
+	case "cpath":
+		// A bounded absolute CONTAINER path of safe segments — the value of a field that names a
+		// single mount point and nothing else. Stricter than `path:<n>`: safe-segment charset
+		// only, a 2..512-byte bound, no trailing slash and no bare root, so the field can carry
+		// no second token and no options sub-grammar.
+		//
+		// THE RULE IS CALLED, NOT COPIED. It lives in internal/volatile — the package that also
+		// owns the mount's fixed hardening — so the manifest DOOR and the LAUNCH SITE cannot
+		// drift into accepting different paths. A second copy here would be a validator that
+		// agrees today and diverges the first time either is touched.
+		return volatile.PathOK(v)
 	case "rolemount":
 		// <role>:<absolute path> — the flat encoding of what a nested format would object-ify.
 		role, path, ok := strings.Cut(v, ":")

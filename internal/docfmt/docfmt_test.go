@@ -265,6 +265,49 @@ func TestDocTypes(t *testing.T) {
 	}
 }
 
+// TestCpathType: `cpath` is the manifest's bounded-absolute-container-path type, and it is
+// STRICTER than `path:<n>` — safe-segment charset only, a 2..512-byte bound, no trailing slash,
+// no bare root. It is what keeps a field naming a mount point a bare mount point, with no room
+// for a second token or an options sub-grammar.
+//
+// The rule is not restated here: TypeOK CALLS the mount wire's own validator, so the manifest
+// DOOR and the LAUNCH SITE cannot drift into accepting different paths. This test checks the type
+// through both surfaces that matter — the type function, and a real schema load, because "checked
+// at the manifest door" is the property, not "a function exists".
+func TestCpathType(t *testing.T) {
+	good := []string{"/run/mythical/credential-homes", "/a", "/x.y_z-1/w"}
+	// relative, bare root, trailing slash, traversal, a colon or comma second token, whitespace.
+	bad := []string{"relative", "/", "/a/", "/a/../b", "/a:rw", "/a,nodev=false", "/a b", ""}
+
+	for _, v := range good {
+		if !TypeOK("cpath", v) {
+			t.Errorf("TypeOK(\"cpath\", %q) = false — a valid bounded container path was rejected", v)
+		}
+	}
+	for _, v := range bad {
+		if TypeOK("cpath", v) {
+			t.Errorf("TypeOK(\"cpath\", %q) = true — an invalid or mount-widening cpath was accepted", v)
+		}
+	}
+
+	// THROUGH THE DOOR. A schema with a cpath key must accept and refuse the same values; a type
+	// that is right in isolation but unreachable from a schema protects nothing.
+	sch := Schema{Type: "manifest", Fixed: map[string]KeySpec{
+		"version": Typed(One, "docver"),
+		"p":       Typed(Opt, "cpath"),
+	}}
+	for _, v := range good {
+		if _, err := Parse(body("version=1", "p="+v), "t", sch); err != nil {
+			t.Errorf("a document carrying the valid cpath %q was refused: %v", v, err)
+		}
+	}
+	for _, v := range bad {
+		if _, err := Parse(body("version=1", "p="+v), "t", sch); err == nil {
+			t.Errorf("a document carrying the invalid cpath %q was accepted at the manifest door", v)
+		}
+	}
+}
+
 func TestAccessors(t *testing.T) {
 	d, err := Parse(body("version=3", "name=b", "role=a", "role=c"), "t", testSchema())
 	if err != nil {
