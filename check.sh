@@ -75,10 +75,13 @@ SELF="./$(basename -- "${BASH_SOURCE[0]}")"
 # closes only the variable, and GOENV=off is what closes the file. Delete either and the bypass
 # is back; `bash check.sh selfcheck` is what says so, on both channels separately.
 #
-# GOWORK=off is the third of the same kind: a `go.work` in ANY ancestor directory is ambient file
-# state that the go command picks up without being asked, and its `replace` directives decide
-# which copy of a dependency is compiled into these graders. This is a single-module repository —
-# there is no workspace here to honour.
+# GOWORK=off is the third of the same kind, and it is not decorative: a `go.work` in ANY ancestor
+# directory — or named by GOWORK — is ambient file state the go command reads without being asked.
+# Measured: with a workspace active that does not `use` this directory, `go list ./...` refuses
+# outright, so every stage below would report a failure that says nothing about this tree; and its
+# `replace` directives decide which copy of a dependency is compiled into these graders. This is a
+# single-module repository — there is no workspace here to honour, and selfcheck probes this
+# channel too.
 #
 # NOT PINNED, deliberately. GOOS/GOARCH: an inherited pair cannot make a grader report success
 # falsely — `go run` refuses to run a cross-compiled binary and `go test`/`go list` fail loudly —
@@ -281,6 +284,8 @@ selfcheck_dump() {
 #             probe stops testing its own premise
 #   neutered  the command must exit 0 — this is the positive control on the payload, not a check
 #             of the tree; <needle> is ignored
+#   breaks    the command must exit NON-ZERO — the other positive control, for a payload whose
+#             effect is to make an unguarded go command refuse rather than grade nothing
 selfcheck_probe() {
   local label="$1" want="$2" needle="$3"
   shift 3
@@ -321,6 +326,15 @@ selfcheck_probe() {
         selfcheck_fail "$label: exited $rc. The payload is supposed to NEUTER an unguarded
           'go run' and it did not, so every probe in this channel would pass while proving
           nothing. Fix the payload before trusting this stage."
+        selfcheck_dump "$out"
+        return 0
+      fi
+      ;;
+    breaks)
+      if [ "$rc" -eq 0 ]; then
+        selfcheck_fail "$label: exited 0. The payload is supposed to make an unguarded go command
+          REFUSE and it did not, so every probe in this channel would pass while proving nothing.
+          Fix the payload before trusting this stage."
         selfcheck_dump "$out"
         return 0
       fi
@@ -398,6 +412,26 @@ check_selfcheck() {
   selfcheck_probe 'parity grader runs (go env file)' ok 'parity-audit: every one of the' \
     env -u GOFLAGS GOENV="$SELFCHECK_TMPDIR/goenv" bash "$SELF" parity
   selfcheck_write_manifest 'go env file' env -u GOFLAGS GOENV="$SELFCHECK_TMPDIR/goenv"
+
+  # CHANNEL 3 — an inherited go WORKSPACE. `go.work` is ambient file state of the same kind as the
+  # go env file: the go command reads it without being asked, from GOWORK or from any ancestor
+  # directory. Its effect here is the opposite sign and matters just as much — measured, a
+  # workspace that does not `use` this directory makes `go list ./...` refuse outright, so every
+  # stage would report a failure that says nothing whatever about this tree, which is the same
+  # false answer the witness commands in tools/parity-audit.sh were guarded against in the first
+  # place. Its `replace` directives also choose which copy of a dependency is compiled into a
+  # grader. This is a single-module repository; there is no workspace here to honour.
+  mkdir -p "$SELFCHECK_TMPDIR/other"
+  printf 'module example.test/other\n\ngo 1.24.0\n' > "$SELFCHECK_TMPDIR/other/go.mod"
+  printf 'package other\n' > "$SELFCHECK_TMPDIR/other/x.go"
+  printf 'go 1.24.0\n\nuse ./other\n' > "$SELFCHECK_TMPDIR/go.work"
+  selfcheck_probe 'the payload breaks an unguarded go command (go.work file)' breaks '' \
+    env GOWORK="$SELFCHECK_TMPDIR/go.work" go list ./...
+  selfcheck_probe 'boundary grader runs (go.work file)' ok 'boundary-gate: clean' \
+    env GOWORK="$SELFCHECK_TMPDIR/go.work" bash "$SELF" boundary
+  selfcheck_probe 'parity grader runs (go.work file)' ok 'parity-audit: every one of the' \
+    env GOWORK="$SELFCHECK_TMPDIR/go.work" bash "$SELF" parity
+  selfcheck_write_manifest 'go.work file' env GOWORK="$SELFCHECK_TMPDIR/go.work"
 
   [ "$SELFCHECK_RC" -eq 0 ] || die "a grader above can be switched off from the environment, so
    every stage that depends on it can report OK while the property it names is false."
