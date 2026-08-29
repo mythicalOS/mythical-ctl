@@ -27,6 +27,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"mythicalos.ai/ctl/internal/volatile"
 )
 
 // LabelNS is the label namespace every object this installer creates is marked with. Also
@@ -101,10 +103,16 @@ func volumeNameOK(n string) error {
 // not. Constructible only below; there is no options field and no propagation field on the
 // type, so `bind-propagation=rshared` and friends are inexpressible.
 type Mount struct {
-	typ      string // "bind" | "volume"
-	source   string // host path (bind) or volume name (volume)
+	typ      string // "bind" | "volume" | "tmpfs"
+	source   string // host path (bind) or volume name (volume); empty for tmpfs — RAM has no source
 	target   string
 	readOnly bool
+	// opts is the tmpfs kernel option string, and is set ONLY by NewTmpfsMount, ONLY to the
+	// frozen set. It exists as a field rather than being fetched at serialization time so that
+	// what the constructor validated is literally what the serializer emits — and so that
+	// NewContainerSpec can re-check it, exactly as it re-checks the `ok` bit below, against a
+	// Mount hand-assembled INSIDE this package where the constructors can be bypassed.
+	opts string
 	// ok is set ONLY by the constructors below. A zero-value Mount is constructible anywhere
 	// (`var m engine.Mount`), and without this bit NewContainerSpec/NewHelperSpec could not
 	// tell it from a validated one — the serializer would then emit an empty mount, which is a
@@ -143,6 +151,31 @@ func NewVolumeMount(volumeName, target string) (Mount, error) {
 		return Mount{}, err
 	}
 	return Mount{typ: "volume", source: volumeName, target: target, readOnly: false, ok: true}, nil
+}
+
+// NewTmpfsMount validates the credential-home mount: a NON-PERSISTENT, RAM-backed tmpfs at a
+// bounded absolute container path, carrying the frozen hardening.
+//
+// A TMPFS, NOT A TYPED MOUNT, AND THE DIFFERENCE IS THE WHOLE POINT. A tmpfs is the one mount
+// form that carries the kernel security flags; a Mounts entry has nowhere to put nodev, nosuid or
+// noexec, so the same mount expressed that way would exist with its hardening SILENTLY ABSENT —
+// no error, no missing mount, just a credential home that permits device nodes, setuid binaries
+// and execution. It is also why the mount is not a named volume: a tmpfs is disposable by
+// construction, so removing the container discards it and its contents, and no backup or removal
+// sweep can enumerate it because there is no volume to find.
+//
+// There is NO options parameter. The hardening is not the caller's to choose — the target is the
+// only thing that varies, which is exactly the closure the manifest field's bare-path grammar
+// exists to guarantee, carried through to the launch site.
+func NewTmpfsMount(target string) (Mount, error) {
+	// The wire's own grammar, not the looser pathOK above: the credential-home mount point is a
+	// bounded safe-segment path, and this is the launch-site half of the same rule the manifest
+	// door applies. Called, never restated, so the two cannot drift into accepting different
+	// paths.
+	if !volatile.PathOK(target) {
+		return Mount{}, fmt.Errorf("engine: tmpfs mount point %q is not a bounded absolute container path", target)
+	}
+	return Mount{typ: "tmpfs", target: target, opts: volatile.TmpfsSecOpts(), ok: true}, nil
 }
 
 // The closed helper-mount vocabulary (D49/D54/D59). The reference adapter's helper arm takes
@@ -356,6 +389,13 @@ func NewContainerSpec(name, imageRef string, opts SpecOpts) (ContainerSpec, erro
 		if mt.helper {
 			return ContainerSpec{}, errors.New("engine: a helper-vocabulary mount is not a product mount (product volume mounts are read-write and target where the manifest says)")
 		}
+		// THE HARDENING IS RE-CHECKED, for the same reason the `ok` bit is: a Mount assembled
+		// inside this package bypasses the constructors, and a tmpfs whose options were anything
+		// but the frozen set would be a weaker mount reaching the daemon under the credential
+		// home's name. Fail-closed — refused, never downgraded.
+		if mt.typ == "tmpfs" && !volatile.SecOptsOK(mt.opts) {
+			return ContainerSpec{}, fmt.Errorf("engine: a tmpfs mount carrying %q is not the frozen credential-home hardening — use NewTmpfsMount", mt.opts)
+		}
 	}
 	for _, p := range opts.Ports {
 		if !p.ok {
@@ -552,6 +592,11 @@ type ContainerInfo struct {
 	Networks map[string]NetEndpoint // keyed by network NAME (the inspect map key)
 	Mounts   []MountRecord
 	Ports    []PortBinding
+	// Tmpfs is HostConfig.Tmpfs — the tmpfs mount points and their kernel option strings, keyed
+	// by mount point. Mounts above does NOT carry those flags, so this is the only surface on
+	// which a mount's hardening is verifiable at all: without it "the mount is present" and "the
+	// mount is hardened" are indistinguishable.
+	Tmpfs map[string]string
 }
 
 // VolumeInfo is the typed volume-inspect subset.

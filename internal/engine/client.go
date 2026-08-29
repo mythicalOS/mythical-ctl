@@ -210,6 +210,11 @@ type rawContainerInspect struct {
 		Destination string `json:"Destination"`
 		RW          bool   `json:"RW"`
 	} `json:"Mounts"`
+	// HostConfig.Tmpfs is where the tmpfs mounts and their kernel option strings live. Mounts
+	// above does not carry those flags, so this is the field a hardening assertion must read.
+	HostConfig struct {
+		Tmpfs map[string]string `json:"Tmpfs"`
+	} `json:"HostConfig"`
 }
 
 // ContainerInspect reads one container. errors.Is(err, ErrAbsent) is "the object is gone";
@@ -247,6 +252,12 @@ func (c *Client) ContainerInspect(ctx context.Context, id string) (*ContainerInf
 		info.Mounts = append(info.Mounts, MountRecord{
 			Type: m.Type, Name: m.Name, Source: m.Source, Destination: m.Destination, RW: m.RW,
 		})
+	}
+	if len(raw.HostConfig.Tmpfs) > 0 {
+		info.Tmpfs = map[string]string{}
+		for target, opts := range raw.HostConfig.Tmpfs {
+			info.Tmpfs[target] = opts
+		}
 	}
 	for port, binds := range raw.NetworkSettings.Ports {
 		for _, b := range binds {
@@ -604,19 +615,35 @@ func containerCreateBody(spec ContainerSpec, networkName string) map[string]any 
 		})
 	}
 	mounts := make([]map[string]any, 0, len(spec.mounts))
+	// A TMPFS IS NOT A Mounts ENTRY. It is its own HostConfig field, keyed by mount point, whose
+	// value is the kernel option string — the only place the mount's nodev/nosuid/noexec
+	// hardening can be expressed at all. Serializing it into Mounts instead would produce a
+	// mount that exists with its hardening silently absent, so the two are split HERE, at the one
+	// place that knows the wire, rather than at every call site.
+	tmpfs := map[string]string{}
 	for _, mt := range spec.mounts {
+		if mt.typ == "tmpfs" {
+			tmpfs[mt.target] = mt.opts
+			continue
+		}
 		mounts = append(mounts, map[string]any{
 			"Type": mt.typ, "Source": mt.source, "Target": mt.target, "ReadOnly": mt.readOnly,
 		})
 	}
+	hostConfig := map[string]any{
+		"Mounts":       mounts,
+		"PortBindings": bindings,
+	}
+	// Emitted ONLY when there is one: an empty map is a field the daemon need not be sent, and
+	// its absence is how "this product declares no credential-home mount" reads on the wire.
+	if len(tmpfs) > 0 {
+		hostConfig["Tmpfs"] = tmpfs
+	}
 	body := map[string]any{
-		"Image":  spec.image,
-		"Labels": spec.labels,
-		"Env":    spec.env,
-		"HostConfig": map[string]any{
-			"Mounts":       mounts,
-			"PortBindings": bindings,
-		},
+		"Image":      spec.image,
+		"Labels":     spec.labels,
+		"Env":        spec.env,
+		"HostConfig": hostConfig,
 		"NetworkingConfig": map[string]any{
 			"EndpointsConfig": map[string]any{
 				networkName: map[string]any{"Aliases": spec.attach.aliases},

@@ -99,6 +99,7 @@ type fakeContainer struct {
 	env       []string
 	endpoints []*fakeEndpoint
 	mounts    []mountRec
+	tmpfs     map[string]string // mount point -> kernel option string (HostConfig.Tmpfs)
 	ports     []portRec
 	netmode   string // "none" for private-mode helpers, else ""
 	cmd       []string
@@ -636,6 +637,9 @@ type createBody struct {
 			HostIP   string `json:"HostIp"`
 			HostPort string `json:"HostPort"`
 		} `json:"PortBindings"`
+		// The tmpfs mounts, keyed by mount point, valued by the kernel option string. This is
+		// where a mount's nodev/nosuid/noexec hardening lives — Mounts above cannot carry it.
+		Tmpfs map[string]string `json:"Tmpfs"`
 	} `json:"HostConfig"`
 	NetworkingConfig struct {
 		EndpointsConfig map[string]struct {
@@ -740,6 +744,19 @@ func (f *Fake) createContainer(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// Tmpfs mounts. A real daemon refuses a tmpfs destination that is not an absolute path
+	// ("invalid volume specification"), so this fake refuses it too — a fake that is MORE
+	// permissive than the daemon it stands in for turns a launch bug into a green test.
+	for target, opts := range body.HostConfig.Tmpfs {
+		if !strings.HasPrefix(target, "/") {
+			fail(w, 400, "invalid volume specification: %q: destination must be an absolute path", target)
+			return
+		}
+		if c.tmpfs == nil {
+			c.tmpfs = map[string]string{}
+		}
+		c.tmpfs[target] = opts
+	}
 	for port, binds := range body.HostConfig.PortBindings {
 		for _, b := range binds {
 			hip := b.HostIP
@@ -838,6 +855,11 @@ func (f *Fake) inspectContainer(w http.ResponseWriter, seg string) {
 		},
 		"NetworkSettings": map[string]any{"Networks": networks, "Ports": ports},
 		"Mounts":          mounts,
+		// Reported under HostConfig, where the daemon reports it — the ONE surface on which a
+		// tmpfs mount's hardening is visible at all. Mounts above carries no option string, so a
+		// fake that reported the mount only there would make "present" and "hardened"
+		// indistinguishable, which is the exact confusion the volatile mount cannot afford.
+		"HostConfig": map[string]any{"Tmpfs": c.tmpfs},
 	})
 }
 
