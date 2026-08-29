@@ -203,8 +203,11 @@ func TestVolatileMountProductionRootGuardAnswersBeforeTheOverlapGuard(t *testing
 	if err == nil {
 		t.Fatal("a credential-home root containing the core-fixed transcripts target was accepted")
 	}
-	if !strings.Contains(err.Error(), "must be rooted at "+volatile.Root()) &&
-		!strings.Contains(err.Error(), "overlaps the volatile credential-home mount") {
-		t.Fatalf("refused, but by neither of the two guards that should have caught it: %v", err)
+	// THE PRODUCTION-ROOT MESSAGE, NOT MERELY A REFUSAL. `/home/mythical` trips BOTH guards — it is
+	// not the canonical root, and it is an ancestor of the core-fixed transcripts and logs targets —
+	// so accepting either message would pin no ordering at all and this test would pass under the
+	// opposite order, which is the arrangement it exists to exclude.
+	if !strings.Contains(err.Error(), "must be rooted at "+volatile.Root()) {
+		t.Fatalf("refused, but not by the production-root guard, which is the one that must answer first here: %v", err)
 	}
 }
