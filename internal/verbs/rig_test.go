@@ -51,6 +51,12 @@ type prodSpec struct {
 	image      string
 	extraRoles []string
 	precious   []string
+	// volatileMount, when set, is the manifest's `volatile_mount=` value; stateTarget, when set,
+	// overrides where the state role is placed inside the container. Together they let a test put
+	// a durable mount at, under or over the credential-home root — the reachable form of the
+	// overlap the launch assembly must refuse.
+	volatileMount string
+	stateTarget   string
 }
 
 type prodOpt func(*prodSpec)
@@ -58,6 +64,12 @@ type prodOpt func(*prodSpec)
 func notLaunched() prodOpt           { return func(p *prodSpec) { p.launched = false } }
 func docVersion(v string) prodOpt    { return func(p *prodSpec) { p.version = v } }
 func declaredAs(name string) prodOpt { return func(p *prodSpec) { p.declared = name } }
+func withVolatileMount(path string) prodOpt {
+	return func(p *prodSpec) { p.volatileMount = path }
+}
+func withStateTarget(path string) prodOpt {
+	return func(p *prodSpec) { p.stateTarget = path }
+}
 func extraRole(role string) prodOpt {
 	return func(p *prodSpec) { p.extraRoles = append(p.extraRoles, role) }
 }
@@ -211,7 +223,14 @@ func (r *rig) writeDocs() {
 		m.WriteString("image=" + p.image + "\n")
 		m.WriteString("min_core=0.1.0\n")
 		m.WriteString("runtime_uid=900\n")
-		m.WriteString("volume=state:/data\n")
+		stateTarget := "/data"
+		if p.stateTarget != "" {
+			stateTarget = p.stateTarget
+		}
+		m.WriteString("volume=state:" + stateTarget + "\n")
+		if p.volatileMount != "" {
+			m.WriteString("volatile_mount=" + p.volatileMount + "\n")
+		}
 		m.WriteString("volume=secrets:/secrets\n")
 		for _, role := range p.extraRoles {
 			m.WriteString("volume=" + role + ":/" + role + "\n")

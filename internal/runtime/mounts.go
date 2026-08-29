@@ -673,8 +673,16 @@ func (r *Runtime) mountsFor(m *manifest.Manifest, p *policy.Policy) ([]rawMount,
 	return mounts, bound, nil
 }
 
-// MountsFor is the exported §4.1a producer: the complete validated bind set for a launch of
-// this manifest — a LOCK-BOUND METHOD. The home comes from the Runtime's token (never a
+// MountsFor is the exported §4.1a producer: the validated BIND-AND-VOLUME set for a launch of
+// this manifest — a LOCK-BOUND METHOD.
+//
+// IT DELIBERATELY EXCLUDES THE CREDENTIAL-HOME TMPFS, and the exclusion is not an oversight. That
+// mount's isolation rule is about the COMPLETE target set, which does not exist until the launch
+// assembly has also placed every unbound role on its named volume — so a credential home added
+// here would be one whose overlap check ran against a partial view. buildSpec is where the whole
+// set exists, and that is where the mount is resolved. This method is therefore not "everything
+// the launch mounts"; it is the §4.1a bind rules, and a caller wanting the launch's real mount
+// set wants buildSpec's, through LaunchProduct or PrelaunchCheck. The home comes from the Runtime's token (never a
 // caller string, so home B cannot be mounted under home A's lock); the product comes
 // EXCLUSIVELY from m.Product() (a separate parameter could derive another product's names,
 // policy queries and config keys from this manifest — the mismatch is inexpressible); the
