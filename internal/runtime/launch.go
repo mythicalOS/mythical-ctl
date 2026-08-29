@@ -256,6 +256,19 @@ func (r *Runtime) buildSpec(m *manifest.Manifest, p *policy.Policy, cfg LaunchCo
 		}
 		raw = append(raw, rawMount{volume: true, source: volName, target: target})
 	}
+	// THE CREDENTIAL-HOME MOUNT IS RESOLVED HERE, and here is the only place it can be: `raw` now
+	// holds EVERY mount target this launch will have — core-fixed, operator binds and named
+	// volumes alike — and the isolation rule is about the whole set. Resolving it earlier would
+	// compare against a partial view and let the very mounts added afterwards overlap the root.
+	//
+	// It runs inside buildSpec, which LaunchProduct and PrelaunchCheck share, so the lifecycle
+	// verbs refuse an overlapping launch BEFORE they tear a working container down — the refusal
+	// cannot drift between the two paths, because there is one assembler.
+	if vm, declared, verr := volatileMountFor(m, raw); verr != nil {
+		return "", engine.ContainerSpec{}, verr
+	} else if declared {
+		raw = append(raw, vm)
+	}
 	mounts, err := buildMounts(raw)
 	if err != nil {
 		return "", engine.ContainerSpec{}, err

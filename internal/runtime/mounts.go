@@ -23,6 +23,7 @@ import (
 	"mythicalos.ai/ctl/internal/engine"
 	"mythicalos.ai/ctl/internal/manifest"
 	"mythicalos.ai/ctl/internal/policy"
+	"mythicalos.ai/ctl/internal/volatile"
 )
 
 // Canon canonicalizes an absolute path the way the reference does — resolve every symlink in
@@ -490,9 +491,56 @@ func ConfSpecFor(product string, m *manifest.Manifest, p *policy.Policy) (conf.S
 // because the engine type's fields are sealed (which is the point of it).
 type rawMount struct {
 	volume   bool // named volume, not bind
+	tmpfs    bool // the credential-home tmpfs: no source, hardening fixed by the constructor
 	source   string
 	target   string
 	readOnly bool
+}
+
+// volatileMountFor resolves the manifest's credential-home mount for a PRODUCTION bring-up, and
+// checks it against every other mount target in the launch.
+//
+// `all` must be the COMPLETE mount set — core-fixed, operator binds AND named volumes — because
+// the property is about the whole launch, not about any one mount. That set exists in exactly one
+// place, after the launch assembly has finished collecting it, which is why this takes it as an
+// argument rather than re-deriving a partial view of it.
+//
+// Two guards, in this order:
+//
+//   - THE PRODUCTION ROOT. On this path the declared root must be the canonical one; production
+//     may not point credential homes at a state directory, a bind, a named volume or the writable
+//     layer. A test rig may inject a private root at the lower layers; a real bring-up may not.
+//   - THE ISOLATION RULE. NO other mount may sit at, under, or over the credential-home root. A
+//     named volume or a bind whose target overlapped it would shadow part of the tmpfs tree with
+//     DURABLE storage — persistent across teardown and captured by backup — which is exactly the
+//     non-persistence and backup exclusion this mount exists to guarantee. The manifest is
+//     authenticated, but the target is still the manifest's to choose, so this is enforced rather
+//     than trusted.
+//
+// A refusal yields NOTHING — no partial mount set, no half-applied launch. The caller has created
+// nothing at this point by construction: this runs during assembly, before any request is issued.
+func volatileMountFor(m *manifest.Manifest, all []rawMount) (rawMount, bool, error) {
+	target, declared := m.VolatileMount()
+	if !declared {
+		return rawMount{}, false, nil // absence is not a mount
+	}
+	if err := volatile.AssertProductionRoot(target); err != nil {
+		return rawMount{}, false, err
+	}
+	for _, mt := range all {
+		if volatile.PathDisjoint(target, mt.target) {
+			continue
+		}
+		kind := "bind"
+		if mt.volume {
+			kind = "named volume"
+		}
+		return rawMount{}, false, fmt.Errorf(
+			"runtime: this product mounts a %s at %q, which overlaps the volatile credential-home mount %q. "+
+				"A durable mount at, under, or over that root would persist past teardown and be captured by "+
+				"backup, defeating the mount's whole purpose — refusing", kind, mt.target, target)
+	}
+	return rawMount{tmpfs: true, target: target}, true, nil
 }
 
 // mountsFor assembles and VALIDATES the launch's bind set: the core-fixed mounts plus every
@@ -647,9 +695,14 @@ func buildMounts(raw []rawMount) ([]engine.Mount, error) {
 	for _, mt := range raw {
 		var em engine.Mount
 		var err error
-		if mt.volume {
+		switch {
+		case mt.tmpfs:
+			// No source and no writability: a tmpfs is RAM-backed, and its hardening is fixed by
+			// the constructor rather than chosen here.
+			em, err = engine.NewTmpfsMount(mt.target)
+		case mt.volume:
 			em, err = engine.NewVolumeMount(mt.source, mt.target)
-		} else {
+		default:
 			em, err = engine.NewBindMount(mt.source, mt.target, mt.readOnly)
 		}
 		if err != nil {
