@@ -276,6 +276,55 @@ func TestCoreOK(t *testing.T) {
 	}
 }
 
+// TestCoreVersionBoundaryIsThisRelease pins the compat gate at exactly the boundary THIS core
+// release sets.
+//
+// This is the first core to honour the closed credential-home mount runtime, so it presents
+// 0.2.0: a product needing that runtime declares min_core=0.2.0, and the gate must now ACCEPT
+// exactly that while still refusing anything newer. Before the bump a min_core=0.2.0 manifest was
+// REFUSED — a manifest asking for semantics this CLI did not have. That is the whole reason the
+// number moves, and it is why the generic "99.0.0 is refused" case in TestCoreOK cannot stand in
+// for this one: 99.0.0 was already refused by the predecessor core, so it shows nothing about
+// WHERE the discriminator sits. Only a value one step past the current core proves it moved.
+//
+// THE GO SHAPE DIFFERS FROM THE REFERENCE HERE, AND THE DIFFERENCE IS THE POINT. The reference
+// carries the number TWICE — an entrypoint VERSION and a core constant — and needs a test to pin
+// them equal, because two copies can drift. There is one variable here, read by CoreOK's only
+// caller, so there is no second constant to drift and the equality is structural rather than
+// asserted. What still needs asserting is the VALUE, which is what the premise below does.
+func TestCoreVersionBoundaryIsThisRelease(t *testing.T) {
+	// The premise. A later core bump must fail LOUDLY here rather than silently weakening the two
+	// checks below into a tautology about whatever number happens to be current.
+	core, _, _ := strings.Cut(version.Version, "-")
+	if core != "0.2.0" {
+		t.Fatalf("premise: this binary's version %q has the numeric core %q, expected 0.2.0 — "+
+			"revisit this boundary test rather than deleting it", version.Version, core)
+	}
+
+	// A manifest requiring exactly this core is accepted. It was refused before the bump.
+	atBoundary, err := ParseVerified(man(map[string]string{"min_core": "0.2.0"}), "t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := CoreOK(atBoundary, version.Version); err != nil {
+		t.Fatalf("a min_core equal to this core (0.2.0) was refused: %v", err)
+	}
+
+	// One PATCH newer is still refused, and the diagnostic names the version the product needs —
+	// an operator who is told only "too old" has nothing to act on.
+	newer, err := ParseVerified(man(map[string]string{"min_core": "0.2.1"}), "t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = CoreOK(newer, version.Version)
+	if err == nil {
+		t.Fatal("a min_core newer than this core (0.2.1) was accepted")
+	}
+	if !strings.Contains(err.Error(), "0.2.1") {
+		t.Fatalf("the refusal does not name the required version: %v", err)
+	}
+}
+
 func TestVersionComparator(t *testing.T) {
 	cases := []struct {
 		a, b string

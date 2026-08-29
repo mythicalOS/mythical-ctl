@@ -174,7 +174,7 @@ func Check(m *Manifest, p *policy.Policy) error {
 // CoreOK: does the RUNNING core satisfy the manifest's declared minimum? binaryVersion is the
 // binary's own version (internal/version.Version at call sites — a min_core check against a
 // stale constant is worse than none). Its comparator: any `-suffix` is STRIPPED before the
-// numeric core comparison (the dev default `0.1.0-dev` and release-candidate stamps compare by
+// numeric core comparison (the dev default `<x.y.z>-dev` and release-candidate stamps compare by
 // their numeric core), components compared as bounded decimal strings — never a raw integer
 // parse that a long component could overflow — with missing components as 0. A min_core value
 // that is not a valid coreversion (a stray 4th component included) refuses rather than
