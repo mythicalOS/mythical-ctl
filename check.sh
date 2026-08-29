@@ -12,6 +12,10 @@
 #                            # runs. It is the evidence that deleting the bash tree loses
 #                            # nothing, so it runs on every change rather than once - and it
 #                            # keeps running AFTER that deletion, from the committed manifest.
+#                            # It EXECUTES the suite (unfiltered, -count=1) rather than only
+#                            # listing it, because listing proves existence and the claim is
+#                            # about execution - see the third-witness note in
+#                            # tools/parity-audit.sh. That is what the stage costs.
 #   bash check.sh release    # the RELEASE lane: builds the published platform matrix with the
 #                            # release flags, grades the artifacts, and proves byte
 #                            # reproducibility by building the whole matrix a second time from
@@ -19,12 +23,15 @@
 #                            # toolchain - it is in CI's go job and in `all`, deliberately, so
 #                            # a broken release script is found on a pull request rather than
 #                            # at a tag.
-#   bash check.sh selfcheck  # THE GATE'S OWN GATE: re-runs the graders under a hostile Go
-#                            # environment and requires each one to still reach its true answer.
+#   bash check.sh selfcheck  # THE GATE'S OWN GATE: re-runs the graders under hostile inherited
+#                            # state and requires each one to still reach its true answer.
 #                            # `go run` honours GOFLAGS, and GOFLAGS carries -exec and -ldflags,
 #                            # so an inherited one can replace a grader with /usr/bin/true or
 #                            # rewrite the constant it grades against — and the stage still
-#                            # prints OK. See the block above check_selfcheck.
+#                            # prints OK. The coverage FLOORS are the same kind of channel: a
+#                            # malformed one makes `[` error, the `if` read the error as "no",
+#                            # and the comparison never happen. See the block above
+#                            # check_selfcheck.
 #   bash check.sh acceptance # the REAL-DAEMON lane: re-measures the daemon behaviors the
 #                            # hermetic fake asserts, against a live local daemon (needs Docker
 #                            # running, and two small pulls). The behaviors it CANNOT reach are
@@ -93,10 +100,74 @@ export GOFLAGS=''
 export GOENV=off
 export GOWORK=off
 
+die() {
+  printf 'check.sh: ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
 # Floors, not exact counts: the tree grows a package per port task, and each task raises these
 # two literals in its commit. Overridable ONLY so a test harness can prove the guard refuses.
 MIN_PACKAGES="${MIN_PACKAGES:-31}"
 MIN_TESTED_PACKAGES="${MIN_TESTED_PACKAGES:-31}"
+
+# A MALFORMED FLOOR MAKES THE CHECK NOT HAPPEN, AND THE STAGE STILL PRINTS OK.
+#
+# `[ "$count" -lt "$MIN_PACKAGES" ]` with a non-integer on either side is not false — it is an
+# ERROR. `[` writes `integer expression expected` to stderr and exits 2, `if` reads any non-zero
+# status as "no", the die branch is skipped, and the stage runs to completion. MEASURED on this
+# tree: `MIN_TESTED_PACKAGES=not-a-number bash check.sh go` printed `tested packages: 31 (floor
+# not-a-number)` and then `check.sh: OK`, exit 0, having never compared anything. That is the same
+# silent-false-green shape as the inherited GOFLAGS bypass — a grader that reports success because
+# it did not run — and `set -e` cannot see it, because a failing command inside an `if` condition is
+# exactly what `set -e` is defined to ignore.
+#
+# A LOW INTEGER IS A DIFFERENT THING AND IS DELIBERATELY STILL ALLOWED. It is a visible, intended
+# weakening: the effective floor is PRINTED beside the count on every run, `packages` additionally
+# NOTES the drift, and the `tested-floor` stage exists precisely so a harness can hand this script a
+# floor the tree does not meet and watch it refuse. An override that says a smaller true thing is a
+# test interface; one that makes the comparison not happen is a bypass. Only the second is closed
+# here.
+#
+# VALIDATED ONCE, HERE, RATHER THAN AT THE TWO PLACES THAT LOOKED IMPORTANT — the lesson the GOFLAGS
+# block above is written out of. Guarding at the point of use means the next stage that reads one of
+# these is unguarded again, and it means the answer depends on which stage you invoked.
+require_floor() { # require_floor <name> <value>
+  # THE COMPARISON ITSELF IS THE ONLY AUTHORITY HERE, AND IT TOOK TWO TRIES TO BELIEVE THAT.
+  #
+  # The property required of a floor is exactly one thing: that `[ N -lt <floor> ]` performs a
+  # comparison instead of erroring. Anything else — a regular expression describing what a number
+  # looks like, a hardcoded upper bound — is a SECOND OPINION about what this shell will do, and a
+  # second opinion is a thing that can be wrong. Both of the ones tried here were:
+  #
+  #   * `case "$2" in *[!0-9]*)` alone let 9223372036854775808 through. bash's `[` parses with
+  #     strtoimax, so a digit-only value at or beyond 2^63 is `integer expression expected` all over
+  #     again. MEASURED: `MIN_TESTED_PACKAGES=9223372036854775808 bash check.sh tested-floor` printed
+  #     `tested packages: 0 (floor 9223372036854775808)` and then `check.sh: OK`, exit 0, having
+  #     compared nothing — the very bypass the digit check was added to close.
+  #   * ...and the same expression REFUSED `+31`, which is a perfectly comparable integer: `[ 31 -lt
+  #     +31 ]` returns 1, an ordinary false, not the 2 that means it could not be read. So the digit
+  #     check both let a bypass through and invented a failure on a valid low floor, which is a
+  #     documented, intended thing to be able to set.
+  #
+  # So the guard runs the comparison and asks nothing else. `[ 0 -le "$2" ]` succeeds if and only if
+  # $2 parses as an integer AND is non-negative, which is the whole requirement: a non-integer and an
+  # out-of-range value both exit 2, a negative one exits 1, and every value `[` can actually compare
+  # exits 0. It cannot drift from the two comparison sites because it IS the comparison.
+  #
+  # `$(( ))` is NOT an alternative. It WRAPS — 9223372036854775808 evaluates to a negative number —
+  # and a floor that silently becomes a different number is worse than one that is rejected.
+  if ! [ 0 -le "$2" ] 2> /dev/null; then
+    die "$1=$(printf '%s' "$2" | tr -d '\n') is not a floor this shell can compare against.
+   It must be a non-negative integer within the integer range: anything else — a non-numeric value,
+   a negative one, or a digit string at or beyond 2^63 — makes \`[ N -lt \$$1 ]\` ERROR rather than
+   return false, the enclosing \`if\` read the error as 'no', and the stage print OK having never
+   performed the comparison. A floor that cannot be compared is not a lower floor, it is no floor at
+   all. Measured: 9223372036854775807 compares correctly, 9223372036854775808 does not; a LOW floor
+   such as 1 or +0 is deliberately still allowed and is printed beside the count on every run."
+  fi
+}
+require_floor MIN_PACKAGES "$MIN_PACKAGES"
+require_floor MIN_TESTED_PACKAGES "$MIN_TESTED_PACKAGES"
 
 # The reference-boundary rules, one per line: `<guarded-import-path>:<Identifier>=<allowed
 # import path>[,<more allowed>]`. Each rule is
@@ -128,11 +199,6 @@ BOUNDARY_RULES=(
   "mythicalos.ai/ctl/internal/engine:NewContainerSpec=mythicalos.ai/ctl/internal/runtime"
   "method:ContainerCreate=internal/runtime/launch.go"
 )
-
-die() {
-  printf 'check.sh: ERROR: %s\n' "$*" >&2
-  exit 1
-}
 
 RELEASE_OUTDIR=''
 SELFCHECK_TMPDIR=''
@@ -246,6 +312,15 @@ check_parity() {
 # GOFLAGS carries `-ldflags` too, so `-ldflags=-X=main.manifestSHA256=<digest>` REPLACES the corpus
 # digest the parity auditor pins against — an edited manifest and its matching digest would pass
 # without the source pin ever changing.
+#
+# GOFLAGS IS NOT THE ONLY SUCH CHANNEL, AND THIS STAGE WAS ONCE SPELLED AS IF IT WERE. The two
+# coverage floors are read from the environment too, and a MALFORMED one disables the check it names
+# without disabling anything visible: `[ 31 -lt not-a-number ]` does not return false, it ERRORS, the
+# enclosing `if` reads that as "no", and the stage runs on to print OK having compared nothing —
+# measured, exit 0, with the floor printed beside the count as though it had been applied. So the
+# probes below open with the floors: same defect shape, different channel, and it is the channel the
+# stage's own configuration travels on. (`set -e` cannot help: a failing command in an `if` condition
+# is precisely what it is defined to ignore.)
 #
 # THIS STAGE EXISTS BECAUSE THE GUARD WAS ONCE APPLIED PER INVOCATION. tools/parity-audit.sh
 # cleared GOFLAGS/GOENV on its four witness commands and not on the `go run` two lines below them
@@ -388,6 +463,86 @@ check_selfcheck() {
   esac
 
   SELFCHECK_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/mctl-selfcheck.XXXXXX")"
+
+  # CHANNEL 0 — THE SCRIPT'S OWN INHERITED CONFIGURATION, which is a grader-disabling channel of
+  # exactly the same shape as GOFLAGS and one this stage did not cover.
+  #
+  # The two coverage floors are read from the environment. A LOW value is a documented, visible test
+  # interface and stays allowed — the effective floor is printed beside the count on every run. A
+  # MALFORMED value is not a lower floor: `[ "$count" -lt "not-a-number" ]` does not return false, it
+  # ERRORS, `if` reads the error as "no", and the stage runs on to print OK having never compared
+  # anything. MEASURED before the guard: `MIN_TESTED_PACKAGES=not-a-number bash check.sh go` printed
+  # `tested packages: 31 (floor not-a-number)` and then `check.sh: OK`, exit 0.
+  #
+  # THREE PROBES PER FLOOR, BECAUSE ONE OR TWO WOULD BE SATISFIED BY A BROKEN FIX. "Refuses a
+  # malformed value" alone is met by a guard that refuses everything; "reaches its true answer" alone
+  # is met by no guard at all; and both together are still met by a guard that validates the value
+  # and then forgets to compare it. So each floor is asked all three questions: it REFUSES a
+  # malformed value naming the malformation, it REACHES ITS VERDICT on the real one, and it STILL
+  # REFUSES a tree that is genuinely below it.
+  #
+  # The cheap stages are used deliberately: `packages` and `tested-floor` call the very functions
+  # `go` calls, and the validation itself sits at the top of this file, so no stage can be picked to
+  # get around it.
+  local floorstream="$SELFCHECK_TMPDIR/tested-floor.json"
+  : > "$floorstream"
+  local fi=0
+  while [ "$fi" -lt "$MIN_TESTED_PACKAGES" ]; do
+    printf '{"Action":"run","Package":"example.test/p%s","Test":"TestX"}\n' "$fi" >> "$floorstream"
+    fi=$((fi + 1))
+  done
+  # shellcheck disable=SC2016  # $1/$2 are the INNER bash -c's arguments; expanding them here is the bug
+  local floorprobe='exec < "$1"; bash "$2" tested-floor'
+
+  selfcheck_probe 'the package floor refuses a malformed value' refuse \
+    'MIN_PACKAGES=not-a-number is not a floor this shell can compare against' \
+    env MIN_PACKAGES=not-a-number bash "$SELF" packages
+  selfcheck_probe 'the package floor reaches its verdict on a valid one' ok \
+    "(floor $MIN_PACKAGES)" \
+    env MIN_PACKAGES="$MIN_PACKAGES" bash "$SELF" packages
+  selfcheck_probe 'the package floor still refuses a tree below it' refuse \
+    'expected at least 100000' \
+    env MIN_PACKAGES=100000 bash "$SELF" packages
+  # THE SECOND DOOR INTO THE SAME BYPASS, and the first version of the guard left it open: a
+  # DIGIT-ONLY value at or beyond 2^63 makes `[` error exactly as a non-numeric one does. 2^63 is
+  # probed rather than some larger round number because it is the first value that fails, and
+  # 2^63-1 is probed beside it so this pair cannot pass by refusing every large number.
+  selfcheck_probe 'the package floor refuses an uncomparable integer' refuse \
+    'is not a floor this shell can compare against' \
+    env MIN_PACKAGES=9223372036854775808 bash "$SELF" packages
+  selfcheck_probe 'the package floor still ACCEPTS the largest comparable one' refuse \
+    'expected at least 9223372036854775807' \
+    env MIN_PACKAGES=9223372036854775807 bash "$SELF" packages
+  # AND THE OTHER DIRECTION, WHICH IS THE ONE A GUARD LIKE THIS GETS WRONG QUIETLY: a floor it
+  # INVENTS a failure for. `+31` is an ordinary comparable integer — `[ 31 -lt +31 ]` returns 1, a
+  # plain false, not the 2 that means unreadable — and an earlier version of the validation refused
+  # it, turning a documented, intended low floor into a hard error. A guard that refuses valid input
+  # is not a safer guard, it is a broken one.
+  selfcheck_probe 'the package floor ACCEPTS a comparable leading-plus value' ok \
+    '(floor +1)' \
+    env MIN_PACKAGES=+1 bash "$SELF" packages
+  selfcheck_probe 'the package floor refuses a negative value' refuse \
+    'is not a floor this shell can compare against' \
+    env MIN_PACKAGES=-1 bash "$SELF" packages
+
+  selfcheck_probe 'the tested-package floor refuses a malformed value' refuse \
+    'MIN_TESTED_PACKAGES=not-a-number is not a floor this shell can compare against' \
+    env MIN_TESTED_PACKAGES=not-a-number bash -c "$floorprobe" _ "$floorstream" "$SELF"
+  selfcheck_probe 'the tested-package floor reaches its verdict on a valid one' ok \
+    "tested packages: $MIN_TESTED_PACKAGES (floor $MIN_TESTED_PACKAGES)" \
+    env MIN_TESTED_PACKAGES="$MIN_TESTED_PACKAGES" bash -c "$floorprobe" _ "$floorstream" "$SELF"
+  selfcheck_probe 'the tested-package floor still refuses a stream below it' refuse \
+    'expected at least 100000' \
+    env MIN_TESTED_PACKAGES=100000 bash -c "$floorprobe" _ "$floorstream" "$SELF"
+  selfcheck_probe 'the tested-package floor refuses an uncomparable integer' refuse \
+    'is not a floor this shell can compare against' \
+    env MIN_TESTED_PACKAGES=9223372036854775808 bash -c "$floorprobe" _ "$floorstream" "$SELF"
+  selfcheck_probe 'the tested-package floor still ACCEPTS the largest comparable one' refuse \
+    'expected at least 9223372036854775807' \
+    env MIN_TESTED_PACKAGES=9223372036854775807 bash -c "$floorprobe" _ "$floorstream" "$SELF"
+  selfcheck_probe 'the tested-package floor ACCEPTS a comparable leading-plus value' ok \
+    "tested packages: $MIN_TESTED_PACKAGES (floor +0)" \
+    env MIN_TESTED_PACKAGES=+0 bash -c "$floorprobe" _ "$floorstream" "$SELF"
 
   # Two flags, two different defeats: -exec replaces the grader with a program that grades
   # nothing, -ldflags rewrites the constant the parity auditor pins the corpus digest to. The
