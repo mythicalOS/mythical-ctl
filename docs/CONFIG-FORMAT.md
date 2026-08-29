@@ -48,16 +48,33 @@ anything over 64 characters. `brokkr`, `skuld`, `saga`, `my-product`, `a` and `a
 
 A product's UI writes **only** `<product>.conf`.
 
-**What is shipped, and what is design.** Everything this document says about the *file format* is
-implemented and tested today: the two paths, the syntax, the byte policy, the ownership and identity
-requirements, the typed validation, the integrity marker, and both size ceilings. The **runtime**
-around it is not — this version of `mythical-ctl` mounts nothing and launches no container, because
-the lifecycle commands are not implemented yet. So read the mounting, and the guarantees that
-`mythical.conf` will never be mounted and that no value in `<product>.conf` will ever reach a
-container-launch argument, as the design this format exists to serve rather than as behaviour you can
-verify against this release. They are stated here because they are *why* the format is shaped the way
-it is — why `<product>.conf` must be written in place, why it needs a marker, and why its size is
-treated as attacker-controlled. Nothing here should be read as a delivered security guarantee.
+**What is shipped.** Everything this document says about the *file format* is implemented and
+tested: the two paths, the syntax, the byte policy, the ownership and identity requirements, the
+typed validation, the integrity marker, and both size ceilings. So is the **runtime** around it.
+This release installs, starts, stops, restarts and recreates product containers, and it assembles
+each launch itself — image, mounts, published ports, injected bootstrap secrets — from the
+authenticated manifest and policy index. The mounting described here is behaviour you can verify
+against this build.
+
+Two of those runtime guarantees are why the format is shaped the way it is — why `<product>.conf`
+must be written in place, why it needs a marker, and why its size is treated as
+attacker-controlled — and both are enforced rather than intended:
+
+- **`mythical.conf` is never mounted.** The mounts the core makes for itself are a closed set it
+  computes rather than reads from configuration: `<home>/<product>.conf`, `<home>/transcripts`,
+  `<home>/logs`, and nothing else. The family home itself is deliberately not among them —
+  binding one directory is simpler than binding three paths, and it would hand every secret in
+  the home to the container with no visible symptom. An operator-configured bind is refused when
+  its resolved source is, is inside, or contains the family home.
+- **No value in `<product>.conf` reaches a container-launch argument.** Nothing on the launch
+  path reads this file at all: the image, the mounts, the ports and the injected secrets come
+  from the authenticated manifest and policy index plus `mythical.conf`, and `<product>.conf`
+  reaches the container only as the bytes behind its own bind mount.
+
+Each is a bounded guarantee rather than an unlimited one, and the bounds are stated where they
+arise: the operator-bind check compares **pathnames**, not object identity (the host-tool slot's
+note on the limit of "never mounted", below, states that in full), and every identity check
+describes the path at the moment it runs (see [Ownership and identity](#ownership-and-identity)).
 
 ## Amendment: the host-tool slot `~/.mythical/<product>/cli.toml`
 
@@ -131,7 +148,7 @@ happen.
 
 | | `~/.mythical/<product>/cli.toml` |
 |---|---|
-| Ownership class (`mi_zone`) | **`user-owned`** — the same class as the two `.conf` files |
+| Ownership class (`layout.ZoneOf`) | **`user-owned`** — the same class as the two `.conf` files |
 | Who writes it | the operator, or that product's host-side tool running **as the operator** |
 | Mounted into a container | **never by name** — no manifest, policy or operator bind can name it; see the limit below |
 | Owner | the user running the host-side tool, which is the user running `mythical-ctl` |
@@ -180,9 +197,11 @@ a bind whose source is an inode reached by another name is outside what the chec
 it means giving the operator-bind path the object-identity comparison the core-fixed path already
 performs — the right fix, and a change to the launch path rather than to this layout contract.
 
-`mythical-ctl` enforces none of the owner, mode, group or identity rules above, because it never
-opens the file. They are requirements **on the host-side tool**, written here so that every such
-tool implements the same ones. What `mythical-ctl` does guarantee is the next section.
+`mythical-ctl` enforces none of the owner, mode, group or identity rules above, because nothing in
+it interprets the file: the first-use sweep looks only at the slot's name and type, and `backup`
+copies its bytes without reading them as anything (both are stated in full below). They are
+requirements **on the host-side tool**, written here so that every such tool implements the same
+ones. What `mythical-ctl` does guarantee is the next section.
 
 ### What `mythical-ctl` may do to it: nothing but copy it into a backup
 
@@ -202,15 +221,16 @@ That is a change in what the installer is *permitted* to do, not only a descript
 today. Installer-managed means the installer may remove what it put in there, and
 `~/.mythical/<product>/` is still installer-managed. **It may not remove that directory wholesale.**
 Any future code that reaps generated artifacts must delete the artifacts it created **by name**, or
-skip every entry whose `mi_zone` class is `user-owned` — never `rm -rf` the product directory. No
-such reaper exists in this release; the rule is written down before one does.
+skip every entry the zone classifier calls `user-owned` — never remove the product directory
+wholesale. No such reaper exists in this release; the rule is written down before one does.
 
 Two honest exceptions, neither of them a deletion:
 
 - **`backup` reads it and copies it.** A backup walks the whole `~/.mythical/` tree and copies every
-  file in it, so the slot — and the credential in it — is inside the backup, exactly as
-  `mythical.conf`'s host secrets already are. **Treat a backup as secret material and give it the
-  protection you would give the token itself.** It is deliberately not excluded: a backup that
+  file in it bar two installer-state things — the operation lock, and the state ledger, which is
+  captured separately as its own entry — so the slot, and the credential in it, is inside the backup,
+  exactly as `mythical.conf`'s host secrets already are. **Treat a backup as secret material and give
+  it the protection you would give the token itself.** It is deliberately not excluded: a backup that
   silently omitted the operator's own configuration would be a worse failure than one that includes
   it, because it would restore to a machine that looks complete and is not. `restore` does not write
   that tree back onto the machine; it restores the named volumes and the installer state ledger, and
@@ -236,51 +256,37 @@ Two honest exceptions, neither of them a deletion:
 
 ### How the classification is spelled, and what it does not check
 
-`mi_zone` classifies a **home-relative path**. It answers `user-owned` for `<component>/cli.toml`
-exactly when `<component>` is a single path component that satisfies the
+The zone classifier (`layout.ZoneOf`) classifies a **home-relative path**. It answers `user-owned`
+for `<component>/cli.toml` exactly when `<component>` is a single path component that satisfies the
 [product-name grammar](#what-product-may-be) in full **and is not `bin`, `logs` or `transcripts`**,
 whose top-level meanings are decided by earlier arms (see
 [the three names that cannot carry a slot](#the-slot)) — so the reserved `mythical` is refused, and so
 are `Brokkr/`, `1foo/`, `-foo/`, `fooBAR/`, `foo.conf/`, `foo bar/`, a 65-character name,
 `.hidden/`, and `../`. Everything else nested keeps the class it always had.
 
-The grammar is **asked of its one authority** (`_mi_conf_product_name_ok`) rather than restated
+The grammar is **asked of its one authority** (`layout.ProductNameOK`) rather than restated
 here, so the layout cannot end up holding a second copy of it to drift against. An earlier revision
 of this amendment stopped at the first character and documented the rest as an accepted overmatch;
 that was wrong, because `user-owned` is a class that says "the installer does not own this", and no
 path outside the carve-out is entitled to it.
 
-Two consequences worth stating, because neither is visible in the pattern:
-
-- **It fails closed when the authority is not loaded.** `mi_zone` lives in a module that is sourced
-  before the one holding the validator, and a caller may have sourced it alone. With the validator
-  absent the answer is `installer-managed` — the class the path carried before the carve-out — so an
-  unanswerable question yields the unprivileged class rather than silently granting the other one.
-- **The uppercase refusal depends on `LC_ALL=C`, which `_mi_conf_product_name_ok` — the grammar's
-  authority, and the only place a character range still decides anything — pins for itself.** Under
-  a dictionary-collating locale `[a-z]` matches uppercase, so without it a path would classify one
-  way on an operator's laptop and another in CI. Measured on the bash 3.2 floor. `mi_zone`
-  deliberately carries no second copy of that pin: with the authority behind it, a copy would decide
-  nothing and could be removed with nothing going red.
-- **Bash's `nocasematch` is defended against, on both halves.** `case` honours that option, so with
-  it enabled `brokkr/CLI.TOML` would otherwise reach the slot arm — hence the leaf being compared as
-  a string rather than matched as a pattern. The option also changes how the grammar's own `case`
-  matches (measured: `_mi_conf_product_name_ok Brokkr` succeeds under it), so the validator is called
-  with the option unset. It is worth knowing that this is reachable from the *environment*:
-  `BASHOPTS=nocasematch` does not arm it, but `BASH_ENV` naming a file that sets it does, for every
-  non-interactive shell. That reachability is a property of the whole CLI, not of this slot — every
-  other `case` in it is still affected — and closing it generally is not something this amendment
-  attempts.
+One consequence is worth stating, because it is not visible in the pattern: **both halves of the
+slot decision are exact byte comparisons, so case is never folded.** The leaf is compared as a
+string rather than matched as a pattern, and the grammar's `[a-z]` is a byte range — so
+`brokkr/CLI.TOML` and `Brokkr/cli.toml` both classify `installer-managed`, on every machine.
+Nothing in the decision consults an ambient collation or a case-folding matcher, so there is no
+environment in which the same path classifies one way on an operator's laptop and another in CI.
 
 Read the classifier's answer as a statement about the path, never as permission to create one.
 
 The depth rule is load-bearing and is not visible in the pattern, so it is worth saying where it
-lives. `case` globs match `/`, so the arm that catches candidates also catches
-`brokkr/generated/cli.toml` and `../cli.toml`. What refuses them is the same exact comparison that
-defends the leaf's spelling: the remainder after the FIRST separator must equal `cli.toml`, and for
-anything deeper that remainder still contains a separator (`generated/cli.toml`) and cannot. The
-traversal spellings are then refused a second time over by the grammar, which does not admit `..`
-or `.` as a product name. One comparison, three rules, and no arm that merely looks like a guard.
+lives. The candidate arm is selected by the suffix `/cli.toml`, which `brokkr/generated/cli.toml`
+and `../cli.toml` carry too. What refuses them is the same exact comparison that defends the
+leaf's spelling: the path is split at its FIRST separator and the remainder must equal `cli.toml`,
+and for anything deeper that remainder still contains a separator (`generated/cli.toml`) and
+cannot. The traversal spellings are then refused a second time over by the grammar, which does not
+admit `..` or `.` as a product name. One comparison, three rules, and no arm that merely looks
+like a guard.
 
 ## Ownership and identity
 
@@ -290,16 +296,15 @@ with the file left untouched — no partial write, and no fallback to defaults e
 refusal and not a torn-file report.
 
 **What the check does and does not promise.** It describes the pathname *at the moment it runs*. That
-is a real limit, not a hedge. Shell can hold a file descriptor open — that is not the problem. What
-portable shell lacks is the sequence needed to *bind* the checked identity to the object it then
-operates on: opening with `O_NOFOLLOW`, verifying the open descriptor itself, and writing through that
-same descriptor. Every step here works on the pathname instead, so between the last check and the
-operation the pathname can in principle be replaced. `mythical-ctl`
-re-checks immediately before every mutation to make that window as small as the language allows, and a
-family operation lock excludes every other `mythical-ctl` process — but the window is not zero, and
-closing it would need file-descriptor- or mount-namespace-based I/O that portable shell does not have.
-Read these requirements as "this path is refused when it is seen to fail", not as an unconditional
-guarantee about the object finally written. Nothing else in this document depends on the difference.
+is a real limit, not a hedge. Every check here is an `lstat` on the path, and every write then names
+the path again rather than a descriptor the check had already verified — so nothing binds the
+identity that was checked to the object that is finally written, and between the last check and the
+write the pathname can in principle be replaced. Three things narrow that window, and none of them
+closes it: `mythical-ctl` re-runs the identity check immediately before every mutation; a family
+operation lock excludes every other `mythical-ctl` process; and every write additionally refuses
+unless what it is about to overwrite still matches what it read. Read these requirements as "this
+path is refused when it is seen to fail", not as an unconditional guarantee about the object finally
+written. Nothing else in this document depends on the difference.
 
 Where the check runs, exactly, because it is not symmetrical:
 
@@ -371,8 +376,9 @@ diagnosis in the second row, where the group is exactly right.
 - There is **no quoting and no escaping**. A value is the literal bytes between the first `=` and the
   end of the line. Do not wrap values in quotes — the quotes become part of the value.
 
-The file is never `source`d, `eval`d or shell-expanded by anything that reads it, so `$(…)` and
-`` `…` `` are inert. They are refused anyway, so that a reader never has to reason about it.
+Nothing that reads this file evaluates, expands or executes any part of it — a value is inert
+bytes from the byte it is read to the byte it is handed on — so `$(…)` and `` `…` `` mean nothing
+here. They are refused anyway, so that a reader never has to reason about it.
 
 ## Values are additionally validated against a type
 
@@ -565,12 +571,12 @@ A file containing **more than 1024 assignments is refused**, before any of them 
 message naming the cap. The boundary is inclusive: 1024 keys is accepted, 1025 is refused. Unlike the
 size ceiling, this applies to **both** files.
 
-It is a separate limit because the size ceiling bounds the *bytes* a reader copies, not the *work* it
-does. The duplicate-key check is quadratic in the number of keys, so a file well inside 1 MiB can cost
-minutes of CPU: measured, 14000 short valid keys is 240 KB and took 22 seconds, and 20000 keys is
-349 KB and took 46. Since a mutating write holds the family operation lock while it reads, an
-oversized-by-key-count file would block every other product's install or reconfigure for as long as
-it took to parse.
+It is a separate limit because the size ceiling bounds the *bytes* a reader copies, not the *number
+of assignments* it accumulates, and the two do not bound each other. `mythical.conf` carries no
+size ceiling at all, so the key count is the only limit on how much of it a reader will take in;
+and 1 MiB of short keys is, on either file, far more assignments than a configuration has. The cap
+is enforced **during** the scan — the file is refused at the line that crosses it, naming the cap,
+rather than after the whole of it has been accumulated.
 
 1024 is far above anything legitimate for the same reason 1 MiB is: 1 MiB divided by the 4096-byte
 value cap is about 256 maximal settings. If a product genuinely needs more than a thousand keys in one
@@ -595,10 +601,14 @@ When `mythical-ctl` reports a `<product>.conf` as torn, the message it prints to
 this file **by path**:
 
 ```
-  If you edited it by hand, recompute the marker (see docs/CONFIG-FORMAT.md);
+if you edited it by hand, recompute the marker (see docs/CONFIG-FORMAT.md); otherwise the last
+write was interrupted
 ```
 
 So `docs/CONFIG-FORMAT.md` is not merely where this document happens to live — it is a string in
 shipped runtime output. Moving or renaming it turns that message into a dangling pointer for every
-operator who ever hits a torn file, and nothing in the build would notice. If it has to move, change
+operator who ever hits a torn file. A test asserts that the message names this path and that the
+path resolves to a real file, so a rename that left the message behind would go red — but the
+test cannot know whether the document at the new path still says what the message promises. If it
+has to move, change
 the message in the same commit.
