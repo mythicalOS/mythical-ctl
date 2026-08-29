@@ -147,7 +147,7 @@ with a cold build cache, and requires every byte to match. `tools/release-verify
 result from the FILES rather than from the commands that made them.
 
 `check.sh parity` is the evidence that retiring the previous shell implementation lost nothing:
-`tests/parity-manifest.tsv` records all 1,178 tests of the suite that specified it, and the audit
+`tests/parity-manifest.tsv` records all 1,201 tests of the suite that specified it, and the audit
 requires each one to be claimed exactly once by a `PORTED:` or argued `N/A:` inventory line in the
 Go tree, with every `PORTED` target resolving to a test that really runs.
 
