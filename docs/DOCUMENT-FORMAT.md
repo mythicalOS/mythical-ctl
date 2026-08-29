@@ -112,8 +112,13 @@ in a value forges a second assignment on the next read. The other two do **not**
 have **no integrity marker** (their authenticity comes from a digest something already
 authenticated names, not from a marker line of their own — in the body, a line that merely looked
 like one is an ordinary comment here; on the first line it is not a comment at all, but a header
-that does not match, and the document is rejected), and they are **not bind-mounted**, so the
-prohibition on replacing the file by `rename()` does not apply to them either.
+that does not match, and the document is rejected), and **nothing bind-mounts them on account of
+being documents**, so the prohibition on replacing the file by `rename()` does not follow from that
+role. It is not a promise that such a file is never mounted: an operator bind names a canonical path
+outside the home and is not filtered by what the file happens to be, so a document stored at such a
+path and *separately* named as a bind is mounted like any other bind, and carries a bind's
+requirement to keep its inode identity. The two roles are independent; the document role is what
+does not impose the restriction.
 
 ## Precedence: the order these checks run in
 
@@ -351,7 +356,13 @@ explicit classification of *regenerable* is treated as a statement that the cont
 
 **What this release does with the value, stated exactly.** `family_gid` is applied to one thing:
 `<product>.conf` is created with that group and mode 0660, so a product process that is *already*
-in that group can write its own settings file. That is the whole of it. This release sets **no**
+in that group can write its own settings file. That is the whole of it.
+
+**One accepted value is nonetheless unusable, and it is refused rather than applied.** The schema
+admits `1..4294967295`, but `4294967295` is `(gid_t)-1` — `chown`'s NO-CHANGE sentinel, which
+succeeds while changing nothing, so a file created under it would silently keep the wrong group.
+Creating the config refuses it instead. A policy naming it is a valid authenticated document that
+cannot be used to create a product config; the usable range ends at `4294967294`. This release sets **no**
 user and **no** group on any product container — a manifest cannot ask for one, and nothing in the
 launch path establishes or checks one — so whether the running product is in the family group is a
 property of the product's own image, not something this tool arranges or verifies. The file half of
