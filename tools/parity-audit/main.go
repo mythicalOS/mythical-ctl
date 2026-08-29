@@ -1144,10 +1144,19 @@ const notExecutedPrefix = "not-executed:"
 // of one name and both run under one package, so the number of starts is what can be held against
 // the number of declarations.
 //
-// SUBTESTS ARE NOT THEIR PARENT. `t.Run` emits `"Test":"TestFoo/case"`, and counting those toward
-// TestFoo would put the run count far above the declaration count for every table-driven test in the
-// tree (1662 events against 1369 top-level starts, measured here). A subtest name is also not a
-// legal target token, so nothing can claim one; they are dropped.
+// SUBTESTS ARE DROPPED, AND HERE IS WHAT THAT IS AND IS NOT WORTH. `t.Run` emits
+// `"Test":"TestFoo/case"` — 1662 events against 1369 top-level starts in this tree, measured. It is
+// tempting to write that keeping them would inflate TestFoo's count and make the
+// count-against-declarations check refuse every table-driven test. IT WOULD NOT, and the first draft
+// of this comment said so until the mutation meant to kill that line SURVIVED: `TestFoo/case` is a
+// DIFFERENT MAP KEY from `TestFoo`, so a subtest never touches its parent's count. Measured both
+// ways — with the drop, `map[TestOne:1]`; without it, `map[TestOne:1 TestOne/case:1]`.
+//
+// So this is a keying decision rather than a correctness guard, and it is kept as one: the witness
+// then holds exactly the names a target can be WRITTEN as (a target token cannot contain `/` — see
+// TestASubtestTargetIsRefusedRatherThanResolvedToItsParent), and `laneRan` counts TESTS rather than
+// tests-and-subtest-names, which is what the liveness refusal below says it is counting. The map
+// shape is asserted by a test, so the line cannot go away in silence.
 //
 // A START, NOT AN OUTCOME — AND THAT IS THE RIGHT READING, BUT SAY WHICH IT IS. `run` is emitted
 // when the test function is INVOKED, so a test that fails still counts (a failing test is still a

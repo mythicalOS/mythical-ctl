@@ -2324,6 +2324,16 @@ func TestParseGoTestExecReadsStartsAndNotSubtestsOrProse(t *testing.T) {
 	if got[pkg]["TestOne"] != 1 {
 		t.Fatalf("TestOne started once and its two subtests are not it: got %d", got[pkg]["TestOne"])
 	}
+	// AND THE SUBTESTS LEAVE NO ENTRY OF THEIR OWN. The assertion above passes whether or not they
+	// are dropped — they land under their own keys, not their parent's, which is why the mutation on
+	// the drop SURVIVED the first time this was written. THIS is the assertion that holds the line:
+	// the witness is keyed by exactly the names a target can be written as, so `laneRan` counts tests
+	// rather than tests-and-subtest-names.
+	for k := range got[pkg] {
+		if strings.Contains(k, "/") {
+			t.Fatalf("a subtest was kept as an entry of its own (%q) — the execution witness is no longer keyed by the names a target can name, and the lane's run count is counting subtests: %v", k, got[pkg])
+		}
+	}
 	if got[pkg]["TestSame"] != 2 {
 		t.Fatalf("two starts of one name are two tests, not a repetition: got %d", got[pkg]["TestSame"])
 	}
