@@ -268,6 +268,11 @@ SELFCHECK_RC=0
 # 64 hex characters, so it is the shape of a digest and not merely a string the pin would reject
 # for its length. Nothing can hash to it.
 SELFCHECK_BOGUS_DIGEST='deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef'
+# tests/smoke.sh needs a payload of its OWN — see the note beside its probes. The symbol is
+# tools/build-release.sh's VERSION_SYMBOL by necessity rather than by copy: if it ever stops
+# resolving, the -X does nothing, the control probe below stops seeing this string and says so.
+SELFCHECK_VERSION_SYMBOL='mythicalos.ai/ctl/internal/version.Version'
+SELFCHECK_BOGUS_VERSION='SELFCHECK-NOT-A-SEMVER'
 
 selfcheck_fail() {
   printf '  FAIL  %s\n' "$*" >&2
@@ -391,6 +396,22 @@ check_selfcheck() {
   local payload="-exec=$neuter -ldflags=-X=main.manifestSHA256=$SELFCHECK_BOGUS_DIGEST"
   printf 'GOFLAGS=%s\n' "$payload" > "$SELFCHECK_TMPDIR/goenv"
 
+  # THE SECOND PAYLOAD, FOR tests/smoke.sh, BECAUSE THE FIRST ONE CANNOT REACH IT. `go build` does
+  # not honour -exec, and the manifest -X names a symbol the CLI does not have, so smoke's binary
+  # would come out identical with or without the shared payload — its GOFLAGS and GOENV guards
+  # would then sit there unprobed, which is the exact condition this whole stage exists to refuse.
+  # What DOES reach it is the version stamp: an inherited
+  # `-ldflags=-X=<version symbol>=<not a semver>` makes the self-built binary report something
+  # --version's shape assertion refuses, so the smoke run answers a question about the shell rather
+  # than about the CLI. It has to be a SEPARATE payload because GOFLAGS is split on spaces and one
+  # -ldflags value cannot carry both -X settings.
+  local vpayload="-ldflags=-X=$SELFCHECK_VERSION_SYMBOL=$SELFCHECK_BOGUS_VERSION"
+  printf 'GOFLAGS=%s\n' "$vpayload" > "$SELFCHECK_TMPDIR/goenv-version"
+  # Builds the CLI under whatever environment the probe hands it and prints its --version, so the
+  # control can see whether the stamp actually landed.
+  # shellcheck disable=SC2016  # $1 is the INNER bash -c's argument; expanding it here is the bug
+  local vprobe='go build -o "$1/vprobe" ./cmd/mythical-ctl && "$1/vprobe" --version'
+
   # CHANNEL 1 — the GOFLAGS ENVIRONMENT VARIABLE.
   selfcheck_probe 'the payload neuters an unguarded go run (GOFLAGS variable)' neutered '' \
     env GOFLAGS="$payload" GOENV=off go run ./tools/boundary-gate
@@ -407,6 +428,11 @@ check_selfcheck() {
   # comparison is check.sh release's job, and this is asking a different question.
   selfcheck_probe 'release graders run (GOFLAGS variable)' ok 'all digests recomputed and matching' \
     env GOFLAGS="$payload" GOENV=off bash tools/build-release.sh 0.0.0-selfcheck "$SELFCHECK_TMPDIR/rel-goflags"
+  selfcheck_probe 'the version payload reaches an unguarded go build (GOFLAGS variable)' ok \
+    "$SELFCHECK_BOGUS_VERSION" \
+    env GOFLAGS="$vpayload" GOENV=off bash -c "$vprobe" _ "$SELFCHECK_TMPDIR"
+  selfcheck_probe 'smoke self-build reaches its true answer (GOFLAGS variable)' ok '0 failed' \
+    env GOFLAGS="$vpayload" GOENV=off bash tests/smoke.sh
 
   # CHANNEL 2 — the go env FILE, and it is NOT the same channel. `GOFLAGS=''` does not close it:
   # go treats an EMPTY environment variable as UNSET and falls back to the file (measured — with
@@ -422,6 +448,11 @@ check_selfcheck() {
   selfcheck_write_manifest 'go env file' env -u GOFLAGS GOENV="$SELFCHECK_TMPDIR/goenv"
   selfcheck_probe 'release graders run (go env file)' ok 'all digests recomputed and matching' \
     env -u GOFLAGS GOENV="$SELFCHECK_TMPDIR/goenv" bash tools/build-release.sh 0.0.0-selfcheck "$SELFCHECK_TMPDIR/rel-goenv"
+  selfcheck_probe 'the version payload reaches an unguarded go build (go env file)' ok \
+    "$SELFCHECK_BOGUS_VERSION" \
+    env -u GOFLAGS GOENV="$SELFCHECK_TMPDIR/goenv-version" bash -c "$vprobe" _ "$SELFCHECK_TMPDIR"
+  selfcheck_probe 'smoke self-build reaches its true answer (go env file)' ok '0 failed' \
+    env -u GOFLAGS GOENV="$SELFCHECK_TMPDIR/goenv-version" bash tests/smoke.sh
 
   # CHANNEL 3 — an inherited go WORKSPACE. `go.work` is ambient file state of the same kind as the
   # go env file: the go command reads it without being asked, from GOWORK or from any ancestor

@@ -81,7 +81,7 @@ jobs:
         run: ./tests/smoke.sh
 
       # The Go lane, byte-identical to the pull-request lane: same script, the
-      # same three stages, in the same order. `release` builds the whole published matrix twice — the second
+      # same four stages, in the same order. `release` builds the whole published matrix twice — the second
       # time from a copy of the source at a different absolute path with a cold
       # build cache — and requires every artifact to be byte-identical. That is
       # the reproducibility claim being exercised rather than asserted, and it
@@ -99,6 +99,19 @@ jobs:
       # could be tagged and published without anything noticing.
       - name: check.sh parity
         run: bash check.sh parity
+
+      # AND THE SELFCHECK RUNS ON A TAG TOO, for the same reason the parity gate
+      # above does and in the same direction of drift. It is the stage that
+      # proves the other graders cannot be switched off from the environment —
+      # `go run` honours GOFLAGS, GOFLAGS carries -exec, and an inherited one
+      # makes a stage build its grader and then execute /usr/bin/true instead,
+      # printing OK and exiting 0 having graded nothing. A commit that removed
+      # one of those guards would sail through every stage above it. A tag can
+      # be pushed to a commit that never saw a pull request, so a release lane
+      # that skipped this would be a lane whose graders are unproven at exactly
+      # the moment an executable gets published.
+      - name: check.sh selfcheck
+        run: bash check.sh selfcheck
 
       - name: check.sh release
         run: bash check.sh release
