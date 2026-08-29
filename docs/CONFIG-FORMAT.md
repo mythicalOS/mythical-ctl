@@ -249,6 +249,14 @@ two destructive verbs at their most destructive — leave it **byte-identical an
 already had**. The rule is not limited to that list; it binds every verb, including ones not yet
 written.
 
+**One exception, and it is the operator's own doing.** `backup` writes to an output directory the
+operator names on the command line, and it creates that directory. An operator who names a path
+inside a product directory gets a directory created there — including at the slot's own name, if
+nothing is there yet. Nothing in the installer chooses that path, and an existing slot is not at
+risk: `backup` refuses an output path it cannot read as a directory, which a regular file is not.
+It is stated because "no verb creates this path" would otherwise be an unqualified claim, and this
+is the one way the path can come to exist without the host-side tool putting it there.
+
 That is a change in what the installer is *permitted* to do, not only a description of what it does
 today. Installer-managed means the installer may remove what it put in there, and
 `~/.mythical/<product>/` is still installer-managed. **It may not remove that directory wholesale.**

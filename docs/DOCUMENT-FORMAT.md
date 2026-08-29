@@ -9,8 +9,12 @@ rejected, and rejection is not a bug.
 
 These documents are **more privileged than `<product>.conf`**, not less. A manifest names the image
 that will run, the mounts that will be made, and the secrets that will be injected. Every rule
-[`docs/CONFIG-FORMAT.md`](CONFIG-FORMAT.md) places on product configuration binds here too, plus the
-authentication and freshness rules this document adds on top.
+[`docs/CONFIG-FORMAT.md`](CONFIG-FORMAT.md) places on the **bytes and values** of product
+configuration binds here too — the byte policy, the value rule, the key-count ceiling — plus the
+authentication and freshness rules this document adds on top. Its **integrity marker** is the one
+thing that does not carry over: these documents have none. Their authenticity comes from a digest a
+parent document vouches for, and a line that merely looks like a marker is an ordinary comment
+here.
 
 ## Why line-oriented `key=value`, not JSON
 
@@ -87,7 +91,9 @@ The byte policy and the value rule are **exactly** `docs/CONFIG-FORMAT.md`'s —
 second implementation of it:
 
 - **No control bytes** anywhere except the `\n` that ends each line (no NUL, CR, TAB, DEL). A file
-  containing one is rejected outright, before the marker or the schema is even considered.
+  containing one is rejected outright, before the header or the schema is considered — but *after*
+  the digest, which is checked before any of these bytes are inspected at all (see
+  [Precedence](#precedence-the-order-these-checks-run-in)).
 - **Values**: no leading or trailing space; no control characters; none of `$`, `` ` ``, `\`; bounded
   length. Any other byte is passed through verbatim, including non-ASCII (UTF-8) content — the
   reader never decodes a value, so it never needs to validate UTF-8.
@@ -129,10 +135,13 @@ their check-only siblings, which run the identical chain and commit nothing):
    already-authenticated has vouched for its bytes.
 2. **Only once the digest matches** are the bytes handed to anything that looks at their content —
    and the byte policy (readable at all; no control bytes; ends in a newline) is the *first* thing
-   that content-reading step does, immediately followed by the header line, the grammar above, and
-   the document's own schema (which fields exist, their types, their cardinality). A control byte, a
-   missing trailing newline, or a malformed line is rejected here — but only ever for a document that
-   has already authenticated.
+   that content-reading step does. Then the **body**: the line grammar above, the key grammar, the
+   value rule and the key-count ceiling. Then the **header line** — after the body has been scanned,
+   deliberately, and before anything at all is handed back to a caller (see
+   [The three document types](#the-three-document-types-and-their-header-line)). Then the document's
+   own **schema**: which fields exist, their types, their cardinality. A control byte, a missing
+   trailing newline, or a malformed line is rejected here — but only ever for a document that has
+   already authenticated.
 3. **Is it fresh?** A version is present, an expiry is present and has not passed, and the version is
    not below the highest one this installation has already accepted for that document (anti-rollback
    — see [Trust model](#trust-model)).
