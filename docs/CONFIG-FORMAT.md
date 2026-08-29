@@ -140,11 +140,13 @@ considered, so `~/.mythical/bin/cli.toml` classifies installer-managed and
 this amendment where following the general rule would be actively unsafe rather than merely
 unsupported:
 
-> **`~/.mythical/logs/` and `~/.mythical/transcripts/` are bind-mounted into product containers.**
-> They are two of the three core-fixed mounts. A host-side tool for a product named `logs` or
-> `transcripts` that followed the general rule would write its bearer token *inside a directory the
-> container can read and write* — the exact outcome this slot exists to prevent, arrived at by
-> obeying the contract. **A host-side tool for a product with one of these three names has no slot,
+> **`~/.mythical/logs/` and `~/.mythical/transcripts/` can be bind-mounted into product
+> containers, read-write.** They are two of the three core-fixed mounts — the two a manifest may
+> *select*, when the policy index permits the selection; `<product>.conf` is the third, and the
+> only one mounted for every product unasked. A host-side tool for a product named `logs` or
+> `transcripts` that followed the general rule would write its bearer token *inside a directory a
+> container can be granted read-write* — the exact outcome this slot exists to prevent, arrived at
+> by obeying the contract. **A host-side tool for a product with one of these three names has no slot,
 > and must not invent one at these paths.**
 
 The collision is older and wider than this amendment: a product named `logs` collides with the
@@ -256,11 +258,13 @@ wholesale. No such reaper exists in this release; the rule is written down befor
 
 Two honest exceptions, neither of them a deletion:
 
-- **`backup` reads it and copies it.** A backup walks the whole `~/.mythical/` tree and copies every
-  file in it bar two installer-state things — the operation lock, and the state ledger, which is
-  captured separately as its own entry — so the slot, and the credential in it, is inside the backup,
-  exactly as `mythical.conf`'s host secrets already are. **Treat a backup as secret material and give
-  it the protection you would give the token itself.** It is deliberately not excluded: a backup that
+- **`backup` reads it and copies it.** A backup walks the whole `~/.mythical/` tree and copies
+  every file in it. What it leaves out is installer state and nothing else — the operation lock and
+  its sidecar files, the live state ledger (captured separately, as its own entry) and a staged one,
+  and, if the operator named an output directory inside the home, that directory's own subtree. The
+  slot, and the credential in it, is inside the backup, exactly as `mythical.conf`'s host secrets
+  already are. **Treat a backup as secret material and give it the protection you would give the
+  token itself.** It is deliberately not excluded: a backup that
   silently omitted the operator's own configuration would be a worse failure than one that includes
   it, because it would restore to a machine that looks complete and is not. `restore` does not write
   that tree back onto the machine; it restores the named volumes and the installer state ledger, and

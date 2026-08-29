@@ -95,8 +95,14 @@ second implementation of it:
   the line. Do not wrap a value in quotes; the quotes become part of it.
 
 If you are implementing a writer for one of these documents, read `docs/CONFIG-FORMAT.md`'s
-"Syntax" and "Writing safely" sections in full — they describe the same rules in more depth, with
-worked examples, and apply here without change.
+"Syntax" section in full: it describes these same byte and value rules in more depth, with worked
+examples, and they apply here unchanged. Its "Writing safely" section carries over only in part.
+The rule against writing a value containing a newline applies here for the same reason — a newline
+in a value forges a second assignment on the next read. The other two do **not**: these documents
+have **no integrity marker** (their authenticity comes from a digest a parent document vouches for,
+not from a marker line of their own — a line that merely looked like one would be an ordinary
+comment here), and they are **not bind-mounted**, so the prohibition on replacing the file by
+`rename()` does not apply to them either.
 
 ## Precedence: the order these checks run in
 
@@ -253,7 +259,7 @@ possible failure.
 | Key | Type | Cardinality | Meaning |
 |---|---|---|---|
 | `<product>.permitted_role` | `ident` | many | A volume role this product may declare in its manifest. |
-| `<product>.bindable_role` | `ident` | many | A subset of the above: a role this product's own settings UI may additionally point at an operator-chosen bind path, rather than only a named volume. |
+| `<product>.bindable_role` | `ident` | many | A subset of the above: a role the **operator** may additionally point at a host directory of their own, rather than leaving it on a named volume. The bind path is named in `mythical.conf`, which is host-only — the product's own settings UI never writes it and cannot ask for a bind. This key grants the operator that option; it grants the product nothing. |
 | `<product>.precious_role` | `ident` | many | A subset of `permitted_role`: a role whose volume holds data that **cannot be regenerated**. A data class, not a permission — it grants nothing and denies nothing. See [Precious roles](#precious-roles-precious_role) below. |
 | `<product>.permitted_secret` | `str:128` | many | A bootstrap secret name this product may request. |
 | `<product>.permitted_mount` | `ident` | many | A fixed mount this product may declare. |
@@ -416,11 +422,11 @@ normalize, or reject them on the way.
 is defined by the products themselves, not by this document, and it is not this project's format to
 change.
 
-**No verb in this release reads `/detect`.** The reader described in this section ships in the
-binary, but nothing in the current command set calls it, so what a product puts in that response
-changes nothing about this release's behaviour. The section stays because these rules are the
-contract a product's response has to satisfy, and because they are why the reader is shaped the way
-it is — not because a command runs them today.
+**No verb in this release reads `/detect`.** The reader described in this section exists in the
+source, but nothing in the command set calls it — it is not even in the shipped binary's dependency
+graph — so what a product puts in that response changes nothing about this release's behaviour. The
+section stays because these rules are the contract a product's response has to satisfy, and because
+they are why the reader is shaped the way it is — not because a command runs them today.
 
 The reader needs exactly three flat string fields out of that response — `product`, `version`,
 `ui_url` — and it does not hand the body to a JSON decoder to get them. That is a
