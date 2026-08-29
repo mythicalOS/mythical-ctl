@@ -57,8 +57,10 @@ each launch itself. The mounting described here is behaviour you can verify agai
 Where each part of a launch comes from, because the inventory matters more than the summary: the
 **image** is the authenticated manifest's, unless the operator passes `--image`, which replaces it
 loudly and is recorded; the **mounts** are the core-fixed set described below, plus a host bind for
-any role `mythical.conf` names *and* the authenticated policy index makes bindable, plus a named
-volume for every other role the manifest declares; the **published ports** are the manifest's, with
+any role `mythical.conf` names *and* the authenticated policy index makes bindable — the manifest is where the role
+has to be declared in the first place, and a configured bind for a role it does not declare is not
+a mount at all — plus a named volume for every other role the manifest declares; the **published
+ports** are the manifest's, with
 the host-side number optionally overridden from `mythical.conf`; and the **bootstrap secrets** are
 named by the manifest, granted by the policy index, and valued from `mythical.conf`.
 
@@ -81,6 +83,28 @@ Each is a bounded guarantee rather than an unlimited one, and the bounds are sta
 arise: the operator-bind check compares **pathnames**, not object identity (the host-tool slot's
 note on the limit of "never mounted", below, states that in full), and every identity check
 describes the path at the moment it runs (see [Ownership and identity](#ownership-and-identity)).
+
+**What this release's verbs actually do to these two files**, stated because everything after this
+point is a *contract* and not a description of one program's behaviour. The rules below are
+implemented — the reader and the writer that apply them ship in the binary, and they are what a
+product's own UI has to match on both sides. What the verbs reach is narrower than all of it:
+
+- **`mythical.conf` is read one key at a time, by name.** That read applies the syntax, the byte
+  policy, the key-count ceiling and the duplicate-key refusal, but **not** the schema and **not**
+  the declared type; each consumer then checks the one value it took, in its own terms — a port
+  must be a port, a bind path must resolve and must not overlap anything protected. So an
+  unrelated unknown key in this file does not by itself stop a launch, and a value read this way
+  is not re-checked against the type its schema declares. The one verb that writes this file,
+  `migrate-storage`, writes exactly one `MYTHICAL_<PRODUCT>_<ROLE>_BIND` key, and does validate
+  that key and that value.
+- **`<product>.conf` is created when it is absent** — an empty body under a correct marker, then
+  the ownership described below — and an existing one is left exactly as found, **unread**. No
+  verb in this release parses an existing `<product>.conf`, so no verb in this release reports one
+  as torn.
+
+So read the reader's rules as the contract a product's own UI implements — which is what this
+document is for — rather than as a list of checks a `mythical-ctl` command runs over your settings
+file today.
 
 ## Amendment: the host-tool slot `~/.mythical/<product>/cli.toml`
 
@@ -401,11 +425,11 @@ The types, and the rules an implementer would not guess:
 | Type | Accepts | The non-obvious part |
 |---|---|---|
 | `str:<maxlen>` | any permitted value, up to `<maxlen>` | `<maxlen>` is **bytes**, like the 4096-byte value cap: a 5-character accented value is 10 bytes. |
-| `int:<min>:<max>` | decimal digits, within the inclusive range | **Non-negative only.** No sign, no leading `+`, no surrounding space — and **no leading zero**, because a leading zero would be re-read as *octal* and `010` would compare as 8, letting a textually out-of-range value validate. `0` on its own is fine. Signed values are not supported at all; a schema writing `int:-10:10` is a schema bug, not a value that should validate. |
+| `int:<min>:<max>` | decimal digits, at most **18** of them, within the inclusive range | **Non-negative only.** No sign, no leading `+`, no surrounding space — and **no leading zero**, because a leading zero would be re-read as *octal* and `010` would compare as 8, letting a textually out-of-range value validate. `0` on its own is fine. Signed values are not supported at all; a schema writing `int:-10:10` is a schema bug, not a value that should validate. The 18-digit bound is on the written value and applies whatever the declared range is: a 19-digit value is refused even where the range would admit it. |
 | `enum:<a>\|<b>\|<c>` | exactly one listed member | A member **cannot contain `\|`**: it is the separator and the format has no escaping. A value containing one is refused rather than matched. Comparison is exact — not a prefix, not a substring, and the empty value is never a member. |
 | `bool` | exactly `true` or `false` | Nothing else. Not `1`, `0`, `yes`, `on`, or `True` — the comparison is case-sensitive. |
 | `path:<maxlen>` | an absolute path, up to `<maxlen>` bytes | Must start with `/`, and must contain **no `..` component**. A `..` inside a *name* is fine: `/srv/..hidden` is a legitimate path, `/srv/../etc` is not. |
-| `netname` | a container-network name: `[A-Za-z0-9]` then `[A-Za-z0-9_.-]*` | Additionally refuses `host`, `none` and `container:<name>` — those are network *modes*, not networks this installer may own. |
+| `netname` | a container-network name: `[A-Za-z0-9]` then `[A-Za-z0-9_.-]*`, at most 128 bytes | Additionally refuses `host`, `none` and `container:<name>` — those are network *modes*, not networks this installer may own. |
 
 Every one of these is evaluated in byte order, so the same file validates identically whatever locale
 the reader is running under.
@@ -413,6 +437,11 @@ the reader is running under.
 **The schema itself is not part of this document.** Which keys exist for a product, and which type
 each one carries, is declared by that product and can change with it; this section fixes only what
 each type *means*. `mythical.conf`'s own keys are core-owned.
+
+This whole-file check is what a reader of one of these files performs, and what this tool applies
+when it *writes* one. It is not what happens on every read: see "What this release's verbs actually
+do to these two files" at the top of this document for which paths apply it and which take a single
+value without it.
 
 ## The integrity marker
 
@@ -612,18 +641,16 @@ file, it needs a different storage mechanism, not a larger config file.
 
 ## This document's path is part of the contract
 
-When `mythical-ctl` reports a `<product>.conf` as torn, the message it prints to the operator names
-this file **by path**:
+The refusal `mythical-ctl` produces for a torn `<product>.conf` names this file **by path**:
 
 ```
 if you edited it by hand, recompute the marker (see docs/CONFIG-FORMAT.md); otherwise the last
 write was interrupted
 ```
 
-So `docs/CONFIG-FORMAT.md` is not merely where this document happens to live — it is a string in
-shipped runtime output. Moving or renaming it turns that message into a dangling pointer for every
-operator who ever hits a torn file. A test asserts that the message names this path and that the
-path resolves to a real file, so a rename that left the message behind would go red — but the
-test cannot know whether the document at the new path still says what the message promises. If it
-has to move, change
-the message in the same commit.
+So `docs/CONFIG-FORMAT.md` is not merely where this document happens to live — it is a literal in
+the shipped binary, on the one path that has to tell an operator how to repair a file by hand.
+Moving or renaming this document turns that message into a dangling pointer. A test asserts that
+the message names this path and that the path resolves to a real file, so a rename that left the
+message behind would go red — but the test cannot know whether the document at the new path still
+says what the message promises. If it has to move, change the message in the same commit.

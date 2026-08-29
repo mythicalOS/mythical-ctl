@@ -168,10 +168,10 @@ Types specific to these authenticated documents:
 | `epoch` | a non-negative decimal integer, bounded to 18 digits | Unix seconds. Compared against the host clock — see the residual on clock dependence below. |
 | `ident` | `[a-z][a-z0-9-]{0,63}` | A product or role identifier. |
 | `sha256` | exactly 64 lowercase hex characters | A raw digest, compared as a literal string — an uppercase-but-otherwise-correct digest does not match. |
-| `digestref` | `<repository>@sha256:<64 hex>` | An image reference **pinned by content digest**: the value must carry `@sha256:` followed by exactly 64 lowercase hex characters, and a bare tag with no digest (`:latest`, `:v1`) is refused — there is no floating reference this format can express, by construction, not by a denylist of tags an attacker would simply avoid. The `<repository>` half is shape- and charset-bounded (see below) but is **not** fully parsed — telling a tag apart from a registry-host port (`host:5000/repo`) needs Docker's full reference grammar, which this project deliberately does not implement. So a tag **may** appear alongside the digest (`repo:latest@sha256:<64 hex>`) and is simply ignored: the digest is what selects the image, so the value is still pinned to one exact content hash either way. |
+| `digestref` | `<repository>@sha256:<64 hex>` | An image reference **pinned by content digest**: the value must carry `@sha256:` followed by exactly 64 lowercase hex characters, and a bare tag with no digest (`:latest`, `:v1`) is refused — there is no floating reference this format can express, by construction, not by a denylist of tags an attacker would simply avoid. The `<repository>` half is shape- and charset-bounded but is **not** fully parsed — telling a tag apart from a registry-host port (`host:5000/repo`) needs Docker's full reference grammar, which this project deliberately does not implement. The bound it does carry, in full: at most 255 bytes; lowercase letters, digits and `. _ - / :` only (an uppercase byte is refused); it may not begin or end with `/` or `:`; and it may not contain `//`, `::`, `:/` or `/:`, each of which brackets an empty component and is not a valid reference. So a tag **may** appear alongside the digest (`repo:latest@sha256:<64 hex>`) and is simply ignored: the digest is what selects the image, so the value is still pinned to one exact content hash either way. |
 | `productdigest` | `<product>:<64 hex>` | The family index's flat encoding of "this product's manifest must hash to this." Exactly one colon. |
-| `coreversion` | `MAJOR[.MINOR[.PATCH]]`, numeric components only | Deliberately not full semver — pre-release and build-metadata suffixes carry ordering machinery a minimum-core requirement has no need of. |
-| `rolemount` | `<role>:/<absolute path>` | The flat encoding of what would be an object (`{role, mount}`) in a format that could nest. See [Residual: the format cannot nest](#residual-the-format-cannot-nest). No `..` component. |
+| `coreversion` | `MAJOR[.MINOR[.PATCH]]`, numeric components only, each at most 18 digits | Deliberately not full semver — pre-release and build-metadata suffixes carry ordering machinery a minimum-core requirement has no need of. |
+| `rolemount` | `<role>:/<absolute path>` | The flat encoding of what would be an object (`{role, mount}`) in a format that could nest. See [Residual: the format cannot nest](#residual-the-format-cannot-nest). No `..` component, and the path is at most 4096 bytes. **The path may contain no `:` of its own**: the first colon separates the role from the path, and a second one would make the split ambiguous in a format with no escaping — so a colon anywhere after it is refused, even though a colon is a legal byte in a pathname. |
 | `cpath` | a bounded absolute container path of safe segments | A single mount point, stricter than `path:<maxlen>`: it must begin with `/`, each segment is `[A-Za-z0-9._-]+`, there is no trailing slash and the bare root `/` is refused, no empty (`//`) or `.`/`..` segment, no whitespace or control byte, and the length is 2..512 bytes. The tight charset is what makes the type **closed**: a value cannot carry a second token or an options list (a space, comma, colon, or `=` is refused), so a field of this type names *where* a mount lives and nothing about *how* it is mounted. See [The volatile credential-home mount](VOLATILE-MOUNT-FORMAT.md). |
 
 Every type is checked byte by byte, with no collation or locale involved anywhere, so the same
@@ -350,7 +350,7 @@ expect are simply absent from the grammar below; their absence is the enforcemen
 | `secret` | `str:128` | many | A bootstrap secret name this product needs injected. Three things must hold when the launch is assembled, or it refuses: the policy index grants this product that name; the name is a key `mythical.conf`'s **core vocabulary defines** — a product selects from that vocabulary and cannot name an arbitrary key; and the key is actually **set** there — a declared secret with no value is a refusal, never an empty injection. |
 | `mount` | `ident` | many | A fixed mount this product needs. **The selectable vocabulary is closed to `transcripts` and `logs`** — the two core-fixed directory mounts. `conf` is not selectable, because `<product>.conf` is mounted for every product whether or not the manifest asks. Any other name is refused when the launch is assembled, even though the `ident` type accepts it and the policy index can be written to grant it. |
 | `port` | `int:1:65535` | many | A port this product's container listens on. |
-| `probe` | `str:256` | opt | An optional health-check path. |
+| `probe` | `str:256` | opt | An optional health-check path. **Declared and validated, but consumed by nothing in this release** — no verb reads it, so supplying it changes no behaviour today. It is listed because the schema accepts it and a manifest carrying it loads; it is not listed as something that does anything. |
 | `volatile_mount` | `cpath` | opt | Where this product's credential-bearing isolated-home mount lives, for a product that materializes a file-based credential per session. A bare mount point and nothing else: every hardening property of the mount is **fixed** and is not declared here, so a manifest names only the path and can never widen the mount. See [The volatile credential-home mount](VOLATILE-MOUNT-FORMAT.md). Optional — a product needing no such mount omits it. |
 | `min_core` | `coreversion` | one | The minimum `mythical-ctl` version this manifest requires. Required — an unstated minimum would silently mean "any core will do," which is never a safe default for a document this privileged. |
 | `runtime_uid` | `int:0:4294967295` | one | The uid this product's container runs as. Required, because migration **maps** ownership rather than preserving it, and this is the principal it maps to. Guessing it, or preserving uid/gid raw, is the dual-owner problem at directory scale: a preserved `0600` file owned by the operator is unreadable by a container still running as uid 900 — and a wrong value here does not fail loudly, it produces a migrated tree the product cannot read, discovered on the first start after the source has already been retired. |
@@ -410,12 +410,20 @@ digest computed over exact, unmodified bytes is only meaningful if it is checked
 have been touched by anything — a byte-policy pass, a parser, a canonicalizer — that might read,
 normalize, or reject them on the way.
 
-## `/detect`: JSON this project reads without decoding it
+## `/detect`: JSON read without being decoded
 
 `/detect` is a live HTTP endpoint each running product exposes, and its response body is JSON — that
 is defined by the products themselves, not by this document, and it is not this project's format to
-change. `mythical-ctl` needs exactly three flat string fields out of that response — `product`,
-`version`, `ui_url` — and it does not hand the body to a JSON decoder to get them. That is a
+change.
+
+**No verb in this release reads `/detect`.** The reader described in this section ships in the
+binary, but nothing in the current command set calls it, so what a product puts in that response
+changes nothing about this release's behaviour. The section stays because these rules are the
+contract a product's response has to satisfy, and because they are why the reader is shaped the way
+it is — not because a command runs them today.
+
+The reader needs exactly three flat string fields out of that response — `product`, `version`,
+`ui_url` — and it does not hand the body to a JSON decoder to get them. That is a
 choice, not a missing capability: a decoding tokenizer makes a literal `"product"` and an escaped
 spelling of it indistinguishable, and this reader has to **refuse** the escaped spelling rather
 than match it. So it reads those three fields with a small bounded scanner that works on raw bytes
@@ -481,7 +489,7 @@ than "every way of spelling this key is recognized"; it is stated here because i
 where the honest answer ("this reader cannot tell") and the intuitive one ("that key was clearly
 meant as `product`") diverge, and the honest one is what ships.
 
-`version` is the field `mythical-ctl` prefers. `image_version` is a **deprecated alias**, consulted
+`version` is the field this reader prefers. `image_version` is a **deprecated alias**, consulted
 in exactly two of the three ways `version` can come back: when `version` is **absent**, and when it
 is present and **empty**. It is never consulted when `version` is present but **unreadable** —
 something was reported and this reader failed to read it, and answering from a different field
@@ -509,11 +517,13 @@ provide.
 **Residual: nothing in this release establishes the anchor.** Every verification of a family index
 is checked against a digest already recorded in this installation's own state, and an installation
 with no such record **refuses** to verify an index rather than adopting whatever it was handed. What
-this release does not have is a path that records a first one: `state repair` preserves an existing
-anchor across a ledger rebuild, and `uninstall --family` clears it, and those are the only two
-things in it that touch the record at all. It also fetches nothing — the family index, the policy
-index and the manifests are read as local files, named on the command line or found at their
-default paths.
+this release does not have is a path that *derives* a first one from an index it verified. Three
+things touch the record, and none of them is that: `state repair` preserves an existing anchor
+across a ledger rebuild; `uninstall --family` clears it; and `restore`, which stages and activates
+a ledger captured by `backup`, transplants onto a machine with no installation whatever anchor the
+backed-up installation already held. This release also fetches nothing — the family index, the
+policy index and the manifests are read as local files, named on the command line or found at
+their default paths.
 
 So the question a trust-on-first-use model has to answer — what vouches for the very first index,
 before any anchor exists? — is not answered here, because nothing here asks it. That is a gap in
