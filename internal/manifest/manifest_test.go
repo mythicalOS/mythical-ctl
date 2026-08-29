@@ -176,6 +176,78 @@ func TestEntitlementCheck(t *testing.T) {
 	}
 }
 
+// TestVolatileMountField: the closed `volatile_mount` field.
+//
+// Three properties, and the third is the one that makes the field CLOSED rather than merely
+// validated. A valid bounded container path is accepted at the door; a path the wire's grammar
+// rejects fails the WHOLE manifest rather than being dropped; and there is deliberately no
+// options sub-grammar, so a sibling key trying to relax the mount falls out of the allowlist as
+// an UNKNOWN KEY. Absence is the enforcement: the field can carry only where the mount lives, so
+// a publisher has no vocabulary in which to widen it.
+func TestVolatileMountField(t *testing.T) {
+	m, err := ParseVerified(man(nil, "volatile_mount=/run/mythical/credential-homes"), "t")
+	if err != nil {
+		t.Fatalf("a valid volatile_mount was refused: %v", err)
+	}
+	got, ok := m.VolatileMount()
+	if !ok || got != "/run/mythical/credential-homes" {
+		t.Fatalf("VolatileMount() = %q, %v — the accessor does not report the declared mount", got, ok)
+	}
+
+	// A manifest that declares none answers "absent" rather than an empty path: "" is a value a
+	// caller could mistake for a mount point, and absence is not a mount.
+	none, err := ParseVerified(man(nil), "t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := none.VolatileMount(); ok {
+		t.Fatalf("VolatileMount() reported %q present on a manifest that declares none", v)
+	}
+
+	// A path the wire's grammar rejects fails the WHOLE manifest — the grammar is the door, not a
+	// later filter.
+	//
+	// THE LIST MATTERS AS MUCH AS THE ASSERTION. A traversal alone would not pin this field to the
+	// `cpath` type at all: the looser `path:<n>` type refuses a traversal too, so a field retyped
+	// to it would keep every traversal case green while quietly accepting everything below. These
+	// are the values that DISTINGUISH the closed type from the loose one — a second token, an
+	// option, the bare root, a trailing slash — and they are the ones a publisher would reach for
+	// to widen the mount.
+	for _, bad := range []string{
+		"/run/../etc",                                // traversal
+		"/run/mythical/credential-homes:rw",          // a second token behind a colon
+		"/run/mythical/credential-homes,nodev=false", // an option behind a comma
+		"/run/mythical/credential-homes exec",        // an option behind a space
+		"/",                                          // the bare container root
+		"/run/mythical/credential-homes/",            // a trailing slash
+		"relative/path",                              // not absolute
+	} {
+		if _, err := ParseVerified(man(nil, "volatile_mount="+bad), "t"); err == nil {
+			t.Errorf("the manifest door accepted volatile_mount=%q — the field is not closed", bad)
+		}
+	}
+
+	// NO SUB-GRAMMAR. An options sibling is an unknown key, not a way to weaken the fixed mount.
+	_, err = ParseVerified(man(nil,
+		"volatile_mount=/run/mythical/credential-homes",
+		"volatile_mount_exec=true"), "t")
+	if err == nil {
+		t.Fatal("an options sibling that would widen the mount was accepted")
+	}
+	if !strings.Contains(err.Error(), "unknown key") {
+		t.Fatalf("the sibling was refused, but not AS AN UNKNOWN KEY: %v", err)
+	}
+
+	// The field is OPTIONAL: a product needing no credential-home mount simply omits it, and the
+	// manifest is still valid (asserted by `none` parsing cleanly above) — stated here so the
+	// cardinality cannot be tightened to `one` without a red.
+	if _, err := ParseVerified(man(nil,
+		"volatile_mount=/run/mythical/credential-homes",
+		"volatile_mount=/run/mythical/credential-homes"), "t"); err == nil {
+		t.Fatal("a REPEATED volatile_mount was accepted — at most one mount, or the launch has two answers")
+	}
+}
+
 func TestCoreOK(t *testing.T) {
 	// The binary's own version normalizes to a valid coreversion (Fix 6's port), and a manifest
 	// needing more than it refuses.

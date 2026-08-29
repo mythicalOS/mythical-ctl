@@ -39,6 +39,17 @@ func Spec() docfmt.Schema {
 			"mount":    docfmt.Typed(docfmt.Many, "ident"),
 			"port":     docfmt.Typed(docfmt.Many, "int:1:65535"),
 			"probe":    docfmt.Typed(docfmt.Opt, "str:256"),
+			// The credential-bearing isolated-home mount. AT MOST ONE, and only for a product
+			// that needs a file-based credential materialized per session. Its value is a bare
+			// bounded container path (`cpath`) — every hardening property of the mount is fixed
+			// by the wire and is NOT declarable, so a manifest carries only WHERE the mount
+			// lives and can never widen it.
+			//
+			// Optional: a product needing no such mount omits it. And there is deliberately no
+			// options sibling in this allowlist — an attempt to add one (`volatile_mount_exec`
+			// and its kind) falls out as an UNKNOWN KEY rather than relaxing the mount. Absence
+			// is the enforcement, exactly as it is for bindable_role and network above.
+			"volatile_mount": docfmt.Typed(docfmt.Opt, "cpath"),
 			// §8: REQUIRED — a manifest that does not declare its minimum core cannot be
 			// checked, and "unstated" silently meaning "any core will do" is the one answer
 			// that is never safe.
@@ -114,6 +125,11 @@ func (m *Manifest) Ports() []uint16 {
 
 // Probe returns the optional probe declaration.
 func (m *Manifest) Probe() (string, bool) { return m.doc.Value("probe") }
+
+// VolatileMount returns the declared credential-home mount point and whether one was declared.
+// The second result is not decoration: ABSENCE IS NOT A MOUNT, and an accessor that answered ""
+// for "none declared" would hand a caller a value it could mistake for a mount point.
+func (m *Manifest) VolatileMount() (string, bool) { return m.doc.Value("volatile_mount") }
 
 // MinCore returns the declared minimum core version.
 func (m *Manifest) MinCore() string { v, _ := m.doc.Value("min_core"); return v }
