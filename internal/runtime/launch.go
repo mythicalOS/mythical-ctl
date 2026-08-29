@@ -130,6 +130,14 @@ type LaunchConfig struct {
 // product's compromise must not disclose another's credentials. The values ride the create
 // body over the local socket (the reference's 0600 env file is the argv-avoidance vehicle
 // this transport does not need).
+//
+// ONE DELIBERATE DIVERGENCE FROM THE REFERENCE, STATED SO IT IS NOT MISTAKEN FOR DRIFT: the
+// reference refused only an ABSENT key. A key PRESENT but assigned nothing reached its env
+// file as `KEY=` — measured against the reference implementation, not inferred — so the "each
+// one SET" clause above was never true of it either, and no test in the frozen corpus covers
+// that case in either direction. It refuses here. A blank assignment is how an operator spells
+// "not filled in yet", and the reference's own behaviour turned that into a container variable
+// that is present and configured as far as any product can tell.
 func (r *Runtime) secretsFor(m *manifest.Manifest, p *policy.Policy) ([]string, error) {
 	wanted := m.Secrets()
 	if len(wanted) == 0 {
@@ -166,6 +174,17 @@ func (r *Runtime) secretsFor(m *manifest.Manifest, p *policy.Policy) ([]string, 
 		}
 		if gerr != nil {
 			return nil, gerr
+		}
+		// PRESENT BUT EMPTY IS NOT SET. `MYTHICAL_TELEMETRY_KEY=` parses cleanly — an empty
+		// value is a legal str, and legitimately so for a NON-secret key — so the scanner
+		// hands back "" with no absence error, and this door is the only one that can tell a
+		// key left blank apart from a key holding a credential. Injecting it would put `KEY=`
+		// in the container, which answers "is it set?" YES to every test a product can write,
+		// out of a family file where the operator's blank assignment meant the opposite. The
+		// refusal is DISTINCT from the absent one above because the two are different
+		// mistakes: one key to add, one key to fill in.
+		if val == "" {
+			return nil, fmt.Errorf("runtime: %q requires bootstrap secret %q, and %s carries no value for it — refusing rather than injecting an empty one; set the key, or withdraw the manifest's declaration of it", product, key, famPath)
 		}
 		env = append(env, key+"="+val)
 	}

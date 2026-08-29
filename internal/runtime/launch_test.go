@@ -444,3 +444,68 @@ func TestAccessorsAndResolve(t *testing.T) {
 		t.Fatalf("running nets: %+v", nets)
 	}
 }
+
+// A DECLARED SECRET WHOSE ASSIGNMENT IS PRESENT BUT EMPTY (`MYTHICAL_TELEMETRY_KEY=`) IS A
+// REFUSAL, NOT AN EMPTY INJECTION — and it is a DIFFERENT refusal from the absent key, because
+// the two are different operator mistakes and a single message would misdiagnose one of them.
+//
+// `docs/DOCUMENT-FORMAT.md`'s `secret` row is the published contract: "the key is actually set
+// there — a declared secret with no value is a refusal, never an empty injection." The scanner
+// accepts an empty value (it is a legal `str:512`, and an empty value is legal for a NON-secret
+// key), so the injection door is where "set" has to mean something. Injecting `KEY=` hands the
+// product a variable that is present-and-configured to every "is it set?" test a product can
+// write, out of a family file where the key was left blank precisely because it was not filled
+// in yet. This is the same call `trust.oneTrustValue` already makes for a present-but-empty
+// trust record, for the same reason: where the value is the security property, present-empty is
+// unreadable, never a value.
+func TestSecretsPresentButEmptyRefuses(t *testing.T) {
+	r := newRig(t, "brokkr")
+	ctx := context.Background()
+	prov, err := engine.NewProvenance("inst1", "netnonce")
+	if err != nil {
+		t.Fatal(err)
+	}
+	netID, err := r.rt.NetworkCreate(ctx, "family", prov)
+	if err != nil {
+		t.Fatal(err)
+	}
+	launch := func(t *testing.T, name string) ([]string, error) {
+		t.Helper()
+		m := man(t, nil, "secret=MYTHICAL_TELEMETRY_KEY")
+		p := pol(t, "brokkr.permitted_secret=MYTHICAL_TELEMETRY_KEY")
+		r.fake.PullImage(m.Image())
+		id, err := r.rt.LaunchProduct(ctx, m, p, runtime.LaunchConfig{Identity: name, Nonce: "n-" + name, NetworkID: netID})
+		if err != nil {
+			return nil, err
+		}
+		info, err := r.c.ContainerInspect(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return info.Env, nil
+	}
+
+	// PRESENT BUT EMPTY: refused, and NOTHING is created — no container, so no `KEY=` anywhere.
+	r.writeFamilyConf(t, "MYTHICAL_NET=fam", "MYTHICAL_TELEMETRY_KEY=")
+	env, empty := launch(t, "present-empty")
+	if empty == nil {
+		t.Fatalf("a declared secret whose assignment is present but EMPTY was INJECTED as an empty value instead of refused: %v", env)
+	}
+	if !strings.Contains(empty.Error(), "carries no value") {
+		t.Fatalf("the present-but-empty refusal must say the key carries no value, not merely that something failed: %v", empty)
+	}
+
+	// ABSENT: also refused — and with its OWN message. If the two collapse into one, an
+	// operator who typed a blank line is told to add a key they already have.
+	r.writeFamilyConf(t, "MYTHICAL_NET=fam")
+	_, absent := launch(t, "absent")
+	if absent == nil {
+		t.Fatal("a declared secret that is not set at all must refuse")
+	}
+	if !strings.Contains(absent.Error(), "not set") {
+		t.Fatalf("the absent refusal must keep its own wording: %v", absent)
+	}
+	if strings.Contains(absent.Error(), "carries no value") || strings.Contains(empty.Error(), "not set") {
+		t.Fatalf("absent and present-but-empty must be DISTINGUISHABLE refusals, not one message:\n  absent: %v\n  empty:  %v", absent, empty)
+	}
+}
