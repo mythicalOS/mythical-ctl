@@ -346,9 +346,9 @@ expect are simply absent from the grammar below; their absence is the enforcemen
 | `product` | `ident` | one | The product this manifest is for. Checked against the product the installer asked for — a perfectly valid manifest for a sibling product is still the wrong answer. |
 | `launched` | `bool` | one | **Declared, never inferred.** Whether this product has a published image yet. Required: inferring "not launched" from, say, a registry 404 would turn a broken publication into a reassuring "not launched yet" notice instead of an error. |
 | `image` | `digestref` | one | The image to run, pinned by content digest. |
-| `volume` | `rolemount` | many | `<role>:<mount point>` — see the `rolemount` type above. |
-| `secret` | `str:128` | many | A bootstrap secret name this product needs injected. |
-| `mount` | `ident` | many | A fixed mount this product needs. |
+| `volume` | `rolemount` | many | `<role>:<mount point>` — see the `rolemount` type above. A role may be placed **at most once**: the same role at two mount points is two answers to a question that has one, and the launch refuses rather than letting record order decide which directory appears where. |
+| `secret` | `str:128` | many | A bootstrap secret name this product needs injected. Three things must hold when the launch is assembled, or it refuses: the policy index grants this product that name; the name is a key `mythical.conf`'s **core vocabulary defines** — a product selects from that vocabulary and cannot name an arbitrary key; and the key is actually **set** there — a declared secret with no value is a refusal, never an empty injection. |
+| `mount` | `ident` | many | A fixed mount this product needs. **The selectable vocabulary is closed to `transcripts` and `logs`** — the two core-fixed directory mounts. `conf` is not selectable, because `<product>.conf` is mounted for every product whether or not the manifest asks. Any other name is refused when the launch is assembled, even though the `ident` type accepts it and the policy index can be written to grant it. |
 | `port` | `int:1:65535` | many | A port this product's container listens on. |
 | `probe` | `str:256` | opt | An optional health-check path. |
 | `volatile_mount` | `cpath` | opt | Where this product's credential-bearing isolated-home mount lives, for a product that materializes a file-based credential per session. A bare mount point and nothing else: every hardening property of the mount is **fixed** and is not declared here, so a manifest names only the path and can never widen the mount. See [The volatile credential-home mount](VOLATILE-MOUNT-FORMAT.md). Optional — a product needing no such mount omits it. |
@@ -386,8 +386,8 @@ The family index is the **only** root. Nothing else authenticates itself: a dige
 authentication on its own — verifying a document against a digest that merely arrived beside it
 proves only that whoever sent both computed one correctly. A digest is meaningful *only* when the
 expected value came from a document that was itself already authenticated. So the family index is
-verified against a locally recorded **anchor** (a digest, established the first time this
-installation successfully verified an index — see the residual on trust-on-first-use, below); the
+verified against a locally recorded **anchor** — a digest held in this installation's own state
+(see [the residual on the anchor](#residuals) below); the
 family policy index and every product's manifest are then verified against digests **the index
 itself names** (`policy_digest`, and one entry per product under `manifest`); nothing is ever
 accepted on its own say-so. Every document additionally carries a **version**, which can only move
@@ -398,7 +398,8 @@ version anyone ever legitimately served would remain replayable forever against 
 been offline. A version floor, once recorded, only moves down through an explicit, reasoned,
 recorded downgrade — never through the ordinary acceptance path — because an emergency rollback that
 could happen silently would not be an emergency rollback, it would be exactly the replay this model
-exists to prevent.
+exists to prevent. The ordinary path only ever raises the floor, and it refuses to lower it; no verb
+in this release performs a downgrade.
 
 Every digest in this chain — the anchor, `policy_digest`, each `manifest` entry — is computed the
 same way: a plain SHA-256 over a document's entire raw bytes, header line and trailing newline
@@ -505,7 +506,17 @@ override for the "current time" this is checked against in normal operation — 
 make an expired document look current would defeat the exact replay protection expiry exists to
 provide.
 
-**Residual: the anchor is trust-on-first-use.** The first successful verification of a family index
-establishes the anchor that every later verification is checked against; nothing authenticates that
-very first fetch beyond TLS to a known origin. This is a stated limit of the model, not an
-oversight, and this document does not claim otherwise.
+**Residual: nothing in this release establishes the anchor.** Every verification of a family index
+is checked against a digest already recorded in this installation's own state, and an installation
+with no such record **refuses** to verify an index rather than adopting whatever it was handed. What
+this release does not have is a path that records a first one: `state repair` preserves an existing
+anchor across a ledger rebuild, and `uninstall --family` clears it, and those are the only two
+things in it that touch the record at all. It also fetches nothing — the family index, the policy
+index and the manifests are read as local files, named on the command line or found at their
+default paths.
+
+So the question a trust-on-first-use model has to answer — what vouches for the very first index,
+before any anchor exists? — is not answered here, because nothing here asks it. That is a gap in
+what ships, stated rather than papered over. It changes nothing about this format or about a
+publisher's obligations: a document that will be verified against an anchor is produced exactly the
+same way as one that would establish it.

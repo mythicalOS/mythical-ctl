@@ -52,9 +52,15 @@ A product's UI writes **only** `<product>.conf`.
 tested: the two paths, the syntax, the byte policy, the ownership and identity requirements, the
 typed validation, the integrity marker, and both size ceilings. So is the **runtime** around it.
 This release installs, starts, stops, restarts and recreates product containers, and it assembles
-each launch itself — image, mounts, published ports, injected bootstrap secrets — from the
-authenticated manifest and policy index. The mounting described here is behaviour you can verify
-against this build.
+each launch itself. The mounting described here is behaviour you can verify against this build.
+
+Where each part of a launch comes from, because the inventory matters more than the summary: the
+**image** is the authenticated manifest's, unless the operator passes `--image`, which replaces it
+loudly and is recorded; the **mounts** are the core-fixed set described below, plus a host bind for
+any role `mythical.conf` names *and* the authenticated policy index makes bindable, plus a named
+volume for every other role the manifest declares; the **published ports** are the manifest's, with
+the host-side number optionally overridden from `mythical.conf`; and the **bootstrap secrets** are
+named by the manifest, granted by the policy index, and valued from `mythical.conf`.
 
 Two of those runtime guarantees are why the format is shaped the way it is — why `<product>.conf`
 must be written in place, why it needs a marker, and why its size is treated as
@@ -67,9 +73,9 @@ attacker-controlled — and both are enforced rather than intended:
   the home to the container with no visible symptom. An operator-configured bind is refused when
   its resolved source is, is inside, or contains the family home.
 - **No value in `<product>.conf` reaches a container-launch argument.** Nothing on the launch
-  path reads this file at all: the image, the mounts, the ports and the injected secrets come
-  from the authenticated manifest and policy index plus `mythical.conf`, and `<product>.conf`
-  reaches the container only as the bytes behind its own bind mount.
+  path reads this file at all. Every part of the launch comes from one of the sources listed
+  above, and none of them is this file; it reaches the container only as the bytes behind its own
+  bind mount.
 
 Each is a bounded guarantee rather than an unlimited one, and the bounds are stated where they
 arise: the operator-bind check compares **pathnames**, not object identity (the host-tool slot's
@@ -300,9 +306,12 @@ is a real limit, not a hedge. Every check here is an `lstat` on the path, and ev
 the path again rather than a descriptor the check had already verified — so nothing binds the
 identity that was checked to the object that is finally written, and between the last check and the
 write the pathname can in principle be replaced. Three things narrow that window, and none of them
-closes it: `mythical-ctl` re-runs the identity check immediately before every mutation; a family
-operation lock excludes every other `mythical-ctl` process; and every write additionally refuses
-unless what it is about to overwrite still matches what it read. Read these requirements as "this
+closes it: each write door re-runs the identity check immediately before it begins to mutate; a
+family operation lock excludes every other `mythical-ctl` process; and every write additionally
+refuses unless what it is about to overwrite still matches what it read. The re-check is **once,
+before the sequence starts, not between its steps** — a `<product>.conf` write is a create, a
+write, a `chgrp` and a `chmod`, and only the first of those is preceded by a fresh check. Read
+these requirements as "this
 path is refused when it is seen to fail", not as an unconditional guarantee about the object finally
 written. Nothing else in this document depends on the difference.
 
@@ -410,7 +419,10 @@ each type *means*. `mythical.conf`'s own keys are core-owned.
 `<product>.conf` ends with **exactly one** marker line, and it must be the **final** line. A line
 beginning with the marker prefix anywhere else in the file is rejected — there is no such thing as a
 "marker comment", and allowing one would let a second marker sit in the body where no reader agrees
-on which is authoritative. The same rule applies to `mythical.conf`, which carries no marker at all:
+on which is authoritative. That rejection is reached only once the **final** line has been found to
+be a valid, matching marker: a file whose last line is not one is reported as torn before its body
+is scanned at all, whatever else the body contains (see
+[How a mismatched marker is treated](#how-a-mismatched-marker-is-treated)). The same rule applies to `mythical.conf`, which carries no marker at all:
 one scanner reads both files, and it refuses a marker-prefix line anywhere except as the final line
 of a `<product>.conf`.
 
@@ -533,7 +545,8 @@ recomputed.
 | Marker correct but **UPPERCASE** | mismatched, therefore **torn** — the comparison is a literal string compare |
 | Marker line has trailing text (a space, a second field) | mismatched, therefore **torn** |
 | Present but zero bytes | **torn** — a file with no marker at all |
-| A marker-prefix line anywhere but the final line | rejected as malformed |
+| A marker-prefix line in the body, under a final line that **is** a matching marker | rejected as malformed |
+| A marker-prefix line in the body, under a final line that is **not** a matching marker | **torn** — the marker gate decides first, and the body is never scanned |
 | Marker matches but the body is not valid config | rejected as malformed — the bytes are intact, so this is not damage |
 | Marker matches but a value fails its type | rejected as malformed — same reason |
 
@@ -571,12 +584,14 @@ A file containing **more than 1024 assignments is refused**, before any of them 
 message naming the cap. The boundary is inclusive: 1024 keys is accepted, 1025 is refused. Unlike the
 size ceiling, this applies to **both** files.
 
-It is a separate limit because the size ceiling bounds the *bytes* a reader copies, not the *number
-of assignments* it accumulates, and the two do not bound each other. `mythical.conf` carries no
-size ceiling at all, so the key count is the only limit on how much of it a reader will take in;
-and 1 MiB of short keys is, on either file, far more assignments than a configuration has. The cap
-is enforced **during** the scan — the file is refused at the line that crosses it, naming the cap,
-rather than after the whole of it has been accumulated.
+It is a separate limit because the size ceiling bounds the *bytes* a reader copies while the key
+cap bounds the *assignments* it accumulates, and neither implies the other. Comment and blank
+lines are not assignments and do not count toward the cap, so this is a bound on a file's
+vocabulary and not on its size — and `mythical.conf`, which has no size ceiling at all and is read
+whole, is bounded by the key cap in that sense only. In the other direction, 1 MiB of short keys is
+far more assignments than any configuration has. The cap is enforced **during** the scan — the file
+is refused at the line that crosses it, naming the cap, rather than after the whole of it has been
+accumulated.
 
 1024 is far above anything legitimate for the same reason 1 MiB is: 1 MiB divided by the 4096-byte
 value cap is about 256 maximal settings. If a product genuinely needs more than a thousand keys in one
