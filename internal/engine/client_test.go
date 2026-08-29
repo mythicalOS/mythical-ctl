@@ -50,7 +50,7 @@ import (
 // PORTED: tests/unit/runtime.bats: "ping succeeds against the fake runtime and reports the engine version" -> TestPingAndServerVersion
 // PORTED: tests/unit/runtime.bats: "an engine version can be faked, so the preflight gate is testable" -> TestInfoAndVersionKnobs
 // N/A: tests/unit/runtime.bats: "the engine version is read from the SERVER, not from the client" -- the API /version document carries the SERVER's Version field and the client binary has no version of its own here; the client/server template confusion is a CLI-grammar hazard with no API analogue
-// PORTED: tests/unit/runtime.bats: "the daemon endpoint is read from the active context (D30)" -> TestResolveEndpointContextSelection -- endpoint_test.go
+// PORTED: tests/unit/runtime.bats: "the daemon endpoint is read from the active context (D30)" -> internal/engine.TestResolveEndpointContextSelection -- endpoint_test.go, which is `package engine`; this file is `package engine_test`, so the target is qualified rather than left to resolve locally
 // PORTED: tests/unit/runtime.bats: "ping FAILS when the daemon is unreachable" -> TestPingDown
 // PORTED: tests/unit/runtime.bats: "inspect returns 3 for an absent object and 1 when the daemon cannot answer" -> TestAbsentVsDown
 // N/A: tests/unit/runtime.bats: "a caller cannot supply its own Go template" -- no template surface exists: inspects return typed documents, so the closed template map's job is done by the types

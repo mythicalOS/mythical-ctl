@@ -310,11 +310,16 @@ func (t target) String() string {
 }
 
 type claim struct {
-	Kind    claimKind
-	Pair    batsPair
-	Detail  string // the raw target column (PORTED) or the argument (N/A) — for messages only
-	GoFile  string
-	GoLine  int
+	Kind   claimKind
+	Pair   batsPair
+	Detail string // the raw target column (PORTED) or the argument (N/A) — for messages only
+	GoFile string
+	GoLine int
+	// Site — which of its package's compiled file sets the CLAIMING file is in. It is what an
+	// unqualified target resolves against: a claim written in an external test file is written in
+	// `x_test`, and a namesake in `x` is a different test that no claim in `x_test` ever named.
+	// Stamped by collectInventory from the toolchain's own file selection.
+	Site    fileKind
 	Targets []target // PORTED only: the targets the column NAMES, parsed as tokens
 }
 
@@ -952,6 +957,14 @@ func canonPath(p string) string {
 	return abs
 }
 
+// ok reports membership in the eligible set. Spelled out rather than read as a zero value, because
+// fileOrdinary IS the zero value: `eligible[canon] == fileOrdinary` is true for every file in the
+// tree, and reading membership off it would make the whole selection inert.
+func ok(eligible map[string]fileKind, canon string) bool {
+	_, in := eligible[canon]
+	return in
+}
+
 // collectInventory reads the whole tree, but only ELIGIBLE files may carry claims.
 //
 // ELIGIBILITY IS THE TOOLCHAIN'S OWN FILE SELECTION, not a rule this program invents: the union,
@@ -962,7 +975,7 @@ func canonPath(p string) string {
 // THE INELIGIBLE FILES ARE STILL READ, and that is deliberate. A claim moved into one of them is
 // not merely uncredited (which shows up as an unclaimed row somewhere else, naming the wrong file);
 // it is REPORTED where it sits, so the message names the file somebody actually has to fix.
-func collectInventory(root string, eligible map[string]bool) ([]claim, []malformed, []stray, int, error) {
+func collectInventory(root string, eligible map[string]fileKind) ([]claim, []malformed, []stray, int, error) {
 	var claims []claim
 	var bad []malformed
 	var strays []stray
@@ -997,8 +1010,10 @@ func collectInventory(root string, eligible map[string]bool) ([]claim, []malform
 		}
 		scanned++
 		var view *astView
-		if canon := canonPath(p); eligible[canon] {
+		site := fileOrdinary
+		if canon := canonPath(p); ok(eligible, canon) {
 			found[canon] = true
+			site = eligible[canon]
 			// A MALFORMED ELIGIBLE FILE REFUSES. It is a file the toolchain compiles, so its claims
 			// are the ones that count — and a parse error that merely skipped it would look exactly
 			// like a file with nothing in it.
@@ -1011,6 +1026,9 @@ func collectInventory(root string, eligible map[string]bool) ([]claim, []malform
 		c, b, st, perr := parseInventory(filepath.ToSlash(rel), content, view)
 		if perr != nil {
 			return perr
+		}
+		for i := range c {
+			c[i].Site = site
 		}
 		claims = append(claims, c...)
 		bad = append(bad, b...)
@@ -1056,8 +1074,14 @@ func collectInventory(root string, eligible map[string]bool) ([]claim, []malform
 // internal/policy) — so a global set lets a package's whole share of claims stay green after its
 // test is DELETED, because a namesake somewhere else keeps supplying the name. That is a parity
 // hole that exits 0, which is the only kind that matters.
-func parseGoTestList(content []byte) map[string]map[string]bool {
-	out := map[string]map[string]bool{}
+//
+// COUNTED, NOT FLAGGED, and the count is a witness in its own right. `x` and `x_test` are compiled
+// separately and may each declare a test of the same name, so the stream really does print one name
+// TWICE for one package — two tests, not a repetition. A boolean cannot hold that, and holding it is
+// what lets this half be compared against the source half's DECLARATION COUNT: if the two disagree
+// about how many tests carry a name, neither can say which one a claim is about.
+func parseGoTestList(content []byte) map[string]map[string]int {
+	out := map[string]map[string]int{}
 	sc := bufio.NewScanner(bytes.NewReader(content))
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	var cur []string
@@ -1075,10 +1099,10 @@ func parseGoTestList(content []byte) map[string]map[string]bool {
 		f := strings.Fields(t)
 		if len(f) >= 2 && (f[0] == "ok" || f[0] == "?" || f[0] == "FAIL" || f[0] == "---") {
 			if out[f[1]] == nil {
-				out[f[1]] = map[string]bool{}
+				out[f[1]] = map[string]int{}
 			}
 			for _, n := range cur {
-				out[f[1]][n] = true
+				out[f[1]][n]++
 			}
 			cur = nil
 		}
@@ -1097,23 +1121,91 @@ func parseGoTestList(content []byte) map[string]map[string]bool {
 // an active init() that merely PRINTS "TestClaimed", satisfied both halves while nothing anywhere
 // registered a test by that name. Requiring the two to agree WITHIN ONE LANE closes it: the source
 // half is now built from exactly the files that lane compiles.
+//
+// AND WHY THE SOURCE HALF IS KEYED BY testPkg. The two halves used to share one key — the import
+// path — which merged a package's internal and external test packages into one name set. See
+// testPkg.
 type testLane struct {
 	name string
-	// list — what `go test -list` printed for this lane, per package.
-	list map[string]map[string]bool
-	// src — what the ACTIVE test files of this lane declare, per package (same key as list).
-	src map[string]map[string]bool
+	// list — what `go test -list` printed for this lane, per package, WITH MULTIPLICITY. It cannot
+	// be keyed any finer: one test binary is built per package under test and its listing prints
+	// the internal and external tests together, under one terminator line. What the stream can say
+	// is HOW MANY tests carry a name, and that is what is kept.
+	list map[string]map[string]int
+	// src — what the ACTIVE test files of this lane declare, per COMPILED TEST PACKAGE.
+	src declSet
+}
+
+// testPkg identifies ONE COMPILED TEST PACKAGE: the import path under test, and whether this is the
+// EXTERNAL `x_test` package built from XTestGoFiles rather than the package itself.
+//
+// THIS IS AN IDENTITY THE AUDIT PREVIOUSLY APPROXIMATED, AND THE APPROXIMATION WAS A FALSE GREEN.
+// TestGoFiles and XTestGoFiles were concatenated and every declaration stored as a bare
+// `import-path/TestName` bit, so `package x`'s TestSame and `package x_test`'s TestSame — two
+// separate tests, compiled into two separate packages, both printed by `go test -list` — became one
+// target. Delete the external one and keep its claim, and the claim resolved against the internal
+// namesake: the audit certifying that deleting the bash tree lost nothing stayed green over a Go
+// test that was gone. It is the same shape as every other false green in this program's history — a
+// namesake in another package answering for a deleted test — reappearing at the one package boundary
+// the key could not express. So the key expresses it.
+type testPkg struct {
+	Path     string
+	External bool
+}
+
+// String spells a compiled test package the way a claim must WRITE it to name it: `x_test` is a
+// real, distinct package path token, and it is the only way to point at the external half from
+// outside it.
+func (p testPkg) String() string {
+	if p.External {
+		return p.Path + "_test"
+	}
+	return p.Path
+}
+
+// testDecl is ONE test declaration — where it is, and the `package` clause its file actually wrote.
+//
+// A LOCATION, NOT A BIT. A bit answers "does something by this name exist somewhere in this
+// package"; a resolution needs "which declaration is this claim about", and a message that cannot
+// name the file and line of the thing it is talking about sends its reader looking. The parsed
+// clause travels with it because it is the INDEPENDENT witness that a file is in the bucket `go
+// list` put it in: an external test file's clause ends in `_test` and an internal one's does not,
+// so reading the two file lists in the wrong order stops being silent.
+type testDecl struct {
+	File    string
+	Line    int
+	PkgName string
+}
+
+// declSet is what one lane's compiled test files declare, per compiled test package: a name maps to
+// EVERY declaration of it, so multiplicity survives to be checked rather than being collapsed on the
+// way in.
+type declSet map[testPkg]map[string][]testDecl
+
+func (d declSet) add(p testPkg, name string, dc testDecl) {
+	if d[p] == nil {
+		d[p] = map[string][]testDecl{}
+	}
+	d[p][name] = append(d[p][name], dc)
 }
 
 // pkgFiles is what one lane compiles for one package: its ordinary source, and the files that can
 // DECLARE tests. The two are kept apart because they answer different questions — every file here
 // may carry a CLAIM (it is compiled, so it is real), but only a `_test.go` file can declare a test,
 // and a `func TestX` in ordinary source is an exported function the toolchain never registers.
+//
+// AND THE TWO TEST LISTS ARE NOT ONE LIST. They were concatenated here, which is where the internal
+// and external test packages first became indistinguishable; everything downstream inherited it.
 type pkgFiles struct {
-	Dir  string
-	Go   []string // GoFiles — compiled into the package itself
-	Test []string // TestGoFiles + XTestGoFiles — the in-package and external test files
+	Dir   string
+	Go    []string // GoFiles — compiled into the package itself
+	Test  []string // TestGoFiles — compiled INTO the package under test (`package x`)
+	XTest []string // XTestGoFiles — compiled into the EXTERNAL test package (`package x_test`)
 }
+
+// AllTest is both test file lists, for the questions that genuinely do not care which package a
+// file is compiled into — eligibility to CARRY a claim is the only one.
+func (p pkgFiles) AllTest() []string { return append(append([]string{}, p.Test...), p.XTest...) }
 
 // parseGoFileList reads `go list -f '{{.ImportPath}}\t{{.Dir}}\t{{join .GoFiles " "}}\t{{join
 // .TestGoFiles " "}}\t{{join .XTestGoFiles " "}}'` output and returns, per package import path, the
@@ -1141,14 +1233,17 @@ func parseGoFileList(content []byte) (map[string]pkgFiles, error) {
 		for _, name := range strings.Fields(f[2]) {
 			e.Go = append(e.Go, filepath.Join(dir, name))
 		}
-		for _, group := range f[3:] {
-			for _, name := range strings.Fields(group) {
-				e.Test = append(e.Test, filepath.Join(dir, name))
-			}
+		// FIELD 4 IS THE IN-PACKAGE TEST FILES AND FIELD 5 IS THE EXTERNAL ONES, kept apart from
+		// here down. They used to be appended into one list, which is the whole of Finding 1.
+		for _, name := range strings.Fields(f[3]) {
+			e.Test = append(e.Test, filepath.Join(dir, name))
+		}
+		for _, name := range strings.Fields(f[4]) {
+			e.XTest = append(e.XTest, filepath.Join(dir, name))
 		}
 		// A PACKAGE WITH NO FILES CONTRIBUTES NO ENTRY. It declares nothing and compiles nothing, so
 		// inventing an empty entry for it would only make the liveness checks below harder to trip.
-		if len(e.Go) == 0 && len(e.Test) == 0 {
+		if len(e.Go) == 0 && len(e.Test) == 0 && len(e.XTest) == 0 {
 			continue
 		}
 		out[pkg] = e
@@ -1162,14 +1257,22 @@ func parseGoFileList(content []byte) (map[string]pkgFiles, error) {
 // which counted a declaration written inside a block comment or a raw string as source evidence —
 // the same class of defect the inventory scanner had, in the tool that was fixing it. go/parser
 // knows what is code, and a file that does not parse is a hard error rather than a silent zero.
-func collectLaneSource(files map[string]pkgFiles) (map[string]map[string]bool, error) {
-	out := map[string]map[string]bool{}
+func collectLaneSource(files map[string]pkgFiles) (declSet, error) {
+	out := declSet{}
 	fset := token.NewFileSet()
-	for pkg, pf := range files {
+	// SORTED, because the messages below name a file and a line and a map iteration would name a
+	// different one on each run. A refusal that moves is a refusal nobody trusts.
+	paths := make([]string, 0, len(files))
+	for pkg := range files {
+		paths = append(paths, pkg)
+	}
+	sort.Strings(paths)
+	for _, pkg := range paths {
+		pf := files[pkg]
 		// ONLY A TEST FILE CAN DECLARE A TEST, and only a package that ACTUALLY DECLARES ONE gets an
 		// entry. An entry created up front — for a package with no test files, or with a test file
 		// that declares nothing — is an empty witness, and an empty witness is indistinguishable
-		// from a real one at every read (`src[p][t]` is false either way) while making the lane look
+		// from a real one at every read (`src[p][t]` is empty either way) while making the lane look
 		// populated to anything that counts entries. It is created below, on the first declaration.
 		//
 		// DELIBERATELY REDUNDANT WITH THE `laneDeclared` COUNT IN run(), AND SAY SO. Either one alone
@@ -1177,48 +1280,84 @@ func collectLaneSource(files map[string]pkgFiles) (map[string]map[string]bool, e
 		// test can distinguish them; only reverting BOTH reddens. That is recorded here rather than
 		// left for a later reader to discover by deleting one — the pair is two readers of the same
 		// fact (this lane can confirm nothing), and the cheaper of the two to get wrong is this one.
-		for _, p := range pf.Test {
-			f, perr := parser.ParseFile(fset, p, nil, parser.SkipObjectResolution)
-			if perr != nil {
-				return nil, fmt.Errorf("parsing %s for its test declarations: %w", p, perr)
-			}
-			for _, decl := range f.Decls {
-				fn, ok := decl.(*ast.FuncDecl)
-				// A METHOD IS NOT A TEST. `func (r *rig) TestX()` is never run by the testing
-				// package, so a receiver disqualifies the declaration however the name reads.
-				if !ok || fn.Recv != nil || fn.Name == nil {
-					continue
+		for _, group := range []struct {
+			files    []string
+			external bool
+		}{{pf.Test, false}, {pf.XTest, true}} {
+			key := testPkg{Path: pkg, External: group.external}
+			for _, p := range group.files {
+				f, perr := parser.ParseFile(fset, p, nil, parser.SkipObjectResolution)
+				if perr != nil {
+					return nil, fmt.Errorf("parsing %s for its test declarations: %w", p, perr)
 				}
-				// THE HARNESS ENTRY POINT IS NOT A TEST. `func TestMain(m *testing.M)` is where
-				// the test binary STARTS; the toolchain never registers it and `go test -list`
-				// never prints it. Counting the declaration was the one name wide enough to walk
-				// through the lane pairing: the list witness is `-list` STDOUT, TestMain is the one
-				// function that RUNS during a listing run, so a TestMain printing its own name
-				// supplied the list half while this loop supplied the other — both witnesses
-				// agreeing about a name that registers no test.
-				//
-				// THE SIGNATURE DECIDES, NOT THE NAME, and that is not a detail: `func TestMain(t
-				// *testing.T)` IS a registered, runnable test (measured — `go test -list` prints it
-				// with nothing printing it), so excluding the name would refuse a legitimate claim
-				// on a legitimate test. This is cmd/go's own rule, applied to the same AST it
-				// applies it to: a single `*T`-shaped parameter is a test, anything else named
-				// TestMain is the entry point.
-				n := fn.Name.Name
-				if n == "TestMain" && !isTestTParam(fn) {
-					continue
+				// THE FILE'S OWN `package` CLAUSE IS THE SECOND WITNESS TO WHICH PACKAGE IT IS IN,
+				// and it is cheap enough that not asking would be a choice. `go list` puts a test
+				// file in TestGoFiles or XTestGoFiles by exactly this clause, so the two can be
+				// cross-checked: an external test file's clause ends in `_test` and an in-package
+				// one's cannot (cmd/go refuses a non-test package name ending that way). Reading the
+				// two fields in the wrong order — the single likeliest way to reintroduce Finding 1
+				// while every count still balances — inverts both answers at once, and this is what
+				// makes that loud instead of silent.
+				name := ""
+				if f.Name != nil {
+					name = f.Name.Name
 				}
-				// The same grammar the testing package applies: `Test` alone, or `Test` followed
-				// by a character that is not a lower-case letter.
-				if isGoTestName(n) {
-					if out[pkg] == nil {
-						out[pkg] = map[string]bool{}
+				if err := checkPackageClause(p, name, group.external); err != nil {
+					return nil, err
+				}
+				for _, decl := range f.Decls {
+					fn, ok := decl.(*ast.FuncDecl)
+					// A METHOD IS NOT A TEST. `func (r *rig) TestX()` is never run by the testing
+					// package, so a receiver disqualifies the declaration however the name reads.
+					if !ok || fn.Recv != nil || fn.Name == nil {
+						continue
 					}
-					out[pkg][n] = true
+					// THE HARNESS ENTRY POINT IS NOT A TEST. `func TestMain(m *testing.M)` is where
+					// the test binary STARTS; the toolchain never registers it and `go test -list`
+					// never prints it. Counting the declaration was the one name wide enough to walk
+					// through the lane pairing: the list witness is `-list` STDOUT, TestMain is the one
+					// function that RUNS during a listing run, so a TestMain printing its own name
+					// supplied the list half while this loop supplied the other — both witnesses
+					// agreeing about a name that registers no test.
+					//
+					// THE SIGNATURE DECIDES, NOT THE NAME, and that is not a detail: `func TestMain(t
+					// *testing.T)` IS a registered, runnable test (measured — `go test -list` prints it
+					// with nothing printing it), so excluding the name would refuse a legitimate claim
+					// on a legitimate test. This is cmd/go's own rule, applied to the same AST it
+					// applies it to: a single `*T`-shaped parameter is a test, anything else named
+					// TestMain is the entry point.
+					n := fn.Name.Name
+					if n == "TestMain" && !isTestTParam(fn) {
+						continue
+					}
+					// The same grammar the testing package applies: `Test` alone, or `Test` followed
+					// by a character that is not a lower-case letter.
+					if isGoTestName(n) {
+						out.add(key, n, testDecl{File: p, Line: fset.Position(fn.Pos()).Line, PkgName: name})
+					}
 				}
 			}
 		}
 	}
 	return out, nil
+}
+
+// checkPackageClause holds the file's own `package` clause against the file list `go list` put it
+// in. It is a structural cross-check, not a style rule: the whole of Finding 1 was the two lists
+// being indistinguishable, and reading them in the wrong order would restore that while every count
+// in this program still balanced.
+func checkPackageClause(file, clause string, external bool) error {
+	if clause == "" {
+		return fmt.Errorf("%s declares no package clause — a Go file the toolchain compiles always has one, so this is not the file `go list` named", file)
+	}
+	isExt := strings.HasSuffix(clause, "_test") && clause != "_test"
+	if external && !isExt {
+		return fmt.Errorf("%s is in XTestGoFiles — the EXTERNAL test package — but its clause is `package %s`, which does not end in `_test`; the two test file lists are being read in the wrong order, which merges a package's internal and external tests back into one namespace", file, clause)
+	}
+	if !external && isExt {
+		return fmt.Errorf("%s is in TestGoFiles — compiled INTO the package under test — but its clause is `package %s`, which names the external test package; the two test file lists are being read in the wrong order, which merges a package's internal and external tests back into one namespace", file, clause)
+	}
+	return nil
 }
 
 // isTestTParam reports whether fn takes exactly one parameter of the shape `*T` or `*something.T`
@@ -1271,7 +1410,13 @@ func isTestTParam(fn *ast.FuncDecl) bool {
 // A BASENAME IS NOT A PACKAGE. `cmd/probe` and `internal/probe` must never collapse onto whichever
 // was seen last, so a multi-segment token must match a real path SUFFIX, and a bare segment matches
 // only when it is unambiguous across the whole module.
-func candidatePackages(all map[string]map[string]bool, goFile string, tg target) map[string]bool {
+//
+// AND IT SAYS WHICH OF THE PACKAGE'S TWO TEST PACKAGES, not only which import path. An unqualified
+// claim binds to the compiled test package of the FILE IT IS WRITTEN IN — a claim in an external
+// test file is a claim in `x_test`, which is not `x` and may declare a different test of the same
+// name. That is the resolution Finding 1 was missing: with the two merged, a claim in `x_test` was
+// answered by `x`'s namesake and survived the deletion of the test it was actually about.
+func candidatePackages(all map[string]map[string]bool, goFile string, site fileKind, tg target) (map[string]bool, bind) {
 	bySeg := map[string][]string{}
 	for p := range all {
 		bySeg[path.Base(p)] = append(bySeg[path.Base(p)], p)
@@ -1289,7 +1434,23 @@ func candidatePackages(all map[string]map[string]bool, goFile string, tg target)
 	// lives is answered by THAT package or by nothing.
 	if tg.Pkg != "" {
 		addTo(all, bySeg, out, tg.Pkg)
-		return out
+		if len(out) > 0 {
+			// THE QUALIFIER NAMES AN IMPORT PATH AND NOT A HALF OF IT, so it constrains the package
+			// and leaves the internal/external question to UNIQUENESS: one declaration answers it,
+			// two REFUSE. Picking one would be the widening this whole family of findings is made of.
+			return out, bindEither
+		}
+		// `x_test` IS THE EXTERNAL TEST PACKAGE'S REAL PATH, and it is the only way to name that
+		// half from outside it. Tried only after the token failed as a path of its own, so a module
+		// that really does hold a package whose last segment ends in `_test` keeps it: the exact
+		// path always wins.
+		if base, ok := strings.CutSuffix(tg.Pkg, "_test"); ok && base != "" {
+			addTo(all, bySeg, out, base)
+			if len(out) > 0 {
+				return out, bindExternal
+			}
+		}
+		return out, bindEither
 	}
 	// UNQUALIFIED: the claiming file's own package, and nothing else. Resolved by the SAME rule as
 	// a qualifier — the directory a claim is written in is a package-path token like any other, and
@@ -1299,7 +1460,129 @@ func candidatePackages(all map[string]map[string]bool, goFile string, tg target)
 	if p, ok := resolvePathToken(all, path.Dir(filepath.ToSlash(goFile))); ok {
 		out[p] = true
 	}
-	return out
+	return out, site.bind()
+}
+
+// fileKind says which of a package's three compiled file sets a file belongs to. It is what makes a
+// claim's OWN package knowable: `internal/x/x_test.go` and `internal/x/ext_test.go` sit in one
+// directory and resolve to one import path, but one is compiled into `package x` and the other into
+// `package x_test`, and a test declared in either is invisible to the other.
+type fileKind int
+
+const (
+	fileOrdinary     fileKind = iota // GoFiles — compiled into the package itself
+	fileInternalTest                 // TestGoFiles — compiled into the package under test
+	fileExternalTest                 // XTestGoFiles — compiled into the external `x_test` package
+)
+
+// bind says WHICH compiled test package a target may be resolved in.
+type bind int
+
+const (
+	// bindEither — the claim did not say, so only a UNIQUE declaration answers it. Two same-named
+	// declarations refuse rather than one of them winning.
+	bindEither bind = iota
+	bindInternal
+	bindExternal
+)
+
+// bind is where a claim written in a file of this kind may look. An ORDINARY source file is not
+// compiled into either test package, so a claim in one names no half and falls back to uniqueness —
+// the honest answer, and the one that cannot silently pick a winner.
+func (k fileKind) bind() bind {
+	switch k {
+	case fileInternalTest:
+		return bindInternal
+	case fileExternalTest:
+		return bindExternal
+	}
+	return bindEither
+}
+
+// resolution is what ONE lane can say about ONE target in ONE package. Its two problem fields are
+// DECISIVE reasons — the question was reached and refused — as opposed to a plain miss, which is
+// silence: another lane may still answer, and only if none does are these reported.
+type resolution struct {
+	OK        bool
+	Ambiguous string // two declarations this claim cannot choose between
+	WrongPkg  string // declared in this import path, but in its OTHER compiled test package
+	Disagree  string // the two witnesses disagree about HOW MANY tests carry the name
+}
+
+// resolve binds ONE target to ONE declaration, or says why it cannot.
+//
+// EXACTLY ONE DECLARATION, NEVER "AT LEAST ONE". A name present in both `x` and `x_test` is TWO
+// tests; answering a claim that does not say which with either of them is how the deleted one keeps
+// its claim green. Where the claim's own file settles it — an unqualified claim is about its own
+// compiled test package — that is the binding; where nothing settles it, this REFUSES.
+func (ln testLane) resolve(pkg string, bd bind, name string) resolution {
+	in := ln.src[testPkg{Path: pkg}][name]
+	ex := ln.src[testPkg{Path: pkg, External: true}][name]
+	var want, other []testDecl
+	otherPkg := testPkg{Path: pkg}
+	switch bd {
+	case bindInternal:
+		want, other, otherPkg = in, ex, testPkg{Path: pkg, External: true}
+	case bindExternal:
+		want, other = ex, in
+	default:
+		want = append(append([]testDecl{}, in...), ex...)
+	}
+	if len(want) > 1 {
+		return resolution{Ambiguous: fmt.Sprintf(
+			"is declared %d times under %s — %s — and this claim names no one of them: a name declared in a package AND in its external test package is TWO tests, compiled separately, and accepting either lets the one this claim is about be deleted while the claim stays green. Name the external one as `%s.%s`, or move the claim into the file whose own package declares the test it is about",
+			len(want), pkg, declList(want), testPkg{Path: pkg, External: true}, name)}
+	}
+	if len(want) == 0 {
+		if len(other) > 0 {
+			return resolution{WrongPkg: fmt.Sprintf(
+				"is not declared in %s — it is declared in %s (%s), which is a DIFFERENT package: `x` and `x_test` are compiled separately and each may declare its own test of a given name, so a claim in one is never about a declaration in the other. Qualify the target as `%s.%s`, or move the claim beside the test",
+				bindPkg(pkg, bd), otherPkg, declList(other), otherPkg, name)}
+		}
+		return resolution{}
+	}
+	// BOTH WITNESSES, WITHIN ONE LANE. `go test -list` says that lane registers the name (so it
+	// compiles and runs there); the lane's ACTIVE test files say that package really declares it.
+	// Agreement ACROSS lanes proves nothing: a name printed by one lane's init and declared in a
+	// file only another lane compiles satisfies both halves while no lane runs a test by that name.
+	listed := ln.list[pkg][name]
+	if listed == 0 {
+		return resolution{}
+	}
+	// AND THEY MUST AGREE ON HOW MANY. The listing prints one line per registered test, so a package
+	// declaring the name twice — once internally, once externally — prints it twice. A count that
+	// does not match the declarations is the two halves describing different worlds: an extra line
+	// is something a package PRINTED during the listing run (the list witness is stdout), a missing
+	// one is a declaration the toolchain did not register. Either way this lane cannot say which
+	// test the claim is about, and saying yes anyway is exactly the guess this audit must not make.
+	if declared := len(in) + len(ex); listed != declared {
+		return resolution{Disagree: fmt.Sprintf(
+			"is declared %d time(s) under %s but `go test -list` printed it %d time(s) for that package — the two witnesses disagree about how many tests carry this name, so neither can say which one this claim is about",
+			declared, pkg, listed)}
+	}
+	return resolution{OK: true}
+}
+
+// bindPkg spells the package a claim was allowed to look in, for a message.
+func bindPkg(pkg string, bd bind) string {
+	switch bd {
+	case bindInternal:
+		return testPkg{Path: pkg}.String()
+	case bindExternal:
+		return testPkg{Path: pkg, External: true}.String()
+	}
+	return pkg + " or " + testPkg{Path: pkg, External: true}.String()
+}
+
+// declList names WHERE declarations are, because a message about which of two tests a claim means is
+// useless without the two files.
+func declList(ds []testDecl) string {
+	out := make([]string, 0, len(ds))
+	for _, d := range ds {
+		out = append(out, fmt.Sprintf("%s:%d", filepath.Base(d.File), d.Line))
+	}
+	sort.Strings(out)
+	return strings.Join(out, ", ")
 }
 
 // addTo resolves one package token into out. A multi-segment token must match a real path SUFFIX,
@@ -1599,18 +1882,33 @@ func auditCoverage(r *report, pairs []batsPair, claims []claim, bad []malformed,
 			continue
 		}
 		for _, t := range c.Targets {
-			cands := candidatePackages(goTests, c.GoFile, t)
-			found := false
+			cands, bd := candidatePackages(goTests, c.GoFile, c.Site, t)
+			pkgs := make([]string, 0, len(cands))
 			for p := range cands {
-				// BOTH WITNESSES, WITHIN ONE LANE. `go test -list` says that lane registers the
-				// name (so it compiles and runs there); the lane's ACTIVE test files say that
-				// package really declares it. Agreement ACROSS lanes proves nothing: a name
-				// printed by one lane's init and declared in a file only another lane compiles
-				// satisfies both halves while no lane runs a test by that name.
+				pkgs = append(pkgs, p)
+			}
+			// SORTED, so a message names the same package on every run. There is at most one
+			// candidate today; a resolution rule that depends on map order is a defect waiting for
+			// the day there are two.
+			sort.Strings(pkgs)
+			found := false
+			var decisive string
+			for _, p := range pkgs {
 				for _, ln := range testLanes {
-					if ln.list[p][t.Name] && ln.src[p][t.Name] {
+					res := ln.resolve(p, bd, t.Name)
+					if res.OK {
 						found = true
 						break
+					}
+					// A DECISIVE REASON IS KEPT, A PLAIN MISS IS NOT. Another lane may still answer
+					// this target, so nothing is reported until every lane has been asked; but when
+					// none does, the reason a lane REACHED and refused says far more than "does not
+					// exist" — which is what this used to say about a test sitting in the next
+					// package over.
+					for _, why := range []string{res.Ambiguous, res.Disagree, res.WrongPkg} {
+						if why != "" && decisive == "" {
+							decisive = why
+						}
 					}
 				}
 				if found {
@@ -1618,6 +1916,11 @@ func auditCoverage(r *report, pairs []batsPair, claims []claim, bad []malformed,
 				}
 			}
 			if found {
+				continue
+			}
+			if decisive != "" {
+				r.fail("%s:%d: PORTED target %s %s (claim: %s: %q)",
+					c.GoFile, c.GoLine, t, decisive, c.Pair.File, c.Pair.Name)
 				continue
 			}
 			var elsewhere []string
@@ -1799,7 +2102,7 @@ func run(root, manifestRel string, writeMan bool, goLists, goFiles []string, max
 	// in; nothing outside it is read as a claim, whatever it says. Union rather than intersection
 	// because the acceptance lane genuinely compiles a file the default lane does not, and a claim
 	// in it is legitimate.
-	eligible := map[string]bool{}
+	eligible := map[string]fileKind{}
 	names := 0
 	for i, p := range goLists {
 		content, err := os.ReadFile(p)
@@ -1815,11 +2118,19 @@ func run(root, manifestRel string, writeMan bool, goLists, goFiles []string, max
 			return fmt.Errorf("reading %s: %w", goFiles[i], perr)
 		}
 		for _, pf := range files {
+			// THE KIND TRAVELS WITH THE FILE, because a claim's own compiled test package is what an
+			// unqualified target resolves against. Ordinary source last would be wrong and internal
+			// last would be wrong: a file is in exactly one of the three lists, in every lane, so
+			// the order these are written in cannot matter — and checkPackageClause is what proves
+			// that independently of `go list`.
 			for _, f := range pf.Go {
-				eligible[canonPath(f)] = true
+				eligible[canonPath(f)] = fileOrdinary
 			}
 			for _, f := range pf.Test {
-				eligible[canonPath(f)] = true
+				eligible[canonPath(f)] = fileInternalTest
+			}
+			for _, f := range pf.XTest {
+				eligible[canonPath(f)] = fileExternalTest
 			}
 		}
 		src, serr := collectLaneSource(files)
