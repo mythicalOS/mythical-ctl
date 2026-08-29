@@ -57,6 +57,12 @@ func TestInstallRefusesAnOverlappingCredentialHome(t *testing.T) {
 	if !strings.Contains(r.said(), "overlaps the volatile credential-home mount") {
 		t.Fatalf("the operator was not told WHY the install was refused:\n%s", r.said())
 	}
+	// AND IT MUST NOT ALSO REPORT THE INSTALL AS DONE. A non-zero exit and a refusal sentence are
+	// not the same as the ABSENCE of a success sentence: an implementation that printed
+	// "p1: installed and running." and then returned the error satisfied every other assertion
+	// here, and the operator reading the output would see both. The success line is asserted absent
+	// because that is the only assertion that can fail on that implementation.
+	r.mustNotSay("installed and running")
 	// NO PARTIAL EFFECT. The refusal happens during assembly, before anything is created, so
 	// there is no container and no membership — and the report must not claim an effect that did
 	// not happen.

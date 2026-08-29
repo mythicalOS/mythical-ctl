@@ -181,17 +181,22 @@ func TestVolatileMountAbsentEmitsNothing(t *testing.T) {
 	}
 }
 
-// TestVolatileMountGuardsTheCoreFixedTargetsToo: the compared set is EVERY mount target, not only
-// the manifest's volumes. The core-fixed mounts are computed by the core itself, so a manifest
-// cannot move them — but they are still targets inside the container, and a credential-home root
-// declared at or over one of them would overlap it. The manifest CAN move the root, which is the
-// reachable half of this pair.
+// TestVolatileMountProductionRootGuardAnswersBeforeTheOverlapGuard: `volatileMountFor` has two
+// guards in order, and this pins WHICH of them answers a manifest that trips both. `/home/mythical`
+// is an ancestor of the core-fixed transcripts and logs targets and is a valid cpath, so it passes
+// the grammar and would overlap — but it is not the canonical root, and the production-root check
+// is first. An operator moving the credential home must hear the specific deployment reason, not a
+// downstream complaint about some other mount.
 //
-// `/home/mythical` is an ancestor of the core-fixed transcripts and logs targets, and it is a
-// valid cpath — so it passes the grammar and reaches the guard. It is refused by the production
-// -root check FIRST (it is not the canonical root), which is the honest outcome and is what this
-// asserts: the two guards are ordered so the more specific production rule answers first.
-func TestVolatileMountGuardsTheCoreFixedTargetsToo(t *testing.T) {
+// IT IS NOT THE OVERLAP TEST, AND ITS OLD NAME SAID IT WAS. As
+// TestVolatileMountGuardsTheCoreFixedTargetsToo it read as the isolation test while never reaching
+// the isolation loop: measured, an implementation that skipped every non-volume mount — ignoring
+// binds and the core-fixed targets entirely — kept `go test ./...` green across the whole tree. The
+// guard itself is exercised by TestVolatileMountRefusesADurableMountOverlappingTheCanonicalRoot in
+// mounts_internal_test.go, which has to be white-box: no production bring-up can be arranged to
+// present the canonical root together with a durable mount overlapping it, because the assembly
+// path refuses such a manifest earlier for a different reason.
+func TestVolatileMountProductionRootGuardAnswersBeforeTheOverlapGuard(t *testing.T) {
 	m := man(t, nil, "volume=state:/var/lib/brokkr", "mount=transcripts", "volatile_mount=/home/mythical")
 	p := pol(t, "brokkr.permitted_role=state", "brokkr.permitted_mount=transcripts")
 	_, err := launchWith(t, m, p)
