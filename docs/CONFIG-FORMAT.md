@@ -191,12 +191,12 @@ happen.
 | Size ceiling | none imposed by this document |
 
 **0600, and specifically not the 0660 + family group that `<product>.conf` uses.** That combination
-exists so the *container* can write its own settings file; applying it here would hand away the one
-property the slot is for. What is forbidden is the *arrangement* — a group-readable or
-group-writable mode, whichever group it names — not membership of any particular group: at 0600 the
-group is inert, so a file that lands in the operator's primary group, or in the family group, is
-equally fine. A host-tool slot found group- or world-readable should be treated as compromised —
-rotate whatever it holds.
+exists so that a product process already in the family group can write its own settings file;
+applying it here would hand away the one property the slot is for. What is forbidden is the
+*arrangement* — a group-readable or group-writable mode, whichever group it names — not membership
+of any particular group: at 0600 the group is inert, so a file that lands in the operator's primary
+group, or in the family group, is equally fine. A host-tool slot found group- or world-readable
+should be treated as compromised — rotate whatever it holds.
 
 **The identity requirements are the same shape as for the `.conf` files**, and for the same reasons
 given in [Ownership and identity](#ownership-and-identity): a regular file, not a symlink, link
@@ -380,7 +380,11 @@ create it **in place, as the operator**, rather than writing it elsewhere and mo
 ### When the mode and group cannot be set
 
 `<product>.conf` is meant to end up **owned by the operator, mode 0660, group = the family group** —
-that combination is what lets the product's own settings screen write the file while nobody else can.
+the file half of what lets the product's own settings screen write it while nobody else can. The
+other half is the product's process being in that group, and **`mythical-ctl` does not arrange
+that**: it sets no user and no group on any product container, so a product's own image is what
+decides whether the group grants it anything. See
+[`docs/DOCUMENT-FORMAT.md`](DOCUMENT-FORMAT.md)'s "The family gid."
 Setting the group requires the operator to be *in* that group, and that is not always true on the
 machine where the write happens.
 
@@ -436,7 +440,7 @@ The types, and the rules an implementer would not guess:
 
 | Type | Accepts | The non-obvious part |
 |---|---|---|
-| `str:<maxlen>` | any permitted value, up to `<maxlen>` | `<maxlen>` is **bytes**, like the 4096-byte value cap: a 5-character accented value is 10 bytes. |
+| `str:<maxlen>` | any permitted value, up to `<maxlen>` | `<maxlen>` is **bytes**, like the 4096-byte value cap: a 5-character accented value is 10 bytes. It is also the **only** type that admits the **empty** value: `KEY=` on its own is a valid `str:` assignment, where every other type refuses it. So `KEY=` means "present, and holding nothing" — not "absent" — and a consumer for which those two differ has to draw the line itself. `mythical-ctl` draws it for exactly one class of key: see the `secret` row in [`docs/DOCUMENT-FORMAT.md`](DOCUMENT-FORMAT.md). |
 | `int:<min>:<max>` | decimal digits, at most **18** of them, within the inclusive range | **Non-negative only.** No sign, no leading `+`, no surrounding space — and **no leading zero**, because a leading zero would be re-read as *octal* and `010` would compare as 8, letting a textually out-of-range value validate. `0` on its own is fine. Signed values are not supported at all; a schema writing `int:-10:10` is a schema bug, not a value that should validate. The 18-digit bound is on the written value and applies whatever the declared range is: a 19-digit value is refused even where the range would admit it. |
 | `enum:<a>\|<b>\|<c>` | exactly one listed member | A member **cannot contain `\|`**: it is the separator and the format has no escaping. A value containing one is refused rather than matched. Comparison is exact — not a prefix, not a substring, and the empty value is never a member. |
 | `bool` | exactly `true` or `false` | Nothing else. Not `1`, `0`, `yes`, `on`, or `True` — the comparison is case-sensitive. |

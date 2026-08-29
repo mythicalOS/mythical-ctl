@@ -3,18 +3,22 @@
 `mythical-ctl` accepts three kinds of document from outside the machine it runs on: a **family
 index**, a **family policy index**, and a per-product **manifest**. This document is the contract
 those three follow. It is written for the people who produce them and never read this repository's
-source to do it: a **product author** writing a manifest, and a **family/policy publisher** signing
-the family index and the policy index. It is normative — a document that does not follow it is
-rejected, and rejection is not a bug.
+source to do it: a **product author** writing a manifest, and a **family/policy publisher**
+publishing the family index and the policy index. It is normative — a document that does not
+follow it is rejected, and rejection is not a bug.
 
 These documents are **more privileged than `<product>.conf`**, not less. A manifest names the image
 that will run, the mounts that will be made, and the secrets that will be injected. Every rule
 [`docs/CONFIG-FORMAT.md`](CONFIG-FORMAT.md) places on the **bytes and values** of product
 configuration binds here too — the byte policy, the value rule, the key-count ceiling — plus the
 authentication and freshness rules this document adds on top. Its **integrity marker** is the one
-thing that does not carry over: these documents have none. Their authenticity comes from a digest a
-parent document vouches for, and a line that merely looks like a marker is an ordinary comment
-here.
+thing that does not carry over: these documents have none. Their authenticity comes from a digest
+something already authenticated names — a parent document, or, for the family index itself, the
+anchor this installation recorded. **In the body, a line that merely looks like a marker is an
+ordinary comment here** — it begins with `#`, so it is ignored like any other comment, where
+`<product>.conf` would refuse it. That holds for the body and only the body: the **first** line of
+one of these documents is never a comment, because it is the mandatory header, and a first line
+that is not the exact header is rejected as such.
 
 ## Why line-oriented `key=value`, not JSON
 
@@ -105,10 +109,11 @@ If you are implementing a writer for one of these documents, read `docs/CONFIG-F
 examples, and they apply here unchanged. Its "Writing safely" section carries over only in part.
 The rule against writing a value containing a newline applies here for the same reason — a newline
 in a value forges a second assignment on the next read. The other two do **not**: these documents
-have **no integrity marker** (their authenticity comes from a digest a parent document vouches for,
-not from a marker line of their own — a line that merely looked like one would be an ordinary
-comment here), and they are **not bind-mounted**, so the prohibition on replacing the file by
-`rename()` does not apply to them either.
+have **no integrity marker** (their authenticity comes from a digest something already
+authenticated names, not from a marker line of their own — in the body, a line that merely looked
+like one is an ordinary comment here; on the first line it is not a comment at all, but a header
+that does not match, and the document is rejected), and they are **not bind-mounted**, so the
+prohibition on replacing the file by `rename()` does not apply to them either.
 
 ## Precedence: the order these checks run in
 
@@ -142,13 +147,27 @@ their check-only siblings, which run the identical chain and commit nothing):
    own **schema**: which fields exist, their types, their cardinality. A control byte, a missing
    trailing newline, or a malformed line is rejected here — but only ever for a document that has
    already authenticated.
-3. **Is it fresh?** A version is present, an expiry is present and has not passed, and the version is
+3. **Is it coherent on the rules its own type carries?** The schema in step 2 is generic — key
+   names, types, cardinality — and each document type adds structural rules a schema cannot state.
+   They run here, **after the schema and before freshness**, and they differ by type:
+   - **Family index**: no product may be listed twice. An index naming two digests for one product
+     is ambiguous about which vouches for it, and is refused at load, not at the moment someone
+     looks that product up.
+   - **Family policy index**: the invariants set out under
+     [The family policy index](#the-family-policy-index-mythical-policy-1) — `bindable ⊆ permitted`,
+     `precious ⊆ permitted`, and the reserved `secrets` role never bindable.
+   - **Manifest**: the `product` it declares must be the product the caller asked for. A perfectly
+     authentic manifest for a sibling product is the wrong answer, not an acceptable one.
+
+   A document failing one of these is refused as malformed. Nothing is repaired, and no field is
+   handed back.
+4. **Is it fresh?** A version is present, an expiry is present and has not passed, and the version is
    not below the highest one this installation has already accepted for that document (anti-rollback
    — see [Trust model](#trust-model)).
-4. **Is it authorized?** (Manifests only.) Every role, secret, and mount the manifest selects must
+5. **Is it authorized?** (Manifests only.) Every role, secret, and mount the manifest selects must
    already be granted to that product by the policy index — a manifest can be perfectly authentic
    and still ask for something it was never entitled to.
-5. **Does it declare compatibility?** (Manifests only.) The manifest's declared minimum core version
+6. **Does it declare compatibility?** (Manifests only.) The manifest's declared minimum core version
    must be one this build satisfies.
 
 A document that fails any earlier step is refused for *that* step's reason, never re-diagnosed by a
@@ -183,7 +202,7 @@ Types specific to these authenticated documents:
 | `epoch` | a non-negative decimal integer, bounded to 18 digits | Unix seconds. Compared against the host clock — see the residual on clock dependence below. |
 | `ident` | `[a-z][a-z0-9-]{0,63}` | A product or role identifier. |
 | `sha256` | exactly 64 lowercase hex characters | A raw digest, compared as a literal string — an uppercase-but-otherwise-correct digest does not match. |
-| `digestref` | `<repository>@sha256:<64 hex>` | An image reference **pinned by content digest**: the value must carry `@sha256:` followed by exactly 64 lowercase hex characters, and a bare tag with no digest (`:latest`, `:v1`) is refused — there is no floating reference this format can express, by construction, not by a denylist of tags an attacker would simply avoid. The `<repository>` half is shape- and charset-bounded but is **not** fully parsed — telling a tag apart from a registry-host port (`host:5000/repo`) needs Docker's full reference grammar, which this project deliberately does not implement. The bound it does carry, in full: at most 255 bytes; lowercase letters, digits and `. _ - / :` only (an uppercase byte is refused); it may not begin or end with `/` or `:`; and it may not contain `//`, `::`, `:/` or `/:`, each of which brackets an empty component and is not a valid reference. So a tag **may** appear alongside the digest (`repo:latest@sha256:<64 hex>`) and is simply ignored: the digest is what selects the image, so the value is still pinned to one exact content hash either way. |
+| `digestref` | `<repository>@sha256:<64 hex>` | An image reference **pinned by content digest**: the value must carry `@sha256:` followed by exactly 64 lowercase hex characters, and a bare tag with no digest (`:latest`, `:v1`) is refused — there is no floating reference this format can express, by construction, not by a denylist of tags an attacker would simply avoid. The `<repository>` half is shape- and charset-bounded but is **not** fully parsed — telling a tag apart from a registry-host port (`host:5000/repo`) needs Docker's full reference grammar, which this project deliberately does not implement. The bound it does carry, in full: at most 255 bytes; lowercase letters, digits and `. _ - / :` only (an uppercase byte is refused); it may not begin or end with `/` or `:`; and it may not contain `//`, `::`, `:/` or `/:`, each of which brackets an empty component and is not a valid reference. So a tag **may** appear alongside the digest (`repo:latest@sha256:<64 hex>`), and the digest half is what pins the value to one exact content hash. It is **not** stripped, though, and this document does not claim it is: the reference is carried through verbatim — into the presence check, into the image pull, into the container that is created from it, and into the record this tool keeps of what it ran. Resolving such a reference is the container runtime's job, not this tool's. So a tag written here is a tag you are choosing to ship, visible wherever the reference is; it is not discarded on the way in. |
 | `productdigest` | `<product>:<64 hex>` | The family index's flat encoding of "this product's manifest must hash to this." Exactly one colon. |
 | `coreversion` | `MAJOR[.MINOR[.PATCH]]`, numeric components only, each at most 18 digits | Deliberately not full semver — pre-release and build-metadata suffixes carry ordering machinery a minimum-core requirement has no need of. |
 | `rolemount` | `<role>:/<absolute path>` | The flat encoding of what would be an object (`{role, mount}`) in a format that could nest. See [Residual: the format cannot nest](#residual-the-format-cannot-nest). No `..` component, and the path is at most 4096 bytes. **The path may contain no `:` of its own**: the first colon separates the role from the path, and a second one would make the split ambiguous in a format with no escaping — so a colon anywhere after it is refused, even though a colon is a legal byte in a pathname. |
@@ -241,19 +260,23 @@ a helper reference can be missing at the moment one is needed.
 
 ## The family policy index (`mythical-policy 1`)
 
-**Authenticity is not authorization.** A manifest signed by its real publisher can still ask for a
-sibling's state volume or another product's bootstrap secret — verifying who wrote a manifest never
-answers whether it may have what it asks for. So entitlements live in a **separate, authenticated**
-document, deliberately not folded into the manifest and deliberately not hard-coded in the core
-(which carries no product-specific logic).
+**Authenticity is not authorization.** A manifest that authenticates perfectly — bytes hashing to
+exactly the digest the family index vouches for — can still ask for a sibling's state volume or
+another product's bootstrap secret. Establishing that a document is the one the chain vouched for
+never answers whether it may have what it asks for. So entitlements live in a **separate,
+authenticated** document, deliberately not folded into the manifest and deliberately not hard-coded
+in the core (which carries no product-specific logic).
 
-This document has **two separate key namespaces**, and they are validated against **two separate
-schemas** — never one union schema — because a single spec that accepted both kinds would let a
-publisher's typo silently pass in either direction: a document-level key written with a product
-prefix would validate as a meaningless per-product setting, and a per-product entitlement key
-written *without* its prefix would validate while granting nothing to anyone. On the one document
-whose entire job is authorization, a typo that grants nothing and reports nothing is the worst
-possible failure.
+This document has **two separate key namespaces**, and every key is resolved against exactly one of
+them — never against an undifferentiated union of the two. There is one schema for the document, and
+it keeps them apart internally: a fixed set holding the document-level keys, and a resolver that
+recognises `<product>.<entitlement>` and nothing else. A schema that accepted both kinds
+indiscriminately would let a publisher's typo silently pass in either direction: a document-level
+key written *with* a product prefix would validate as a meaningless per-product setting, and a
+per-product entitlement key written *without* its prefix would validate while granting nothing to
+anyone. On the one document whose entire job is authorization, a typo that grants nothing and
+reports nothing is the worst possible failure. As it is, neither spelling resolves in either
+namespace: both are refused as unknown keys, and the whole document fails to load.
 
 **Document-level keys** (never product-prefixed):
 
@@ -326,8 +349,17 @@ explicit classification of *regenerable* is treated as a statement that the cont
 
 ### The family gid (`family_gid`)
 
-An earlier design fixed a family group id — the Unix group every product container runs as, so that
-sibling products can share state through the filesystem without running as each other — as a
+**What this release does with the value, stated exactly.** `family_gid` is applied to one thing:
+`<product>.conf` is created with that group and mode 0660, so a product process that is *already*
+in that group can write its own settings file. That is the whole of it. This release sets **no**
+user and **no** group on any product container — a manifest cannot ask for one, and nothing in the
+launch path establishes or checks one — so whether the running product is in the family group is a
+property of the product's own image, not something this tool arranges or verifies. The file half of
+the arrangement is what ships; the process half is the product's to satisfy. When the group cannot
+be set on the file, that is reported as a distinct outcome rather than being treated as success —
+see [`docs/CONFIG-FORMAT.md`](CONFIG-FORMAT.md)'s "When the mode and group cannot be set."
+
+**Why it lives here rather than in code.** An earlier design fixed the family group id as a
 hard-coded default inside this project's own configuration code. That shape was wrong: as long as
 the default lived in code, it was a **second authority** for the value, competing with whatever an
 operator's actual policy index said, and on any installation made before the two were unified, the
@@ -362,7 +394,7 @@ expect are simply absent from the grammar below; their absence is the enforcemen
 | `launched` | `bool` | one | **Declared, never inferred.** Whether this product has a published image yet. Required: inferring "not launched" from, say, a registry 404 would turn a broken publication into a reassuring "not launched yet" notice instead of an error. |
 | `image` | `digestref` | one | The image to run, pinned by content digest. |
 | `volume` | `rolemount` | many | `<role>:<mount point>` — see the `rolemount` type above. A role may be placed **at most once**: the same role at two mount points is two answers to a question that has one, and the launch refuses rather than letting record order decide which directory appears where. |
-| `secret` | `str:128` | many | A bootstrap secret name this product needs injected. Three things must hold when the launch is assembled, or it refuses: the policy index grants this product that name; the name is a key `mythical.conf`'s **core vocabulary defines** — a product selects from that vocabulary and cannot name an arbitrary key; and the key is actually **set** there — a declared secret with no value is a refusal, never an empty injection. |
+| `secret` | `str:128` | many | A bootstrap secret name this product needs injected. Three things must hold when the launch is assembled, or it refuses: the policy index grants this product that name; the name is a key `mythical.conf`'s **core vocabulary defines** — a product selects from that vocabulary and cannot name an arbitrary key; and the key is actually **set** there — a declared secret with no value is a refusal, never an empty injection. **Set** means carrying a value, and the two ways of not carrying one are distinguished: a key that is absent, and a key present but assigned nothing (`KEY=`, which the `str:` type otherwise admits), are each refused, with their own message — one key to add, one key to fill in. Neither reaches the container as an empty variable. |
 | `mount` | `ident` | many | A fixed mount this product needs. **The selectable vocabulary is closed to `transcripts` and `logs`** — the two core-fixed directory mounts. `conf` is not selectable, because `<product>.conf` is mounted for every product whether or not the manifest asks. Any other name is refused when the launch is assembled, even though the `ident` type accepts it and the policy index can be written to grant it. |
 | `port` | `int:1:65535` | many | A port this product's container listens on. |
 | `probe` | `str:256` | opt | An optional health-check path. **Declared and validated, but consumed by nothing in this release** — no verb reads it, so supplying it changes no behaviour today. It is listed because the schema accepts it and a manifest carrying it loads; it is not listed as something that does anything. |
@@ -396,6 +428,17 @@ key, rather than shipping a field that quietly does nothing.
   speak in roles cannot reach outside its own product's namespace to do so.
 
 ## Trust model
+
+**Nothing in this format is signed, and no part of this chain verifies a signature.** There is no
+publisher key, no signature field, and nothing a reader could check one against. This is stated
+first because "authenticated" carries a specific and limited meaning throughout this document: a
+document is authenticated when its bytes hash to a digest that **something already authenticated
+named in advance**, in a chain ending at a digest this installation recorded for itself. What that
+buys is integrity and continuity — a document is the one the chain expected, and cannot be swapped
+for a different one without the swap being seen. What it does not buy is evidence about **who
+produced** it. That rests entirely on the recorded anchor being the right one, which this release
+never establishes and never re-derives (see
+[the residual on the anchor](#residuals)).
 
 The family index is the **only** root. Nothing else authenticates itself: a digest is not
 authentication on its own — verifying a document against a digest that merely arrived beside it
