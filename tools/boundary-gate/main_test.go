@@ -1,0 +1,355 @@
+package main
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// writeTree lays a fixture module on disk: map of relative path -> content.
+func writeTree(t *testing.T, files map[string]string) string {
+	t.Helper()
+	root := t.TempDir()
+	for rel, content := range files {
+		p := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return root
+}
+
+const fixtureGoMod = "module example.test/mod\n\ngo 1.24.0\n"
+
+const guardedPkg = `package engine
+
+func NewMutator() int { return 1 }
+func Benign() int     { return 2 }
+`
+
+// The self-test the plan requires per rule: an INDIRECT reference (function value, no call
+// parentheses) must fail the gate — the exact form a grep for "NewMutator(" misses.
+func TestIndirectReferenceIsCaught(t *testing.T) {
+	root := writeTree(t, map[string]string{
+		"go.mod":                    fixtureGoMod,
+		"internal/engine/engine.go": guardedPkg,
+		"internal/rogue/rogue.go": `package rogue
+
+import "example.test/mod/internal/engine"
+
+var f = engine.NewMutator // no call: a bare function value
+`,
+	})
+	v, err := run(root, []string{"example.test/mod/internal/engine:NewMutator=example.test/mod/internal/runtime"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(v) != 1 || !strings.Contains(v[0], "NewMutator referenced outside its boundary") {
+		t.Fatalf("want 1 indirect-reference violation, got %v", v)
+	}
+}
+
+func TestDirectCallIsCaughtAndAllowedPackagePasses(t *testing.T) {
+	root := writeTree(t, map[string]string{
+		"go.mod":                    fixtureGoMod,
+		"internal/engine/engine.go": guardedPkg,
+		"internal/runtime/ok.go": `package runtime
+
+import "example.test/mod/internal/engine"
+
+var n = engine.NewMutator() // the allowlisted caller
+`,
+		"internal/rogue/rogue.go": `package rogue
+
+import "example.test/mod/internal/engine"
+
+var n = engine.NewMutator()
+`,
+	})
+	v, err := run(root, []string{"example.test/mod/internal/engine:NewMutator=example.test/mod/internal/runtime"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(v) != 1 || !strings.Contains(v[0], "rogue") {
+		t.Fatalf("want exactly the rogue violation, got %v", v)
+	}
+}
+
+func TestUnguardedIdentifierAndTestFilesAreExempt(t *testing.T) {
+	root := writeTree(t, map[string]string{
+		"go.mod":                    fixtureGoMod,
+		"internal/engine/engine.go": guardedPkg,
+		"internal/rogue/rogue.go": `package rogue
+
+import "example.test/mod/internal/engine"
+
+var n = engine.Benign() // not the guarded identifier
+`,
+		"internal/rogue/rogue_test.go": `package rogue
+
+import "example.test/mod/internal/engine"
+
+var m = engine.NewMutator() // tests may exercise boundaries deliberately
+`,
+	})
+	v, err := run(root, []string{"example.test/mod/internal/engine:NewMutator=example.test/mod/internal/runtime"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(v) != 0 {
+		t.Fatalf("want no violations, got %v", v)
+	}
+}
+
+func TestDotImportOfGuardedPackageIsRefused(t *testing.T) {
+	root := writeTree(t, map[string]string{
+		"go.mod":                    fixtureGoMod,
+		"internal/engine/engine.go": guardedPkg,
+		"internal/rogue/rogue.go": `package rogue
+
+import . "example.test/mod/internal/engine"
+
+var n = NewMutator() // unattributable through a dot-import; the import itself is the violation
+`,
+	})
+	v, err := run(root, []string{"example.test/mod/internal/engine:NewMutator=example.test/mod/internal/runtime"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(v) != 1 || !strings.Contains(v[0], "dot-import") {
+		t.Fatalf("want the dot-import violation, got %v", v)
+	}
+}
+
+// The defining package is NOT exempt: a bare in-package reference (no import selector) is the
+// one shape the selector walk cannot see, and it is exactly how a production file added inside
+// the guarded package would build the guarded thing unseen. The declaration alone is fine; an
+// EXPLICIT allow entry for the package is the way to say it may.
+func TestDefiningPackageIsNotExempt(t *testing.T) {
+	root := writeTree(t, map[string]string{
+		"go.mod":                    fixtureGoMod,
+		"internal/engine/engine.go": guardedPkg,
+		"internal/engine/self.go": `package engine
+
+var f = NewMutator   // bare in-package function value
+var n = NewMutator() // bare in-package call
+`,
+	})
+	v, err := run(root, []string{"example.test/mod/internal/engine:NewMutator=example.test/mod/internal/runtime"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(v) != 2 {
+		t.Fatalf("want both in-package references flagged (and not the declaration), got %v", v)
+	}
+	for _, s := range v {
+		if !strings.Contains(s, "self.go") || !strings.Contains(s, "inside its defining package") {
+			t.Fatalf("unexpected violation shape: %v", v)
+		}
+	}
+	v, err = run(root, []string{"example.test/mod/internal/engine:NewMutator=example.test/mod/internal/engine"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(v) != 0 {
+		t.Fatalf("an explicit allow entry for the defining package must pass, got %v", v)
+	}
+}
+
+func TestMalformedRuleIsAnError(t *testing.T) {
+	root := writeTree(t, map[string]string{"go.mod": fixtureGoMod})
+	if _, err := run(root, []string{"no-separators"}); err == nil {
+		t.Fatal("malformed rule accepted")
+	}
+}
+
+// The method: rule form — the round-fix for the finding that a method call or method value has
+// a variable receiver and evades import-alias attribution.
+func TestMethodRuleCatchesCallAndValue(t *testing.T) {
+	root := writeTree(t, map[string]string{
+		"go.mod": fixtureGoMod,
+		"internal/rogue/rogue.go": `package rogue
+
+type mut struct{}
+
+func (mut) ContainerCreate() int { return 1 }
+
+var m mut
+var a = m.ContainerCreate()  // method CALL through a variable receiver
+var b = m.ContainerCreate    // method VALUE
+`,
+		"internal/runtime/launch.go": `package runtime
+
+type mut struct{}
+
+func (mut) ContainerCreate() int { return 1 }
+
+var m mut
+var ok = m.ContainerCreate() // the allowlisted file
+`,
+	})
+	v, err := run(root, []string{"method:ContainerCreate=example.test/mod/internal/runtime"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(v) != 2 {
+		t.Fatalf("want the rogue call AND the rogue value flagged, got %v", v)
+	}
+	for _, s := range v {
+		if !strings.Contains(s, "rogue") {
+			t.Fatalf("flagged outside rogue: %v", v)
+		}
+	}
+}
+
+// A `.go` allow entry pins a symbol to ONE FILE within a package: the same package's other
+// file is a violation.
+func TestFileLevelAllowancePinsToOneFile(t *testing.T) {
+	root := writeTree(t, map[string]string{
+		"go.mod": fixtureGoMod,
+		"internal/runtime/launch.go": `package runtime
+
+type mut struct{}
+
+func (mut) ContainerCreate() int { return 1 }
+
+var m mut
+var ok = m.ContainerCreate()
+`,
+		"internal/runtime/other.go": `package runtime
+
+var also = m.ContainerCreate() // same package, WRONG file
+`,
+	})
+	v, err := run(root, []string{"method:ContainerCreate=internal/runtime/launch.go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(v) != 1 || !strings.Contains(v[0], "other.go") {
+		t.Fatalf("want exactly the other.go violation, got %v", v)
+	}
+}
+
+// An unaliased import binds the file's DECLARED package name, not the path basename:
+// `package daemon` living at internal/engine imports as `daemon`, and `daemon.NewMutator`
+// must not evade the rule on the engine path.
+func TestDeclaredPackageNameResolvesUnaliasedImports(t *testing.T) {
+	root := writeTree(t, map[string]string{
+		"go.mod": fixtureGoMod,
+		"internal/engine/engine.go": `package daemon
+
+func NewMutator() int { return 1 }
+`,
+		"internal/rogue/rogue.go": `package rogue
+
+import "example.test/mod/internal/engine"
+
+var f = daemon.NewMutator
+`,
+	})
+	v, err := run(root, []string{"example.test/mod/internal/engine:NewMutator=example.test/mod/internal/runtime"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(v) != 1 || !strings.Contains(v[0], "NewMutator referenced outside its boundary") {
+		t.Fatalf("declared-name import evaded the rule: %v", v)
+	}
+}
+
+// The collision regression: a decoy directory whose (build-tagged, inactive) file declares the
+// SAME package name the guarded package actively uses. With alias->single-path resolution the
+// later import would shadow the guarded binding and the reference would evade the rule; the
+// alias->path-SET keeps both bindings live and the rule fires.
+func TestAliasCollisionCannotShadowGuardedImport(t *testing.T) {
+	root := writeTree(t, map[string]string{
+		"go.mod":                    fixtureGoMod,
+		"internal/engine/engine.go": guardedPkg, // declares `package engine`
+		"internal/decoy/decoy.go": `package engine
+
+func NewMutator() int { return 99 } // harmless twin: dir "decoy", DECLARED name "engine" —
+// imported unaliased after the guarded import, it binds the same "engine" alias, and a
+// last-write-wins map would shadow the guarded path (the pre-fix bug this fixture recreates).
+`,
+		"internal/rogue/rogue.go": `package rogue
+
+import (
+	"example.test/mod/internal/engine"
+	"example.test/mod/internal/decoy"
+)
+
+var f = engine.NewMutator // the guarded binding must still be seen
+`,
+	})
+	v, err := run(root, []string{"example.test/mod/internal/engine:NewMutator=example.test/mod/internal/runtime"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, s := range v {
+		if strings.Contains(s, "internal/engine.NewMutator referenced outside") ||
+			strings.Contains(s, "engine:NewMutator") || strings.Contains(s, "engine.NewMutator") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("guarded reference evaded via alias collision: %v", v)
+	}
+}
+
+// Per-rule self-tests for the PRODUCTION rules check.sh carries: each exact rule string must
+// catch a violation in a fixture tree (an omitted or misspelled permanent rule would
+// otherwise pass silently forever).
+func TestProductionRulesCatchViolations(t *testing.T) {
+	cases := []struct {
+		rule  string
+		files map[string]string
+	}{
+		{"mythicalos.ai/ctl/internal/policy:ParseVerified=mythicalos.ai/ctl/internal/trust",
+			map[string]string{"internal/policy/policy.go": "package policy\n\nfunc ParseVerified() {}\n",
+				"internal/rogue/r.go": "package rogue\n\nimport \"mythicalos.ai/ctl/internal/policy\"\n\nvar _ = policy.ParseVerified\n"}},
+		{"mythicalos.ai/ctl/internal/manifest:ParseVerified=mythicalos.ai/ctl/internal/trust",
+			map[string]string{"internal/manifest/m.go": "package manifest\n\nfunc ParseVerified() {}\n",
+				"internal/rogue/r.go": "package rogue\n\nimport \"mythicalos.ai/ctl/internal/manifest\"\n\nvar _ = manifest.ParseVerified\n"}},
+		{"mythicalos.ai/ctl/internal/ledger:OpenStaging=mythicalos.ai/ctl/internal/backup",
+			map[string]string{"internal/ledger/l.go": "package ledger\n\nfunc OpenStaging() {}\n",
+				"internal/rogue/r.go": "package rogue\n\nimport \"mythicalos.ai/ctl/internal/ledger\"\n\nvar _ = ledger.OpenStaging\n"}},
+		{"method:ReplaceLines=mythicalos.ai/ctl/internal/trust",
+			map[string]string{"internal/rogue/r.go": "package rogue\n\ntype x struct{}\n\nfunc (x) ReplaceLines() {}\n\nvar v x\nvar _ = v.ReplaceLines\n"}},
+		{"mythicalos.ai/ctl/internal/engine:NewMutator=mythicalos.ai/ctl/internal/runtime",
+			map[string]string{"internal/engine/e.go": "package engine\n\nfunc NewMutator() {}\n",
+				"internal/rogue/r.go": "package rogue\n\nimport \"mythicalos.ai/ctl/internal/engine\"\n\nvar _ = engine.NewMutator\n"}},
+		{"mythicalos.ai/ctl/internal/engine:NewContainerSpec=mythicalos.ai/ctl/internal/runtime",
+			map[string]string{"internal/engine/e.go": "package engine\n\nfunc NewContainerSpec() {}\n",
+				"internal/rogue/r.go": "package rogue\n\nimport \"mythicalos.ai/ctl/internal/engine\"\n\nvar _ = engine.NewContainerSpec\n"}},
+		// The defining package's OWN production file: not exempt — a second Mutator or spec
+		// door added inside internal/engine must trip the same rules.
+		{"mythicalos.ai/ctl/internal/engine:NewMutator=mythicalos.ai/ctl/internal/runtime",
+			map[string]string{"internal/engine/e.go": "package engine\n\nfunc NewMutator() {}\n",
+				"internal/engine/self.go": "package engine\n\nvar _ = NewMutator\n"}},
+		{"mythicalos.ai/ctl/internal/engine:NewContainerSpec=mythicalos.ai/ctl/internal/runtime",
+			map[string]string{"internal/engine/e.go": "package engine\n\nfunc NewContainerSpec() {}\n",
+				"internal/engine/self.go": "package engine\n\nvar _ = NewContainerSpec()\n"}},
+		// The file-level sole-launch pin: a second create call site anywhere — even inside
+		// internal/runtime, in a file that is not launch.go — must trip it.
+		{"method:ContainerCreate=internal/runtime/launch.go",
+			map[string]string{"internal/runtime/other.go": "package runtime\n\ntype m struct{}\n\nfunc (m) ContainerCreate() {}\n\nvar v m\nvar _ = v.ContainerCreate\n"}},
+	}
+	for _, c := range cases {
+		files := map[string]string{"go.mod": "module mythicalos.ai/ctl\n\ngo 1.24.0\n"}
+		for k, v := range c.files {
+			files[k] = v
+		}
+		root := writeTree(t, files)
+		v, err := run(root, []string{c.rule})
+		if err != nil {
+			t.Fatalf("%s: %v", c.rule, err)
+		}
+		if len(v) == 0 {
+			t.Errorf("production rule %q caught nothing", c.rule)
+		}
+	}
+}

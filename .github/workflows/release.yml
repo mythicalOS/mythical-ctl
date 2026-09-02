@@ -1,0 +1,385 @@
+name: Release
+
+# Publishes a versioned mythical-ctl to GitHub Releases, with checksums and a
+# signed build-provenance attestation, on a `v*` tag.
+#
+# Why a GitHub Release and not a package registry: mythical-ctl runs BEFORE any
+# language runtime is guaranteed to exist on the machine, so a registry that
+# presupposes one cannot be the primary channel. The artifacts are static
+# binaries with no runtime dependency at all — one per supported platform.
+# get.mythicalos.ai serves a pinned release artifact from here.
+#
+# The provenance attestation is the counterpart to package provenance elsewhere
+# in the family, and it matters more here than anywhere: what is downloaded is
+# an executable, so "prove this is the artifact your workflow built from this
+# tag" is the security story, not a formality.
+#
+# THE RELEASE LANE RUNS THE SAME GATES AS THE PULL-REQUEST LANE, from the same
+# script (check.sh). A tag can be pushed to a commit that never saw a pull
+# request, and a release lane that spells its own checks out drifts away from
+# the PR lane in exactly one direction — laxer. See check.sh's header.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # create the release and upload assets
+  id-token: write # OIDC, for the provenance attestation
+  attestations: write
+
+jobs:
+  release:
+    name: release
+    runs-on: ubuntu-latest
+    # The same pin as ci.yml's go job. tools/build-release.sh REFUSES to run under a different
+    # one: two Go releases do not emit the same bytes, so a drifted pin would publish an
+    # artifact nobody can reproduce. Bump all three together, deliberately, in one commit.
+    env:
+      GOTOOLCHAIN: go1.26.5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The version the binaries will report is the tag with its "v" stripped —
+      # it is stamped in, not read out of the source — so the only thing to
+      # check here is that the tag is a version at all. Checked FIRST, before
+      # minutes of gates, because a malformed tag can never produce a release.
+      # That the built artifacts actually REPORT it is proved after the build,
+      # by executing one of them.
+      - name: Tag is a usable version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          if [ -z "$tag" ]; then
+            echo "::error::the tag carries no version"
+            exit 1
+          fi
+          if ! printf '%s' "$tag" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::tag ${GITHUB_REF_NAME} is not vX.Y.Z[-suffix]"
+            exit 1
+          fi
+          echo "version to stamp: ${tag}"
+
+      # The release runs the same gates as CI. A tag can be pushed to a commit
+      # that never saw a pull request, so re-running them here is the difference
+      # between a gate and a suggestion.
+      - name: Ensure shellcheck is available
+        run: command -v shellcheck >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck; }
+
+      # The same narrowed scope as ci.yml's lint job: the four scripts that are
+      # all the shell this repository still has after the cutover.
+      - name: shellcheck
+        run: shellcheck -x check.sh tests/*.sh tools/*.sh
+
+      # MCTL_BIN is deliberately UNSET, so this takes tests/smoke.sh's own
+      # default path and builds the binary it tests — the same reason ci.yml
+      # runs it that way. The published artifacts get their own smoke below,
+      # after they exist.
+      - name: Smoke (the script's own default — MCTL_BIN deliberately unset)
+        run: ./tests/smoke.sh
+
+      # The Go lane, byte-identical to the pull-request lane: same script, the
+      # same four stages, in the same order. `release` builds the whole published matrix twice — the second
+      # time from a copy of the source at a different absolute path with a cold
+      # build cache — and requires every artifact to be byte-identical. That is
+      # the reproducibility claim being exercised rather than asserted, and it
+      # runs here as well as on every pull request so a broken release script is
+      # found before somebody is waiting on a tag.
+      - name: check.sh go
+        run: bash check.sh go
+
+      # THE PARITY GATE RUNS ON A TAG TOO, and it did not before this commit —
+      # ci.yml had it and this workflow did not, which is exactly the drift the
+      # comment above warns about, in the direction it warns about. It matters
+      # more now than it did: after the cutover tests/parity-manifest.tsv IS the
+      # corpus, so a commit that removed an inventory claim, hand-edited the
+      # manifest, or left a PORTED target naming a test that no longer exists
+      # could be tagged and published without anything noticing.
+      - name: check.sh parity
+        run: bash check.sh parity
+
+      # AND THE SELFCHECK RUNS ON A TAG TOO, for the same reason the parity gate
+      # above does and in the same direction of drift. It is the stage that
+      # proves the other graders cannot be switched off from the environment —
+      # `go run` honours GOFLAGS, GOFLAGS carries -exec, and an inherited one
+      # makes a stage build its grader and then execute /usr/bin/true instead,
+      # printing OK and exiting 0 having graded nothing. A commit that removed
+      # one of those guards would sail through every stage above it. A tag can
+      # be pushed to a commit that never saw a pull request, so a release lane
+      # that skipped this would be a lane whose graders are unproven at exactly
+      # the moment an executable gets published.
+      - name: check.sh selfcheck
+        run: bash check.sh selfcheck
+
+      - name: check.sh release
+        run: bash check.sh release
+
+      # Public-safety gate — same intent as CI's hygiene job. A tag can be pushed
+      # to a commit that never saw a PR, so the release must re-run it or a banned
+      # internal name could be published. docs-bar.yml does NOT cover this: it
+      # triggers on pull_request and push to main only, never on tags.
+      #
+      # THERE IS NO third_party/ EXCLUSION ANY MORE. It existed for the bats
+      # submodule, which the cutover deregistered — and an --exclude-dir naming
+      # a directory that does not exist is precisely the shape of stale gate
+      # this file already got caught by once (it used to say vendor/ after the
+      # submodule had moved). This workflow's scan now covers the whole tree,
+      # exactly as ci.yml's plain-checkout scan always did.
+      #
+      # The term list is sourced from the organisation secret DOCS_DENY_PATTERN,
+      # never written here — see the long note in ci.yml for why an inline,
+      # bracket-split list was the leak it claimed to prevent.
+      #
+      # No fork-PR escape hatch here, deliberately: this workflow only ever runs
+      # on a tag push in this repository, where the secret is always available.
+      # A release must be strictly fail-closed.
+      - name: Genericize gate (banned internal names)
+        env:
+          DENY: ${{ secrets.DOCS_DENY_PATTERN }}
+          PROBE: ${{ secrets.DOCS_DENY_PROBE }}
+        run: |
+          set -euo pipefail
+
+          # FAIL CLOSED — and test DENY *on its own*, never the combined pattern
+          # built below. EXTRAS is a non-empty literal, so an unset secret would
+          # still leave a non-empty FULL: the job would go green having checked
+          # almost nothing, and would publish. Explicit guard, deliberately here.
+          if [ -z "${DENY:-}" ]; then
+            echo "::error::DOCS_DENY_PATTERN is unset or empty — failing closed"
+            exit 1
+          fi
+
+          # Repo-local extra, safe to spell out: an in-image install path is not
+          # a private name and discloses nothing.
+          EXTRAS='/opt/mythical'
+          FULL="${DENY}|${EXTRAS}"
+
+          # Self-test — the probes come from a second organisation secret, one term
+          # per line, so no banned term is written in this file. Every probe must
+          # match: that proves the secret arrived, is a usable ERE, and still covers
+          # what it is declared to cover. It does NOT prove the list is complete.
+          [ -n "${PROBE:-}" ] || { echo "::error::DOCS_DENY_PROBE is unset or empty — failing closed"; exit 1; }
+          n=0
+          while IFS= read -r probe; do
+            [ -n "$probe" ] || continue
+            n=$((n+1))
+            printf '%s\n' "$probe" | grep -aiqE -e "$DENY" && rc=0 || rc=$?
+            [ "$rc" -eq 0 ] || { echo "::error::self-test failed (grep rc=$rc) — DOCS_DENY_PATTERN does not cover probe #$n, or is not a usable pattern; the gate is weaker than declared"; exit 1; }
+          done <<< "$PROBE"
+          [ "$n" -gt 0 ] || { echo "::error::DOCS_DENY_PROBE held no probes — failing closed"; exit 1; }
+          echo "self-test OK: DOCS_DENY_PATTERN covers $n probe(s)"
+
+          # Self-test B — the COMBINED pattern is still a usable ERE once joined.
+          printf '%s\n' '/opt/mythical' | grep -aiqE -e "$FULL" && rc=0 || rc=$?
+          [ "$rc" -eq 0 ] || { echo "::error::self-test failed (grep rc=$rc) — combined pattern did not match its repo-local probe"; exit 1; }
+
+          # -a, never -I: one NUL byte hides a whole file from a bare grep.
+          # grep rc >=2 means the scan FAILED; a bare `if grep` would fold that
+          # into "no match" and publish a release off a scan that never ran.
+          # PASS 1 — the combined pattern, .github excluded so the repo-local
+          # EXTRAS spelled out in this file cannot match it.
+          hits="$(grep -rlaiE -e "$FULL" . \
+              --exclude-dir=.git --exclude-dir=.github --exclude-dir=node_modules)" && rc=0 || rc=$?
+          [ "$rc" -le 1 ] || { echo "::error::tree scan failed (grep rc=$rc) — the tree was NOT fully scanned"; exit 1; }
+          if [ -n "$hits" ]; then
+            # A path is printed, never the matched line. Workflow commands are
+            # suppressed around it with a per-use random token: a file whose NAME
+            # contains a newline followed by "::" would otherwise inject a command
+            # into the log. Log integrity only -- the build is already failing.
+            tok="stop-$RANDOM$RANDOM"
+            echo "::stop-commands::$tok"
+            printf '%s\n' "$hits"
+            echo "::${tok}::"
+            echo "::error::banned internal name(s) found — see the file(s) listed above"
+            exit 1
+          fi
+
+          # PASS 2 — the SECRET half over the WHOLE tree, .github INCLUDED. See
+          # the long note in ci.yml: --exclude-dir skips that directory name at
+          # EVERY depth, so pass 1 alone is blind to nested .github paths too.
+          ghits="$(grep -rlaiE -e "$DENY" . \
+              --exclude-dir=.git --exclude-dir=node_modules)" && rc=0 || rc=$?
+          [ "$rc" -le 1 ] || { echo "::error::whole-tree scan failed (grep rc=$rc) — NOT fully scanned"; exit 1; }
+          if [ -n "$ghits" ]; then
+            # A path is printed, never the matched line. Workflow commands are
+            # suppressed around it with a per-use random token: a file whose NAME
+            # contains a newline followed by "::" would otherwise inject a command
+            # into the log. Log integrity only -- the build is already failing.
+            tok="stop-$RANDOM$RANDOM"
+            echo "::stop-commands::$tok"
+            printf '%s\n' "$ghits"
+            echo "::${tok}::"
+            echo "::error::banned internal name(s) found — see the file(s) listed above"
+            exit 1
+          fi
+          echo "genericize gate: clean"
+
+      # Case-SENSITIVE half, from its own secret — see ci.yml for why it cannot
+      # be folded into the case-insensitive pattern above.
+      - name: Genericize gate (internal role moniker, case-sensitive)
+        env:
+          DENY_CS: ${{ secrets.DOCS_DENY_PATTERN_CS }}
+          PROBE_CS: ${{ secrets.DOCS_DENY_PROBE_CS }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${DENY_CS:-}" ]; then
+            echo "::error::DOCS_DENY_PATTERN_CS is unset or empty — failing closed"
+            exit 1
+          fi
+
+          # Self-test — probes from a second organisation secret, one per line; no -i
+          # on any grep in this step, case sensitivity is the entire point of it.
+          [ -n "${PROBE_CS:-}" ] || { echo "::error::DOCS_DENY_PROBE_CS is unset or empty — failing closed"; exit 1; }
+          n=0
+          while IFS= read -r probe; do
+            [ -n "$probe" ] || continue
+            n=$((n+1))
+            printf '%s\n' "$probe" | grep -aqE -e "$DENY_CS" && rc=0 || rc=$?
+            [ "$rc" -eq 0 ] || { echo "::error::self-test failed (grep rc=$rc) — DOCS_DENY_PATTERN_CS does not cover probe #$n, or is not a usable pattern; the gate is weaker than declared"; exit 1; }
+          done <<< "$PROBE_CS"
+          [ "$n" -gt 0 ] || { echo "::error::DOCS_DENY_PROBE_CS held no probes — failing closed"; exit 1; }
+          echo "self-test OK: DOCS_DENY_PATTERN_CS covers $n probe(s)"
+
+          # ONE pass over the WHOLE tree, .github INCLUDED — no inline extras
+          # here, so the old .github exclusion would only cost a blind spot.
+          # grep rc >=2 means the scan failed, not that the tree is clean.
+          hits="$(grep -rlaE -e "$DENY_CS" . \
+              --exclude-dir=.git --exclude-dir=node_modules)" && rc=0 || rc=$?
+          [ "$rc" -le 1 ] || { echo "::error::tree scan failed (grep rc=$rc) — the tree was NOT fully scanned"; exit 1; }
+          if [ -n "$hits" ]; then
+            # A path is printed, never the matched line. Workflow commands are
+            # suppressed around it with a per-use random token: a file whose NAME
+            # contains a newline followed by "::" would otherwise inject a command
+            # into the log. Log integrity only -- the build is already failing.
+            tok="stop-$RANDOM$RANDOM"
+            echo "::stop-commands::$tok"
+            printf '%s\n' "$hits"
+            echo "::${tok}::"
+            echo "::error::internal role moniker found (case-sensitive) — see the file(s) listed above"
+            exit 1
+          fi
+          echo "genericize gate (role moniker): clean"
+
+      - name: Community-health files are physically present
+        run: |
+          set -euo pipefail
+          missing=0
+          for f in LICENSE NOTICE README.md SECURITY.md CONTRIBUTING.md \
+                   CODE_OF_CONDUCT.md SUPPORT.md TRADEMARK.md; do
+            if [ -f "$f" ]; then echo "  ✓ $f"; else echo "  ✗ $f MISSING"; missing=1; fi
+          done
+          [ "$missing" -eq 0 ] || { echo "::error::required health file(s) missing from the tree"; exit 1; }
+
+      # THE PUBLISHED ARTIFACTS. One static binary per supported platform,
+      # stamped with the tag, built with the determinism flags, plus the
+      # checksum file. tools/build-release.sh carries the flags and the reasons
+      # for each one; tools/release-verify grades what came out — it reads the
+      # FILES, not the commands that made them, which is the only way to notice
+      # that the intent and the bytes disagree.
+      #
+      # It is the same script `check.sh release` just ran, so nothing about the
+      # published build is exercised for the first time here. The difference is
+      # the version: this one stamps the tag.
+      - name: Build the release artifacts
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          bash tools/build-release.sh "$tag" dist
+
+      # The artifacts are staged by the build; this is the human-readable record
+      # of exactly what is about to be published, digests beside byte counts.
+      # A digest on its own cannot tell a reader that the thing hashed had any
+      # content at all — sha256 of nothing is a perfectly healthy-looking
+      # e3b0c442... — so the sizes are printed next to it.
+      - name: Show what will be published
+        run: |
+          set -euo pipefail
+          ls -l dist
+          cat dist/SHA256SUMS
+          ( cd dist && sha256sum -c SHA256SUMS )
+
+      # THE RELEASE-ARTIFACT SMOKE. tests/smoke.sh survived the cutover for this
+      # step: its assertions are the transport-level CLI contract — exit codes,
+      # the exact `mythical-ctl <semver>` line, --version and -v agreeing, usage
+      # errors staying off stdout — and this is the one place they are asserted
+      # against the bytes that are about to be PUBLISHED rather than against a
+      # binary built a moment ago for the purpose.
+      #
+      # The artifact is named by the runner's own platform, never hard-coded: a
+      # literal linux_amd64 would name a missing file the day this job moves,
+      # and MCTL_BIN pointing at nothing fails one assertion out of eight in a
+      # way that reads like a CLI defect rather than a broken step.
+      - name: Smoke against the published artifact
+        run: |
+          set -euo pipefail
+          art="dist/mythical-ctl_$(go env GOOS)_$(go env GOARCH)"
+          [ -f "$art" ] || { echo "::error::no release artifact at $art"; exit 1; }
+          MCTL_BIN="$PWD/$art" ./tests/smoke.sh
+
+      # Every binary is attested. SHA256SUMS is not: it is not an artifact
+      # anybody executes, and its integrity is the digests it carries, each of
+      # which names an attested file.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: |
+            dist/mythical-ctl_darwin_amd64
+            dist/mythical-ctl_darwin_arm64
+            dist/mythical-ctl_linux_amd64
+            dist/mythical-ctl_linux_arm64
+
+      # ACCIDENT GUARD, not an immutability guarantee (design D20).
+      #
+      # An earlier version used --clobber so a transient runner failure would not
+      # burn a version number. That is the wrong trade: it lets the bytes behind a
+      # published version change after the fact, so the attestation only ever
+      # describes whichever upload happened last.
+      #
+      # Removing it does NOT make releases immutable, and this step must not be
+      # read as claiming so: anyone with write access can delete this release and
+      # publish again, or replace an asset, without the tag moving. What this
+      # catches is the ordinary accident — a re-run, a re-pushed tag.
+      #
+      # The actual integrity guarantee is content-addressed and lives at the
+      # consumer: verify the recorded SHA-256 digest, never the version string.
+      - name: Refuse to republish an existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "::error::${GITHUB_REF_NAME} is already published — cut a new patch version instead of replacing published bytes."
+            exit 1
+          fi
+          echo "${GITHUB_REF_NAME} is unpublished — proceeding"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # The four artifacts are NAMED, not globbed. A glob uploads whatever
+          # happens to be there: if a target had silently not been built, a
+          # glob would publish a three-platform release that looks complete.
+          # Naming them makes a missing platform a failed release.
+          gh release create "$GITHUB_REF_NAME" \
+            dist/mythical-ctl_darwin_amd64 \
+            dist/mythical-ctl_darwin_arm64 \
+            dist/mythical-ctl_linux_amd64 \
+            dist/mythical-ctl_linux_arm64 \
+            dist/SHA256SUMS \
+            --title "$GITHUB_REF_NAME" \
+            --notes "mythical-ctl $GITHUB_REF_NAME
+
+          Static binaries — no runtime to install. Pick the one for your
+          platform, verify it, then move it onto your PATH.
+
+          Verify the download before running it:
+
+              sha256sum --ignore-missing -c SHA256SUMS
+              gh attestation verify mythical-ctl_<os>_<arch> --repo mythicalOS/mythical-ctl
+
+          The digest is the identity — verify that, not the version string."

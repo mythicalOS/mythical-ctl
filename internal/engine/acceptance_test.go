@@ -1,0 +1,614 @@
+//go:build acceptance
+
+package engine_test
+
+// The REAL-DAEMON acceptance lane: re-measures against a live local daemon the
+// behaviors the hermetic fake asserts, so the fake can never quietly drift from the runtime
+// it stands in for. Opt-in — `bash check.sh acceptance` — because it needs a local daemon and
+// (once, for the pinned test image) the network; CI's default path stays hermetic. Run before
+// every wave gate from here on; the measured Engine/API version is logged into the output.
+//
+// Every resource this suite creates carries a per-process name prefix and is removed on
+// cleanup; the suite refuses to run if the resolved daemon is not local (ResolveEndpoint
+// already guarantees that structurally).
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"mythicalos.ai/ctl/internal/engine"
+	"mythicalos.ai/ctl/internal/famlock"
+)
+
+// acceptImage is a tiny image whose entrypoint STAYS RUNNING with no arguments — a product
+// container's shape (the spec type has no command override, by design). busybox was the first
+// choice and MEASURED wrong: with no TTY its default shell exits at once, so every "running"
+// assertion inspected an exited container. Tag-addressed on purpose: this is the test rig's
+// scaffolding, not a family artifact — nothing here exercises the trust chain, which pins by
+// digest.
+const acceptImage = "registry.k8s.io/pause:3.9"
+
+type acceptRig struct {
+	c      *engine.Client
+	m      *engine.Mutator
+	pfx    string
+	socket string
+}
+
+func acceptClient(t *testing.T) *acceptRig {
+	t.Helper()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	socket, err := engine.ResolveEndpoint(os.Environ(), home)
+	if err != nil {
+		t.Fatalf("acceptance needs a local daemon: %v", err)
+	}
+	// The production door: endpoint + registry-auth wiring in one step (the auth-registry
+	// case below relies on Connect having configured credential resolution already).
+	c, err := engine.Connect(os.Environ(), home)
+	if err != nil {
+		t.Fatalf("acceptance needs a local daemon: %v", err)
+	}
+	ctx := context.Background()
+	if err := c.Ping(ctx); err != nil {
+		t.Fatalf("acceptance needs a RUNNING local daemon at %s: %v", socket, err)
+	}
+	v, api, err := c.ServerVersion(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The record the plan asks for: which engine actually answered these measurements.
+	t.Logf("MEASURED against Engine %s (API %s) at %s", v, api, socket)
+	h, err := famlock.Acquire(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = famlock.Release(h) })
+	m, err := engine.NewMutator(h, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &acceptRig{c: c, m: m, pfx: fmt.Sprintf("mctlacc%d", os.Getpid()), socket: socket}
+	if _, ierr := c.ImageInspect(ctx, acceptImage); errors.Is(ierr, engine.ErrAbsent) {
+		if perr := m.ImagePull(ctx, acceptImage); perr != nil {
+			t.Fatalf("acceptance needs %s (one pull): %v", acceptImage, perr)
+		}
+	}
+	return r
+}
+
+// Cleanup addresses objects by IMMUTABLE IDENTITY, never by a reusable name (§6a): a name
+// can be reassigned between the moment a test learned it and the moment cleanup runs, and a
+// removal by name would then take a stranger's object. Containers and networks have runtime
+// ids; volumes do not (D56), so their identity is name + the provenance NONCE this test
+// stamped — a same-name volume carrying other labels, or none, is left exactly where it is.
+
+func (r *acceptRig) cleanupContainer(t *testing.T, id string) {
+	t.Cleanup(func() { _ = r.m.ContainerRemove(context.Background(), id) })
+}
+
+// cleanupOwnedContainer is for a name whose id the test never learned (a helper that failed
+// to launch, a create whose response was lost): inspect by name, remove by the inspected id
+// ONLY when the provenance labels are this test's installation and the given nonce.
+func (r *acceptRig) cleanupOwnedContainer(t *testing.T, name, nonce string) {
+	t.Cleanup(func() {
+		bg := context.Background()
+		info, err := r.c.ContainerInspect(bg, name)
+		if err != nil {
+			return
+		}
+		if info.Labels[engine.LabelNS+"installation"] != "acceptance" || info.Labels[engine.LabelNS+"nonce"] != nonce {
+			return
+		}
+		_ = r.m.ContainerRemove(bg, info.ID)
+	})
+}
+
+func (r *acceptRig) cleanupNetwork(t *testing.T, id string) {
+	t.Cleanup(func() { _ = r.m.NetworkRemove(context.Background(), id) })
+}
+
+func (r *acceptRig) cleanupVolume(t *testing.T, name, nonce string) {
+	t.Cleanup(func() {
+		bg := context.Background()
+		info, err := r.c.VolumeInspect(bg, name)
+		if err != nil {
+			return
+		}
+		if info.Labels[engine.LabelNS+"installation"] != "acceptance" || info.Labels[engine.LabelNS+"nonce"] != nonce {
+			return
+		}
+		_ = r.m.VolumeRemove(bg, name)
+	})
+}
+
+// removeOwnedVolume is the IN-TEST counterpart of cleanupVolume: a volume is removed only
+// after proving it is this test's — installation AND nonce — and a refusal is reported
+// otherwise, so an assertion never mutates a same-name replacement it did not create.
+func (r *acceptRig) removeOwnedVolume(ctx context.Context, name, nonce string) error {
+	info, err := r.c.VolumeInspect(ctx, name)
+	if err != nil {
+		return err
+	}
+	if info.Labels[engine.LabelNS+"installation"] != "acceptance" || info.Labels[engine.LabelNS+"nonce"] != nonce {
+		return fmt.Errorf("refusing to remove volume %q: its labels %v are not this test's (nonce %q)", name, info.Labels, nonce)
+	}
+	return r.m.VolumeRemove(ctx, name)
+}
+
+// removeUnlabelledVolume is the in-test counterpart of cleanupUnlabelledVolume, same rule.
+func (r *acceptRig) removeUnlabelledVolume(ctx context.Context, name string) error {
+	info, err := r.c.VolumeInspect(ctx, name)
+	if err != nil {
+		return err
+	}
+	if info.Labels[engine.LabelNS+"installation"] != "" || info.Labels[engine.LabelNS+"nonce"] != "" {
+		return fmt.Errorf("refusing to remove volume %q: it carries provenance labels %v and is not the unlabelled auto-created one", name, info.Labels)
+	}
+	return r.m.VolumeRemove(ctx, name)
+}
+
+// cleanupUnlabelledVolume is for the ONE volume this suite does not create itself: the one
+// the daemon auto-creates for a mount. It carries no provenance, so ownership cannot be
+// proven by label; the argument is stated instead — the caller asserted the name ABSENT
+// before the create that auto-created it, the name is per-process-prefixed, and the removal
+// runs only while the volume STILL carries no provenance labels at all.
+func (r *acceptRig) cleanupUnlabelledVolume(t *testing.T, name string) {
+	t.Cleanup(func() {
+		bg := context.Background()
+		info, err := r.c.VolumeInspect(bg, name)
+		if err != nil {
+			return
+		}
+		if info.Labels[engine.LabelNS+"installation"] != "" || info.Labels[engine.LabelNS+"nonce"] != "" {
+			return
+		}
+		_ = r.m.VolumeRemove(bg, name)
+	})
+}
+
+func (r *acceptRig) network(t *testing.T, ctx context.Context, name string) string {
+	t.Helper()
+	prov, _ := engine.NewProvenance("acceptance", "n1")
+	id, err := r.m.NetworkCreate(ctx, name, prov)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.cleanupNetwork(t, id)
+	return id
+}
+
+// rawCreate issues a create the typed client deliberately cannot express (an EndpointsConfig
+// keyed by the network ID) straight at the REAL daemon, so the fake's model of that shape is
+// re-measured here rather than asserted from memory.
+func (r *acceptRig) rawCreate(t *testing.T, name string, body map[string]any) {
+	t.Helper()
+	hc := &http.Client{Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "unix", r.socket)
+		},
+	}}
+	// The raw create carries provenance labels so its cleanup can prove OWNERSHIP: a name —
+	// even under the per-process prefix — is reusable and reserved to no one, so removal keys
+	// on the labels, exactly as HelperRun's ambiguous-create sweep does.
+	if _, has := body["Labels"]; has {
+		t.Fatal("rawCreate owns the Labels key")
+	}
+	body["Labels"] = map[string]string{
+		engine.LabelNS + "installation": "acceptance",
+		engine.LabelNS + "nonce":        name,
+	}
+	payload, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodPost, "http://docker/"+engine.APIVersion+"/containers/create?name="+name, bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	// Registered BEFORE the request goes out — a transport error can arrive after the daemon
+	// created the container — and it removes ONLY a container it can prove is this call's, by
+	// the labels above: a 409's pre-existing conflicting container carries other labels (or
+	// none) and is left exactly where it is.
+	t.Cleanup(func() {
+		bg := context.Background()
+		info, ierr := r.c.ContainerInspect(bg, name)
+		if ierr != nil {
+			return
+		}
+		if info.Labels[engine.LabelNS+"installation"] != "acceptance" || info.Labels[engine.LabelNS+"nonce"] != name {
+			return
+		}
+		_ = r.m.ContainerRemove(bg, info.ID)
+	})
+	resp, err := hc.Do(req)
+	if err != nil {
+		t.Fatalf("raw create: %v", err)
+	}
+	defer resp.Body.Close()
+	out, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		t.Fatalf("raw create: %d %s", resp.StatusCode, out)
+	}
+}
+
+func (r *acceptRig) container(t *testing.T, ctx context.Context, name, netID, alias string) string {
+	t.Helper()
+	spec := launchSpec(t, name, acceptImage, netID, alias, engine.SpecOpts{})
+	id, err := r.m.ContainerCreate(ctx, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.cleanupContainer(t, id)
+	return id
+}
+
+func TestAcceptanceFidelity(t *testing.T) {
+	r := acceptClient(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	t.Run("volume create on existing keeps labels (D56)", func(t *testing.T) {
+		name := r.pfx + "-vol1"
+		provA, _ := engine.NewProvenance("acceptance", "orig")
+		if err := r.m.VolumeCreate(ctx, name, provA); err != nil {
+			t.Fatal(err)
+		}
+		r.cleanupVolume(t, name, "orig") // the labels the volume KEEPS (the second create does not relabel)
+		provB, _ := engine.NewProvenance("other", "later")
+		if err := r.m.VolumeCreate(ctx, name, provB); err != nil {
+			t.Fatalf("create-on-existing must succeed: %v", err)
+		}
+		info, err := r.c.VolumeInspect(ctx, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Labels[engine.LabelNS+"nonce"] != "orig" {
+			t.Fatalf("the original labels must survive: %v", info.Labels)
+		}
+	})
+
+	t.Run("never-started endpoint id, address lifecycle (D48 + the 2026-08-04 lesson)", func(t *testing.T) {
+		netID := r.network(t, ctx, r.pfx+"-net1")
+		name := r.pfx + "-c1"
+		id := r.container(t, ctx, name, netID, r.pfx+"-alias")
+		info, err := r.c.ContainerInspect(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ep, present := info.Networks[r.pfx+"-net1"]
+		if !present {
+			t.Fatalf("the name key must be present from creation: %+v", info.Networks)
+		}
+		if ep.NetworkID != "" {
+			t.Fatalf("a NEVER-STARTED container must report an empty NetworkID (measured 2026-08-04), got %q", ep.NetworkID)
+		}
+		found := false
+		for _, a := range ep.Aliases {
+			if a == r.pfx+"-alias" {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("the explicit alias must be registered: %v", ep.Aliases)
+		}
+		if err := r.m.ContainerStart(ctx, id); err != nil {
+			t.Fatal(err)
+		}
+		info, _ = r.c.ContainerInspect(ctx, id)
+		started := info.Networks[r.pfx+"-net1"]
+		if started.NetworkID == "" || started.IPAddress == "" {
+			t.Fatalf("start assigns endpoint id and address: %+v", started)
+		}
+		if err := r.m.ContainerStop(ctx, id); err != nil {
+			t.Fatal(err)
+		}
+		info, _ = r.c.ContainerInspect(ctx, id)
+		stopped := info.Networks[r.pfx+"-net1"]
+		if stopped.IPAddress != "" {
+			t.Fatalf("stop RELEASES the address: %+v", stopped)
+		}
+		if stopped.NetworkID == "" {
+			t.Fatalf("the endpoint id PERSISTS across stop: %+v", stopped)
+		}
+	})
+
+	t.Run("a never-started endpoint is keyed by the SUBMITTED key (the fake's model, re-measured)", func(t *testing.T) {
+		// MEASURED through the client path and asserted DIRECTLY here since the fake
+		// models it: the daemon reports a create-time endpoint under whatever string keyed
+		// EndpointsConfig — the ID, when the ID was submitted — until first start, then under
+		// the name. This is why the typed client resolves to the name before creating.
+		netName := r.pfx + "-netk"
+		netID := r.network(t, ctx, netName)
+		name := r.pfx + "-ck"
+		r.rawCreate(t, name, map[string]any{
+			"Image":            acceptImage,
+			"NetworkingConfig": map[string]any{"EndpointsConfig": map[string]any{netID: map[string]any{}}},
+		})
+		info, err := r.c.ContainerInspect(ctx, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, byName := info.Networks[netName]; byName {
+			t.Fatalf("an ID-keyed create must NOT be reported under the name before start: %+v", info.Networks)
+		}
+		if _, byID := info.Networks[netID]; !byID {
+			t.Fatalf("a never-started create is reported under the SUBMITTED key: %+v", info.Networks)
+		}
+		if err := r.m.ContainerStart(ctx, info.ID); err != nil {
+			t.Fatal(err)
+		}
+		info, err = r.c.ContainerInspect(ctx, info.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, byName := info.Networks[netName]; !byName {
+			t.Fatalf("after start the daemon normalizes the key to the network NAME: %+v", info.Networks)
+		}
+	})
+
+	t.Run("absent is an answer; unpulled image refused", func(t *testing.T) {
+		if _, err := r.c.ContainerInspect(ctx, r.pfx+"-ghost"); !errors.Is(err, engine.ErrAbsent) {
+			t.Fatalf("absent: %v", err)
+		}
+		netID := r.network(t, ctx, r.pfx+"-net2")
+		spec := launchSpec(t, r.pfx+"-c2", r.pfx+"-neverpulled:v1", netID, "a1", engine.SpecOpts{})
+		_, err := r.m.ContainerCreate(ctx, spec)
+		if !errors.Is(err, engine.ErrAbsent) || !strings.Contains(err.Error(), "No such image") {
+			t.Fatalf("unpulled image: %v", err)
+		}
+	})
+
+	t.Run("bind mount refuses an absent source", func(t *testing.T) {
+		netID := r.network(t, ctx, r.pfx+"-net3")
+		b, err := engine.NewBindMount("/nonexistent/mctl/acceptance/source", "/dst", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		spec := launchSpec(t, r.pfx+"-c3", acceptImage, netID, "a1", engine.SpecOpts{Mounts: []engine.Mount{b}})
+		_, cerr := r.m.ContainerCreate(ctx, spec)
+		if cerr == nil || !strings.Contains(cerr.Error(), "bind source path does not exist") {
+			t.Fatalf("absent bind source: %v", cerr)
+		}
+	})
+
+	t.Run("referenced resources cannot be removed; force-remove clears a running container", func(t *testing.T) {
+		// MEASURED, and ASSERTED here so the divergence cannot regress unnoticed: a
+		// created-but-never-started attachment does NOT block network removal (no active
+		// endpoint exists yet) — the fake models exactly that, and the assertion below is what
+		// keeps the model honest.
+		netB := r.network(t, ctx, r.pfx+"-net4b")
+		nameB := r.pfx + "-c4b"
+		idB := r.container(t, ctx, nameB, netB, "a4b")
+		if err := r.m.NetworkRemove(ctx, netB); err != nil {
+			t.Fatalf("a network whose only attachment is a NEVER-STARTED container is removable (measured 2026-08-25): %v", err)
+		}
+		if err := r.m.ContainerRemove(ctx, idB); err != nil {
+			t.Fatal(err)
+		}
+		// A RUNNING attachment does block it.
+		netID := r.network(t, ctx, r.pfx+"-net4")
+		name := r.pfx + "-c4"
+		id := r.container(t, ctx, name, netID, "a4")
+		if err := r.m.ContainerStart(ctx, id); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.m.NetworkRemove(ctx, netID); err == nil {
+			t.Fatal("a network with a RUNNING container attached must refuse removal")
+		}
+		// The client always force-removes — reconciliation must be able to clear a live one.
+		if err := r.m.ContainerRemove(ctx, id); err != nil {
+			t.Fatalf("force-remove of a running container: %v", err)
+		}
+		if err := r.m.NetworkRemove(ctx, netID); err != nil {
+			t.Fatalf("after detach-by-removal the network goes: %v", err)
+		}
+	})
+
+	t.Run("duplicate endpoint and private-mode connect refusals", func(t *testing.T) {
+		netID := r.network(t, ctx, r.pfx+"-net5")
+		name := r.pfx + "-c5"
+		id := r.container(t, ctx, name, netID, "a5")
+		// MEASURED: on a NON-running container a second connect of the same network
+		// is ACCEPTED (the stored endpoint config is updated); the conflict is a running-
+		// container fact.
+		if err := r.m.NetworkConnect(ctx, netID, id, "again", 0); err != nil {
+			t.Fatalf("non-running duplicate connect is accepted by the daemon: %v", err)
+		}
+		if err := r.m.ContainerStart(ctx, id); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.m.NetworkConnect(ctx, netID, id, "again2", 0); err == nil {
+			t.Fatal("connecting the same network twice to a RUNNING container must refuse")
+		}
+		// The private-mode (`none`) connect refusal is not measurable through this client: the
+		// only `none`-mode door is HelperRun, which removes its container before returning.
+		// It stays a bash-measured fidelity in the fake until the pinned helper image exists.
+	})
+
+	t.Run("duplicate network name refused; a mounted volume cannot be removed", func(t *testing.T) {
+		// MEASURED: a second create of the same network name is refused — 409,
+		// "network with name … already exists" — which is the fake's DEFAULT behavior. The
+		// fake's DuplicateNetworkNames knob fabricates D38's both-succeeded state (concurrent
+		// creates, older engines), a state a live daemon cannot be asked to produce on demand.
+		netName := r.pfx + "-net6"
+		netID := r.network(t, ctx, netName)
+		prov, _ := engine.NewProvenance("acceptance", "dup")
+		if _, err := r.m.NetworkCreate(ctx, netName, prov); err == nil || !strings.Contains(err.Error(), "already exists") {
+			t.Fatalf("a duplicate network name must be refused in the daemon's words: %v", err)
+		}
+		// A volume mounted by a CREATED (never-started) container is held — removal refused in
+		// the daemon's words; gone once the container is.
+		volName := r.pfx + "-vol6"
+		if err := r.m.VolumeCreate(ctx, volName, prov); err != nil {
+			t.Fatal(err)
+		}
+		r.cleanupVolume(t, volName, "dup")
+		vm, err := engine.NewVolumeMount(volName, "/data")
+		if err != nil {
+			t.Fatal(err)
+		}
+		// And a named volume that does NOT exist yet: the daemon AUTO-CREATES it, carrying
+		// none of our labels — the unlabelled orphan the fake models (MEASURED here).
+		autoName := r.pfx + "-vol6auto"
+		if _, ierr := r.c.VolumeInspect(ctx, autoName); !errors.Is(ierr, engine.ErrAbsent) {
+			t.Fatalf("the auto-create volume must not pre-exist: %v", ierr)
+		}
+		av, err := engine.NewVolumeMount(autoName, "/autodata")
+		if err != nil {
+			t.Fatal(err)
+		}
+		name := r.pfx + "-c6"
+		spec := launchSpec(t, name, acceptImage, netID, "a6", engine.SpecOpts{Mounts: []engine.Mount{vm, av}})
+		// Registered BEFORE the container exists (and before its cleanup), so on an early
+		// failure the LIFO order removes the container FIRST and this best-effort sweep can
+		// actually take the then-unreferenced volume with it.
+		r.cleanupUnlabelledVolume(t, autoName)
+		id6, err := r.m.ContainerCreate(ctx, spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.cleanupContainer(t, id6)
+		autoInfo, err := r.c.VolumeInspect(ctx, autoName)
+		if err != nil {
+			t.Fatalf("the daemon auto-creates a missing named volume (measured): %v", err)
+		}
+		if autoInfo.Labels[engine.LabelNS+"installation"] != "" {
+			t.Fatalf("an auto-created volume carries NO provenance labels: %v", autoInfo.Labels)
+		}
+		if err := r.removeOwnedVolume(ctx, volName, "dup"); err == nil || !strings.Contains(err.Error(), "volume is in use") {
+			t.Fatalf("a mounted volume must refuse removal in the daemon's words: %v", err)
+		}
+		if err := r.m.ContainerRemove(ctx, id6); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.removeOwnedVolume(ctx, volName, "dup"); err != nil {
+			t.Fatalf("after the container is gone the volume goes: %v", err)
+		}
+		// The auto-created one is ASSERTED removable too — an undeletable auto-created volume
+		// would otherwise vanish into a discarded best-effort cleanup and never fail the lane.
+		if err := r.removeUnlabelledVolume(ctx, autoName); err != nil {
+			t.Fatalf("the auto-created volume goes the same way: %v", err)
+		}
+	})
+
+	t.Run("gw-priority round-trips at v1.48 (the rebind case)", func(t *testing.T) {
+		netA := r.network(t, ctx, r.pfx+"-neta")
+		netB := r.network(t, ctx, r.pfx+"-netb")
+		name := r.pfx + "-c6"
+		id := r.container(t, ctx, name, netA, "a6")
+		if err := r.m.ContainerStart(ctx, id); err != nil {
+			t.Fatal(err)
+		}
+		// The target is attached at LOWER priority than the source, so the route must not
+		// move before the migration's final phase — the reason APIVersion is v1.48.
+		if err := r.m.NetworkConnect(ctx, netB, id, "a6", -10); err != nil {
+			t.Fatalf("connect with gw-priority: %v", err)
+		}
+		info, err := r.c.ContainerInspect(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ep := info.Networks[r.pfx+"-netb"]
+		if ep.GwPriority != -10 {
+			t.Fatalf("GwPriority must round-trip: %+v", ep)
+		}
+		if err := r.m.NetworkDisconnect(ctx, netA, id); err != nil {
+			t.Fatalf("rebind detach: %v", err)
+		}
+		info, _ = r.c.ContainerInspect(ctx, id)
+		if _, still := info.Networks[r.pfx+"-neta"]; still {
+			t.Fatal("detached")
+		}
+		if err := r.m.ContainerRemove(ctx, id); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("helper launch failure removes the container", func(t *testing.T) {
+		// No pinned helper image exists yet, and MEASURED: a missing executable
+		// fails the container at START (the daemon's 400, in containerd's words), not as an
+		// exit code — so what this measures is HelperRun's failure path: the daemon's own
+		// words ride the error, and the created container does NOT survive. The helper's
+		// success path (wait / logs demultiplex / stdin attach) remains UNMEASURED against a
+		// real daemon until the pinned probe image exists; the wave that builds it must add
+		// that case here.
+		// busybox, NOT the pause image: pause's entrypoint ignores argv and runs for ever, so
+		// the closed command word would never fail — busybox has no entrypoint, and the word
+		// is then the executable the daemon cannot find.
+		const helperImage = "busybox:1.36"
+		if _, ierr := r.c.ImageInspect(ctx, helperImage); errors.Is(ierr, engine.ErrAbsent) {
+			if perr := r.m.ImagePull(ctx, helperImage); perr != nil {
+				t.Fatalf("the helper case needs %s: %v", helperImage, perr)
+			}
+		}
+		prov, _ := engine.NewProvenance("acceptance", "h1")
+		hs, err := engine.NewHelperSpec(helperImage, r.pfx+"-h1", engine.HelperResolve, prov, engine.HelperOpts{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.cleanupOwnedContainer(t, r.pfx+"-h1", "h1")
+		_, herr := r.m.HelperRun(ctx, hs)
+		if herr == nil || !strings.Contains(herr.Error(), "resolve") {
+			t.Fatalf("the daemon's own words must ride the launch failure: %v", herr)
+		}
+		if _, ierr := r.c.ContainerInspect(ctx, r.pfx+"-h1"); !errors.Is(ierr, engine.ErrAbsent) {
+			t.Fatal("no helper outlives its own invocation — a failed launch included")
+		}
+	})
+
+	t.Run("cleanup helpers prove ownership before removing", func(t *testing.T) {
+		// A same-name volume stamped by a STRANGER (a different nonce) must survive a cleanup
+		// registered for OUR nonce — the ownership proof is the label, never the name. The
+		// verifier is registered FIRST so LIFO runs it LAST, after the cleanup under test.
+		name := r.pfx + "-guardvol"
+		stranger, _ := engine.NewProvenance("acceptance", "stranger")
+		if err := r.m.VolumeCreate(ctx, name, stranger); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			bg := context.Background()
+			info, err := r.c.VolumeInspect(bg, name)
+			if err != nil {
+				t.Errorf("a stranger's same-name volume must survive a cleanup that cannot prove ownership: %v", err)
+				return
+			}
+			if info.Labels[engine.LabelNS+"installation"] != "acceptance" || info.Labels[engine.LabelNS+"nonce"] != "stranger" {
+				t.Errorf("the surviving volume must be the stranger's: %v", info.Labels)
+				return
+			}
+			_ = r.m.VolumeRemove(bg, name) // the verifier's own removal, by its own full proof
+		})
+		// The in-test remover REFUSES too — it must not delete what it cannot prove is ours.
+		if err := r.removeOwnedVolume(ctx, name, "mine"); err == nil || !strings.Contains(err.Error(), "refusing to remove") {
+			t.Fatalf("removeOwnedVolume must refuse a volume whose labels are not ours: %v", err)
+		}
+		r.cleanupVolume(t, name, "mine") // must NOT remove: the nonce is not ours
+	})
+
+	t.Run("authenticated registry pull", func(t *testing.T) {
+		ref := os.Getenv("MYTHICAL_ACCEPTANCE_AUTH_REF")
+		if ref == "" {
+			t.Skip("SKIPPED LOUDLY: no authenticated registry configured — set MYTHICAL_ACCEPTANCE_AUTH_REF to a ref whose registry needs the docker login this machine holds, and re-run")
+		}
+		// No setter here: acceptClient constructed the client via engine.Connect, which
+		// configured credential resolution already — that absence IS the case's point.
+		if err := r.m.ImagePull(ctx, ref); err != nil {
+			t.Fatalf("authenticated pull of %s: %v", ref, err)
+		}
+	})
+}

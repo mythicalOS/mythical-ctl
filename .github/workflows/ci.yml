@@ -1,0 +1,352 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Public-safety gate. Internal-only names must never appear in this PUBLIC
+  # repository. Any hit is a release blocker, not a style nit.
+  #
+  # THE TERM LIST IS NOT WRITTEN HERE, IN ANY ENCODING. It arrives at runtime
+  # from the organisation secret DOCS_DENY_PATTERN, mirroring the canonical list
+  # that lives in the private umbrella repository. This step used to inline the
+  # list with every term split by a single-character bracket class; that defeats
+  # grep but not a reader, so the gate against disclosure was itself the
+  # disclosure. Do not reintroduce it — not verbatim, not bracket-split, not
+  # obfuscated any other way. The --exclude-dir=.github below is defence in
+  # depth on top of sourcing, not a substitute for it. Same model as
+  # docs-bar.yml, which is byte-identical across the family.
+  #
+  # DELIBERATELY NOT BANNED: the sibling product names (brokkr, skuld, saga).
+  # They are open source too, and naming them is this repository's entire job —
+  # an installer that cannot say what it installs is not an installer. The
+  # shared secret does not carry them, so there is nothing here to un-ban.
+  hygiene:
+    name: hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Genericize gate (banned internal names)
+        env:
+          DENY: ${{ secrets.DOCS_DENY_PATTERN }}
+          PROBE: ${{ secrets.DOCS_DENY_PROBE }}
+          EVENT: ${{ github.event_name }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          THIS_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # Fork PRs cannot read organisation secrets. Skipping is the same call
+          # docs-bar.yml makes: maintainer review covers a fork's diff.
+          if [ "$EVENT" = pull_request ] && [ -n "$HEAD_REPO" ] && [ "$HEAD_REPO" != "$THIS_REPO" ]; then
+            echo "::notice::genericize gate skipped on fork PRs — secret unavailable; maintainer review covers this"
+            exit 0
+          fi
+
+          # FAIL CLOSED — and test DENY *on its own*, never the combined pattern
+          # built below. EXTRAS is a non-empty literal, so an unset secret would
+          # still leave a non-empty FULL: the job would go green having checked
+          # almost nothing. That is the single most dangerous failure mode of
+          # sourcing the list, and this is the explicit guard against it.
+          if [ -z "${DENY:-}" ]; then
+            echo "::error::DOCS_DENY_PATTERN is unset or empty — failing closed"
+            exit 1
+          fi
+
+          # Repo-local extras, safe to spell out: an in-image install path is
+          # not a private name and discloses nothing. Deliberately NOT in the
+          # shared secret — it is this repository's concern, not the family's.
+          EXTRAS='/opt/mythical'
+          FULL="${DENY}|${EXTRAS}"
+
+          # Self-test — the probes come from a second organisation secret, one term
+          # per line, so no banned term is written in this file. Every probe must
+          # match: that proves the secret arrived, is a usable ERE, and still covers
+          # what it is declared to cover. It does NOT prove the list is complete.
+          [ -n "${PROBE:-}" ] || { echo "::error::DOCS_DENY_PROBE is unset or empty — failing closed"; exit 1; }
+          n=0
+          while IFS= read -r probe; do
+            [ -n "$probe" ] || continue
+            n=$((n+1))
+            printf '%s\n' "$probe" | grep -aiqE -e "$DENY" && rc=0 || rc=$?
+            [ "$rc" -eq 0 ] || { echo "::error::self-test failed (grep rc=$rc) — DOCS_DENY_PATTERN does not cover probe #$n, or is not a usable pattern; the gate is weaker than declared"; exit 1; }
+          done <<< "$PROBE"
+          [ "$n" -gt 0 ] || { echo "::error::DOCS_DENY_PROBE held no probes — failing closed"; exit 1; }
+          echo "self-test OK: DOCS_DENY_PATTERN covers $n probe(s)"
+
+          # Self-test B — the COMBINED pattern: proves the alternation is still
+          # a usable ERE once joined, and that the repo-local half fires too.
+          printf '%s\n' '/opt/mythical' | grep -aiqE -e "$FULL" && rc=0 || rc=$?
+          [ "$rc" -eq 0 ] || { echo "::error::self-test failed (grep rc=$rc) — combined pattern did not match its repo-local probe"; exit 1; }
+
+          # -a, never -I. One NUL byte makes a file invisible to a bare grep,
+          # and -I (what this step used before) skips such a file outright — a
+          # silent pass on the one file most worth reading. -e guards a pattern
+          # that begins with a dash from being parsed as an option.
+          #
+          # grep's exit code is THREE-valued: 0 = matched, 1 = no match, >=2 =
+          # the scan itself failed (unreadable file, pattern too large, I/O
+          # error). A bare `if grep ...; then` folds >=2 into the no-match
+          # branch and reports a clean tree it never finished reading — a green
+          # build with no scan behind it. So capture the code and treat
+          # anything above 1 as a hard failure, exactly as docs-bar.yml does.
+          # PASS 1 — the combined pattern, with .github excluded so the
+          # repo-local EXTRAS spelled out in this very file cannot match it.
+          hits="$(grep -rlaiE -e "$FULL" . \
+              --exclude-dir=.git --exclude-dir=.github --exclude-dir=node_modules)" && rc=0 || rc=$?
+          [ "$rc" -le 1 ] || { echo "::error::tree scan failed (grep rc=$rc) — the tree was NOT fully scanned"; exit 1; }
+          if [ -n "$hits" ]; then
+            # A path is printed, never the matched line. Workflow commands are
+            # suppressed around it with a per-use random token: a file whose NAME
+            # contains a newline followed by "::" would otherwise inject a command
+            # into the log. Log integrity only -- the build is already failing.
+            tok="stop-$RANDOM$RANDOM"
+            echo "::stop-commands::$tok"
+            printf '%s\n' "$hits"
+            echo "::${tok}::"
+            echo "::error::banned internal name(s) found — see the file(s) listed above"
+            exit 1
+          fi
+
+          # PASS 2 — the SECRET half over the WHOLE tree, .github INCLUDED.
+          # The exclusion above exists only for the inline EXTRAS; the secret's
+          # terms are not written anywhere in this repository any more, so there
+          # is nothing for them to self-match and no reason to skip a directory.
+          # This matters more than it looks: --exclude-dir skips that directory
+          # NAME AT EVERY DEPTH, so pass 1 alone is blind to a nested path such
+          # as docs/.github/ as well as to the root one. After this pass the
+          # private names have no blind spot left anywhere in the tree. Only the
+          # repo-local EXTRAS stay unchecked inside a .github directory, and
+          # they are written inline precisely because they disclose nothing.
+          ghits="$(grep -rlaiE -e "$DENY" . \
+              --exclude-dir=.git --exclude-dir=node_modules)" && rc=0 || rc=$?
+          [ "$rc" -le 1 ] || { echo "::error::whole-tree scan failed (grep rc=$rc) — NOT fully scanned"; exit 1; }
+          if [ -n "$ghits" ]; then
+            # A path is printed, never the matched line. Workflow commands are
+            # suppressed around it with a per-use random token: a file whose NAME
+            # contains a newline followed by "::" would otherwise inject a command
+            # into the log. Log integrity only -- the build is already failing.
+            tok="stop-$RANDOM$RANDOM"
+            echo "::stop-commands::$tok"
+            printf '%s\n' "$ghits"
+            echo "::${tok}::"
+            echo "::error::banned internal name(s) found — see the file(s) listed above"
+            exit 1
+          fi
+
+          # Accepted residual (availability only, never a bypass): with -a, a
+          # long base64 data-URI payload or a binary asset can in principle
+          # match by chance. The secret half already carries that risk in
+          # docs-bar.yml, which strips payloads before re-testing. The EXTRAS
+          # add ~nothing to it: '/opt/mythical' is 13 base64-alphabet
+          # characters (~1e-19 per offset) and every other extra contains '-',
+          # '.' or ':', which cannot occur inside a base64 payload at all.
+          # A chance hit fails the build and names the file — loud, and safe.
+          echo "genericize gate: clean"
+
+      # Separate, case-SENSITIVE check for the internal decision-maker moniker
+      # (an all-caps role term). It cannot join the pattern above: that gate greps
+      # case-insensitively, so folding an all-caps word in would also flag the
+      # same word used lowercase in ordinary prose and fail on false positives.
+      # Its pattern is sourced from a SECOND organisation secret for exactly the
+      # reason the first one is — so the term is not written in this file.
+      - name: Genericize gate (internal role moniker, case-sensitive)
+        env:
+          DENY_CS: ${{ secrets.DOCS_DENY_PATTERN_CS }}
+          PROBE_CS: ${{ secrets.DOCS_DENY_PROBE_CS }}
+          EVENT: ${{ github.event_name }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          THIS_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT" = pull_request ] && [ -n "$HEAD_REPO" ] && [ "$HEAD_REPO" != "$THIS_REPO" ]; then
+            echo "::notice::role-moniker gate skipped on fork PRs — secret unavailable; maintainer review covers this"
+            exit 0
+          fi
+
+          if [ -z "${DENY_CS:-}" ]; then
+            echo "::error::DOCS_DENY_PATTERN_CS is unset or empty — failing closed"
+            exit 1
+          fi
+
+          # Self-test — probes from a second organisation secret, one per line; no -i
+          # on any grep in this step, case sensitivity is the entire point of it.
+          [ -n "${PROBE_CS:-}" ] || { echo "::error::DOCS_DENY_PROBE_CS is unset or empty — failing closed"; exit 1; }
+          n=0
+          while IFS= read -r probe; do
+            [ -n "$probe" ] || continue
+            n=$((n+1))
+            printf '%s\n' "$probe" | grep -aqE -e "$DENY_CS" && rc=0 || rc=$?
+            [ "$rc" -eq 0 ] || { echo "::error::self-test failed (grep rc=$rc) — DOCS_DENY_PATTERN_CS does not cover probe #$n, or is not a usable pattern; the gate is weaker than declared"; exit 1; }
+          done <<< "$PROBE_CS"
+          [ "$n" -gt 0 ] || { echo "::error::DOCS_DENY_PROBE_CS held no probes — failing closed"; exit 1; }
+          echo "self-test OK: DOCS_DENY_PATTERN_CS covers $n probe(s)"
+
+          # ONE pass over the WHOLE tree, .github INCLUDED. This step has no
+          # inline extras, and the term is no longer written here, so the
+          # .github exclusion it used to carry would buy nothing and cost a
+          # blind spot at every depth. grep rc >=2 means the scan failed, not
+          # that the tree is clean.
+          hits="$(grep -rlaE -e "$DENY_CS" . \
+              --exclude-dir=.git --exclude-dir=node_modules)" && rc=0 || rc=$?
+          [ "$rc" -le 1 ] || { echo "::error::tree scan failed (grep rc=$rc) — the tree was NOT fully scanned"; exit 1; }
+          if [ -n "$hits" ]; then
+            # A path is printed, never the matched line. Workflow commands are
+            # suppressed around it with a per-use random token: a file whose NAME
+            # contains a newline followed by "::" would otherwise inject a command
+            # into the log. Log integrity only -- the build is already failing.
+            tok="stop-$RANDOM$RANDOM"
+            echo "::stop-commands::$tok"
+            printf '%s\n' "$hits"
+            echo "::${tok}::"
+            echo "::error::internal role moniker found (case-sensitive) — see the file(s) listed above"
+            exit 1
+          fi
+          echo "genericize gate (role moniker): clean"
+
+      # The health files must be PHYSICALLY present in the tree. Organisation-level
+      # defaults do not travel in a clone, a tarball, or a container image, so a
+      # consumer who downloads this repository sees only what is committed here.
+      - name: Community-health files are physically present
+        run: |
+          set -euo pipefail
+          missing=0
+          for f in LICENSE NOTICE README.md SECURITY.md CONTRIBUTING.md \
+                   CODE_OF_CONDUCT.md SUPPORT.md TRADEMARK.md; do
+            if [ -f "$f" ]; then echo "  ✓ $f"; else echo "  ✗ $f MISSING"; missing=1; fi
+          done
+          [ "$missing" -eq 0 ] || { echo "::error::required health file(s) missing from the tree"; exit 1; }
+
+  lint:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Ensure shellcheck is available
+        run: command -v shellcheck >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck; }
+
+      # THE SHIPPED CLI IS NO LONGER SHELL — the four scripts below are all the
+      # shell this repository still has, and every one of them is load-bearing:
+      # check.sh is the gate every lane runs, tools/build-release.sh builds what
+      # gets published, tools/parity-audit.sh drives the parity gate, and
+      # tests/smoke.sh is the release-artifact smoke. The scope was NARROWED at
+      # the cutover rather than deleted along with the bash tree: a lint that
+      # stops existing is not the same thing as a lint with nothing left to say.
+      #
+      # -x follows `source`d files. Nothing sources anything today; it stays on
+      # so the lint keeps working if one of these grows a helper.
+      - name: shellcheck
+        run: |
+          set -euo pipefail
+          shellcheck --version
+          shellcheck -x check.sh tests/*.sh tools/*.sh
+          echo "shellcheck: clean"
+
+      # Shell that is not executable is shell that will not run when invoked by
+      # name. All four are in scope: the release workflow runs build-release.sh
+      # through `bash`, but check.sh invokes parity-audit.sh and a person
+      # invokes check.sh the way its own header documents.
+      - name: Entrypoints are executable
+        run: |
+          set -euo pipefail
+          rc=0
+          for f in check.sh tests/*.sh tools/*.sh; do
+            [ -x "$f" ] || { echo "::error file=$f::not executable"; rc=1; }
+          done
+          exit "$rc"
+
+  # The Go lane. One script, run identically here and locally — see check.sh's header for why.
+  # No setup-go action: the workflow's only action dependency is checkout (kept deliberately).
+  # The toolchain is PINNED, not floating: GOTOOLCHAIN names the exact release, and the go
+  # command downloads precisely that one regardless of what the runner image ships — the same
+  # pin a setup-go version matrix would give, without a second action to trust. Bump the pin
+  # deliberately, in its own commit.
+  go:
+    name: go
+    runs-on: ubuntu-latest
+    env:
+      GOTOOLCHAIN: go1.26.5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: check.sh go
+        run: bash check.sh go
+
+      # The parity audit. It proves every @test in the frozen bats corpus is accounted for
+      # exactly once by the Go tree's PORTED:/N/A: inventory, and that every PORTED line names a
+      # test that really runs — which is the whole evidence that deleting the bash tree loses
+      # nothing. It runs HERE, on every pull request, rather than once at the cutover: an audit
+      # nobody invokes protects only the day it was run. It also keeps running after the
+      # deletion, from the committed tests/parity-manifest.tsv.
+      #
+      # IT EXECUTES THE SUITE, and that is the step's cost rather than an accident. Listing a test
+      # proves it EXISTS; a TestMain can print a name during a listing run and filter that same
+      # test out of the real one. So the stage runs `go test -json -count=1` unfiltered and
+      # requires a run event for every PORTED target. It is a second full suite run in this job,
+      # deliberately: the `go` step above answers whether the suite passes, this one answers
+      # whether the tests the inventory claims are the tests that ran.
+      - name: check.sh parity
+        run: bash check.sh parity
+
+      # THE GATE'S OWN GATE, AND IT RUNS HERE FOR THE REASON EVERY OTHER STAGE DOES.
+      # `go run` honours GOFLAGS, and GOFLAGS carries -exec: an inherited
+      # `GOFLAGS=-exec=/usr/bin/true` makes a stage BUILD its grader and then execute
+      # /usr/bin/true instead of it, so the stage prints OK and exits 0 having graded
+      # nothing — measured on this repository, on boundary and on parity, the latter
+      # with a real parity hole present. This stage re-runs those graders under exactly
+      # that environment, on both channels the go command reads it from (the variable
+      # and the go env file), and requires each one to still reach its true answer:
+      # exit 0 AND its own verdict line. A guard nobody invokes is the shape of defect
+      # it exists to close, so it is a step here rather than a script somebody remembers.
+      - name: check.sh selfcheck
+        run: bash check.sh selfcheck
+
+      # The release build runs on EVERY pull request, not only at a tag. A
+      # release lane that carries checks the PR lane does not is a lane whose
+      # breakage is discovered while somebody is waiting to ship; this stage
+      # builds the whole published platform matrix twice — the second time from
+      # a copy of the source at a different absolute path with a cold build
+      # cache — and requires the artifacts to be byte-identical, so the
+      # reproducibility claim is exercised continuously rather than asserted.
+      - name: check.sh release
+        run: bash check.sh release
+
+      # SMOKE, TWICE, AND THE FIRST ONE IS THE POINT OF RUNNING IT TWICE.
+      #
+      # MCTL_BIN is deliberately ABSENT here, so this run takes tests/smoke.sh's
+      # OWN default path — which builds the binary it tests. Every job that ever
+      # ran this script passed MCTL_BIN, which meant the default was never once
+      # exercised: before the cutover it named a fixed path in the tree and could
+      # have named anything at all without a single lane going red. A default
+      # nothing runs is not a default, so one lane runs it with nothing set.
+      - name: Smoke (the script's own default — MCTL_BIN deliberately unset)
+        run: ./tests/smoke.sh
+
+      # And once against a STAMPED artifact, built by the real release script so
+      # the version this asserts came through the same -X path a published
+      # binary's does. The artifact name is derived rather than spelled out: a
+      # hard-coded linux_amd64 would silently test nothing the day this job's
+      # runner changes architecture, because MCTL_BIN would name a file that
+      # does not exist and the first assertion would be the only one to fail.
+      - name: Smoke against a stamped release artifact
+        run: |
+          set -euo pipefail
+          bash tools/build-release.sh 0.0.0-ci "$RUNNER_TEMP/relsmoke"
+          art="$RUNNER_TEMP/relsmoke/mythical-ctl_$(go env GOOS)_$(go env GOARCH)"
+          [ -f "$art" ] || { echo "::error::no release artifact at $art"; exit 1; }
+          MCTL_BIN="$art" ./tests/smoke.sh
