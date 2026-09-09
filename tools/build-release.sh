@@ -62,9 +62,11 @@ set -euo pipefail
 _HERE="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(CDPATH='' cd -- "${_HERE}/.." && pwd)"
 
-# The pinned toolchain. It is duplicated in .github/workflows/ci.yml's go job, which is the
-# only other place that pins one, so a drift between them is refused below rather than left to
-# produce two different "reproducible" answers.
+# The pinned toolchain. Three places in this repository name one, and they must agree: this
+# constant, the GOTOOLCHAIN of .github/workflows/ci.yml's go job, and the GOTOOLCHAIN of
+# .github/workflows/release.yml's release job. A drift between them is refused below -- the guard
+# reads the INHERITED GOTOOLCHAIN, which is exactly how a workflow's pin reaches this script --
+# rather than left to produce two different "reproducible" answers.
 #
 # Go, checked 2026-09-09: 1.26.8 is the newest patch of the 1.26 line, and 1.26 is supported --
 # Go services the two newest major releases, and 1.27 is the current one. Every published
