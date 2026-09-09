@@ -65,7 +65,13 @@ ROOT="$(CDPATH='' cd -- "${_HERE}/.." && pwd)"
 # The pinned toolchain. It is duplicated in .github/workflows/ci.yml's go job, which is the
 # only other place that pins one, so a drift between them is refused below rather than left to
 # produce two different "reproducible" answers.
-PIN_GOTOOLCHAIN='go1.26.5'
+#
+# Go, checked 2026-09-09: 1.26.8 is the newest patch of the 1.26 line, and 1.26 is supported --
+# Go services the two newest major releases, and 1.27 is the current one. Every published
+# artifact records this toolchain, so moving it is a decision about reproducibility, not a
+# routine version bump.
+# Re-check the lifecycle before changing this pin; never write a version from memory.
+PIN_GOTOOLCHAIN='go1.26.8'
 
 VERSION_SYMBOL='mythicalos.ai/ctl/internal/version.Version'
 VERIFIER='./tools/release-verify'

@@ -275,11 +275,17 @@ jobs:
   # command downloads precisely that one regardless of what the runner image ships — the same
   # pin a setup-go version matrix would give, without a second action to trust. Bump the pin
   # deliberately, in its own commit.
+  #
+  # Go, checked 2026-09-09: 1.26.8 is the newest patch of the 1.26 line, and 1.26 is supported —
+  # Go services the two newest major releases, and 1.27 is the current one. The `go 1.24.0`
+  # directive in go.mod is the LANGUAGE floor and is a different thing from this toolchain; 1.24
+  # being out of service says nothing about the binaries built here.
+  # Re-check the lifecycle before changing this pin; never write a version from memory.
   go:
     name: go
     runs-on: ubuntu-latest
     env:
-      GOTOOLCHAIN: go1.26.5
+      GOTOOLCHAIN: go1.26.8
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

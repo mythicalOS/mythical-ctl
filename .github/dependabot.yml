@@ -13,3 +13,23 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+
+  # The Go module. Without this block nothing watches go.mod at all: the actions
+  # block above covers workflow pins and nothing else, so a published advisory
+  # on a direct or transitive Go dependency would sit here unannounced — and
+  # these dependencies are compiled INTO the published binaries, which is the
+  # one dependency surface a consumer cannot patch for themselves.
+  #
+  # It does NOT cover the toolchain. GOTOOLCHAIN is pinned in the two workflows
+  # and in tools/build-release.sh, deliberately, and moving it changes the bytes
+  # of every published artifact — that is a decision, not a bump, and it stays
+  # with the people who make it.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      gomod:
+        patterns: ["*"]

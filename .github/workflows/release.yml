@@ -36,8 +36,12 @@ jobs:
     # The same pin as ci.yml's go job. tools/build-release.sh REFUSES to run under a different
     # one: two Go releases do not emit the same bytes, so a drifted pin would publish an
     # artifact nobody can reproduce. Bump all three together, deliberately, in one commit.
+    #
+    # Go, checked 2026-09-09: 1.26.8 is the newest patch of the 1.26 line, and 1.26 is supported —
+    # Go services the two newest major releases, and 1.27 is the current one.
+    # Re-check the lifecycle before changing this pin; never write a version from memory.
     env:
-      GOTOOLCHAIN: go1.26.5
+      GOTOOLCHAIN: go1.26.8
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
