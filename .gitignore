@@ -13,3 +13,6 @@ docs/superpowers/
 # Editor / OS noise
 .DS_Store
 *.swp
+
+# Generated knowledge-graph output (graphify) — tool-managed, never committed.
+graphify-out/
